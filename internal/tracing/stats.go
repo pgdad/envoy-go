@@ -55,20 +55,6 @@ func RegisterTracerCounters(reg *stats.Registry) *TracerCounters {
 	}
 }
 
-// IncSent adds n to the spans_sent counter (nil-safe).
-func (c *TracerCounters) IncSent(n int) {
-	if c != nil {
-		c.spansSent.Add(uint64(n))
-	}
-}
-
-// IncDropped increments the spans_dropped counter (nil-safe).
-func (c *TracerCounters) IncDropped() {
-	if c != nil {
-		c.spansDropped.Inc()
-	}
-}
-
 // ZipkinCounters holds the 2 process-global tracer-scoped counters registered
 // under tracing.zipkin.* (D-TRACE-ZIPKIN-STATS-FINAL). These are static names
 // (no dynamic segment) so no IsValidName guard is required.
@@ -83,20 +69,6 @@ func RegisterZipkinCounters(reg *stats.Registry) *ZipkinCounters {
 	return &ZipkinCounters{
 		spansSent:    reg.NewCounter("tracing.zipkin.spans_sent"),
 		spansDropped: reg.NewCounter("tracing.zipkin.spans_dropped"),
-	}
-}
-
-// IncSent adds n to the spans_sent counter (nil-safe).
-func (c *ZipkinCounters) IncSent(n int) {
-	if c != nil {
-		c.spansSent.Add(uint64(n))
-	}
-}
-
-// IncDropped increments the spans_dropped counter (nil-safe).
-func (c *ZipkinCounters) IncDropped() {
-	if c != nil {
-		c.spansDropped.Inc()
 	}
 }
 

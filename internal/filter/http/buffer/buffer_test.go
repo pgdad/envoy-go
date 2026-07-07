@@ -578,3 +578,55 @@ func TestPerRoute_ResolveCalledOncePerStream(t *testing.T) {
 		t.Errorf("expected exactly 1 RequestRouteConfig.Resolve call; got %d", cb.resolveCount)
 	}
 }
+
+// --- Per-route compiled-config lazy cache (shared envoyhttp.PerRouteCache) ---
+
+// TestPerRoute_CompiledConfigCachedByPointer verifies that repeated
+// resolveEffective calls against the SAME *BufferPerRoute pointer compile the
+// per-route config once and serve subsequent resolves from the pointer-keyed
+// cache (one entry; identical resolved values), and that an unparseable
+// per-route falls back to the listener cap without polluting the cache —
+// mirroring the localratelimit/bandwidthlimit lazy-cache discipline.
+func TestPerRoute_CompiledConfigCachedByPointer(t *testing.T) {
+	f := freshFilter(t, 1024)
+	cb := newFakeCallbacks()
+	cb.perRoute = &bufferv3.BufferPerRoute{
+		Override: &bufferv3.BufferPerRoute_Buffer{
+			Buffer: &bufferv3.Buffer{MaxRequestBytes: wrapperspb.UInt32(2048)},
+		},
+	}
+	f.SetDecoderCallbacks(cb)
+
+	for i := 0; i < 3; i++ {
+		max, disabled := f.resolveEffective()
+		if disabled || max != 2048 {
+			t.Fatalf("resolve %d: got (max=%d, disabled=%v), want (2048, false)", i, max, disabled)
+		}
+	}
+	entries := 0
+	f.config.perRoute.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	if entries != 1 {
+		t.Errorf("cache entries after 3 resolves: got %d, want 1", entries)
+	}
+
+	// Unparseable per-route (override oneof unset) → listener fallback, NOT cached.
+	f2 := freshFilter(t, 1024)
+	cb2 := newFakeCallbacks()
+	cb2.perRoute = &bufferv3.BufferPerRoute{} // Override nil → parse error
+	f2.SetDecoderCallbacks(cb2)
+	max, disabled := f2.resolveEffective()
+	if disabled || max != 1024 {
+		t.Errorf("unparseable per-route: got (max=%d, disabled=%v), want listener (1024, false)", max, disabled)
+	}
+	entries = 0
+	f2.config.perRoute.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	if entries != 0 {
+		t.Errorf("cache entries after failed parse: got %d, want 0 (errors are not cached)", entries)
+	}
+}

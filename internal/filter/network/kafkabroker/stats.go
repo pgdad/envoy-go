@@ -1,8 +1,7 @@
 package kafkabroker
 
 import (
-	"fmt"
-
+	"github.com/pgdad/envoy-go/internal/filter/network/statroster"
 	"github.com/pgdad/envoy-go/internal/stats"
 )
 
@@ -20,35 +19,31 @@ type kafkaStats struct {
 // fixedSuffixes are the 4 non-per-key roster entries.
 var fixedSuffixes = []string{"request.unknown", "request.failure", "response.unknown", "response.failure"}
 
+// rosterSuffixes builds the full 176-suffix table: 86 per-key request +
+// 86 per-key response + the 4 fixed entries (the kafkaStats doc order).
+func rosterSuffixes() []string {
+	roots := apiKeyRoster()
+	out := make([]string, 0, 2*len(roots)+len(fixedSuffixes))
+	for _, root := range roots {
+		out = append(out, "request."+root+"_request", "response."+root+"_response")
+	}
+	return append(out, fixedSuffixes...)
+}
+
 // newKafkaStats eagerly creates all 176 counters under kafka.<statPrefix>. via
-// NewCounterIfAbsent — post-Freeze-permitted and idempotent across listeners
-// sharing a stat_prefix (the mongoproxy newMongoStats precedent).
+// the shared statroster scaffold (NewCounterIfAbsent — post-Freeze-permitted and
+// idempotent across listeners sharing a stat_prefix; the mongoproxy precedent).
 func newKafkaStats(reg *stats.Registry, statPrefix string) *kafkaStats {
-	ks := &kafkaStats{
-		prefix:   "kafka." + statPrefix + ".",
-		counters: make(map[string]*stats.Counter, 176),
+	prefix := "kafka." + statPrefix + "."
+	return &kafkaStats{
+		prefix:   prefix,
+		counters: statroster.New(reg, prefix, rosterSuffixes()),
 	}
-	for _, root := range apiKeyRoster() {
-		reqSuf := "request." + root + "_request"
-		respSuf := "response." + root + "_response"
-		ks.counters[reqSuf] = reg.NewCounterIfAbsent(ks.prefix + reqSuf)
-		ks.counters[respSuf] = reg.NewCounterIfAbsent(ks.prefix + respSuf)
-	}
-	for _, suf := range fixedSuffixes {
-		ks.counters[suf] = reg.NewCounterIfAbsent(ks.prefix + suf)
-	}
-	return ks
 }
 
 // inc increments the roster counter for suffix. Unknown suffix is a programming
 // error → panic (the roster is closed and eager).
-func (ks *kafkaStats) inc(suffix string) {
-	c, ok := ks.counters[suffix]
-	if !ok {
-		panic(fmt.Sprintf("kafkabroker: unknown roster suffix %q", suffix))
-	}
-	c.Inc()
-}
+func (ks *kafkaStats) inc(suffix string) { statroster.Inc("kafkabroker", ks.counters, suffix) }
 
 func (ks *kafkaStats) incRequest(root string)  { ks.inc("request." + root + "_request") }
 func (ks *kafkaStats) incResponse(root string) { ks.inc("response." + root + "_response") }

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pgdad/envoy-go/internal/filter/network"
 	"github.com/pgdad/envoy-go/internal/stats"
 )
 
@@ -27,6 +28,14 @@ const (
 	opCommandReply int32 = 2011
 	opMsg          int32 = 2013
 )
+
+// maxMessageLen caps a mongo wire message's declared messageLength. MongoDB's
+// own wire limit is 48MB (16MB max BSON document + overhead); 100 MiB — the
+// kafkabroker maxFrameLen precedent — comfortably exceeds any legal message
+// while preventing a downstream that declares msgLen≈2GiB from ballooning the
+// reassembly buffer. A larger declared length takes the decoderError path
+// exactly like a msgLen < 16 (sniffing off; the connection keeps flowing).
+const maxMessageLen = 100 << 20
 
 // activeQuery carries what the response-side correlation + the dynamic reply-side
 // stats need. Written on every decoded OP_QUERY (appendQuery); read+erased on a
@@ -306,12 +315,9 @@ func (d *decoder) decodeOnData(chainBytes []byte, totalAppended int64) {
 	if d.cfg.emitDynamicMetadata { // per-pass clear (filter.emitDynamicMetadata reads it; harmless when nil)
 		d.dynMeta = nil
 	}
-	if newCount := totalAppended - d.chainConsumed; newCount > 0 {
-		d.readBuf = append(d.readBuf, chainBytes[int64(len(chainBytes))-newCount:]...)
-		d.chainConsumed = totalAppended
-	}
+	d.readBuf = append(d.readBuf, network.NewBytes(chainBytes, totalAppended, &d.chainConsumed)...)
 	for {
-		m, ok := d.nextMessage()
+		m, ok := d.nextMessage(&d.readBuf)
 		if !ok {
 			break // no complete frame buffered (or sniffing went off mid-loop)
 		}
@@ -327,23 +333,27 @@ func (d *decoder) decodeOnData(chainBytes []byte, totalAppended int64) {
 	}
 }
 
-// nextMessage extracts one complete wire message from readBuf (header + body;
-// messageLength INCLUDES the 16-byte header). Returns ok=false on a partial
-// frame (wait for more — never an error). A malformed length (< 16) → decode error.
-func (d *decoder) nextMessage() ([]byte, bool) {
-	if len(d.readBuf) < 16 {
+// nextMessage extracts one complete wire message from *buf (header + body;
+// messageLength INCLUDES the 16-byte header; buf is &d.readBuf on the request
+// side and &d.writeBuf on the response side — the kafkabroker nextFrame
+// pointer-parameter shape). Returns ok=false on a partial frame (wait for more
+// — never an error). A malformed length (< 16, or beyond the maxMessageLen
+// cap) → decode error.
+func (d *decoder) nextMessage(buf *[]byte) ([]byte, bool) {
+	b := *buf
+	if len(b) < 16 {
 		return nil, false
 	}
-	msgLen := int32(binary.LittleEndian.Uint32(d.readBuf[0:4]))
-	if msgLen < 16 {
+	msgLen := int32(binary.LittleEndian.Uint32(b[0:4]))
+	if msgLen < 16 || msgLen > maxMessageLen {
 		d.decoderError()
 		return nil, false
 	}
-	if int64(len(d.readBuf)) < int64(msgLen) {
+	if int64(len(b)) < int64(msgLen) {
 		return nil, false // partial frame — wait for more bytes
 	}
-	m := d.readBuf[:msgLen]
-	d.readBuf = d.readBuf[msgLen:]
+	m := b[:msgLen]
+	*buf = b[msgLen:]
 	return m, true
 }
 
@@ -683,7 +693,7 @@ func (d *decoder) decodeOnWrite(p []byte) {
 	}
 	d.writeBuf = append(d.writeBuf, p...)
 	for {
-		m, ok := d.nextWriteMessage()
+		m, ok := d.nextMessage(&d.writeBuf)
 		if !ok {
 			break
 		}
@@ -694,26 +704,6 @@ func (d *decoder) decodeOnWrite(p []byte) {
 	if !d.sniffing.Load() {
 		d.writeBuf = nil
 	}
-}
-
-// nextWriteMessage extracts one complete wire message from writeBuf (the
-// nextMessage shape over the write-side buffer). Partial frame → wait; a
-// messageLength < 16 → decode error.
-func (d *decoder) nextWriteMessage() ([]byte, bool) {
-	if len(d.writeBuf) < 16 {
-		return nil, false
-	}
-	msgLen := int32(binary.LittleEndian.Uint32(d.writeBuf[0:4]))
-	if msgLen < 16 {
-		d.decoderError()
-		return nil, false
-	}
-	if int64(len(d.writeBuf)) < int64(msgLen) {
-		return nil, false // partial frame — wait for more bytes
-	}
-	m := d.writeBuf[:msgLen]
-	d.writeBuf = d.writeBuf[msgLen:]
-	return m, true
 }
 
 // decodeResponseMessage parses the MsgHeader of a response frame and dispatches

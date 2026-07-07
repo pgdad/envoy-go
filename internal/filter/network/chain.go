@@ -92,7 +92,7 @@ func NewChainRuntime(filters []NetworkFilter, conn net.Conn, facts ConnFacts) *C
 		remote:     facts.Remote,
 	})
 	rt.terminal = terminal
-	rt.writeFilters = write
+	rt.setWriteFilters(write)
 	// Write-callbacks injection (mirrors the read-callbacks loop in
 	// newChainRuntime): every WriteFilter receives
 	// SetWriteFilterCallbacks exactly once at construction. A both-directions
@@ -157,12 +157,14 @@ type chainRuntime struct {
 	filters  []ReadFilter
 	terminal TerminalFilter // optional trailing connection-takeover filter (26.2)
 	// writeFilters is the write-direction half of the chain in CHAIN order
-	// (ADR-0221). handleTerminal hands a REVERSED copy (dispatch order) to the
-	// writeChainConn (AMEND-A11 LIFO parity). A both-directions filter appears
-	// here AND in filters — the same instance.
-	writeFilters []WriteFilter
-	conn         net.Conn
-	facts        connFacts
+	// (ADR-0221). handleTerminal hands writeDispatch — the REVERSED copy
+	// (dispatch order), built ONCE at setWriteFilters since the set is fixed for
+	// the connection's lifetime — to the writeChainConn (AMEND-A11 LIFO parity).
+	// A both-directions filter appears here AND in filters — the same instance.
+	writeFilters  []WriteFilter
+	writeDispatch []WriteFilter
+	conn          net.Conn
+	facts         connFacts
 
 	buf    *Buffer
 	bucket *dynamicmetadata.Bucket
@@ -269,6 +271,19 @@ func newChainRuntime(filters []ReadFilter, conn net.Conn, facts connFacts) *chai
 	return rt
 }
 
+// setWriteFilters records the write-direction half of the chain (CHAIN order)
+// and builds the REVERSED dispatch copy once (AMEND-A11 LIFO parity: config
+// [A, B, C] ⇒ write dispatch C → B → A). The write set is fixed for the
+// connection's lifetime, so handleTerminal reuses writeDispatch instead of
+// rebuilding the reversal per handoff. The chain-order slice is never mutated.
+func (rt *chainRuntime) setWriteFilters(write []WriteFilter) {
+	rt.writeFilters = write
+	rt.writeDispatch = make([]WriteFilter, len(write))
+	for i, wf := range write {
+		rt.writeDispatch[len(write)-1-i] = wf
+	}
+}
+
 // setCloseDirection records the post-handoff close direction first-wins (29.3,
 // §3.5). Called by tcp_proxy via the readChainConn.SetCloseDirection forwarding on
 // the pump goroutine; read by callbacks.CloseDirection() at OnDestroy (after the
@@ -334,14 +349,11 @@ func (rt *chainRuntime) handleTerminal(ctx context.Context) {
 	// writes promote: write chain → embedded conns → raw conn). Zero-write-filter
 	// chains get NO wrap → byte-identical to the pre-28.1 path (R1 back-compat
 	// over all 47 existing fixtures).
-	// The dispatch slice is a REVERSED COPY of the chain-order writeFilters
-	// (AMEND-A11 LIFO parity: config [A, B, C] ⇒ write dispatch C → B → A).
+	// The dispatch slice is the REVERSED COPY of the chain-order writeFilters
+	// (AMEND-A11 LIFO parity: config [A, B, C] ⇒ write dispatch C → B → A),
+	// built once at setWriteFilters.
 	if len(rt.writeFilters) > 0 {
-		dispatch := make([]WriteFilter, len(rt.writeFilters))
-		for i, wf := range rt.writeFilters {
-			dispatch[len(rt.writeFilters)-1-i] = wf
-		}
-		conn = newWriteChainConn(conn, dispatch)
+		conn = newWriteChainConn(conn, rt.writeDispatch)
 	}
 	if rt.upstreamClusterOverride != "" {
 		ctx = withUpstreamClusterOverride(ctx, rt.upstreamClusterOverride)
@@ -444,6 +456,16 @@ func (rt *chainRuntime) runData() {
 			return
 		}
 		rt.resumeIdx = i + 1
+	}
+	// A completed pass over a PURE-READ chain (no terminal) resets the resume
+	// index so the next socket read re-delivers the accumulated buffer to every
+	// filter (upstream FilterManagerImpl::onRead re-iterates on EVERY read).
+	// Without the reset, resumeIdx would stick at len(filters) after an
+	// all-Continue pass and every later read would be buffered but never
+	// delivered. Terminal chains keep resumeIdx at len(filters): terminalReady
+	// keys on it, and the terminal takes over the conn at handoff.
+	if rt.terminal == nil {
+		rt.resumeIdx = 0
 	}
 }
 

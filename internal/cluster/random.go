@@ -43,18 +43,11 @@ func (r *randomLB) Pick(_ uint64, _ bool, _ SubsetMatch, _ bool) (Endpoint, func
 		return Endpoint{}, noopRelease, errNoEndpoints // the roundRobin/leastRequest parity (AMEND-R5)
 	}
 	i := int(r.rng() % uint64(n))
-	if r.health == nil {
+	if r.health.panicGate(r.endpoints) {
 		return r.endpoints[i], noopRelease, nil
 	}
-	if r.health.inPanic(r.endpoints) {
-		r.health.panicInc()
-		return r.endpoints[i], noopRelease, nil
-	}
-	for k := 0; k < n; k++ {
-		j := (i + k) % n
-		if r.health.available(r.endpoints[j]) {
-			return r.endpoints[j], noopRelease, nil
-		}
+	if j, ok := r.health.nextAvailable(r.endpoints, i); ok {
+		return r.endpoints[j], noopRelease, nil
 	}
 	return Endpoint{}, noopRelease, errNoEndpoints
 }

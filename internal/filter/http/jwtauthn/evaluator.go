@@ -44,35 +44,13 @@ import (
 // to `ErrJwtMissed` failure-reason at the deny-path emit (Task 9 per ADR-0155).
 // ---------------------------------------------------------------------------
 
-// extractedToken is one (rawToken, source, name) tuple per extraction match.
-// The `name` field carries the header / param / cookie name the token was
-// extracted from — used by Task 9's `forward=false` request-mutation pass to
-// strip the JWT from the forwarded request on success per SPEC §6.11.
-type extractedToken struct {
-	raw  string     // the JWT bytes (post-prefix-strip; post-non-base64url-trim for value_prefix extractions)
-	src  sourceKind // which extraction source produced this token
-	name string     // header / param / cookie name; "authorization" or "access_token" for the defaults
-}
-
-// sourceKind enumerates the 3 extraction-source families per ADR-0152.
-type sourceKind int
-
-const (
-	// sourceHeader: extracted from an HTTP header (default Authorization OR
-	// configured from_headers entry).
-	sourceHeader sourceKind = iota
-	// sourceParam: extracted from a URL query parameter (default access_token
-	// OR configured from_params entry).
-	sourceParam
-	// sourceCookie: extracted from the Cookie header (configured from_cookies
-	// entry; there is no default cookie source).
-	sourceCookie
-)
-
 // extractTokens implements the 4-source extraction-iteration surface per
-// SPEC §6.7 + §11.P14 + §11.P15 + ADR-0152. Returns the list of (rawToken,
-// sourceKind, name) tuples in iteration order; empty when no extraction
-// matched.
+// SPEC §6.7 + §11.P14 + §11.P15 + ADR-0152. Returns the list of raw JWT
+// strings (post-prefix-strip; post-non-base64url-trim for value_prefix
+// extractions) in iteration order; empty when no extraction matched. The
+// producing source/name is NOT carried alongside — the strip-on-success
+// request-mutation pass (provider.go) reads the extraction sources from the
+// provider config directly per SPEC §6.11.
 //
 // Iteration discipline:
 //
@@ -85,12 +63,12 @@ const (
 // The caller (Task 6 evaluateProvider) iterates the returned slice
 // first-success-wins: each token is attempted against the provider's
 // JWKS; the first successful Parse + VerifySignature + ValidateClaims wins.
-func extractTokens(p *compiledProvider, headers http.Header) []extractedToken {
+func extractTokens(p *compiledProvider, headers http.Header) []string {
 	hasExplicit := len(p.fromHeaders) > 0 || len(p.fromParams) > 0 || len(p.fromCookies) > 0
 
 	if !hasExplicit {
 		// DEFAULTS path: Authorization Bearer + access_token query.
-		var out []extractedToken
+		var out []string
 		if v := headers.Get("Authorization"); strings.HasPrefix(v, "Bearer ") {
 			// Mirror the explicit from_headers post-prefix treatment: trim
 			// leading whitespace then strip trailing non-base64url-alphabet
@@ -99,27 +77,19 @@ func extractTokens(p *compiledProvider, headers http.Header) []extractedToken {
 			// garbage to the verifier.
 			raw := stripNonBase64URLChars(strings.TrimSpace(v[len("Bearer "):]))
 			if raw != "" {
-				out = append(out, extractedToken{
-					raw:  raw,
-					src:  sourceHeader,
-					name: "authorization",
-				})
+				out = append(out, raw)
 			}
 		}
 		path := headers.Get(":path")
 		if vals, ok := parseQueryParam(path, "access_token"); ok && len(vals) > 0 && vals[0] != "" {
-			out = append(out, extractedToken{
-				raw:  vals[0],
-				src:  sourceParam,
-				name: "access_token",
-			})
+			out = append(out, vals[0])
 		}
 		return out
 	}
 
 	// EXPLICIT path: from_headers → from_params → from_cookies. Defaults
 	// suppressed.
-	var out []extractedToken
+	var out []string
 
 	// (1) Configured from_headers, in declared order. value_prefix is
 	// substring-searched per ADR-0152.
@@ -135,7 +105,7 @@ func extractTokens(p *compiledProvider, headers http.Header) []extractedToken {
 			if raw == "" {
 				continue
 			}
-			out = append(out, extractedToken{raw: raw, src: sourceHeader, name: hl.name})
+			out = append(out, raw)
 			continue
 		}
 		// Substring search via strings.Index. The JWT bytes are everything
@@ -149,7 +119,7 @@ func extractTokens(p *compiledProvider, headers http.Header) []extractedToken {
 		if raw == "" {
 			continue
 		}
-		out = append(out, extractedToken{raw: raw, src: sourceHeader, name: hl.name})
+		out = append(out, raw)
 	}
 
 	// (2) Configured from_params — case-sensitive; URL-decoded;
@@ -161,11 +131,7 @@ func extractTokens(p *compiledProvider, headers http.Header) []extractedToken {
 			if !ok || len(vals) == 0 || vals[0] == "" {
 				continue
 			}
-			out = append(out, extractedToken{
-				raw:  vals[0],
-				src:  sourceParam,
-				name: paramName,
-			})
+			out = append(out, vals[0])
 		}
 	}
 
@@ -178,11 +144,7 @@ func extractTokens(p *compiledProvider, headers http.Header) []extractedToken {
 			if !ok || v == "" {
 				continue
 			}
-			out = append(out, extractedToken{
-				raw:  v,
-				src:  sourceCookie,
-				name: cookieName,
-			})
+			out = append(out, v)
 		}
 	}
 
@@ -529,7 +491,7 @@ func (f *filter) evaluateAllowMissing(headers http.Header) evalResult {
 //
 //  1. Extract tokens via `extractTokens(p, headers)`. Empty → `ErrJwtMissed`.
 //  2. For each extracted token (first-success-wins):
-//     a. `jwt.Parse(et.raw)` — 3-part header.payload.signature decode.
+//     a. `jwt.Parse(raw)` — 3-part header.payload.signature decode.
 //     b. Resolve the JWKS:
 //     - LocalJwks: direct `p.localJwks`.
 //     - RemoteJwks: `p.jwksFetcher.Get(ctx)`; on failure +1 `jwksFetchFailed`.
@@ -555,8 +517,8 @@ func (f *filter) evaluateProvider(p *compiledProvider, headers http.Header, effe
 	}
 
 	var lastErr error = jwt.ErrJwtMissed
-	for _, et := range tokens {
-		t, err := jwt.Parse(et.raw)
+	for _, raw := range tokens {
+		t, err := jwt.Parse(raw)
 		if err != nil {
 			lastErr = err
 			continue

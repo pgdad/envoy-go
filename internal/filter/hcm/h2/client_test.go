@@ -1164,3 +1164,88 @@ func TestClientConn_ResetHooks_Nil(t *testing.T) {
 		t.Error("conn Closed() = true after a stream RST; want false")
 	}
 }
+
+// TestClientConn_RoundTrip_LateResponseAfterLocalReset_Tolerated pins the
+// RST_STREAM/response race required by RFC 9113 §5.1: after the client
+// cancels a RoundTrip (sending RST_STREAM(CANCEL) and removing the stream
+// from cc.streams), response HEADERS/DATA already in flight from the server
+// for that stream MUST be silently discarded — NOT escalated to a connection
+// error that cancels cc.ctx and kills every other in-flight stream on the
+// pooled multiplexed conn. The peer deterministically writes the late
+// response only AFTER observing the RST on the wire, then serves a second
+// RoundTrip on the same conn to prove the conn survived.
+func TestClientConn_RoundTrip_LateResponseAfterLocalReset_Tolerated(t *testing.T) {
+	cc, peer, cleanup := dialClientConn(t)
+	defer cleanup()
+
+	peerDone := make(chan error, 1)
+	go func() {
+		// Stream 1: read the request HEADERS, then block until the client's
+		// RST_STREAM(CANCEL) arrives.
+		hf, _, err := peer.readRequestHeaders()
+		if err != nil {
+			peerDone <- fmt.Errorf("readRequestHeaders(1): %w", err)
+			return
+		}
+		for {
+			f, err := peer.readNextFrame()
+			if err != nil {
+				peerDone <- fmt.Errorf("waiting for RST: %w", err)
+				return
+			}
+			if rst, ok := f.(*http2.RSTStreamFrame); ok {
+				if rst.ErrCode != http2.ErrCodeCancel {
+					peerDone <- fmt.Errorf("RST code = %v, want CANCEL", rst.ErrCode)
+					return
+				}
+				break
+			}
+		}
+		// The race: the full response (HEADERS + DATA/END_STREAM) lands on the
+		// wire AFTER the client reset the stream.
+		if err := peer.writeResponse(hf.StreamID, 200, nil, []byte("late")); err != nil {
+			peerDone <- fmt.Errorf("late writeResponse: %w", err)
+			return
+		}
+		// Stream 3: the conn must still serve a fresh RoundTrip.
+		hf2, _, err := peer.readRequestHeaders()
+		if err != nil {
+			peerDone <- fmt.Errorf("readRequestHeaders(2): %w", err)
+			return
+		}
+		peerDone <- peer.writeResponse(hf2.StreamID, 200, nil, []byte("ok2"))
+	}()
+
+	// First RoundTrip: cancel shortly after the HEADERS are written.
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel1()
+	}()
+	_, err := cc.RoundTrip(ctx1, H2Request{
+		Method: "GET", Path: "/slow", Scheme: "https", Authority: "example.test",
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("first RoundTrip err = %v, want context.Canceled", err)
+	}
+
+	// Second RoundTrip on the SAME conn must succeed even though the late
+	// stream-1 response frames precede its response in the read order.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	resp, err := cc.RoundTrip(ctx2, H2Request{
+		Method: "GET", Path: "/next", Scheme: "https", Authority: "example.test",
+	})
+	if err != nil {
+		t.Fatalf("second RoundTrip on the raced conn: %v (conn was torn down by the late response frames)", err)
+	}
+	if resp.Status != 200 || string(resp.Body) != "ok2" {
+		t.Errorf("second RoundTrip = (%d, %q), want (200, %q)", resp.Status, resp.Body, "ok2")
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatalf("peer: %v", err)
+	}
+	if cc.Closed() {
+		t.Error("cc.Closed() = true, want false (late post-reset frames must not kill the conn)")
+	}
+}

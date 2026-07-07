@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"sync"
+
+	"github.com/pgdad/envoy-go/internal/filter/network"
 )
 
 // maxFrameLen caps a Kafka frame's declared body length. A 4-byte INT32 length
@@ -75,31 +77,13 @@ func (d *decoder) lookupAndErase(corr int32) (respSpec, bool) {
 	return s, ok
 }
 
-// newBytes returns ONLY the never-before-seen trailing bytes of the cumulative
-// chain buffer (the bytes beyond *consumed), then advances *consumed to
-// totalAppended. The filter (Task 9) calls decodeOnData(buf.Bytes(),
-// buf.TotalAppended()) where buf.Bytes() is the WHOLE chain buffer so far and
-// TotalAppended() is its monotonic cumulative count; this helper mirrors the
-// mongoproxy high-water slice (chainBytes[len-newCount:]). codec.go stays
-// decoupled from the network package — the filter passes []byte + int64 in.
-func newBytes(chain []byte, totalAppended int64, consumed *int64) []byte {
-	newCount := totalAppended - *consumed
-	if newCount <= 0 {
-		return nil
-	}
-	if newCount > int64(len(chain)) {
-		newCount = int64(len(chain)) // defensive: never slice before the buffer start
-	}
-	out := chain[int64(len(chain))-newCount:]
-	*consumed = totalAppended
-	return out
-}
-
-// decodeOnData appends only the never-before-seen trailing bytes (high-water),
-// then drains complete frames. Each complete frame decodes ONE request header.
-// It NEVER drains the chain buffer, never closes, never halts.
+// decodeOnData appends only the never-before-seen trailing bytes (the shared
+// network.NewBytes high-water helper — the filter passes buf.Bytes() +
+// buf.TotalAppended() in), then drains complete frames. Each complete frame
+// decodes ONE request header. It NEVER drains the chain buffer, never closes,
+// never halts.
 func (d *decoder) decodeOnData(chain []byte, totalAppended int64) {
-	d.readBuf = append(d.readBuf, newBytes(chain, totalAppended, &d.chainConsumed)...)
+	d.readBuf = append(d.readBuf, network.NewBytes(chain, totalAppended, &d.chainConsumed)...)
 	for {
 		frame, ok := d.nextFrame(&d.readBuf) // peels 4-byte length + body; ok=false → wait/reset
 		if !ok {

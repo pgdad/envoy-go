@@ -81,25 +81,10 @@ const hmacOutputLen = sha256.Size // 32
 // hmacSecret length is unconstrained per RFC 2104; callers typically supply
 // the bytes from the filesystem-SDS-loaded `hmac_secret` Secret per ADR-0178.
 func computeHMAC(domain, expires, token, idToken, refreshToken string, hmacSecret []byte) string {
-	// Compose the 5-input newline-joined message in a single allocation by
-	// pre-computing the final length. This is a hot path on every request
-	// that carries a cookie envelope, so the allocation discipline matters.
-	totalLen := len(domain) + len(expires) + len(token) +
-		len(idToken) + len(refreshToken) + 4 // 4 newlines between 5 inputs
-	msg := make([]byte, 0, totalLen)
-	msg = append(msg, domain...)
-	msg = append(msg, '\n')
-	msg = append(msg, expires...)
-	msg = append(msg, '\n')
-	msg = append(msg, token...)
-	msg = append(msg, '\n')
-	msg = append(msg, idToken...)
-	msg = append(msg, '\n')
-	msg = append(msg, refreshToken...)
-
-	mac := hmac.New(sha256.New, hmacSecret)
-	mac.Write(msg)
-	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	// Delegate the message composition + MAC computation to rawHMAC (the
+	// single home of the 5-input composition); only the Base64URL-raw
+	// encoding differs between the emit side and the validate side.
+	return base64.RawURLEncoding.EncodeToString(rawHMAC(domain, expires, token, idToken, refreshToken, hmacSecret))
 }
 
 // validateHMAC returns true iff cookieHMAC validates against the recomputed
@@ -136,11 +121,15 @@ func validateHMAC(domain, expires, token, idToken, refreshToken string, hmacSecr
 }
 
 // rawHMAC computes the raw 32-byte HMAC-SHA256 sum without Base64 encoding —
-// used internally by validateHMAC for the constant-time compare against the
-// candidate decoded bytes. Mirrors computeHMAC's input composition exactly.
+// the single home of the 5-input message composition. computeHMAC wraps it
+// with the Base64URL-raw emit encoding; validateHMAC consumes the raw sum
+// for the constant-time compare against the candidate decoded bytes.
 func rawHMAC(domain, expires, token, idToken, refreshToken string, hmacSecret []byte) []byte {
+	// Compose the 5-input newline-joined message in a single allocation by
+	// pre-computing the final length. This is a hot path on every request
+	// that carries a cookie envelope, so the allocation discipline matters.
 	totalLen := len(domain) + len(expires) + len(token) +
-		len(idToken) + len(refreshToken) + 4
+		len(idToken) + len(refreshToken) + 4 // 4 newlines between 5 inputs
 	msg := make([]byte, 0, totalLen)
 	msg = append(msg, domain...)
 	msg = append(msg, '\n')

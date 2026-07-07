@@ -73,7 +73,6 @@ package wasm
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -96,7 +95,6 @@ import (
 //	    a token-miss (drops + counter-increment per AMEND-B3).
 type pendingHttpCall struct {
 	streamCtxID uint32             // originating stream context
-	deadline    time.Time          // per-call deadline (timeoutMs from guest)
 	cancel      context.CancelFunc // cancel the dispatch goroutine's request context
 }
 
@@ -169,7 +167,22 @@ func WithRootHTTPDispatcher(d HTTPDispatcher) RootVMOption {
 // httpCallsMu is a DIFFERENT mutex (guards only the httpCalls map +
 // nextCallID); acquiring it from within dispatchMu is safe (lock order:
 // dispatchMu → httpCallsMu).
-func (rv *RootVM) DispatchHttpCall(ctx context.Context, streamCtxID uint32, cluster string, headers []HeaderPair, body []byte, trailers []HeaderPair, timeoutMs uint32) (uint32, abi.WasmResult) {
+//
+// The first parameter is the hostcall-frame ctx, deliberately unused: the
+// dispatch survives the hostcall return + completes asynchronously against
+// its own per-call timeout context (see the goroutine-spawn comment below).
+// The parameter stays on the signature for the abi/httpCallHost adapter at
+// host_bridge_25_2.go, which threads the hostcall ctx through.
+func (rv *RootVM) DispatchHttpCall(_ context.Context, streamCtxID uint32, cluster string, headers []HeaderPair, body []byte, trailers []HeaderPair, timeoutMs uint32) (uint32, abi.WasmResult) {
+	// Closed-VM guard: Close cancels + nils the httpCalls map; a dispatch
+	// racing past this point could otherwise lazily re-create the map +
+	// launch a request goroutine that runs to its full timeout against a
+	// closed VM (Close's sweep runs after the dispatchMu drain, so a
+	// dispatch inside a pre-Close dispatchMu frame is still swept; this
+	// guard covers post-Close callers).
+	if rv.closed.Load() {
+		return 0, abi.WasmResultInternalFailure
+	}
 	if rv.httpDispatcher == nil {
 		return 0, abi.WasmResultInternalFailure
 	}
@@ -212,7 +225,6 @@ func (rv *RootVM) DispatchHttpCall(ctx context.Context, streamCtxID uint32, clus
 	}
 	rv.httpCalls[callID] = &pendingHttpCall{
 		streamCtxID: streamCtxID,
-		deadline:    time.Now().Add(timeout),
 		cancel:      cancel,
 	}
 	rv.httpCallsMu.Unlock()
@@ -235,7 +247,6 @@ func (rv *RootVM) DispatchHttpCall(ctx context.Context, streamCtxID uint32, clus
 	// invocation ctx (used when re-entering the wazero VM to invoke
 	// proxy_on_http_call_response).
 	go rv.dispatchHttpCallGoroutine(callID, cluster, req)
-	_ = ctx // ctx is for the hostcall path; response goroutine uses background
 
 	return callID, abi.WasmResultOk
 }
@@ -340,9 +351,10 @@ func (rv *RootVM) handleHttpCallResponse(callID uint32, resp *http.Response, dis
 	// originating stream context. Mirrors tick.go lockAndDispatchTick.
 	//
 	// Use a fresh context.Background() — the original reqCtx is canceled
-	// by the deferred entry.cancel() above; the guest invocation runs
-	// synchronously under the dispatchMu-held frame and consumes its own
-	// dispatch ctx, NOT the per-call ctx.
+	// by the entry.cancel() call above (a plain call, before the dispatchMu
+	// acquisition); the guest invocation runs synchronously under the
+	// dispatchMu-held frame and consumes its own dispatch ctx, NOT the
+	// per-call ctx.
 	ctx := context.Background()
 
 	rv.dispatchMu.Lock()
@@ -541,13 +553,6 @@ func (r *byteReader) Read(p []byte) (int, error) {
 // supplied timeoutMs is zero. Mirrors a conservative default; production
 // guests should always supply an explicit timeout.
 const defaultHttpCallTimeout = 5 * time.Second
-
-// errHttpDispatchTimeout is a sentinel surfaced when the per-call deadline
-// exceeds (future scope — currently unused; reserved for the Task 17 +
-// counter integration).
-//
-//nolint:unused // reserved for Task 17 counter wiring
-var errHttpDispatchTimeout = errors.New("wasm: http_call: per-call deadline exceeded")
 
 // Compile-time guard: the byteReader satisfies io.Reader.
 var _ io.Reader = (*byteReader)(nil)

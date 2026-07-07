@@ -1172,6 +1172,137 @@ func TestCompleteStage_D9Race_DoneFlagDropsSignal(t *testing.T) {
 	}
 }
 
+// lockCheckDCB wraps fakeDCB to observe whether f.mu is held at the
+// ContinueDecoding call site (the resume signal). Used by
+// TestCompleteStage_HoldsMuAcrossDisposition.
+type lockCheckDCB struct {
+	fakeDCB
+	f              *filter
+	heldInContinue bool
+}
+
+func (d *lockCheckDCB) ContinueDecoding() {
+	// TryLock failing proves the caller holds f.mu.
+	if d.f != nil {
+		if !d.f.mu.TryLock() {
+			d.heldInContinue = true
+		} else {
+			d.f.mu.Unlock()
+		}
+	}
+	d.fakeDCB.ContinueDecoding()
+}
+
+// TestCompleteStage_HoldsMuAcrossDisposition asserts completeStage holds
+// f.mu across the ENTIRE per-stage disposition — the applyProcessingResponseFn
+// call (where emitImmediateResponse/SendLocalReply fires) AND the resume
+// signal — matching the phase-18.x ext_authz applyDisposition precedent.
+// Pre-fix, completeStage released f.mu immediately after the done-check;
+// OnDestroy (chain teardown after parkDecode unblocks on ctx.Done) could
+// complete in that window and the dispatch goroutine would then call
+// SendLocalReply/ContinueDecoding on a destroyed chain. The test also
+// verifies a concurrent onDestroyImpl is EXCLUDED (blocked on f.mu) while
+// the disposition is in flight.
+func TestCompleteStage_HoldsMuAcrossDisposition(t *testing.T) {
+	dcb := &lockCheckDCB{}
+	f := &filter{dcb: dcb}
+	dcb.f = f
+
+	heldInApply := false
+	doneFlippedMidDisposition := false
+	destroyDone := make(chan struct{})
+	withApplyOverride(t, func(ff *filter, _ stage, _ *extprocsvcv3.ProcessingResponse) (action, error) {
+		// TryLock failing proves completeStage holds f.mu here.
+		if !ff.mu.TryLock() {
+			heldInApply = true
+		} else {
+			ff.mu.Unlock()
+		}
+		// Fire OnDestroy concurrently mid-disposition: it must BLOCK on
+		// f.mu (held by completeStage) — f.done stays false for the rest
+		// of this disposition. Reading ff.done here is safe: this
+		// goroutine holds f.mu, which guards the flag.
+		go func() {
+			defer close(destroyDone)
+			ff.onDestroyImpl()
+		}()
+		time.Sleep(20 * time.Millisecond)
+		if ff.done {
+			doneFlippedMidDisposition = true
+		}
+		return actContinue, nil
+	})
+
+	f.completeStage(stageRequestHeaders, &extprocsvcv3.ProcessingResponse{}, nil)
+	<-destroyDone
+
+	if !heldInApply {
+		t.Errorf("f.mu not held during applyProcessingResponseFn; want held across the disposition (ext_authz precedent)")
+	}
+	if !dcb.heldInContinue {
+		t.Errorf("f.mu not held during ContinueDecoding; want held across the resume signal")
+	}
+	if doneFlippedMidDisposition {
+		t.Errorf("f.done flipped mid-disposition; want OnDestroy excluded (blocked on f.mu) until the disposition completes")
+	}
+	if !f.done {
+		t.Errorf("f.done = false after onDestroyImpl completed; want true")
+	}
+	if dcb.calls() != 1 {
+		t.Errorf("ContinueDecoding called %d times; want 1", dcb.calls())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// watchStageDeadline — per-stage watchdog decision helper (dispatchStage).
+// ---------------------------------------------------------------------------
+
+// TestWatchStageDeadline_RecvCompletedWins asserts the completed-Recv outcome
+// wins DETERMINISTICALLY when the per-message deadline expires at (nearly)
+// the same instant Recv completes: with BOTH channels ready, the watchdog
+// must NOT fire cancelStream. Pre-fix the two-arm select picked randomly, so
+// a successful stage could silently poison the still-healthy bidi-stream for
+// all subsequent stages of the transaction. 100 iterations make the pre-fix
+// ~50%-per-iteration select randomness a near-certain failure.
+func TestWatchStageDeadline_RecvCompletedWins(t *testing.T) {
+	t.Parallel()
+	for i := 0; i < 100; i++ {
+		msgCtx, msgCancel := context.WithCancel(context.Background())
+		msgCancel() // per-message deadline already expired
+		doneCh := make(chan struct{})
+		close(doneCh) // Recv already completed
+		canceled := false
+		watchStageDeadline(msgCtx, doneCh, func() { canceled = true })
+		if canceled {
+			t.Fatalf("iteration %d: watchStageDeadline fired cancelStream with doneCh already closed; want no cancel (completed Recv wins)", i)
+		}
+	}
+}
+
+// TestWatchStageDeadline_DeadlineExpiryCancels asserts the genuine-expiry
+// path is preserved: deadline expired + Recv still parked (doneCh open) →
+// cancelStream fires (the stream-fatal cascade that unblocks the in-flight
+// Recv).
+func TestWatchStageDeadline_DeadlineExpiryCancels(t *testing.T) {
+	t.Parallel()
+	msgCtx, msgCancel := context.WithCancel(context.Background())
+	msgCancel()
+	canceled := false
+	watchStageDeadline(msgCtx, make(chan struct{}), func() { canceled = true })
+	if !canceled {
+		t.Fatalf("watchStageDeadline did not fire cancelStream on deadline expiry with Recv still in flight")
+	}
+}
+
+// TestWatchStageDeadline_NilCancelTolerated asserts the nil-cancelStream
+// tolerance (test paths that bypass openProcessorStream) — must not panic.
+func TestWatchStageDeadline_NilCancelTolerated(t *testing.T) {
+	t.Parallel()
+	msgCtx, msgCancel := context.WithCancel(context.Background())
+	msgCancel()
+	watchStageDeadline(msgCtx, make(chan struct{}), nil)
+}
+
 // ---------------------------------------------------------------------------
 // Group 10 — OnDestroy lifecycle per ADR-0171 §Decision D9 (Task 7).
 //
@@ -2697,8 +2828,8 @@ var _ envoyhttp.DecoderFilterCallbacks = (*recordingDCB)(nil)
 // Group 11 — attributes.go envelope builder per ADR-0174 + SPEC §6.6 (Task 9).
 //
 // Tests cover:
-//   - lowercaseHeaderMap + sourcePrincipalFirstOrEmpty helpers (parity with
-//     the phase-18.2 attributes.go precedent).
+//   - sourcePrincipalFirstOrEmpty helper (parity with the phase-18.2
+//     attributes.go precedent).
 //   - buildAttributeEnvelope: the SPEC §6.6 7-attribute hypothesis-table
 //     evaluation against a pluggable accessor surface — empty allowlist →
 //     nil envelope; allowlist-of-one → only that attribute populated;
@@ -2771,43 +2902,11 @@ var (
 	_ envoyhttp.EncoderFilterCallbacks = (*ecbStub)(nil)
 )
 
-// TestLowercaseHeaderMap_Basic asserts the canonical → lowercased single-value
-// projection + the multi-value comma-join discipline (mirrors phase-18.2
-// attributes.go precedent + the reference Envoy v1.37.2 internal lowercase +
-// comma-join convention for the headers map).
-func TestLowercaseHeaderMap_Basic(t *testing.T) {
-	t.Parallel()
-	in := http.Header{
-		"Authorization":   []string{"Bearer x"},
-		"X-Forwarded-For": []string{"1.1.1.1", "2.2.2.2"},
-		":method":         []string{"GET"},
-	}
-	got := lowercaseHeaderMap(in)
-	if got["authorization"] != "Bearer x" {
-		t.Errorf("authorization = %q; want %q", got["authorization"], "Bearer x")
-	}
-	if got["x-forwarded-for"] != "1.1.1.1,2.2.2.2" {
-		t.Errorf("x-forwarded-for = %q; want %q (multi-value comma-join)",
-			got["x-forwarded-for"], "1.1.1.1,2.2.2.2")
-	}
-	if got[":method"] != "GET" {
-		t.Errorf(":method = %q; want %q (pseudo-headers included)",
-			got[":method"], "GET")
-	}
-}
-
-// TestLowercaseHeaderMap_Empty asserts a nil / empty input returns a non-nil
-// empty map (the proto-faithful contract — never nil).
-func TestLowercaseHeaderMap_Empty(t *testing.T) {
-	t.Parallel()
-	got := lowercaseHeaderMap(nil)
-	if got == nil {
-		t.Errorf("lowercaseHeaderMap(nil) = nil; want non-nil empty map")
-	}
-	if len(got) != 0 {
-		t.Errorf("len = %d; want 0", len(got))
-	}
-}
+// (TestLowercaseHeaderMap_Basic / TestLowercaseHeaderMap_Empty were deleted
+// alongside the production-dead lowercaseHeaderMap helper — the live header
+// projection is headerMapToHeaderMap, covered by the envelope-builder tests
+// below; the map[string]string projection behavior remains tested at its
+// phase-18.2 ext_authz home.)
 
 // TestSourcePrincipalFirstOrEmpty asserts the first-or-empty helper used by
 // the source.principal attribute extraction.
@@ -4751,10 +4850,8 @@ func TestBuildCompiledConfig_GRPC_HappyPath_FieldsPopulated(t *testing.T) {
 	} else if !cc.mutationRules.AllowAllRouting {
 		t.Errorf("AllowAllRouting = false; want true")
 	}
-	// Forward rules — placeholder at 19.1.
-	if cc.forwardRules == nil {
-		t.Errorf("cc.forwardRules = nil; want non-nil placeholder")
-	}
+	// Forward rules — DEFERRED: silently ignored, no compiled field (the
+	// former empty placeholder allocation was deleted as dead code).
 	// Attribute envelopes.
 	if len(cc.requestAttributes) != 2 {
 		t.Errorf("requestAttributes len = %d; want 2", len(cc.requestAttributes))
@@ -7641,7 +7738,7 @@ func TestExtProc_OnDestroy_DuringBodyStageOutbound_NoBufferReleaseFires(t *testi
 //
 //   - TestRace_PerMessageTimerCancelRebuild_AgainstInFlightSendRecv — per
 //     D4 behavioral lift: dispatch goroutine spawns the watchdog +
-//     publishes f.activeMsgCancel under f.mu; concurrent
+//     publishes f.activeMsgCancel under f.cancelMu; concurrent
 //     handleOverrideMessageTimeout fires the captured cancel → watchdog
 //     fires streamCancel → in-flight Recv unblocks with
 //     context.Canceled. Race detector observes no race on f.activeMsgCancel
@@ -7905,7 +8002,7 @@ func TestRace_EncodeBufConcurrentWithContinueEncoding_EndToEnd(t *testing.T) {
 // Per D4 behavioral lift (ADR-0171 §Decision AMENDMENT bullet 5): the
 // per-message timer is consumed BEHAVIORALLY via context.WithTimeout
 // cancel-and-rebuild on each stage's Send. The dispatchStage publishes the
-// per-message cancel hook on f.activeMsgCancel under f.mu; the watchdog
+// per-message cancel hook on f.activeMsgCancel under f.cancelMu; the watchdog
 // goroutine selects on msgCtx.Done vs doneCh + fires f.streamCancel on
 // per-message deadline expiry (cascade-cancels the bidi-stream so the
 // in-flight Recv unblocks).
@@ -7917,8 +8014,9 @@ func TestRace_EncodeBufConcurrentWithContinueEncoding_EndToEnd(t *testing.T) {
 // completeStage handles the recvErr path → streamsFailed increments.
 //
 // Race-detector clean under the concurrent activeMsgCancel set (dispatch
-// goroutine, under f.mu) + read+clear (handleOverrideMessageTimeout, under
-// f.mu) + the deferred clear at goroutine exit (also under f.mu). The
+// goroutine, under f.cancelMu) + read+clear (handleOverrideMessageTimeout,
+// under f.cancelMu) + the deferred clear at goroutine exit (also under
+// f.cancelMu). The
 // stream-fatal cascade is the intended behavior per the D4 docstring's
 // "Stream-fatal cascade" note.
 func TestRace_PerMessageTimerCancelRebuild_AgainstInFlightSendRecv(t *testing.T) {
@@ -7956,15 +8054,15 @@ func TestRace_PerMessageTimerCancelRebuild_AgainstInFlightSendRecv(t *testing.T)
 		t.Fatalf("dispatch goroutine did not enter Recv within 500ms")
 	}
 	// Verify the cancel hook is published.
-	f.mu.Lock()
+	f.cancelMu.Lock()
 	gotCancel := f.activeMsgCancel != nil
-	f.mu.Unlock()
+	f.cancelMu.Unlock()
 	if !gotCancel {
-		t.Fatalf("f.activeMsgCancel not published after Recv entry; expected dispatchStage to set it under f.mu")
+		t.Fatalf("f.activeMsgCancel not published after Recv entry; expected dispatchStage to set it under f.cancelMu")
 	}
 
 	// Concurrent handleOverrideMessageTimeout — race surface: read+clear of
-	// f.activeMsgCancel under f.mu (handleOverrideMessageTimeout) vs the
+	// f.activeMsgCancel under f.cancelMu (handleOverrideMessageTimeout) vs the
 	// dispatch goroutine's deferred clear-under-f.mu at goroutine exit + the
 	// set-under-f.mu at goroutine entry. Per ADR-0171 §Decision AMENDMENT
 	// bullet 5: the override accept fires the captured cancel → watchdog
@@ -7985,9 +8083,9 @@ func TestRace_PerMessageTimerCancelRebuild_AgainstInFlightSendRecv(t *testing.T)
 
 	// Post-race: f.activeMsgCancel is cleared (the override path set it nil
 	// before firing; the deferred clear at goroutine exit is idempotent).
-	f.mu.Lock()
+	f.cancelMu.Lock()
 	stillSet := f.activeMsgCancel != nil
-	f.mu.Unlock()
+	f.cancelMu.Unlock()
 	if stillSet {
 		t.Errorf("f.activeMsgCancel still set after override-timeout + dispatch exit; want nil (idempotent clear)")
 	}

@@ -149,27 +149,29 @@ type permAny struct{ val bool }
 
 func (e *permAny) evaluatePermission(_ EvalContext) bool { return e.val }
 
-// permHeader wraps a parsed HeaderMatcher. Per SPEC §6.5; uses the
-// matchHeader local adapter (see Shared infrastructure adapters below).
-type permHeader struct{ matcher *routev3.HeaderMatcher }
+// permHeader wraps a build-time-compiled HeaderMatcher. Per SPEC §6.5; uses
+// the compiledHeaderMatcher local adapter (see Shared infrastructure adapters
+// below).
+type permHeader struct{ matcher compiledHeaderMatcher }
 
 func (e *permHeader) evaluatePermission(ctx EvalContext) bool {
-	return matchHeader(e.matcher, ctx)
+	return e.matcher.matches(ctx)
 }
 
-// permURLPath wraps a parsed PathMatcher. Per SPEC §6.5; uses matchPath.
-type permURLPath struct{ matcher *matcherv3.PathMatcher }
+// permURLPath wraps a parsed PathMatcher lowered onto its inner compiled
+// StringMatcher via compilePathMatcher. Per SPEC §6.5.
+type permURLPath struct{ matcher compiledStringMatcher }
 
 func (e *permURLPath) evaluatePermission(ctx EvalContext) bool {
-	return matchPath(e.matcher, ctx.URLPath())
+	return e.matcher.matches(ctx.URLPath())
 }
 
-// permDestIP wraps a parsed CidrRange. CIDR-range match against
+// permDestIP wraps a build-time-compiled CidrRange. CIDR-range match against
 // ctx.DestinationIP() per SPEC §6.5.
-type permDestIP struct{ cidr *corev3.CidrRange }
+type permDestIP struct{ cidr compiledCidr }
 
 func (e *permDestIP) evaluatePermission(ctx EvalContext) bool {
-	return matchCidr(e.cidr, ctx.DestinationIP())
+	return e.cidr.matches(ctx.DestinationIP())
 }
 
 // permDestPort exact-matches a single uint32 port. Per SPEC §6.5.
@@ -192,12 +194,12 @@ func (e *permDestPortRange) evaluatePermission(ctx EvalContext) bool {
 	return p >= int64(e.start) && p < int64(e.end)
 }
 
-// permSNI matches a StringMatcher against ctx.RequestedServerName(). Per
-// SPEC §6.5.
-type permSNI struct{ matcher *matcherv3.StringMatcher }
+// permSNI matches a build-time-compiled StringMatcher against
+// ctx.RequestedServerName(). Per SPEC §6.5.
+type permSNI struct{ matcher compiledStringMatcher }
 
 func (e *permSNI) evaluatePermission(ctx EvalContext) bool {
-	return matchString(e.matcher, ctx.RequestedServerName())
+	return e.matcher.matches(ctx.RequestedServerName())
 }
 
 // permAnd is the AND-semantic short-circuit recursive combinator. Returns
@@ -295,7 +297,7 @@ func buildOnePermission(p *rbacconfigv3.Permission, profile Profile) (permission
 		if r.Header == nil {
 			return nil, errors.New("rbac: permission.header is nil")
 		}
-		return &permHeader{matcher: r.Header}, nil
+		return &permHeader{matcher: compileHeaderMatcher(r.Header)}, nil
 	case *rbacconfigv3.Permission_UrlPath:
 		if !profile.permits(armURLPath) {
 			return nil, errors.New("rbac: permission.url_path is HTTP-only (unsupported for L4 network RBAC)")
@@ -303,12 +305,12 @@ func buildOnePermission(p *rbacconfigv3.Permission, profile Profile) (permission
 		if r.UrlPath == nil {
 			return nil, errors.New("rbac: permission.url_path is nil")
 		}
-		return &permURLPath{matcher: r.UrlPath}, nil
+		return &permURLPath{matcher: compilePathMatcher(r.UrlPath)}, nil
 	case *rbacconfigv3.Permission_DestinationIp:
 		if r.DestinationIp == nil {
 			return nil, errors.New("rbac: permission.destination_ip is nil")
 		}
-		return &permDestIP{cidr: r.DestinationIp}, nil
+		return &permDestIP{cidr: compileCidr(r.DestinationIp)}, nil
 	case *rbacconfigv3.Permission_DestinationPort:
 		// PGV lte=65535 mirror per §1.1 amendment 4. uint32 from proto carries
 		// values up to 2^32-1; defensive reject out-of-port-range.
@@ -328,7 +330,7 @@ func buildOnePermission(p *rbacconfigv3.Permission, profile Profile) (permission
 		if r.RequestedServerName == nil {
 			return nil, errors.New("rbac: permission.requested_server_name is nil")
 		}
-		return &permSNI{matcher: r.RequestedServerName}, nil
+		return &permSNI{matcher: compileStringMatcher(r.RequestedServerName)}, nil
 	case *rbacconfigv3.Permission_AndRules:
 		if r.AndRules == nil {
 			return nil, errors.New("rbac: permission.and_rules is nil")
@@ -413,17 +415,20 @@ func (e *prinAny) evaluatePrincipal(_ EvalContext) bool { return e.val }
 
 // prinAuthenticated implements the three-case algorithm per §1.1 amendment 12
 // + SPEC §6.6 + ADR-0143 §Decision (vi). The nameMatcher field is the
-// (possibly-nil) StringMatcher carried by Principal_Authenticated.principal_name.
+// build-time-compiled form of the (possibly-nil) StringMatcher carried by
+// Principal_Authenticated.principal_name; a nil pointer records the
+// proto-nil case.
 //
 //   - Case (a): nameMatcher == nil + len(ctx.DownstreamPrincipal()) > 0 → TRUE
 //     (match any authenticated user per amendment 12).
-//   - Case (b): non-nil StringMatcher iterates over ctx.DownstreamPrincipal()
-//     candidates in priority order (URI SAN first, then DNS SAN, then Subject
-//     DN Common Name per ADR-0144); TRUE on first match via matchString.
+//   - Case (b): non-nil compiled StringMatcher iterates over
+//     ctx.DownstreamPrincipal() candidates in priority order (URI SAN first,
+//     then DNS SAN, then Subject DN Common Name per ADR-0144); TRUE on first
+//     match.
 //   - Case (c): len(ctx.DownstreamPrincipal()) == 0 → FALSE (plaintext /
 //     no client cert).
 type prinAuthenticated struct {
-	nameMatcher *matcherv3.StringMatcher // nil for case (a)
+	nameMatcher *compiledStringMatcher // nil for case (a)
 }
 
 func (e *prinAuthenticated) evaluatePrincipal(ctx EvalContext) bool {
@@ -438,7 +443,7 @@ func (e *prinAuthenticated) evaluatePrincipal(ctx EvalContext) bool {
 	}
 	// Case (b): iterate priority-ordered candidates; TRUE on first match.
 	for _, candidate := range candidates {
-		if matchString(e.nameMatcher, candidate) {
+		if e.nameMatcher.matches(candidate) {
 			return true
 		}
 	}
@@ -447,10 +452,10 @@ func (e *prinAuthenticated) evaluatePrincipal(ctx EvalContext) bool {
 
 // prinDirectRemoteIP CIDR-matches the peer connection source IP per §11.P18.
 // Distinct from prinRemoteIP: NO XFF resolution.
-type prinDirectRemoteIP struct{ cidr *corev3.CidrRange }
+type prinDirectRemoteIP struct{ cidr compiledCidr }
 
 func (e *prinDirectRemoteIP) evaluatePrincipal(ctx EvalContext) bool {
-	return matchCidr(e.cidr, ctx.DirectRemoteIP())
+	return e.cidr.matches(ctx.DirectRemoteIP())
 }
 
 // prinRemoteIP CIDR-matches the XFF-resolved remote IP per §11.P18. The
@@ -458,26 +463,27 @@ func (e *prinDirectRemoteIP) evaluatePrincipal(ctx EvalContext) bool {
 // when one is exposed; phase-16 MVP MAY return the peer addr verbatim when
 // the framework primitive is not yet surfaced (documented at the EvalContext
 // interface comment).
-type prinRemoteIP struct{ cidr *corev3.CidrRange }
+type prinRemoteIP struct{ cidr compiledCidr }
 
 func (e *prinRemoteIP) evaluatePrincipal(ctx EvalContext) bool {
-	return matchCidr(e.cidr, ctx.RemoteIP())
+	return e.cidr.matches(ctx.RemoteIP())
 }
 
-// prinHeader wraps a routev3.HeaderMatcher; reuses the matchHeader local
-// adapter (the matcher type is the same as Permission.Header per the proto
-// binding).
-type prinHeader struct{ matcher *routev3.HeaderMatcher }
+// prinHeader wraps a build-time-compiled routev3.HeaderMatcher; reuses the
+// compiledHeaderMatcher local adapter (the matcher type is the same as
+// Permission.Header per the proto binding).
+type prinHeader struct{ matcher compiledHeaderMatcher }
 
 func (e *prinHeader) evaluatePrincipal(ctx EvalContext) bool {
-	return matchHeader(e.matcher, ctx)
+	return e.matcher.matches(ctx)
 }
 
-// prinURLPath wraps a matcherv3.PathMatcher; reuses the matchPath local adapter.
-type prinURLPath struct{ matcher *matcherv3.PathMatcher }
+// prinURLPath wraps a matcherv3.PathMatcher lowered via compilePathMatcher;
+// mirrors permURLPath.
+type prinURLPath struct{ matcher compiledStringMatcher }
 
 func (e *prinURLPath) evaluatePrincipal(ctx EvalContext) bool {
-	return matchPath(e.matcher, ctx.URLPath())
+	return e.matcher.matches(ctx.URLPath())
 }
 
 // prinAnd is the AND-semantic short-circuit recursive combinator. Mirrors
@@ -587,22 +593,26 @@ func buildOnePrincipal(p *rbacconfigv3.Principal, profile Profile) (principalEva
 		}
 		return &prinAny{val: id.Any}, nil
 	case *rbacconfigv3.Principal_Authenticated_:
-		// nameMatcher MAY be nil — case (a) of the three-case algorithm.
-		var nm *matcherv3.StringMatcher
+		// nameMatcher MAY be nil — case (a) of the three-case algorithm. A
+		// non-nil principal_name is compiled at build time (case (b)).
+		var nm *compiledStringMatcher
 		if id.Authenticated != nil {
-			nm = id.Authenticated.GetPrincipalName()
+			if pn := id.Authenticated.GetPrincipalName(); pn != nil {
+				compiled := compileStringMatcher(pn)
+				nm = &compiled
+			}
 		}
 		return &prinAuthenticated{nameMatcher: nm}, nil
 	case *rbacconfigv3.Principal_DirectRemoteIp:
 		if id.DirectRemoteIp == nil {
 			return nil, errors.New("rbac: principal.direct_remote_ip is nil")
 		}
-		return &prinDirectRemoteIP{cidr: id.DirectRemoteIp}, nil
+		return &prinDirectRemoteIP{cidr: compileCidr(id.DirectRemoteIp)}, nil
 	case *rbacconfigv3.Principal_RemoteIp:
 		if id.RemoteIp == nil {
 			return nil, errors.New("rbac: principal.remote_ip is nil")
 		}
-		return &prinRemoteIP{cidr: id.RemoteIp}, nil
+		return &prinRemoteIP{cidr: compileCidr(id.RemoteIp)}, nil
 	case *rbacconfigv3.Principal_Header:
 		if !profile.permits(armHeader) {
 			return nil, errors.New("rbac: principal.header is HTTP-only (unsupported for L4 network RBAC)")
@@ -610,7 +620,7 @@ func buildOnePrincipal(p *rbacconfigv3.Principal, profile Profile) (principalEva
 		if id.Header == nil {
 			return nil, errors.New("rbac: principal.header is nil")
 		}
-		return &prinHeader{matcher: id.Header}, nil
+		return &prinHeader{matcher: compileHeaderMatcher(id.Header)}, nil
 	case *rbacconfigv3.Principal_UrlPath:
 		if !profile.permits(armURLPath) {
 			return nil, errors.New("rbac: principal.url_path is HTTP-only (unsupported for L4 network RBAC)")
@@ -618,7 +628,7 @@ func buildOnePrincipal(p *rbacconfigv3.Principal, profile Profile) (principalEva
 		if id.UrlPath == nil {
 			return nil, errors.New("rbac: principal.url_path is nil")
 		}
-		return &prinURLPath{matcher: id.UrlPath}, nil
+		return &prinURLPath{matcher: compilePathMatcher(id.UrlPath)}, nil
 	case *rbacconfigv3.Principal_AndIds:
 		if id.AndIds == nil {
 			return nil, errors.New("rbac: principal.and_ids is nil")
@@ -692,11 +702,41 @@ func buildOnePrincipal(p *rbacconfigv3.Principal, profile Profile) (principalEva
 // cross-filter reuse.
 // ----------------------------------------------------------------------------
 
-// matchString evaluates a matcherv3.StringMatcher against a candidate string.
+// compiledStringMatcher pairs a matcherv3.StringMatcher with its pre-compiled
+// SafeRegex program. The proto matcher is retained for the non-regex arms
+// (their per-call cost is a plain string compare); the regex is compiled ONCE
+// at buildOnePermission/buildOnePrincipal time so request evaluation never
+// invokes regexp.Compile (closing the former per-call-compile TECH-DEBT).
+//
+// A nil `re` alongside a SafeRegex arm means "nil SafeRegex OR compile
+// failure" — matches() returns false, byte-identical to the historical
+// per-call disposition (compile failure → runtime false).
+type compiledStringMatcher struct {
+	sm *matcherv3.StringMatcher
+	re *regexp.Regexp // non-nil iff the SafeRegex arm compiled successfully
+}
+
+// compileStringMatcher lowers a StringMatcher at parse time. nil sm is
+// tolerated (matches() → false), mirroring the historical nil handling.
+func compileStringMatcher(sm *matcherv3.StringMatcher) compiledStringMatcher {
+	c := compiledStringMatcher{sm: sm}
+	if sm == nil {
+		return c
+	}
+	if mp, ok := sm.GetMatchPattern().(*matcherv3.StringMatcher_SafeRegex); ok && mp.SafeRegex != nil {
+		if re, err := regexp.Compile(mp.SafeRegex.GetRegex()); err == nil {
+			c.re = re
+		}
+	}
+	return c
+}
+
+// matches evaluates the StringMatcher against a candidate string.
 // Subset honored: Exact / Prefix / Suffix / Contains / SafeRegex with
 // `ignore_case` for non-regex variants. Custom + nil pattern → false (no
 // PARSE-REJECT here; the build-side helpers reject earlier if applicable).
-func matchString(sm *matcherv3.StringMatcher, candidate string) bool {
+func (c compiledStringMatcher) matches(candidate string) bool {
+	sm := c.sm
 	if sm == nil {
 		return false
 	}
@@ -726,17 +766,10 @@ func matchString(sm *matcherv3.StringMatcher, candidate string) bool {
 		}
 		return strings.Contains(candidate, mp.Contains)
 	case *matcherv3.StringMatcher_SafeRegex:
-		if mp.SafeRegex == nil {
-			return false
-		}
-		// Re-compile per call: the runtime cost is acceptable for the canonical
-		// subset. TECH-DEBT: pre-compile at buildOnePermission time per future
-		// optimization phase.
-		re, err := regexp.Compile(mp.SafeRegex.GetRegex())
-		if err != nil {
-			return false
-		}
-		return re.MatchString(candidate)
+		// Pre-compiled at build time; a nil re covers BOTH the nil-SafeRegex
+		// and the compile-failure dispositions (runtime false, byte-identical
+		// to the former per-call compile).
+		return c.re != nil && c.re.MatchString(candidate)
 	case *matcherv3.StringMatcher_Custom, nil:
 		return false
 	default:
@@ -744,22 +777,59 @@ func matchString(sm *matcherv3.StringMatcher, candidate string) bool {
 	}
 }
 
-// matchPath evaluates a matcherv3.PathMatcher against a request URL path.
-// PathMatcher carries a single inner StringMatcher (`Path` field per
-// matcherv3.PathMatcher_Path). nil PathMatcher → false; nil inner Path →
-// false.
-func matchPath(pm *matcherv3.PathMatcher, candidate string) bool {
+// compilePathMatcher lowers a matcherv3.PathMatcher onto its single inner
+// StringMatcher (`Path` field per matcherv3.PathMatcher_Path) at parse time.
+// The config-shape failure modes (nil PathMatcher / non-Path rule / nil inner
+// Path) all collapse onto the zero-value compiledStringMatcher, whose
+// matches() returns false — byte-identical to the historical disposition.
+func compilePathMatcher(pm *matcherv3.PathMatcher) compiledStringMatcher {
 	if pm == nil {
-		return false
+		return compiledStringMatcher{}
 	}
 	rule, ok := pm.GetRule().(*matcherv3.PathMatcher_Path)
 	if !ok || rule.Path == nil {
-		return false
+		return compiledStringMatcher{}
 	}
-	return matchString(rule.Path, candidate)
+	return compileStringMatcher(rule.Path)
 }
 
-// matchHeader evaluates a routev3.HeaderMatcher against the per-stream header
+// compiledHeaderMatcher pairs a routev3.HeaderMatcher with the pre-compiled
+// forms of its regex-bearing arms: the canonical StringMatch arm's inner
+// StringMatcher and the deprecated SafeRegexMatch arm's regex program. All
+// other arms evaluate off the retained proto per call (plain compares).
+//
+//nolint:staticcheck // proto-faithful support for deprecated HeaderMatchSpecifier variants per ADR-0143 §Decision (vii) — operators may still configure them
+type compiledHeaderMatcher struct {
+	hm          *routev3.HeaderMatcher
+	stringMatch compiledStringMatcher // compiled StringMatch arm (zero-value for other arms)
+	re          *regexp.Regexp        // compiled SafeRegexMatch arm; nil = absent-or-failed
+}
+
+// compileHeaderMatcher lowers a HeaderMatcher at parse time, pre-compiling
+// the StringMatch + SafeRegexMatch arms. nil hm is tolerated (matches() →
+// false). A SafeRegexMatch that is nil or fails to compile leaves re nil —
+// runtime false, byte-identical to the historical per-call disposition.
+//
+//nolint:staticcheck // proto-faithful support for deprecated HeaderMatchSpecifier variants per ADR-0143 §Decision (vii) — operators may still configure them
+func compileHeaderMatcher(hm *routev3.HeaderMatcher) compiledHeaderMatcher {
+	c := compiledHeaderMatcher{hm: hm}
+	if hm == nil {
+		return c
+	}
+	switch spec := hm.GetHeaderMatchSpecifier().(type) {
+	case *routev3.HeaderMatcher_StringMatch:
+		c.stringMatch = compileStringMatcher(spec.StringMatch)
+	case *routev3.HeaderMatcher_SafeRegexMatch:
+		if spec.SafeRegexMatch != nil {
+			if re, err := regexp.Compile(spec.SafeRegexMatch.GetRegex()); err == nil {
+				c.re = re
+			}
+		}
+	}
+	return c
+}
+
+// matches evaluates the routev3.HeaderMatcher against the per-stream header
 // state exposed via EvalContext.Header(name).
 //
 // HeaderMatcher subset honored:
@@ -768,9 +838,9 @@ func matchPath(pm *matcherv3.PathMatcher, candidate string) bool {
 //   - PrefixMatch      — DEPRECATED upstream; HasPrefix.
 //   - SuffixMatch      — DEPRECATED upstream; HasSuffix.
 //   - ContainsMatch    — DEPRECATED upstream; Contains.
-//   - SafeRegexMatch   — DEPRECATED upstream; regexp.MatchString.
+//   - SafeRegexMatch   — DEPRECATED upstream; pre-compiled regexp MatchString.
 //   - StringMatch      — canonical Envoy-recommended replacement; delegates
-//     to matchString on the inner StringMatcher.
+//     to the compiled inner StringMatcher.
 //   - RangeMatch       — Int64Range over numeric header value.
 //
 // InvertMatch is honored last (final XOR).
@@ -782,7 +852,8 @@ func matchPath(pm *matcherv3.PathMatcher, candidate string) bool {
 // surprising.
 //
 //nolint:staticcheck // proto-faithful support for deprecated HeaderMatchSpecifier variants per ADR-0143 §Decision (vii) — operators may still configure them
-func matchHeader(hm *routev3.HeaderMatcher, ctx EvalContext) bool {
+func (c compiledHeaderMatcher) matches(ctx EvalContext) bool {
+	hm := c.hm
 	if hm == nil {
 		return false
 	}
@@ -802,7 +873,7 @@ func matchHeader(hm *routev3.HeaderMatcher, ctx EvalContext) bool {
 		if !present {
 			matched = false
 		} else {
-			matched = matchString(spec.StringMatch, value)
+			matched = c.stringMatch.matches(value)
 		}
 	case *routev3.HeaderMatcher_ExactMatch:
 		matched = present && value == spec.ExactMatch
@@ -813,12 +884,10 @@ func matchHeader(hm *routev3.HeaderMatcher, ctx EvalContext) bool {
 	case *routev3.HeaderMatcher_ContainsMatch:
 		matched = present && strings.Contains(value, spec.ContainsMatch)
 	case *routev3.HeaderMatcher_SafeRegexMatch:
-		if !present || spec.SafeRegexMatch == nil {
-			matched = false
-		} else {
-			re, err := regexp.Compile(spec.SafeRegexMatch.GetRegex())
-			matched = err == nil && re.MatchString(value)
-		}
+		// Pre-compiled at build time; a nil re covers BOTH the nil-
+		// SafeRegexMatch and the compile-failure dispositions (runtime false,
+		// byte-identical to the former per-call compile).
+		matched = present && c.re != nil && c.re.MatchString(value)
 	case *routev3.HeaderMatcher_RangeMatch:
 		if !present || spec.RangeMatch == nil {
 			matched = false
@@ -838,16 +907,27 @@ func matchHeader(hm *routev3.HeaderMatcher, ctx EvalContext) bool {
 	return matched
 }
 
-// matchCidr evaluates a corev3.CidrRange against an IP. PrefixLen defaults to
-// 0 when unset (wrapperspb.UInt32Value nil) — meaning the prefix matches all
-// addresses (the canonical Envoy semantic). nil ip → false.
-func matchCidr(cidr *corev3.CidrRange, ip net.IP) bool {
-	if cidr == nil || ip == nil {
-		return false
+// compiledCidr is the parse-time-lowered form of a corev3.CidrRange: the
+// *net.IPNet is computed once in buildOnePermission/buildOnePrincipal instead
+// of per evaluation (the former per-call fmt.Sprintf + ParseIP + ParseCIDR
+// cost). PrefixLen defaults to 0 when unset (wrapperspb.UInt32Value nil) —
+// meaning the prefix matches all addresses (the canonical Envoy semantic).
+//
+// A nil ipNet means "nil CidrRange OR unparseable address prefix OR prefix
+// length exceeding the address family's bit-width" — matches() returns
+// false, byte-identical to the historical per-call parse-failure disposition.
+type compiledCidr struct {
+	ipNet *net.IPNet
+}
+
+// compileCidr lowers a CidrRange at parse time per the compiledCidr contract.
+func compileCidr(cidr *corev3.CidrRange) compiledCidr {
+	if cidr == nil {
+		return compiledCidr{}
 	}
 	prefixIP := net.ParseIP(cidr.GetAddressPrefix())
 	if prefixIP == nil {
-		return false
+		return compiledCidr{}
 	}
 	var prefixLen int
 	if pl := cidr.GetPrefixLen(); pl != nil {
@@ -862,11 +942,19 @@ func matchCidr(cidr *corev3.CidrRange, ip net.IP) bool {
 		bits = 128
 	}
 	if prefixLen > bits {
-		return false
+		return compiledCidr{}
 	}
 	_, ipNet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", cidr.GetAddressPrefix(), prefixLen))
 	if err != nil {
+		return compiledCidr{}
+	}
+	return compiledCidr{ipNet: ipNet}
+}
+
+// matches reports whether ip falls inside the compiled range. nil ip → false.
+func (c compiledCidr) matches(ip net.IP) bool {
+	if c.ipNet == nil || ip == nil {
 		return false
 	}
-	return ipNet.Contains(ip)
+	return c.ipNet.Contains(ip)
 }

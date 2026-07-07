@@ -628,3 +628,41 @@ func indexOf(s, sub string) int {
 
 // Compile-time guard: fakeHTTPDispatcher satisfies HTTPDispatcher.
 var _ HTTPDispatcher = (*fakeHTTPDispatcher)(nil)
+
+// --- TestHttpCall_DispatchOnClosedVM_InternalFailure ----------------------
+
+// TestHttpCall_DispatchOnClosedVM_InternalFailure: DispatchHttpCall on a
+// closed *RootVM must refuse up-front with InternalFailure — a dispatch
+// racing past Close could otherwise lazily re-create the swept httpCalls
+// map + launch a request goroutine that runs to its full timeout against
+// the closed VM (escaping cancel-at-destruction).
+func TestHttpCall_DispatchOnClosedVM_InternalFailure(t *testing.T) {
+	ctx := context.Background()
+	mod := mustCompileForRootVM(t, ctx, minimalInitModule)
+	disp := newFakeHTTPDispatcher("cluster_a")
+	rv, err := NewRootVM(ctx, mod, 1, WithRootHTTPDispatcher(disp))
+	if err != nil {
+		t.Fatalf("NewRootVM: %v", err)
+	}
+	if err := rv.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	callID, status := rv.DispatchHttpCall(ctx, 100, "cluster_a", nil, nil, nil, 1000)
+	if status != abi.WasmResultInternalFailure {
+		t.Errorf("status=%v; want InternalFailure (closed RootVM)", status)
+	}
+	if callID != 0 {
+		t.Errorf("callID=%d; want 0 on closed RootVM", callID)
+	}
+
+	// No dispatch goroutine may have launched + the swept map must stay nil.
+	if got := len(disp.dispatchedSnapshot()); got != 0 {
+		t.Errorf("dispatched count = %d; want 0 (no request may launch against a closed VM)", got)
+	}
+	rv.httpCallsMu.Lock()
+	if rv.httpCalls != nil {
+		t.Error("httpCalls map re-created after Close; want nil (sweep must be final)")
+	}
+	rv.httpCallsMu.Unlock()
+}

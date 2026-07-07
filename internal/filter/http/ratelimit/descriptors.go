@@ -103,6 +103,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
@@ -638,18 +639,27 @@ func actionRemoteAddress(
 	}, true, false
 }
 
-// ipStringFromAddr extracts the bare IP string from a net.Addr. Mirrors the
-// ADR-0165 set-once primitive's contract (HCM dispatch seeds *net.TCPAddr).
-// Returns "" for nil or non-TCPAddr types — production HCM dispatch ONLY ever
-// seeds *net.TCPAddr per ADR-0165's H1/H2 connection-side typed source.
-func ipStringFromAddr(a net.Addr) string {
+// ipFromAddr extracts the bare net.IP from a net.Addr. Mirrors the ADR-0165
+// set-once primitive's contract (HCM dispatch seeds *net.TCPAddr). Returns
+// nil for nil, non-TCPAddr, or nil-IP addresses — production HCM dispatch
+// ONLY ever seeds *net.TCPAddr per ADR-0165's H1/H2 connection-side typed
+// source. Shared drop discipline for actionRemoteAddress (via
+// ipStringFromAddr) and actionMaskedRemoteAddress.
+func ipFromAddr(a net.Addr) net.IP {
 	if v, ok := a.(*net.TCPAddr); ok {
-		if v.IP == nil {
-			return ""
-		}
-		return v.IP.String()
+		return v.IP
 	}
-	return ""
+	return nil
+}
+
+// ipStringFromAddr renders ipFromAddr's result as a bare IP string
+// (IPv4 dotted-quad / IPv6 bare form per net.IP.String()); "" on drop.
+func ipStringFromAddr(a net.Addr) string {
+	ip := ipFromAddr(a)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
 }
 
 // actionDestinationCluster implements the destination_cluster action per
@@ -721,11 +731,38 @@ func actionHeaderValueMatch(
 //      per-request; pre-compiling matchers at HCM parse-time would require
 //      threading compiled state through the chain seed (out of scope for
 //      24.1 — adds chain plumbing the Task-5 D-RL1 byte-confirmation has not
-//      sanctioned). 24.2 may extract a pre-compile path if the per-request
-//      regexp.Compile cost shows up in profiling.
+//      sanctioned). The safe_regex arms amortize the per-request
+//      regexp.Compile cost via the package-level cachedRegex sync.Map below
+//      (compile once per distinct pattern; compile errors cached as nil,
+//      preserving the swallow-to-false semantics).
 //   2. ALL matchers must match (AND-fold), not ANY (the oauth2 list-of-matchers
 //      OR-fold). Matches upstream HeaderUtility::matchHeaders semantics.
 // ----------------------------------------------------------------------------
+
+// regexCache caches compiled safe_regex patterns keyed by the pattern string.
+// A config with a safe_regex rate-limit action would otherwise pay one
+// regexp.Compile per request per matcher. Compile ERRORS are cached as a nil
+// *regexp.Regexp so a bad pattern is also compiled only once — the caller
+// maps nil to matched=false, byte-identical to the previous per-request
+// swallow-to-false behavior. Unbounded by design: the pattern population is
+// config-derived (route-table safe_regex strings), not request-derived.
+var regexCache sync.Map // map[string]*regexp.Regexp; nil value ⇒ compile error
+
+// cachedRegex returns the compiled regexp for pattern (nil if the pattern
+// does not compile), consulting/populating regexCache.
+func cachedRegex(pattern string) *regexp.Regexp {
+	if v, ok := regexCache.Load(pattern); ok {
+		re, _ := v.(*regexp.Regexp)
+		return re
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		re = nil // cache the failure; callers treat nil as matched=false
+	}
+	v, _ := regexCache.LoadOrStore(pattern, re)
+	cached, _ := v.(*regexp.Regexp)
+	return cached
+}
 
 // evaluateAllHeaderMatchers returns true iff EVERY HeaderMatcher in matchers
 // matches the request headers (vacuous-true AND-fold — empty list returns
@@ -764,7 +801,7 @@ func evaluateOneHeaderMatcher(m *routev3.HeaderMatcher, headers http.Header) boo
 		safeRe := spec.SafeRegexMatch //nolint:staticcheck // intentional: deprecated arm honored for backward-compat per ADR-0080
 		if safeRe == nil {
 			matched = false
-		} else if re, err := regexp.Compile(safeRe.GetRegex()); err == nil {
+		} else if re := cachedRegex(safeRe.GetRegex()); re != nil {
 			matched = re.MatchString(value)
 		}
 	case *routev3.HeaderMatcher_PresentMatch:
@@ -833,8 +870,8 @@ func evaluateStringMatcher(sm *matcherv3.StringMatcher, value string) bool {
 		if spec.SafeRegex == nil {
 			return false
 		}
-		re, err := regexp.Compile(spec.SafeRegex.GetRegex())
-		if err != nil {
+		re := cachedRegex(spec.SafeRegex.GetRegex())
+		if re == nil {
 			return false
 		}
 		return re.MatchString(value)
@@ -883,14 +920,12 @@ func actionMaskedRemoteAddress(
 	mra *routev3.RateLimit_Action_MaskedRemoteAddress,
 	addr net.Addr,
 ) (*ratelimitv3.RateLimitDescriptor_Entry, bool, bool) {
-	if addr == nil {
+	ip := ipFromAddr(addr)
+	if ip == nil {
+		// nil addr / non-TCPAddr / nil IP — same drop discipline as
+		// actionRemoteAddress via the shared ipFromAddr helper.
 		return nil, false, true
 	}
-	tcp, ok := addr.(*net.TCPAddr)
-	if !ok || tcp.IP == nil {
-		return nil, false, true
-	}
-	ip := tcp.IP
 
 	// Determine v4 vs v6 family. net.IP.To4() returns non-nil for IPv4 (incl.
 	// IPv4-mapped-IPv6). For IPv6, use the 16-byte form.

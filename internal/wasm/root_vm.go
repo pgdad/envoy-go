@@ -825,13 +825,33 @@ func (rv *RootVM) NewStreamContext(ctx context.Context) (*StreamContext, error) 
 
 	// Record the child BEFORE firing proxy_on_context_create so the
 	// hostcall dispatch (which reads rv.currentCtxID = id) sees a registered
-	// child if it consults streamCtxs.
+	// child if it consults streamCtxs. A nil streamCtxs map means Close ran
+	// between the entry closed-check and here (Close nils the map under
+	// streamCtxsMu) — bail out rather than writing to a nil map.
 	rv.streamCtxsMu.Lock()
+	if rv.streamCtxs == nil {
+		rv.streamCtxsMu.Unlock()
+		return nil, errors.New("wasm: NewStreamContext on closed RootVM")
+	}
 	rv.streamCtxs[id] = sc
 	rv.streamCtxsMu.Unlock()
 
 	rv.dispatchMu.Lock()
 	defer rv.dispatchMu.Unlock()
+
+	// Re-check closed AFTER acquiring dispatchMu: Close flips rv.closed +
+	// nils rv.instance under dispatchMu, so a caller that passed the entry
+	// pre-check but lost the race to Close must early-return here instead
+	// of dereferencing the cleared instance below. Mirrors the tick path's
+	// lockAndDispatchTick re-check discipline.
+	if rv.closed.Load() || rv.instance == nil {
+		rv.streamCtxsMu.Lock()
+		if rv.streamCtxs != nil {
+			delete(rv.streamCtxs, id)
+		}
+		rv.streamCtxsMu.Unlock()
+		return nil, errors.New("wasm: NewStreamContext on closed RootVM")
+	}
 
 	rv.currentCtxID.Store(id)
 
@@ -975,7 +995,29 @@ func (rv *RootVM) Close() error {
 			sc.closed.Store(true)
 		}
 
-		// Cancel any in-flight httpCalls (Task 8 per AMEND-B3). Snapshot under
+		// Acquire dispatchMu before clearing runtime/instance/module so we
+		// serialize with any in-flight per-stream callback dispatch +
+		// response goroutine (handleHttpCallResponse at http_call.go re-
+		// acquires dispatchMu before touching rv.instance). This races
+		// would otherwise produce a write-vs-read on rv.instance under
+		// `-race` per the standard Go memory model — the closeOnce.Do
+		// flips closed.Load() FIRST so subsequent dispatchMu acquirers
+		// observe the closed flag + early-return; this acquisition drains
+		// any frame already inside dispatchMu before we wipe the fields.
+		rv.dispatchMu.Lock()
+		rt := rv.runtime
+		rv.runtime = nil
+		rv.instance = nil
+		rv.module = nil
+		rv.dispatchMu.Unlock()
+
+		// Cancel any in-flight httpCalls (Task 8 per AMEND-B3). Runs AFTER
+		// the dispatchMu drain above: DispatchHttpCall executes inside a
+		// dispatchMu-held hostcall frame, so any dispatch that raced past
+		// the closed flag has finished inserting its entry by the time the
+		// drain completes — sweeping here guarantees no entry escapes the
+		// cancel (a pre-drain sweep could miss an insert + leave a request
+		// running to its full timeout against the closed VM). Snapshot under
 		// httpCallsMu + cancel OUTSIDE the lock to keep lock-held duration
 		// bounded. The dispatch goroutines observe the canceled ctx + their
 		// handleHttpCallResponse path early-returns via the token-miss guard
@@ -992,22 +1034,6 @@ func (rv *RootVM) Close() error {
 		for _, c := range cancels {
 			c()
 		}
-
-		// Acquire dispatchMu before clearing runtime/instance/module so we
-		// serialize with any in-flight per-stream callback dispatch +
-		// response goroutine (handleHttpCallResponse at http_call.go re-
-		// acquires dispatchMu before touching rv.instance). This races
-		// would otherwise produce a write-vs-read on rv.instance under
-		// `-race` per the standard Go memory model — the closeOnce.Do
-		// flips closed.Load() FIRST so subsequent dispatchMu acquirers
-		// observe the closed flag + early-return; this acquisition drains
-		// any frame already inside dispatchMu before we wipe the fields.
-		rv.dispatchMu.Lock()
-		rt := rv.runtime
-		rv.runtime = nil
-		rv.instance = nil
-		rv.module = nil
-		rv.dispatchMu.Unlock()
 
 		if rt != nil {
 			closeErr = rt.Close(context.Background())

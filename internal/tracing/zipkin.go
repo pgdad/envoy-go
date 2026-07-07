@@ -275,7 +275,13 @@ func (e *ZipkinExporter) run() {
 				_, _ = io.Copy(io.Discard, resp.Body)
 				_ = resp.Body.Close()
 			}
-			log.Printf("tracing: Zipkin POST (cluster=%s, attempt=%d, status=%d): %v", e.clusterName, attempt+1, status, derr)
+			if derr != nil {
+				log.Printf("tracing: Zipkin POST (cluster=%s, attempt=%d, status=%d): %v", e.clusterName, attempt+1, status, derr)
+			} else {
+				// Non-2xx status with a nil transport error: the status IS the
+				// failure — omit the misleading "<nil>" error suffix.
+				log.Printf("tracing: Zipkin POST (cluster=%s, attempt=%d, status=%d)", e.clusterName, attempt+1, status)
+			}
 		}
 		// Reset the buffer whether sent or dropped — a dropped batch is
 		// logged-not-counted, keeping memory bounded under a sustained outage.

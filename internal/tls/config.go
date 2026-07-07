@@ -63,13 +63,9 @@ func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string) (*Downstrea
 		if vc == nil || vc.GetTrustedCa() == nil {
 			return nil, fmt.Errorf("tls: downstream: require_client_certificate=true requires validation_context.trusted_ca")
 		}
-		caPEM, err := loadDataSource(vc.GetTrustedCa(), baseDir)
+		pool, err := loadTrustedCAPool(vc, baseDir, "downstream")
 		if err != nil {
-			return nil, fmt.Errorf("tls: downstream: validation_context: trusted_ca: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caPEM) {
-			return nil, fmt.Errorf("tls: downstream: validation_context: trusted_ca: parse failure")
+			return nil, err
 		}
 		cfg.ClientCAs = pool
 		cfg.ClientAuth = stdtls.RequireAndVerifyClientCert
@@ -111,17 +107,30 @@ func NewUpstreamConfig(ts *corev3.TransportSocket, baseDir string) (*UpstreamCon
 	}
 
 	// Load CA into RootCAs pool.
-	caPEM, err := loadDataSource(vc.GetTrustedCa(), baseDir)
+	pool, err := loadTrustedCAPool(vc, baseDir, "upstream")
 	if err != nil {
-		return nil, fmt.Errorf("tls: upstream: validation_context: trusted_ca: %w", err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, fmt.Errorf("tls: upstream: validation_context: trusted_ca: parse failure")
+		return nil, err
 	}
 	cfg.RootCAs = pool
 	cfg.ServerName = ctx.GetSni()
 	return &UpstreamConfig{TLSConfig: cfg, SNI: ctx.GetSni()}, nil
+}
+
+// loadTrustedCAPool loads validation_context.trusted_ca into a fresh
+// *x509.CertPool. Shared by NewDownstreamConfig (ClientCAs for mandatory
+// mTLS) and NewUpstreamConfig (RootCAs). side is "downstream" or "upstream"
+// and prefixes every error; the error strings are byte-identical to the
+// previously-inlined copies at both call sites.
+func loadTrustedCAPool(vc *tlsv3.CertificateValidationContext, baseDir, side string) (*x509.CertPool, error) {
+	caPEM, err := loadDataSource(vc.GetTrustedCa(), baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("tls: %s: validation_context: trusted_ca: %w", side, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("tls: %s: validation_context: trusted_ca: parse failure", side)
+	}
+	return pool, nil
 }
 
 // commonTLSContextToConfig builds a *stdtls.Config carrying Certificates (from

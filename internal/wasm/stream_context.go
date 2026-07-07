@@ -89,88 +89,107 @@ func (sc *StreamContext) HasGlobalFunc(name string) bool {
 	return sc.rootVM.HasGlobalFunc(name)
 }
 
+// dispatchGuest is the shared per-callback dispatch template consumed by
+// every CallProxyOn* method below: closed-check → capability gate → export
+// lookup → dispatchMu acquisition → currentCtxID store → panic-wrapped
+// fn.Call → noteTrapOnError. Per-method variation (cap key, export name,
+// args, result decoding) stays at the caller; the error string is built from
+// methodName so each method's closed-StreamContext error text stays
+// byte-identical to the pre-consolidation per-method literals.
+//
+// Returns (results, dispatched, err):
+//
+//   - dispatched == false + err == nil: cap denied OR guest does not export
+//     the callback — the caller returns its per-callback default.
+//   - dispatched == false + err != nil: closed StreamContext (pre-check or
+//     the post-Lock re-check below) — the caller returns its default + err.
+//   - dispatched == true: the guest callback ran; results is fn.Call's
+//     result stack on success (nil on err).
+//
+// # Close-race guard
+//
+// The rv.instance read and export lookup happen ONLY under dispatchMu, and
+// closed re-checks AFTER Lock: RootVM.Close flips sc.closed / rv.closed and
+// nils rv.instance under dispatchMu, so a pre-check-passed caller that loses
+// the race to Close observes the closed flag (or the nil instance) here and
+// early-returns instead of dereferencing the cleared instance. Mirrors the
+// tick path's lockAndDispatchTick re-check discipline at tick.go.
+func (sc *StreamContext) dispatchGuest(ctx context.Context, capKey, export, methodName string, args ...uint64) (results []uint64, dispatched bool, err error) {
+	if sc.closed.Load() {
+		return nil, false, errors.New("wasm: " + methodName + " on closed StreamContext")
+	}
+	rv := sc.rootVM
+	if !rv.sandbox.IsAllowed(capKey) {
+		return nil, false, nil
+	}
+
+	rv.dispatchMu.Lock()
+	defer rv.dispatchMu.Unlock()
+
+	// Re-check closed AFTER Lock (see the Close-race guard doc above). The
+	// rv.instance == nil arm is defensive: Close flips every child's closed
+	// flag before clearing the instance, so a nil instance without a closed
+	// flag should be unreachable.
+	if sc.closed.Load() || rv.closed.Load() || rv.instance == nil {
+		return nil, false, errors.New("wasm: " + methodName + " on closed StreamContext")
+	}
+	fn := rv.instance.ExportedFunction(export)
+	if fn == nil {
+		return nil, false, nil
+	}
+	rv.currentCtxID.Store(sc.streamCtxID)
+
+	err = rv.runCallWithPanicWrapper(func() error {
+		rs, callErr := fn.Call(ctx, args...)
+		if callErr != nil {
+			return callErr
+		}
+		results = rs
+		return nil
+	})
+	sc.noteTrapOnError(err)
+	return results, true, err
+}
+
+// boolToU64 encodes a bool as the u64 0/1 wire form used by the proxy_on_*
+// endOfStream args.
+func boolToU64(b bool) uint64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// decodeProxyAction extracts the ProxyAction from a dispatchGuest result
+// stack. Empty results (no return value, or an errored/undispatched call)
+// decode to the zero value ProxyActionContinue, matching the per-method
+// pre-consolidation defaults.
+func decodeProxyAction(results []uint64) abi.ProxyAction {
+	if len(results) > 0 {
+		//nolint:gosec // wazero call results are bit-typed by us; truncation is the wire-protocol intent.
+		return abi.ProxyAction(int32(results[0]))
+	}
+	return abi.ProxyActionContinue
+}
+
 // CallProxyOnRequestHeaders invokes `proxy_on_request_headers(streamCtxID,
 // numHeaders, endOfStream)` — returns `ProxyAction::CONTINUE` (=0) or
 // `::PAUSE` (=1). Gated by capProxyOnRequestHeaders. When denied or when
 // the guest does not export the callback, returns ProxyActionContinue +
 // nil.
 func (sc *StreamContext) CallProxyOnRequestHeaders(ctx context.Context, numHeaders uint32, endOfStream bool) (abi.ProxyAction, error) {
-	if sc.closed.Load() {
-		return abi.ProxyActionContinue, errors.New("wasm: CallProxyOnRequestHeaders on closed StreamContext")
-	}
-	rv := sc.rootVM
-	if !rv.sandbox.IsAllowed(capProxyOnRequestHeaders) {
-		return abi.ProxyActionContinue, nil
-	}
-	fn := rv.instance.ExportedFunction("proxy_on_request_headers")
-	if fn == nil {
-		return abi.ProxyActionContinue, nil
-	}
-
-	rv.dispatchMu.Lock()
-	defer rv.dispatchMu.Unlock()
-	rv.currentCtxID.Store(sc.streamCtxID)
-
-	var endOfStreamU uint64
-	if endOfStream {
-		endOfStreamU = 1
-	}
-
-	var action abi.ProxyAction
-	err := rv.runCallWithPanicWrapper(func() error {
-		results, err := fn.Call(ctx, uint64(sc.streamCtxID), uint64(numHeaders), endOfStreamU)
-		if err != nil {
-			return err
-		}
-		if len(results) > 0 {
-			//nolint:gosec // wazero call results are bit-typed by us; truncation is the wire-protocol intent.
-			action = abi.ProxyAction(int32(results[0]))
-		}
-		return nil
-	})
-	sc.noteTrapOnError(err)
-	return action, err
+	results, _, err := sc.dispatchGuest(ctx, capProxyOnRequestHeaders, "proxy_on_request_headers", "CallProxyOnRequestHeaders",
+		uint64(sc.streamCtxID), uint64(numHeaders), boolToU64(endOfStream))
+	return decodeProxyAction(results), err
 }
 
 // CallProxyOnResponseHeaders invokes `proxy_on_response_headers(streamCtxID,
 // numHeaders, endOfStream)`. Cap + export semantics mirror
 // CallProxyOnRequestHeaders.
 func (sc *StreamContext) CallProxyOnResponseHeaders(ctx context.Context, numHeaders uint32, endOfStream bool) (abi.ProxyAction, error) {
-	if sc.closed.Load() {
-		return abi.ProxyActionContinue, errors.New("wasm: CallProxyOnResponseHeaders on closed StreamContext")
-	}
-	rv := sc.rootVM
-	if !rv.sandbox.IsAllowed(capProxyOnResponseHeaders) {
-		return abi.ProxyActionContinue, nil
-	}
-	fn := rv.instance.ExportedFunction("proxy_on_response_headers")
-	if fn == nil {
-		return abi.ProxyActionContinue, nil
-	}
-
-	rv.dispatchMu.Lock()
-	defer rv.dispatchMu.Unlock()
-	rv.currentCtxID.Store(sc.streamCtxID)
-
-	var endOfStreamU uint64
-	if endOfStream {
-		endOfStreamU = 1
-	}
-
-	var action abi.ProxyAction
-	err := rv.runCallWithPanicWrapper(func() error {
-		results, err := fn.Call(ctx, uint64(sc.streamCtxID), uint64(numHeaders), endOfStreamU)
-		if err != nil {
-			return err
-		}
-		if len(results) > 0 {
-			//nolint:gosec // wazero call results are bit-typed by us; truncation is the wire-protocol intent.
-			action = abi.ProxyAction(int32(results[0]))
-		}
-		return nil
-	})
-	sc.noteTrapOnError(err)
-	return action, err
+	results, _, err := sc.dispatchGuest(ctx, capProxyOnResponseHeaders, "proxy_on_response_headers", "CallProxyOnResponseHeaders",
+		uint64(sc.streamCtxID), uint64(numHeaders), boolToU64(endOfStream))
+	return decodeProxyAction(results), err
 }
 
 // CallProxyOnRequestBody invokes `proxy_on_request_body(streamCtxID,
@@ -184,82 +203,18 @@ func (sc *StreamContext) CallProxyOnResponseHeaders(ctx context.Context, numHead
 // not export the callback, returns (ProxyActionContinue, nil) — the chain
 // proceeds as if the guest hadn't opted into body callbacks.
 func (sc *StreamContext) CallProxyOnRequestBody(ctx context.Context, bodySize uint32, endOfStream bool) (abi.ProxyAction, error) {
-	if sc.closed.Load() {
-		return abi.ProxyActionContinue, errors.New("wasm: CallProxyOnRequestBody on closed StreamContext")
-	}
-	rv := sc.rootVM
-	if !rv.sandbox.IsAllowed(capProxyOnRequestBody) {
-		return abi.ProxyActionContinue, nil
-	}
-	fn := rv.instance.ExportedFunction("proxy_on_request_body")
-	if fn == nil {
-		return abi.ProxyActionContinue, nil
-	}
-
-	rv.dispatchMu.Lock()
-	defer rv.dispatchMu.Unlock()
-	rv.currentCtxID.Store(sc.streamCtxID)
-
-	var endOfStreamU uint64
-	if endOfStream {
-		endOfStreamU = 1
-	}
-
-	var action abi.ProxyAction
-	err := rv.runCallWithPanicWrapper(func() error {
-		results, err := fn.Call(ctx, uint64(sc.streamCtxID), uint64(bodySize), endOfStreamU)
-		if err != nil {
-			return err
-		}
-		if len(results) > 0 {
-			//nolint:gosec // wazero call results are bit-typed by us; truncation is the wire-protocol intent.
-			action = abi.ProxyAction(int32(results[0]))
-		}
-		return nil
-	})
-	sc.noteTrapOnError(err)
-	return action, err
+	results, _, err := sc.dispatchGuest(ctx, capProxyOnRequestBody, "proxy_on_request_body", "CallProxyOnRequestBody",
+		uint64(sc.streamCtxID), uint64(bodySize), boolToU64(endOfStream))
+	return decodeProxyAction(results), err
 }
 
 // CallProxyOnResponseBody invokes `proxy_on_response_body(streamCtxID,
 // bodySize, endOfStream)` per 25.2 SPEC §5.3 C15. Mirror of
 // CallProxyOnRequestBody for the encode side.
 func (sc *StreamContext) CallProxyOnResponseBody(ctx context.Context, bodySize uint32, endOfStream bool) (abi.ProxyAction, error) {
-	if sc.closed.Load() {
-		return abi.ProxyActionContinue, errors.New("wasm: CallProxyOnResponseBody on closed StreamContext")
-	}
-	rv := sc.rootVM
-	if !rv.sandbox.IsAllowed(capProxyOnResponseBody) {
-		return abi.ProxyActionContinue, nil
-	}
-	fn := rv.instance.ExportedFunction("proxy_on_response_body")
-	if fn == nil {
-		return abi.ProxyActionContinue, nil
-	}
-
-	rv.dispatchMu.Lock()
-	defer rv.dispatchMu.Unlock()
-	rv.currentCtxID.Store(sc.streamCtxID)
-
-	var endOfStreamU uint64
-	if endOfStream {
-		endOfStreamU = 1
-	}
-
-	var action abi.ProxyAction
-	err := rv.runCallWithPanicWrapper(func() error {
-		results, err := fn.Call(ctx, uint64(sc.streamCtxID), uint64(bodySize), endOfStreamU)
-		if err != nil {
-			return err
-		}
-		if len(results) > 0 {
-			//nolint:gosec // wazero call results are bit-typed by us; truncation is the wire-protocol intent.
-			action = abi.ProxyAction(int32(results[0]))
-		}
-		return nil
-	})
-	sc.noteTrapOnError(err)
-	return action, err
+	results, _, err := sc.dispatchGuest(ctx, capProxyOnResponseBody, "proxy_on_response_body", "CallProxyOnResponseBody",
+		uint64(sc.streamCtxID), uint64(bodySize), boolToU64(endOfStream))
+	return decodeProxyAction(results), err
 }
 
 // CallProxyOnRequestTrailers invokes `proxy_on_request_trailers(streamCtxID,
@@ -270,72 +225,18 @@ func (sc *StreamContext) CallProxyOnResponseBody(ctx context.Context, bodySize u
 // Returns ProxyAction (Continue/Pause). Gated by capProxyOnRequestTrailers +
 // gate-at-getFunction per AMEND-B5.
 func (sc *StreamContext) CallProxyOnRequestTrailers(ctx context.Context, numTrailers uint32) (abi.ProxyAction, error) {
-	if sc.closed.Load() {
-		return abi.ProxyActionContinue, errors.New("wasm: CallProxyOnRequestTrailers on closed StreamContext")
-	}
-	rv := sc.rootVM
-	if !rv.sandbox.IsAllowed(capProxyOnRequestTrailers) {
-		return abi.ProxyActionContinue, nil
-	}
-	fn := rv.instance.ExportedFunction("proxy_on_request_trailers")
-	if fn == nil {
-		return abi.ProxyActionContinue, nil
-	}
-
-	rv.dispatchMu.Lock()
-	defer rv.dispatchMu.Unlock()
-	rv.currentCtxID.Store(sc.streamCtxID)
-
-	var action abi.ProxyAction
-	err := rv.runCallWithPanicWrapper(func() error {
-		results, err := fn.Call(ctx, uint64(sc.streamCtxID), uint64(numTrailers))
-		if err != nil {
-			return err
-		}
-		if len(results) > 0 {
-			//nolint:gosec // wazero call results are bit-typed by us; truncation is the wire-protocol intent.
-			action = abi.ProxyAction(int32(results[0]))
-		}
-		return nil
-	})
-	sc.noteTrapOnError(err)
-	return action, err
+	results, _, err := sc.dispatchGuest(ctx, capProxyOnRequestTrailers, "proxy_on_request_trailers", "CallProxyOnRequestTrailers",
+		uint64(sc.streamCtxID), uint64(numTrailers))
+	return decodeProxyAction(results), err
 }
 
 // CallProxyOnResponseTrailers invokes `proxy_on_response_trailers(streamCtxID,
 // numTrailers)` per 25.2 SPEC §5.3 C17. Mirror of CallProxyOnRequestTrailers
 // for the encode side.
 func (sc *StreamContext) CallProxyOnResponseTrailers(ctx context.Context, numTrailers uint32) (abi.ProxyAction, error) {
-	if sc.closed.Load() {
-		return abi.ProxyActionContinue, errors.New("wasm: CallProxyOnResponseTrailers on closed StreamContext")
-	}
-	rv := sc.rootVM
-	if !rv.sandbox.IsAllowed(capProxyOnResponseTrailers) {
-		return abi.ProxyActionContinue, nil
-	}
-	fn := rv.instance.ExportedFunction("proxy_on_response_trailers")
-	if fn == nil {
-		return abi.ProxyActionContinue, nil
-	}
-
-	rv.dispatchMu.Lock()
-	defer rv.dispatchMu.Unlock()
-	rv.currentCtxID.Store(sc.streamCtxID)
-
-	var action abi.ProxyAction
-	err := rv.runCallWithPanicWrapper(func() error {
-		results, err := fn.Call(ctx, uint64(sc.streamCtxID), uint64(numTrailers))
-		if err != nil {
-			return err
-		}
-		if len(results) > 0 {
-			//nolint:gosec // wazero call results are bit-typed by us; truncation is the wire-protocol intent.
-			action = abi.ProxyAction(int32(results[0]))
-		}
-		return nil
-	})
-	sc.noteTrapOnError(err)
-	return action, err
+	results, _, err := sc.dispatchGuest(ctx, capProxyOnResponseTrailers, "proxy_on_response_trailers", "CallProxyOnResponseTrailers",
+		uint64(sc.streamCtxID), uint64(numTrailers))
+	return decodeProxyAction(results), err
 }
 
 // CallProxyOnHttpCallResponse invokes `proxy_on_http_call_response(plugin_
@@ -356,33 +257,12 @@ func (sc *StreamContext) CallProxyOnResponseTrailers(ctx context.Context, numTra
 // Returns nil err on cap-denied / not-exported (the dispatch is best-effort).
 // The 5-tuple matches §5.3 C19 wire shape exactly.
 func (sc *StreamContext) CallProxyOnHttpCallResponse(ctx context.Context, callID, numHeaders, bodySize, numTrailers uint32) error {
-	if sc.closed.Load() {
-		return errors.New("wasm: CallProxyOnHttpCallResponse on closed StreamContext")
-	}
-	rv := sc.rootVM
-	if !rv.sandbox.IsAllowed(capProxyOnHttpCallResponse) {
-		return nil
-	}
-	fn := rv.instance.ExportedFunction("proxy_on_http_call_response")
-	if fn == nil {
-		return nil
-	}
-
-	rv.dispatchMu.Lock()
-	defer rv.dispatchMu.Unlock()
-	rv.currentCtxID.Store(sc.streamCtxID)
-
-	err := rv.runCallWithPanicWrapper(func() error {
-		_, callErr := fn.Call(ctx,
-			uint64(sc.streamCtxID),
-			uint64(callID),
-			uint64(numHeaders),
-			uint64(bodySize),
-			uint64(numTrailers),
-		)
-		return callErr
-	})
-	sc.noteTrapOnError(err)
+	_, _, err := sc.dispatchGuest(ctx, capProxyOnHttpCallResponse, "proxy_on_http_call_response", "CallProxyOnHttpCallResponse",
+		uint64(sc.streamCtxID),
+		uint64(callID),
+		uint64(numHeaders),
+		uint64(bodySize),
+		uint64(numTrailers))
 	return err
 }
 
@@ -391,64 +271,28 @@ func (sc *StreamContext) CallProxyOnHttpCallResponse(ctx context.Context, callID
 // Gated by capProxyOnDone. When denied or when the guest does not export
 // the callback, returns (true, nil) — "done" is the default.
 func (sc *StreamContext) CallProxyOnDone(ctx context.Context) (bool, error) {
-	if sc.closed.Load() {
-		return true, errors.New("wasm: CallProxyOnDone on closed StreamContext")
+	results, dispatched, err := sc.dispatchGuest(ctx, capProxyOnDone, "proxy_on_done", "CallProxyOnDone",
+		uint64(sc.streamCtxID))
+	if !dispatched {
+		// Closed (err non-nil) OR cap-denied / not-exported (err nil) —
+		// "done" is the default either way.
+		return true, err
 	}
-	rv := sc.rootVM
-	if !rv.sandbox.IsAllowed(capProxyOnDone) {
-		return true, nil
+	if err != nil {
+		return false, err
 	}
-	fn := rv.instance.ExportedFunction("proxy_on_done")
-	if fn == nil {
-		return true, nil
+	if len(results) > 0 {
+		return results[0] != 0, nil
 	}
-
-	rv.dispatchMu.Lock()
-	defer rv.dispatchMu.Unlock()
-	rv.currentCtxID.Store(sc.streamCtxID)
-
-	var done bool
-	err := rv.runCallWithPanicWrapper(func() error {
-		results, err := fn.Call(ctx, uint64(sc.streamCtxID))
-		if err != nil {
-			return err
-		}
-		if len(results) > 0 {
-			done = results[0] != 0
-		} else {
-			done = true
-		}
-		return nil
-	})
-	sc.noteTrapOnError(err)
-	return done, err
+	return true, nil
 }
 
 // CallProxyOnLog invokes `proxy_on_log(streamCtxID)`. Gated by
 // capProxyOnLog. When denied or when the guest does not export the
 // callback, returns nil (no-op success).
 func (sc *StreamContext) CallProxyOnLog(ctx context.Context) error {
-	if sc.closed.Load() {
-		return errors.New("wasm: CallProxyOnLog on closed StreamContext")
-	}
-	rv := sc.rootVM
-	if !rv.sandbox.IsAllowed(capProxyOnLog) {
-		return nil
-	}
-	fn := rv.instance.ExportedFunction("proxy_on_log")
-	if fn == nil {
-		return nil
-	}
-
-	rv.dispatchMu.Lock()
-	defer rv.dispatchMu.Unlock()
-	rv.currentCtxID.Store(sc.streamCtxID)
-
-	err := rv.runCallWithPanicWrapper(func() error {
-		_, callErr := fn.Call(ctx, uint64(sc.streamCtxID))
-		return callErr
-	})
-	sc.noteTrapOnError(err)
+	_, _, err := sc.dispatchGuest(ctx, capProxyOnLog, "proxy_on_log", "CallProxyOnLog",
+		uint64(sc.streamCtxID))
 	return err
 }
 
@@ -456,27 +300,8 @@ func (sc *StreamContext) CallProxyOnLog(ctx context.Context) error {
 // capProxyOnDelete. When denied or when the guest does not export the
 // callback, returns nil (no-op success).
 func (sc *StreamContext) CallProxyOnDelete(ctx context.Context) error {
-	if sc.closed.Load() {
-		return errors.New("wasm: CallProxyOnDelete on closed StreamContext")
-	}
-	rv := sc.rootVM
-	if !rv.sandbox.IsAllowed(capProxyOnDelete) {
-		return nil
-	}
-	fn := rv.instance.ExportedFunction("proxy_on_delete")
-	if fn == nil {
-		return nil
-	}
-
-	rv.dispatchMu.Lock()
-	defer rv.dispatchMu.Unlock()
-	rv.currentCtxID.Store(sc.streamCtxID)
-
-	err := rv.runCallWithPanicWrapper(func() error {
-		_, callErr := fn.Call(ctx, uint64(sc.streamCtxID))
-		return callErr
-	})
-	sc.noteTrapOnError(err)
+	_, _, err := sc.dispatchGuest(ctx, capProxyOnDelete, "proxy_on_delete", "CallProxyOnDelete",
+		uint64(sc.streamCtxID))
 	return err
 }
 

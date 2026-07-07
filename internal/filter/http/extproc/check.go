@@ -544,39 +544,21 @@ func emitImmediateResponse(f *filter, ir *extprocsvcv3.ImmediateResponse, s stag
 	// SendLocalReply boundary.
 	_ = ir.GetDetails()
 
-	// Emit per-stage. Decode-stage: f.dcb.SendLocalReply.
-	// Encode-stage: f.ecb.SendLocalReply (FIRST §9 row to emit SendLocalReply
-	// from the encode side at response_headers per ADR-0167 + ADR-0075).
+	// Emit via dcb.SendLocalReply for ALL FOUR stages. The BOTH-decode-and-
+	// encode filter at ADR-0167 carries f.dcb non-nil throughout the
+	// per-stream lifetime; the framework's encode-side local-reply path
+	// enters via dcb per ADR-0075 (the encode chain enters at
+	// filter[len-1]), so the encode stages (response_headers /
+	// response_body — the FIRST §9 rows to emit SendLocalReply from the
+	// encode side) route through the SAME dcb call as the decode stages.
 	//
 	// At phase 19.2 the body stages (stageRequestBody / stageResponseBody)
 	// are added per ADR-0172 §Decision AMENDMENT + SPEC §4.4 — body-stage
 	// ImmediateResponse fires SendLocalReply via the SAME multi-stage
-	// infrastructure (the deny-path wire shape is identical at all four
-	// stages). Each direction routes through dcb.SendLocalReply per ADR-0075
-	// (the framework's encode-side local-reply path enters via dcb regardless
-	// of the originating stage — the encode chain enters at filter[len-1]).
-	switch s {
-	case stageRequestHeaders, stageRequestBody:
-		// Decode side (request_headers / request_body): emit via
-		// dcb.SendLocalReply. The 19.2 body-stage extension reuses the
-		// existing dcb path verbatim per SPEC §4.4.
-		if f.dcb != nil {
-			f.dcb.SendLocalReply(status, body, headers)
-		}
-	case stageResponseHeaders, stageResponseBody:
-		// Encode side (response_headers / response_body): the BOTH-decode-
-		// and-encode filter at ADR-0167 carries f.dcb non-nil throughout
-		// the per-stream lifetime; the framework's encode-side local-reply
-		// path enters via dcb per ADR-0075 (the encode chain enters at
-		// filter[len-1]). The 19.2 response_body stage activation reuses
-		// the SAME dcb path per SPEC §4.4 ("the deny-path wire shape is
-		// identical at all four stages"). The presence of f.ecb is checked
-		// for forward-compat if/when EncoderFilterCallbacks grows its own
-		// SendLocalReply primitive, but the emission still routes through
-		// dcb for protocol-faithful behavior.
-		if f.dcb != nil {
-			f.dcb.SendLocalReply(status, body, headers)
-		}
+	// infrastructure ("the deny-path wire shape is identical at all four
+	// stages"), which is why the per-stage dispatch collapses to ONE call.
+	if f.dcb != nil {
+		f.dcb.SendLocalReply(status, body, headers)
 	}
 	return actImmediate
 }

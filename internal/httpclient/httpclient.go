@@ -123,23 +123,28 @@ func New(opts Options) *Client {
 	// the stdlib default Transport (its default TLSClientConfig).
 	hc := &http.Client{Timeout: opts.Timeout}
 	if opts.TLSConfig != nil {
-		// Clone the default transport so we inherit the connection-pool +
-		// proxy + dial discipline of http.DefaultTransport while overriding
-		// the TLSClientConfig. Using a fresh *http.Transport literal here
-		// would lose the stdlib defaults (e.g. MaxIdleConns, IdleConnTimeout).
-		dt, ok := http.DefaultTransport.(*http.Transport)
-		if !ok {
-			// Defensive: stdlib invariant says http.DefaultTransport is a
-			// *http.Transport; if a future Go version changes this we fall
-			// back to a minimal transport carrying just the TLS config.
-			hc.Transport = &http.Transport{TLSClientConfig: opts.TLSConfig}
-		} else {
-			tr := dt.Clone()
-			tr.TLSClientConfig = opts.TLSConfig
-			hc.Transport = tr
-		}
+		hc.Transport = transportForTLS(opts.TLSConfig)
 	}
 	return &Client{httpClient: hc, opts: opts}
+}
+
+// transportForTLS builds an *http.Transport carrying cfg as TLSClientConfig.
+// It clones http.DefaultTransport so the connection-pool + proxy + dial
+// discipline of the stdlib defaults (e.g. MaxIdleConns, IdleConnTimeout) is
+// inherited; a fresh *http.Transport literal would lose them. Shared by New
+// and ClusterDispatch (which previously carried byte-duplicated copies of
+// this clone block).
+func transportForTLS(cfg *tls.Config) *http.Transport {
+	dt, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		// Defensive: stdlib invariant says http.DefaultTransport is a
+		// *http.Transport; if a future Go version changes this we fall
+		// back to a minimal transport carrying just the TLS config.
+		return &http.Transport{TLSClientConfig: cfg}
+	}
+	tr := dt.Clone()
+	tr.TLSClientConfig = cfg
+	return tr
 }
 
 // Do executes the request synchronously, honoring the Options envelope:
@@ -163,6 +168,16 @@ func New(opts Options) *Client {
 // `strings.NewReader` bodies (oauth2 token_endpoint POST), each of which
 // satisfies the caller-side body-rewind responsibility).
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
+	return c.doWithRetry(c.httpClient, req)
+}
+
+// doWithRetry runs the Options.RetryPolicy-driven retry loop over hc.Do(req).
+// Shared by Do (the receiver's own *http.Client) and ClusterDispatch (a
+// temporary per-cluster *http.Client carrying the cluster's TLS posture) —
+// the two previously carried byte-duplicated copies of this loop. The
+// request's bound context is the cancellation authority (ClusterDispatch
+// re-binds the caller ctx onto the request before calling).
+func (c *Client) doWithRetry(hc *http.Client, req *http.Request) (*http.Response, error) {
 	// Zero RetryPolicy or empty RetryOnStatus → single attempt, no retry.
 	maxAttempts := c.opts.RetryPolicy.Attempts + 1
 	if c.opts.RetryPolicy.Attempts <= 0 || len(c.opts.RetryPolicy.RetryOnStatus) == 0 {
@@ -198,7 +213,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			}
 		}
 
-		resp, err = c.httpClient.Do(req)
+		resp, err = hc.Do(req)
 		if err != nil {
 			// Transport-level error — no retry; propagate verbatim.
 			return nil, err
@@ -282,16 +297,30 @@ func (c *Client) ClusterDispatch(ctx context.Context, clusterName string, reques
 		return nil, fmt.Errorf("httpclient: ClusterDispatch: pick endpoint: %w", err)
 	}
 
-	// Rewrite request.URL.Host + Scheme so the underlying http.Client dials
-	// the LB-selected endpoint with the right transport (TLS vs plaintext).
-	// Clone the URL so we don't mutate the caller's request state in-place
-	// (the caller's request may be reused by other code paths).
 	if request.URL == nil {
 		// Construct a minimal URL when the caller didn't pre-populate one
 		// (e.g., http.NewRequestWithContext with a relative path). This is a
 		// defensive path — production consumers always pass a URL.
 		return nil, fmt.Errorf("httpclient: ClusterDispatch: request.URL is nil")
 	}
+
+	// Re-bind the request to the supplied ctx so the stdlib http.Client.Do
+	// observes the caller's cancellation/deadline at the transport layer.
+	// (The caller typically already does NewRequestWithContext(ctx, ...); this
+	// is a defensive re-bind that closes the gap if they passed a different
+	// ctx as the ClusterDispatch ctx parameter than the one bound on the
+	// request.) WithContext returns a shallow copy — this MUST happen BEFORE
+	// the URL rewrite below so the rewritten URL lands on the copy, not the
+	// caller's *http.Request (the caller's request may be reused across calls
+	// and must not observe the LB-picked endpoint).
+	request = request.WithContext(ctx)
+
+	// Rewrite request.URL.Host + Scheme (on a cloned *url.URL, assigned to
+	// the shallow request copy) so the underlying http.Client dials the
+	// LB-selected endpoint with the right transport (TLS vs plaintext). The
+	// Host header is intentionally NOT touched: leaving request.Host == ""
+	// tells the stdlib to derive it from URL.Host, and a caller-set non-empty
+	// Host conveys explicit intent (e.g. an SNI override pattern).
 	urlCopy := *request.URL
 	urlCopy.Host = ep.Addr()
 	if cl.UpstreamTLSConfig() != nil {
@@ -300,12 +329,6 @@ func (c *Client) ClusterDispatch(ctx context.Context, clusterName string, reques
 		urlCopy.Scheme = "http"
 	}
 	request.URL = &urlCopy
-	// Update Host header to match so the upstream server's vhost routing
-	// observes the rewritten host (idiomatic per net/http when Host==""):
-	// leaving Host == "" tells the stdlib to derive from URL.Host. We do not
-	// overwrite a caller-set Host (a non-empty Host conveys explicit intent —
-	// e.g. an SNI override pattern).
-	// (No-op when request.Host was already empty.)
 
 	// Build the temporary *http.Client carrying the cluster's TLS config +
 	// receiver's Options.Timeout. We do not memoize this per (clusterName, c)
@@ -316,71 +339,9 @@ func (c *Client) ClusterDispatch(ctx context.Context, clusterName string, reques
 	// expansion non-breakingly).
 	hc := &http.Client{Timeout: c.opts.Timeout}
 	if upCfg := cl.UpstreamTLSConfig(); upCfg != nil {
-		// Clone the default transport to inherit stdlib defaults
-		// (MaxIdleConns, IdleConnTimeout, etc.) and override TLSClientConfig.
-		// Mirrors New()'s discipline at httpclient.go:115-130.
-		dt, ok := http.DefaultTransport.(*http.Transport)
-		if !ok {
-			hc.Transport = &http.Transport{TLSClientConfig: upCfg}
-		} else {
-			tr := dt.Clone()
-			tr.TLSClientConfig = upCfg
-			hc.Transport = tr
-		}
+		hc.Transport = transportForTLS(upCfg)
 	}
 
-	// Re-bind the request to the supplied ctx so the stdlib http.Client.Do
-	// observes the caller's cancellation/deadline at the transport layer.
-	// (The caller typically already does NewRequestWithContext(ctx, ...); this
-	// is a defensive re-bind that closes the gap if they passed a different
-	// ctx as the ClusterDispatch ctx parameter than the one bound on the
-	// request.)
-	request = request.WithContext(ctx)
-
-	// Retry loop — mirrors Do at httpclient.go:155-202. Zero RetryPolicy or
-	// empty RetryOnStatus → single attempt, no retry.
-	maxAttempts := c.opts.RetryPolicy.Attempts + 1
-	if c.opts.RetryPolicy.Attempts <= 0 || len(c.opts.RetryPolicy.RetryOnStatus) == 0 {
-		maxAttempts = 1
-	}
-
-	var (
-		resp    *http.Response
-		dispErr error
-	)
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 {
-			// Inter-attempt sleep honoring ctx cancellation.
-			if c.opts.RetryPolicy.PerAttemptDelay > 0 {
-				timer := time.NewTimer(c.opts.RetryPolicy.PerAttemptDelay)
-				select {
-				case <-timer.C:
-				case <-ctx.Done():
-					timer.Stop()
-					return nil, ctx.Err()
-				}
-			}
-			// Re-check ctx even when PerAttemptDelay is zero.
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-			// Drain + close the prior response body so the stdlib connection-
-			// pool can reuse the underlying conn.
-			if resp != nil {
-				_, _ = io.Copy(io.Discard, resp.Body)
-				_ = resp.Body.Close()
-			}
-		}
-
-		resp, dispErr = hc.Do(request)
-		if dispErr != nil {
-			// Transport-level error — no retry; propagate verbatim.
-			return nil, dispErr
-		}
-		if !shouldRetryStatus(resp.StatusCode, c.opts.RetryPolicy.RetryOnStatus) {
-			return resp, nil
-		}
-	}
-	// Exhausted retries — return the last response (caller inspects status).
-	return resp, nil
+	// Retry loop — the same status-driven discipline as Do (shared helper).
+	return c.doWithRetry(hc, request)
 }

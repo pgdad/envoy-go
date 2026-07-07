@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	metricsv3 "github.com/envoyproxy/go-control-plane/envoy/service/metrics/v3"
@@ -38,9 +39,18 @@ type fakeMetricsStream struct {
 	// blockCh, when non-nil, blocks each Send on a receive until the test
 	// closes it (used to wedge the writer goroutine for the drop test).
 	blockCh chan struct{}
+
+	// sendStarted, when non-nil, receives one signal at the start of each Send
+	// (BEFORE the blockCh wait) so a test can observe that the writer goroutine
+	// has dequeued a batch and is wedged inside Send. Must be buffered deeply
+	// enough for every Send the test triggers.
+	sendStarted chan struct{}
 }
 
 func (f *fakeMetricsStream) Send(m *metricsv3.StreamMetricsMessage) error {
+	if f.sendStarted != nil {
+		f.sendStarted <- struct{}{}
+	}
 	if f.blockCh != nil {
 		<-f.blockCh
 	}
@@ -286,6 +296,58 @@ func TestSink_DeltaMode_RewritesCountersToDeltas(t *testing.T) {
 	}
 	if got := msgs[1].GetEnvoyMetrics()[0].GetMetric()[0].GetCounter().GetValue(); got != 3 {
 		t.Errorf("message[1] counter = %v, want 3 (per-flush delta)", got)
+	}
+}
+
+// TestSink_DeltaMode_EnqueueDropDoesNotLatch pins the item-2 fix: the delta
+// transform runs in the WRITER goroutine (just before flush), so a batch dropped
+// at enqueue (full channel) never latches deltaState — its increments ride the
+// next successfully-enqueued flush's delta instead of being silently lost. The
+// pre-fix Submit-side apply latched the dropped batch's value, permanently
+// undercounting the delta stream.
+func TestSink_DeltaMode_EnqueueDropDoesNotLatch(t *testing.T) {
+	block := make(chan struct{})
+	started := make(chan struct{}, 8)
+	stream := &fakeMetricsStream{blockCh: block, sendStarted: started}
+	client := &fakeMetricsClient{streams: []*fakeMetricsStream{stream}}
+	s := newSinkWithCapacity(client, testNode(), true /*deltas*/, false /*labels*/, 1)
+
+	// Batch A (7): the writer dequeues it, latches 7, and wedges inside Send.
+	s.Submit([]*dto.MetricFamily{counterFam("c.rq", 7)})
+	<-started // the writer is now wedged in Send and the 1-deep channel is EMPTY
+
+	// Batch B (10) fills the channel; batch C (12) is DROPPED at enqueue. The
+	// drop must NOT latch deltaState (the pre-fix bug latched 12 here).
+	s.Submit([]*dto.MetricFamily{counterFam("c.rq", 10)})
+	s.Submit([]*dto.MetricFamily{counterFam("c.rq", 12)}) // channel full -> dropped
+
+	close(block) // release the writer: A then B flush
+
+	// Wait for B's message so the channel has room for D (Submit never blocks).
+	deadline := time.Now().Add(5 * time.Second)
+	for len(stream.messages()) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for 2 flushed messages, got %d", len(stream.messages()))
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Batch D (20): its delta must be 20-10=10 (relative to B, the last batch
+	// the WRITER saw) — NOT 20-12=8, which would mean the dropped C latched.
+	s.Submit([]*dto.MetricFamily{counterFam("c.rq", 20)})
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	msgs := stream.messages()
+	if len(msgs) != 3 {
+		t.Fatalf("got %d streamed messages, want 3 (A, B, D; C dropped)", len(msgs))
+	}
+	want := []float64{7, 3, 10} // A absolute, B delta 10-7, D delta 20-10
+	for i, w := range want {
+		if got := msgs[i].GetEnvoyMetrics()[0].GetMetric()[0].GetCounter().GetValue(); got != w {
+			t.Errorf("message[%d] counter = %v, want %v", i, got, w)
+		}
 	}
 }
 

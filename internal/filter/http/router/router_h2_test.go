@@ -1,7 +1,6 @@
 package router
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/ecdsa"
@@ -12,12 +11,9 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"io"
-	"log"
 	"math/big"
 	"net"
-	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -714,52 +710,8 @@ func TestRouterActionH2_Upstream5xxForwardedVerbatim(t *testing.T) {
 	}
 }
 
-// TestRouterActionH2_DefensiveDoEmits500AndLogs verifies the H1-path
-// defensive stub of *routerActionH2: in well-formed bootstraps, build-
-// time variant selection in buildRouterAction routes H2-cluster routes
-// to *routerActionH2 (consumed by the H2 driver via h2RouterActionAdapter)
-// and H1-cluster routes to *routerAction. The H1 driver only invokes
-// routeAction.do(...) — never routeAction.doH2(...) — so on the H1 path
-// reaching *routerActionH2.do is a bootstrap-misconfiguration signal.
-//
-// Closes REVIEW I-2 (observability gap). The stub must:
-//  1. emit a 500 status line on the bufio.Writer (not crash; not panic);
-//  2. log a diagnostic naming the cluster and the misconfiguration so an
-//     operator debugging an unexpected 500 can grep server logs for the
-//     cause without spelunking the codec-dispatch code.
-func TestRouterActionH2_DefensiveDoEmits500AndLogs(t *testing.T) {
-	// Capture log output so we can assert the diagnostic line.
-	var logBuf bytes.Buffer
-	prevWriter := log.Writer()
-	prevFlags := log.Flags()
-	log.SetOutput(&logBuf)
-	log.SetFlags(0)
-	defer func() {
-		log.SetOutput(prevWriter)
-		log.SetFlags(prevFlags)
-	}()
-
-	// Construct a minimal *routerActionH2 against any cluster (the cluster
-	// is only used for its Name() in the log line; do() does not dial).
-	// Use the existing singleEndpointCluster helper for an H1 cluster
-	// because we explicitly want to exercise the H1-path stub.
-	c := singleEndpointCluster(t, "127.0.0.1:1")
-	a := &routerActionH2{cluster: c}
-
-	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://x/", nil)
-	var buf bytes.Buffer
-	bw := bufio.NewWriter(&buf)
-	if _, err := a.do(req.Context(), req, bw); err != nil {
-		t.Fatalf("do: unexpected error %v", err)
-	}
-	_ = bw.Flush()
-	if !strings.HasPrefix(buf.String(), "HTTP/1.1 500 ") {
-		t.Errorf("expected 500 status line, got: %q", buf.String())
-	}
-	if !strings.Contains(logBuf.String(), "routerActionH2.do reached on H1 path") {
-		t.Errorf("expected misconfiguration diagnostic in log, got: %q", logBuf.String())
-	}
-	if !strings.Contains(logBuf.String(), `cluster=`) {
-		t.Errorf("expected cluster name in log diagnostic, got: %q", logBuf.String())
-	}
-}
+// The pre-maintenance TestRouterActionH2_DefensiveDoEmits500AndLogs covered
+// the *routerActionH2.do defensive stub for the legacy direct-write H1 path.
+// That path (and the routeAction interface's do method) was deleted as
+// production-unreachable: variant selection at filter-build time guarantees
+// H2-clusters get the H2 closure, so the stub had no remaining caller.

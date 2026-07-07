@@ -46,39 +46,36 @@ func Default(r *Record) []byte {
 	b.WriteString(` -`)
 	b.WriteString(` "-"`)
 	b.WriteString(` "`)
-	b.WriteString(escape(orEmptyDash(r.UserAgent)))
+	b.WriteString(escape(orDash(r.UserAgent)))
 	b.WriteByte('"')
 	b.WriteString(` "-"`)
 	b.WriteString(` "`)
-	b.WriteString(escape(orEmptyDash(r.Authority)))
+	b.WriteString(escape(orDash(r.Authority)))
 	b.WriteByte('"')
 	b.WriteString(` "`)
-	b.WriteString(escape(orEmptyDash(r.UpstreamHost)))
+	b.WriteString(escape(orDash(r.UpstreamHost)))
 	b.WriteByte('"')
 	b.WriteByte('\n')
 	return b.Bytes()
 }
 
+// logEscaper is the shared field-escape Replacer, built once at package init
+// (Replacer is goroutine-safe) so the escape slow path allocates no per-call
+// replacer machine. Backslash escape MUST come first in the NewReplacer arg
+// list — strings.NewReplacer is single-pass non-overlapping, so listing `\` →
+// `\\` before `"` → `\"` ensures `\"` in input becomes `\\\"` in output
+// (escaped backslash + escaped quote), not `\\"` (which would re-parse as
+// escaped-backslash + bare-quote = field terminator).
+var logEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`)
+
 func escape(s string) string {
 	if !strings.ContainsAny(s, "\\\"\n\r") {
 		return s
 	}
-	// Backslash escape MUST come first in the NewReplacer arg list — strings.NewReplacer
-	// is single-pass non-overlapping, so listing `\` → `\\` before `"` → `\"` ensures
-	// `\"` in input becomes `\\\"` in output (escaped backslash + escaped quote), not
-	// `\\"` (which would re-parse as escaped-backslash + bare-quote = field terminator).
-	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`)
-	return r.Replace(s)
+	return logEscaper.Replace(s)
 }
 
 func orDash(s string) string {
-	if s == "" {
-		return "-"
-	}
-	return s
-}
-
-func orEmptyDash(s string) string {
 	if s == "" {
 		return "-"
 	}

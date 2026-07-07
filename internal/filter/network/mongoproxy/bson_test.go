@@ -163,3 +163,37 @@ func TestBSON_AsInt64(t *testing.T) {
 		}
 	}
 }
+
+// nestedDoc builds a document nested n levels deep under the top level:
+// {"a": {"a": ... {}}} — each level is a Document (0x03) element named "a".
+func nestedDoc(n int) []byte {
+	d := doc() // innermost empty document
+	for i := 0; i < n; i++ {
+		d = doc(append(append([]byte{0x03}, cstr("a")...), d...)...)
+	}
+	return d
+}
+
+// The depth guard: nesting at the limit parses; one level beyond returns the
+// errBSON path (stack-exhaustion guard — a crafted document at 5 bytes/level
+// would otherwise recurse until the goroutine stack dies, an unrecoverable
+// runtime panic from downstream bytes).
+func TestBSON_NestingDepthLimit(t *testing.T) {
+	if _, err := parseBSON(nestedDoc(maxBSONDepth - 1)); err != nil {
+		t.Fatalf("nesting at the limit (depth %d) must parse: %v", maxBSONDepth-1, err)
+	}
+	if _, err := parseBSON(nestedDoc(maxBSONDepth)); err == nil {
+		t.Fatalf("nesting beyond maxBSONDepth (%d) must fail with errBSON", maxBSONDepth)
+	}
+}
+
+// Arrays (0x04) share the recursion; the guard covers them identically.
+func TestBSON_NestingDepthLimitArrays(t *testing.T) {
+	d := doc() // innermost empty document
+	for i := 0; i < maxBSONDepth; i++ {
+		d = doc(append(append([]byte{0x04}, cstr("0")...), d...)...)
+	}
+	if _, err := parseBSON(d); err == nil {
+		t.Fatal("array nesting beyond maxBSONDepth must fail with errBSON")
+	}
+}

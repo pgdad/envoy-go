@@ -26,9 +26,9 @@ package admission_control
 // # Fakes consumed (from test-scope files per Task 3 — NOT redefined here)
 //
 //   - fakeRand (rand_test.go): fakeRand{v: uint64} — deterministic Rand seam
-//   - fakeClock (clock_test.go): newFakeClock(start) + Advance(d)
+//   - clock.FakeClock (internal/clock): clock.NewFakeClock(start) + Advance(d)
 //
-// DO NOT redefine fakeRand or fakeClock here.
+// DO NOT redefine fakeRand here; the fake clock comes from internal/clock.
 
 import (
 	"crypto/tls"
@@ -42,6 +42,7 @@ import (
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/pgdad/envoy-go/internal/clock"
 	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 	"github.com/pgdad/envoy-go/internal/stats"
@@ -108,17 +109,17 @@ func (c *acCallbacks) RouteIncludeVhRateLimits() bool              { return fals
 // Test helpers
 // -----------------------------------------------------------------------------
 
-// newACTestFilter constructs a *filter + *controller wired with a fakeClock and
+// newACTestFilter constructs a *filter + *controller wired with a clock.FakeClock and
 // the provided fakeRand. The filter's record is true at construction (default
 // per AMEND-11 + PD-4: record=true out of the gate). The controller starts with
 // an empty window.
 //
 // cfg.rpsThreshold defaults to 0 in testCompiledConfigAC() so the RPS gate never
 // suppresses unless the test sets rpsThreshold explicitly.
-func newACTestFilter(t *testing.T, rnd Rand) (*filter, *controller, *fakeClock, *acCallbacks) {
+func newACTestFilter(t *testing.T, rnd Rand) (*filter, *controller, *clock.FakeClock, *acCallbacks) {
 	t.Helper()
 	cfg := testCompiledConfigAC()
-	clock := newFakeClock(time.Unix(0, 0))
+	clock := clock.NewFakeClock(time.Unix(0, 0))
 	st := newFilterStats(stats.NewRegistry(), "http.test")
 	ctrl := newController(cfg, st, clock, rnd)
 	cb := &acCallbacks{}

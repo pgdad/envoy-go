@@ -37,13 +37,18 @@ type Metric interface {
 	Format() string
 }
 
-// nameRE is the validation regex applied to every NewCounter / NewGauge name.
-// Per BRAINSTORM §5.2 the form is ASCII-letter-or-underscore prefix followed
-// by ASCII-alphanumerics, underscores, and dots. Dots are permitted because
-// the internal hierarchical-dotted-name shape uses them as the segment separator.
-// A trailing dot is rejected (dots are segment separators, not terminators —
-// "trailing." is a malformed name with an empty trailing segment).
-var nameRE = regexp.MustCompile(`^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$`)
+// NamePattern is the regex source enforced on every NewCounter / NewGauge name
+// (and via IsValidName). Per BRAINSTORM §5.2 the form is ASCII-letter-or-
+// underscore prefix followed by ASCII-alphanumerics, underscores, and dots.
+// Dots are permitted because the internal hierarchical-dotted-name shape uses
+// them as the segment separator. A trailing dot is rejected (dots are segment
+// separators, not terminators — "trailing." is a malformed name with an empty
+// trailing segment). Exported so boundary validators (e.g. stats/dynamic's
+// user-name check) can reuse the SAME pattern instead of hand-copying it.
+const NamePattern = `^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$`
+
+// nameRE is the compiled NamePattern applied by checkName / IsValidName.
+var nameRE = regexp.MustCompile(NamePattern)
 
 // IsValidName reports whether name passes the same regex that NewCounter and
 // NewGauge enforce internally via checkName. Exposed so callers that derive
@@ -77,33 +82,32 @@ func NewRegistry() *Registry {
 // whose stat_prefix is data-driven and not knowable at boot time), see
 // NewCounterIfAbsent below (added by phase 11 per ADR-0117).
 func (r *Registry) NewCounter(name string) *Counter {
-	r.checkName(name)
 	c := &Counter{name: name}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.checkFrozenLocked(name)
-	if _, dup := r.byName[name]; dup {
-		panic(fmt.Sprintf("stats: duplicate metric registration: %q", name))
-	}
-	r.metrics = append(r.metrics, c)
-	r.byName[name] = c
+	r.register(name, c)
 	return c
 }
 
 // NewGauge registers and returns a gauge under the given name. Same panic
 // discipline as NewCounter.
 func (r *Registry) NewGauge(name string) *Gauge {
-	r.checkName(name)
 	g := &Gauge{name: name}
+	r.register(name, g)
+	return g
+}
+
+// register is the shared boot-time registration step behind NewCounter and
+// NewGauge: name validation (outside the lock), then the locked frozen check,
+// duplicate check, list append, and map insert.
+func (r *Registry) register(name string, m Metric) {
+	r.checkName(name)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.checkFrozenLocked(name)
 	if _, dup := r.byName[name]; dup {
 		panic(fmt.Sprintf("stats: duplicate metric registration: %q", name))
 	}
-	r.metrics = append(r.metrics, g)
-	r.byName[name] = g
-	return g
+	r.metrics = append(r.metrics, m)
+	r.byName[name] = m
 }
 
 // checkName panics if the name fails the nameRE validation. Called outside
@@ -155,19 +159,32 @@ func (r *Registry) Walk(fn func(Metric)) {
 //
 // Per ADR-0117 (phase 11 ADR-0073 amendment) + ADR-0061 LBP-1 amendment.
 func (r *Registry) NewCounterIfAbsent(name string) *Counter {
-	r.checkName(name) // panic-on-invalid-name preserved (programmer error, not ops issue)
+	m := r.getOrRegister(name, func() Metric { return &Counter{name: name} })
+	c, ok := m.(*Counter)
+	if !ok {
+		panic(fmt.Sprintf("stats: NewCounterIfAbsent: name %q registered as non-Counter", name))
+	}
+	return c
+}
+
+// getOrRegister is the shared idempotent-registration step behind
+// NewCounterIfAbsent and NewGaugeIfAbsent: name validation (panic-on-invalid-name
+// preserved — programmer error, not ops issue), then under r.mu either the
+// existing metric is returned as-is (the caller type-asserts and panics with its
+// own message on a cross-type hit) or mk's fresh metric is appended + inserted.
+// PERMITTED post-Freeze by design (ADR-0117); r.mu serializes the read + register
+// pair.
+func (r *Registry) getOrRegister(name string, mk func() Metric) Metric {
+	r.checkName(name)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if existing, ok := r.byName[name]; ok {
-		if c, ok := existing.(*Counter); ok {
-			return c
-		}
-		panic(fmt.Sprintf("stats: NewCounterIfAbsent: name %q registered as non-Counter", name))
+		return existing
 	}
-	c := &Counter{name: name}
-	r.metrics = append(r.metrics, c)
-	r.byName[name] = c
-	return c
+	m := mk()
+	r.metrics = append(r.metrics, m)
+	r.byName[name] = m
+	return m
 }
 
 // NewGaugeIfAbsent returns the gauge for `name` if already registered,
@@ -189,18 +206,11 @@ func (r *Registry) NewCounterIfAbsent(name string) *Counter {
 // Per ADR-0117 (phase 11) + ADR-0139 (phase 15 per-route INDEPENDENT-stats
 // ratification — extending the NewCounterIfAbsent pattern to gauges).
 func (r *Registry) NewGaugeIfAbsent(name string) *Gauge {
-	r.checkName(name) // panic-on-invalid-name preserved (programmer error, not ops issue)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if existing, ok := r.byName[name]; ok {
-		if g, ok := existing.(*Gauge); ok {
-			return g
-		}
+	m := r.getOrRegister(name, func() Metric { return &Gauge{name: name} })
+	g, ok := m.(*Gauge)
+	if !ok {
 		panic(fmt.Sprintf("stats: NewGaugeIfAbsent: name %q registered as non-Gauge", name))
 	}
-	g := &Gauge{name: name}
-	r.metrics = append(r.metrics, g)
-	r.byName[name] = g
 	return g
 }
 

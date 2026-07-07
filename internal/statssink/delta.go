@@ -7,12 +7,14 @@ import (
 
 // deltaState holds the per-sink last-flushed COUNTER values keyed by full dotted
 // family name, for report_counters_as_deltas=true (ADR-0263). A delta-mode sink
-// owns one deltaState and applies it in Submit: each COUNTER family's value is
-// rewritten to current-last (the per-flush delta) and last is latched to current;
-// GAUGE (and any non-COUNTER) families pass through absolute, untransformed. The
-// map is touched ONLY from MetricsServiceSink.Submit, which the single Flusher
+// owns one deltaState and applies it once per batch: each COUNTER family's value
+// is rewritten to current-last (the per-flush delta) and last is latched to
+// current; GAUGE (and any non-COUNTER) families pass through absolute,
+// untransformed. Each owner touches the map from exactly ONE goroutine — the
+// MetricsServiceSink writer goroutine (run, just before flush, so an enqueue-drop
+// never latches), or the statsd/dog_statsd Submit which the single Flusher
 // goroutine calls serially per flush (the sink contract forbids Submit after
-// Close), so no lock is needed.
+// Close) — so no lock is needed.
 type deltaState struct {
 	last map[string]uint64
 }

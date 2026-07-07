@@ -134,3 +134,48 @@ func TestWindow_TinyWindowStressDelivery(t *testing.T) {
 		t.Errorf("delivered = %d, want 100", delivered)
 	}
 }
+
+// TestWindow_SingleReplenishWakesAllWaiters pins the reserveBlocking chained
+// wakeup: the signal channel has capacity 1, so a single replenish wakes
+// exactly one waiter. When TWO goroutines are blocked on the same window
+// (e.g. two streams stalled on the conn-level send window) and one replenish
+// arrives with enough capacity for both partial takes, the first waiter must
+// re-signal after taking so the second waiter also proceeds — instead of
+// stalling until an unrelated future replenish arrives.
+func TestWindow_SingleReplenishWakesAllWaiters(t *testing.T) {
+	w := newWindow(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	const waiters = 2
+	var wg sync.WaitGroup
+	errs := make([]error, waiters)
+	for i := 0; i < waiters; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, errs[idx] = w.reserveBlocking(ctx, 10)
+		}(i)
+	}
+
+	// Give both goroutines time to park on the signal channel, then issue
+	// ONE replenish large enough for both takes (10 + 10 < 30).
+	time.Sleep(20 * time.Millisecond)
+	w.replenish(30)
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("waiters did not all return within 1s after a single sufficient replenish (lost wakeup)")
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("waiter %d: reserveBlocking returned %v, want nil", i, err)
+		}
+	}
+	if got := w.available(); got != 10 {
+		t.Errorf("available = %d, want 10 (30 - 2*10)", got)
+	}
+}

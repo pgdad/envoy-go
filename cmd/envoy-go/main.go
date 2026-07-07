@@ -13,9 +13,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -95,7 +97,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("extract admin: %v", err)
 	}
-	adminAddr := fmt.Sprintf("%s:%d", adminHost, adminPort)
+	// net.JoinHostPort (not fmt.Sprintf) so an IPv6 admin address renders
+	// bracketed ("[::1]:9901") and stays bindable; IPv4/hostname output is
+	// byte-identical to the previous Sprintf form.
+	adminAddr := net.JoinHostPort(adminHost, strconv.FormatUint(uint64(adminPort), 10))
 
 	cm, err := cluster.NewManagerWithBaseDir(bs.Proto, filepath.Dir(*cfgPath), bs.Stats)
 	if err != nil {
@@ -143,30 +148,30 @@ func main() {
 	// Task 3) for the Zipkin arm's v2-JSON ClusterDispatch POSTs.
 	httpClient := httpclient.New(httpclient.Options{Timeout: 30 * time.Second})
 	tracingProvider := boot.NewTracingProvider(dialer, httpClient, cm, bs.Stats)
-	if len(bs.ALSConfigs) > 0 || len(bs.OTLPConfigs) > 0 {
-		if len(bs.ALSConfigs) > 0 {
-			written, dropped := accesslog.RegisterGrpcSinkCounters(bs.Stats)
-			node := &corev3.Node{Id: bs.Proto.GetNode().GetId(), Cluster: bs.Proto.GetNode().GetCluster()}
-			for _, cfg := range bs.ALSConfigs {
-				client, err := grpcclient.NewALSClient(dialer, cfg.ClusterName)
-				if err != nil {
-					log.Fatalf("accesslog: gRPC ALS client for cluster %q: %v", cfg.ClusterName, err)
-				}
-				sinks = append(sinks, accesslog.NewGrpcAccessLogSink(client, cfg.LogName, node, written, dropped, int(cfg.BufferSizeBytes), cfg.BufferFlushInterval, cfg.AdditionalRequestHeaders, cfg.AdditionalResponseHeaders))
+	// minNode is the minimal Node (Id/Cluster only) shared by the gRPC ALS
+	// access-log sink and the metrics_service stats sink below. The OTLP
+	// access-log sink deliberately does NOT use it — its Resource labels need
+	// node.locality.zone, so it sources the FULL bootstrap node (D-OTLP-NODE).
+	minNode := &corev3.Node{Id: bs.Proto.GetNode().GetId(), Cluster: bs.Proto.GetNode().GetCluster()}
+	if len(bs.ALSConfigs) > 0 {
+		written, dropped := accesslog.RegisterGrpcSinkCounters(bs.Stats)
+		for _, cfg := range bs.ALSConfigs {
+			client, err := grpcclient.NewALSClient(dialer, cfg.ClusterName)
+			if err != nil {
+				log.Fatalf("accesslog: gRPC ALS client for cluster %q: %v", cfg.ClusterName, err)
 			}
+			sinks = append(sinks, accesslog.NewGrpcAccessLogSink(client, cfg.LogName, minNode, written, dropped, int(cfg.BufferSizeBytes), cfg.BufferFlushInterval, cfg.AdditionalRequestHeaders, cfg.AdditionalResponseHeaders))
 		}
-		if len(bs.OTLPConfigs) > 0 {
-			otlpWritten, otlpDropped := accesslog.RegisterOTLPSinkCounters(bs.Stats)
-			// The OTLP Resource labels need node.locality.zone, so source the FULL
-			// bootstrap node (Id/Cluster/Locality) — NOT the ALS minimal node (D-OTLP-NODE).
-			otlpNode := bs.Proto.GetNode()
-			for _, cfg := range bs.OTLPConfigs {
-				client, err := grpcclient.NewOTLPLogsClient(dialer, cfg.ClusterName)
-				if err != nil {
-					log.Fatalf("accesslog: OTLP logs client for cluster %q: %v", cfg.ClusterName, err)
-				}
-				sinks = append(sinks, accesslog.NewOTLPAccessLogSink(client, cfg.LogName, otlpNode, cfg.DisableBuiltinLabels, cfg.Body, cfg.Attributes, cfg.ResourceAttributes, otlpWritten, otlpDropped, int(cfg.BufferSizeBytes), cfg.BufferFlushInterval))
+	}
+	if len(bs.OTLPConfigs) > 0 {
+		otlpWritten, otlpDropped := accesslog.RegisterOTLPSinkCounters(bs.Stats)
+		otlpNode := bs.Proto.GetNode()
+		for _, cfg := range bs.OTLPConfigs {
+			client, err := grpcclient.NewOTLPLogsClient(dialer, cfg.ClusterName)
+			if err != nil {
+				log.Fatalf("accesslog: OTLP logs client for cluster %q: %v", cfg.ClusterName, err)
 			}
+			sinks = append(sinks, accesslog.NewOTLPAccessLogSink(client, cfg.LogName, otlpNode, cfg.DisableBuiltinLabels, cfg.Body, cfg.Attributes, cfg.ResourceAttributes, otlpWritten, otlpDropped, int(cfg.BufferSizeBytes), cfg.BufferFlushInterval))
 		}
 	}
 	defer func() {
@@ -191,13 +196,12 @@ func main() {
 	flusherDone := make(chan struct{})
 	if len(bs.StatsSinkConfigs) > 0 || len(bs.StatsdSinkConfigs) > 0 || len(bs.DogStatsdSinkConfigs) > 0 {
 		if len(bs.StatsSinkConfigs) > 0 {
-			node := &corev3.Node{Id: bs.Proto.GetNode().GetId(), Cluster: bs.Proto.GetNode().GetCluster()}
 			for _, cfg := range bs.StatsSinkConfigs {
 				client, err := grpcclient.NewMetricsServiceClient(dialer, cfg.ClusterName)
 				if err != nil {
 					log.Fatalf("statssink: metrics_service client for cluster %q: %v", cfg.ClusterName, err)
 				}
-				statsSinks = append(statsSinks, statssink.NewMetricsServiceSink(client, node, cfg.ReportCountersAsDeltas, cfg.EmitTagsAsLabels))
+				statsSinks = append(statsSinks, statssink.NewMetricsServiceSink(client, minNode, cfg.ReportCountersAsDeltas, cfg.EmitTagsAsLabels))
 			}
 		}
 		// Phase 48 (ADR-0265): the statsd UDP stats sink. NewStatsdSink dials a

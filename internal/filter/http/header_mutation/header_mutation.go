@@ -255,16 +255,18 @@ func applyAppendAction(headers http.Header, op compiledMutationOp) {
 	}
 }
 
-// compileForRequest projects a per-route HeaderMutationPerRoute proto.Message
-// into a request-mutations slice. Sub-microsecond on small per-route configs
-// (typical: <5 ops per tier). Per planner-time decision 2 we re-compile fresh
-// per request rather than caching; the cost is negligible.
+// compilePerRoute projects a per-route HeaderMutationPerRoute proto.Message
+// into a mutations slice for one direction (response=false → request
+// mutations; response=true → response mutations). Sub-microsecond on small
+// per-route configs (typical: <5 ops per tier). Per planner-time decision 2
+// we re-compile fresh per request rather than caching; the cost is
+// negligible.
 //
 // Returns nil for nil input or for messages that fail the type-assertion (the
 // per-route validator at HCM-build time per ADR-0111 already rejects per-route
 // configs containing protected-header mutations, so the compileOps call here
 // is expected to succeed; defensive on error → return nil).
-func (f *filter) compileForRequest(msg proto.Message) []compiledMutationOp {
+func compilePerRoute(msg proto.Message, response bool) []compiledMutationOp {
 	if msg == nil {
 		return nil
 	}
@@ -276,30 +278,13 @@ func (f *filter) compileForRequest(msg proto.Message) []compiledMutationOp {
 	if m == nil {
 		return nil
 	}
-	ops, err := compileOps(m.GetRequestMutations())
+	in := m.GetRequestMutations()
+	if response {
+		in = m.GetResponseMutations()
+	}
+	ops, err := compileOps(in)
 	if err != nil {
 		// Per-route validator at HCM-build time rejects this case; defensive return.
-		return nil
-	}
-	return ops
-}
-
-// compileForResponse projects a per-route HeaderMutationPerRoute proto.Message
-// into a response-mutations slice. Symmetric to compileForRequest.
-func (f *filter) compileForResponse(msg proto.Message) []compiledMutationOp {
-	if msg == nil {
-		return nil
-	}
-	pr, ok := msg.(*headermutationv3.HeaderMutationPerRoute)
-	if !ok {
-		return nil
-	}
-	m := pr.GetMutations()
-	if m == nil {
-		return nil
-	}
-	ops, err := compileOps(m.GetResponseMutations())
-	if err != nil {
 		return nil
 	}
 	return ops
@@ -315,7 +300,6 @@ type filter struct {
 	cfg *runtimeConfig
 
 	dcb envoyhttp.DecoderFilterCallbacks
-	ecb envoyhttp.EncoderFilterCallbacks
 }
 
 // Statically assert the both-sides interface conformance (matches cors + fault precedents).
@@ -325,22 +309,30 @@ var (
 )
 
 func (f *filter) SetDecoderCallbacks(cb envoyhttp.DecoderFilterCallbacks) { f.dcb = cb }
-func (f *filter) SetEncoderCallbacks(cb envoyhttp.EncoderFilterCallbacks) { f.ecb = cb }
 
-// DecodeHeaders implements the header_mutation filter's decode-side discipline
-// per SPEC §6.6 + ADR-0109 + ADR-0110. Apply listener-level cfg.requestOps
-// FIRST (per the proto comment at header_mutation.pb.go:141–142), then
-// per-route tiers in flag-controlled order (per §6.5 algorithm + §11.5
-// empirical confirmation).
-func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHeadersStatus {
-	applyOps(headers, f.cfg.requestOps)
+// SetEncoderCallbacks is a no-op retained to satisfy StreamEncoderFilter —
+// the encode side deliberately reaches per-route configs through f.dcb (see
+// applyMutations), so the encoder callbacks are never consulted.
+func (f *filter) SetEncoderCallbacks(envoyhttp.EncoderFilterCallbacks) {}
+
+// applyMutations is the shared three-tier resolve + flag-ordered apply block
+// behind DecodeHeaders (response=false) and EncodeHeaders (response=true) per
+// SPEC §6.6/§6.8 + ADR-0109 + ADR-0110. Apply listener-level ops FIRST (per
+// the proto comment at header_mutation.pb.go:141–142), then per-route tiers
+// in flag-controlled order (per §6.5 algorithm + §11.5 empirical
+// confirmation). Uses the DECODER callback's RequestRouteConfigsAllTiers on
+// BOTH directions (DECODER-ONLY per planner-time decision 1; the dcb is set
+// during chain wiring regardless of decode vs encode firing — mirrors cors
+// precedent at cors.go:163).
+func (f *filter) applyMutations(headers http.Header, listenerOps []compiledMutationOp, response bool) {
+	applyOps(headers, listenerOps)
 	if f.dcb == nil {
-		return envoyhttp.Continue
+		return
 	}
 	routeMsg, vhMsg, rcMsg := f.dcb.RequestRouteConfigsAllTiers()
-	routeOps := f.compileForRequest(routeMsg)
-	vhOps := f.compileForRequest(vhMsg)
-	rcOps := f.compileForRequest(rcMsg)
+	routeOps := compilePerRoute(routeMsg, response)
+	vhOps := compilePerRoute(vhMsg, response)
+	rcOps := compilePerRoute(rcMsg, response)
 
 	if !f.cfg.mostSpecificHeaderMutationsWins {
 		// DEFAULT (flag=false): Route → VHost → RC; least-specific wins overlap
@@ -353,34 +345,20 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 		applyOps(headers, vhOps)
 		applyOps(headers, routeOps)
 	}
+}
+
+// DecodeHeaders implements the header_mutation filter's decode-side discipline
+// per SPEC §6.6 + ADR-0109 + ADR-0110 — see applyMutations.
+func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHeadersStatus {
+	f.applyMutations(headers, f.cfg.requestOps, false)
 	return envoyhttp.Continue
 }
 
 // EncodeHeaders implements the header_mutation filter's encode-side discipline
-// per SPEC §6.8 — symmetric to DecodeHeaders modulo (a) reads cfg.responseOps;
-// (b) compiles response-side mutations via compileForResponse; (c) uses the
-// SAME f.dcb.RequestRouteConfigsAllTiers callback (DECODER-ONLY per planner-
-// time decision 1; the dcb is set during chain wiring regardless of decode
-// vs encode firing — mirrors cors precedent at cors.go:163).
+// per SPEC §6.8 — symmetric to DecodeHeaders modulo reading cfg.responseOps +
+// response-side per-route mutations; see applyMutations.
 func (f *filter) EncodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHeadersStatus {
-	applyOps(headers, f.cfg.responseOps)
-	if f.dcb == nil {
-		return envoyhttp.Continue
-	}
-	routeMsg, vhMsg, rcMsg := f.dcb.RequestRouteConfigsAllTiers()
-	routeOps := f.compileForResponse(routeMsg)
-	vhOps := f.compileForResponse(vhMsg)
-	rcOps := f.compileForResponse(rcMsg)
-
-	if !f.cfg.mostSpecificHeaderMutationsWins {
-		applyOps(headers, routeOps)
-		applyOps(headers, vhOps)
-		applyOps(headers, rcOps)
-	} else {
-		applyOps(headers, rcOps)
-		applyOps(headers, vhOps)
-		applyOps(headers, routeOps)
-	}
+	f.applyMutations(headers, f.cfg.responseOps, true)
 	return envoyhttp.Continue
 }
 

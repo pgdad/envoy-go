@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -57,11 +58,23 @@ type Endpoint struct {
 	// locality ZERO load whenever a sibling locality has an explicit weight).
 	// Only consulted by localityWeightedLB.
 	LocalityWeight uint32
+
+	// addr is the Addr() string precomputed at extractEndpoints time (the pick
+	// hot path — health scans, pool/hash keys — calls Addr() per host; caching
+	// removes the per-call formatting allocation). Empty for directly-constructed
+	// Endpoints (tests, zero values): Addr() falls back to computing it.
+	addr string
 }
 
-// Addr returns the dial-string form "host:port".
+// Addr returns the dial-string form "host:port" (IPv6 hosts bracketed:
+// "[::1]:80" — net.JoinHostPort is byte-identical to the previous
+// fmt.Sprintf("%s:%d") form for IPv4/hostname hosts, and produces the
+// dialable/reference form for IPv6, which the Sprintf form got wrong).
 func (e Endpoint) Addr() string {
-	return fmt.Sprintf("%s:%d", e.Host, e.Port)
+	if e.addr != "" {
+		return e.addr
+	}
+	return net.JoinHostPort(e.Host, strconv.FormatUint(uint64(e.Port), 10))
 }
 
 // IsZero reports whether the Endpoint is the zero value (no host picked).
@@ -645,33 +658,16 @@ func (c *Cluster) AcquireH1(ctx context.Context) (*PooledH1Conn, Endpoint, error
 		return nil, ep, err
 	}
 
-	// Slow path: dial fresh (mirrors the Dial code path verbatim so the
-	// connWithGauge / TLS handshake / counters semantics stay aligned —
-	// release-on-failure + dec composition).
-	d := &net.Dialer{Timeout: c.connectTimeout}
-	raw, err := d.DialContext(ctx, "tcp", addr)
+	// Slow path: dial fresh via the SHARED post-pick dial body (dialPicked —
+	// the same body Dial and dialPooledH2To use, so the compiler enforces the
+	// connWithGauge / TLS handshake / counters / release-on-failure parity).
+	conn, _, err := c.dialPicked(ctx, ep, release, true /*ownPermit*/)
 	if err != nil {
-		c.releaseConnSlot()
-		release()
-		return nil, ep, fmt.Errorf("cluster: dial: %w", err)
+		return nil, ep, err
 	}
-	var final net.Conn = raw
-	if c.upstreamCfg != nil {
-		conn := stdtls.Client(raw, c.upstreamCfg)
-		if err := conn.HandshakeContext(ctx); err != nil {
-			_ = raw.Close()
-			c.releaseConnSlot()
-			release()
-			return nil, ep, fmt.Errorf("cluster: tls: handshake: %w", err)
-		}
-		final = conn
-	}
-	c.upstreamCxTotal.Inc()
-	c.upstreamCxActive.Inc()
-	wrapped := &connWithGauge{Conn: final, dec: c.connDec(release)}
 	return &PooledH1Conn{
-		Conn: wrapped,
-		Br:   bufio.NewReaderSize(wrapped, 4096),
+		Conn: conn,
+		Br:   bufio.NewReaderSize(conn, 4096),
 		ep:   ep,
 	}, ep, nil
 }

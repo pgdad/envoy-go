@@ -33,18 +33,18 @@ import (
 
 // otlpOperators maps a supported operator TOKEN (inner text between % delimiters, no %)
 // to a func(*Record) string extractor. Empty-value dispositions reuse format.go's
-// orDash/orEmptyDash (the same Envoy StreamInfoFormatter behavior).
+// orDash (the same Envoy StreamInfoFormatter behavior).
 var otlpOperators = map[string]func(*Record) string{
 	"START_TIME":      func(r *Record) string { return r.StartTime.UTC().Format("2006-01-02T15:04:05.000Z") },
 	"REQ(:METHOD)":    func(r *Record) string { return r.Method },
 	"REQ(:PATH)":      func(r *Record) string { return orDash(r.Path) },
-	"REQ(:AUTHORITY)": func(r *Record) string { return orEmptyDash(r.Authority) },
-	"REQ(USER-AGENT)": func(r *Record) string { return orEmptyDash(r.UserAgent) },
+	"REQ(:AUTHORITY)": func(r *Record) string { return orDash(r.Authority) },
+	"REQ(USER-AGENT)": func(r *Record) string { return orDash(r.UserAgent) },
 	"PROTOCOL":        func(r *Record) string { return r.Protocol },
 	"RESPONSE_CODE":   func(r *Record) string { return strconv.Itoa(r.ResponseCode) },
 	"BYTES_SENT":      func(r *Record) string { return strconv.FormatInt(r.BytesSent, 10) },
 	"DURATION":        func(r *Record) string { return strconv.FormatInt(int64(r.Duration/1e6), 10) },
-	"UPSTREAM_HOST":   func(r *Record) string { return orEmptyDash(r.UpstreamHost) },
+	"UPSTREAM_HOST":   func(r *Record) string { return orDash(r.UpstreamHost) },
 }
 
 type otlpSegment struct {

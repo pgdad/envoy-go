@@ -46,12 +46,7 @@ func (rr *roundRobin) Pick(_ uint64, _ bool, _ SubsetMatch, _ bool) (Endpoint, f
 	if n == 0 {
 		return Endpoint{}, noopRelease, errNoEndpoints
 	}
-	if rr.health == nil {
-		i := rr.counter.Add(1) - 1
-		return rr.endpoints[int(i)%n], noopRelease, nil
-	}
-	if rr.health.inPanic(rr.endpoints) {
-		rr.health.panicInc()
+	if rr.health.panicGate(rr.endpoints) {
 		i := rr.counter.Add(1) - 1
 		return rr.endpoints[int(i)%n], noopRelease, nil
 	}

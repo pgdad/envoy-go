@@ -501,10 +501,31 @@ func (f *filter) SetEncoderCallbacks(cb envoyhttp.EncoderFilterCallbacks) { f.ec
 // len(data) per call per SPEC §7.1.
 //
 // Body-bridge logic lives at body.go's accumulateRequestBody + the
-// per-:body() yield/resume orchestration; the lua-filter callback simply
-// dispatches to that helper.
+// per-:body() yield/resume orchestration.
+//
+// Respond-state check on the resume path: when the endStream resume ran
+// a suspended coroutine to completion, the continuation may have called
+// request_handle:respond() — the canonical upstream body-inspection
+// pattern `local b = handle:body(); if bad(b) then handle:respond(...)`.
+// The DecodeHeaders dispatcher's step-9 respond-state check already
+// returned (it saw ResumeYield), so the check MUST re-run here:
+// increment respondCalls + SendLocalReply + stop iteration (mirrors
+// decode_headers.go step 9). The chain's RunDecodeData additionally
+// aborts on its own localReplyDone observation right after this
+// callback returns, so the stop status is belt-and-braces for direct
+// callers.
 func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataStatus {
-	accumulateRequestBody(f, data, endStream)
+	resumed := accumulateRequestBody(f, data, endStream)
+	if resumed && f.reqCtx != nil && f.reqCtx.respondCaptured != nil {
+		if f.cc != nil && f.cc.stats != nil && f.cc.stats.respondCalls != nil {
+			f.cc.stats.respondCalls.Inc()
+		}
+		rs := f.reqCtx.respondCaptured
+		if f.dcb != nil {
+			f.dcb.SendLocalReply(rs.status, rs.body, rs.headers)
+		}
+		return envoyhttp.DataStopIterationNoBuffer
+	}
 	return envoyhttp.DataContinue
 }
 

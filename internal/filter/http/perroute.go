@@ -20,6 +20,17 @@ import (
 type RouteScope struct {
 	VHost map[string]*anypb.Any // typed_per_filter_config from the containing virtual_host
 	Route map[string]*anypb.Any // typed_per_filter_config from the route itself
+
+	// VHostIndex + RouteIndex are the scope's coordinates within the
+	// RouteConfiguration: the index of the containing virtual_host, and the
+	// index of the route within that virtual_host. Consumed only by the
+	// envoy-go-internal boot-error location strings in BuildPerRouteConfig
+	// (scopes are one-per-route, so the flat scope index previously stood in
+	// for BOTH coordinates and misreported the location for any config with
+	// more than one route per vhost). Zero-value construction (tests) yields
+	// virtual_hosts[0].routes[0], matching the single-scope shape.
+	VHostIndex int
+	RouteIndex int
 }
 
 // routeScope is a transitional alias preserved so the fuzzer's internal seed
@@ -40,6 +51,11 @@ type PerRouteConfig struct {
 type scopeParsed struct {
 	vhost map[string]proto.Message
 	route map[string]proto.Message
+
+	// vhostIdx + routeIdx carry the RouteScope coordinates through to the
+	// per-route-validator error wrappers below.
+	vhostIdx int
+	routeIdx int
 }
 
 type cacheKey struct {
@@ -90,15 +106,15 @@ func BuildPerRouteConfig(rcCfg map[string]*anypb.Any, scopes []routeScope, chain
 	}
 	out.scopes = make([]scopeParsed, len(scopes))
 	for i, s := range scopes {
-		vh, err := parseMap(s.VHost, fmt.Sprintf("route_config.virtual_hosts[%d]", i))
+		vh, err := parseMap(s.VHost, fmt.Sprintf("route_config.virtual_hosts[%d]", s.VHostIndex))
 		if err != nil {
 			return nil, err
 		}
-		rt, err := parseMap(s.Route, fmt.Sprintf("route_config.virtual_hosts[%d].routes[%d]", i, i))
+		rt, err := parseMap(s.Route, fmt.Sprintf("route_config.virtual_hosts[%d].routes[%d]", s.VHostIndex, s.RouteIndex))
 		if err != nil {
 			return nil, err
 		}
-		out.scopes[i] = scopeParsed{vhost: vh, route: rt}
+		out.scopes[i] = scopeParsed{vhost: vh, route: rt, vhostIdx: s.VHostIndex, routeIdx: s.RouteIndex}
 	}
 	// Per-route validation hook per ADR-0110 + planner-time decision 3:
 	// for each filter name in chainNames that has a registered validator,
@@ -117,15 +133,15 @@ func BuildPerRouteConfig(rcCfg map[string]*anypb.Any, scopes []routeScope, chain
 					return nil, fmt.Errorf("hcm: route_config: typed_per_filter_config[%q]: %w", name, err)
 				}
 			}
-			for i, sp := range out.scopes {
+			for _, sp := range out.scopes {
 				if msg, ok := sp.vhost[name]; ok {
 					if err := v(msg); err != nil {
-						return nil, fmt.Errorf("hcm: route_config.virtual_hosts[%d]: typed_per_filter_config[%q]: %w", i, name, err)
+						return nil, fmt.Errorf("hcm: route_config.virtual_hosts[%d]: typed_per_filter_config[%q]: %w", sp.vhostIdx, name, err)
 					}
 				}
 				if msg, ok := sp.route[name]; ok {
 					if err := v(msg); err != nil {
-						return nil, fmt.Errorf("hcm: route_config.virtual_hosts[%d].routes[%d]: typed_per_filter_config[%q]: %w", i, i, name, err)
+						return nil, fmt.Errorf("hcm: route_config.virtual_hosts[%d].routes[%d]: typed_per_filter_config[%q]: %w", sp.vhostIdx, sp.routeIdx, name, err)
 					}
 				}
 			}

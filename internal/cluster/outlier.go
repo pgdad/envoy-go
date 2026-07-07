@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync/atomic"
 	"time"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -420,7 +421,6 @@ func (d *outlierDetector) tryEject(ep Endpoint, h *hostHealth, enforcing uint32,
 		return false
 	}
 	h.unejectAtNanos.Store(d.health.nowNanos() + d.cfg.baseEjectionTime.Nanoseconds())
-	h.ejectCount.Add(1)
 	if d.ejectionsActive != nil {
 		d.ejectionsActive.Inc()
 	}
@@ -466,35 +466,39 @@ func (d *outlierDetector) record(ep Endpoint, statusCode int, localOriginErr boo
 	d.recordExternal5xx(ep, h, statusCode)
 }
 
+// bumpStreak is the shared consecutive-detector body (gateway / consecutive_5xx
+// / local-origin arms): streak.Add(1), threshold-compare, Inc the detected
+// counter (nil-guarded), then tryEject under the arm's enforce-roll %. Returns
+// true iff THIS call ejected the host. A disabled detector neither bumps the
+// streak nor ejects. Stat ordering (detected before enforced) is preserved from
+// the three inlined copies this consolidates.
+func (d *outlierDetector) bumpStreak(ep Endpoint, h *hostHealth, streak *atomic.Uint32, enabled bool, threshold uint32, detected, enforced *stats.Counter, enforcing uint32) bool {
+	if !enabled {
+		return false
+	}
+	if streak.Add(1) < threshold {
+		return false
+	}
+	if detected != nil {
+		detected.Inc()
+	}
+	return d.tryEject(ep, h, enforcing, enforced)
+}
+
 // recordExternal5xx applies one external 5xx, gateway detector FIRST (AMEND-OD2-2):
 // a gateway eject short-circuits before the consecutive_5xx detector fires, so a
 // gateway-driven eject leaves detected_consecutive_5xx at 0 for that call.
 func (d *outlierDetector) recordExternal5xx(ep Endpoint, h *hostHealth, statusCode int) {
 	gateway := statusCode == 502 || statusCode == 503 || statusCode == 504
 	if gateway {
-		if d.cfg.consecGwEnabled {
-			if h.consecGw.Add(1) >= d.cfg.consecutiveGw {
-				if d.ejectionsDetectedGw != nil {
-					d.ejectionsDetectedGw.Inc()
-				}
-				if d.tryEject(ep, h, d.cfg.enforcingGw, d.ejectionsEnforcedGw) {
-					return // gateway ejected → the 5xx detector does NOT fire this call (detected_5xx stays 0)
-				}
-			}
+		if d.bumpStreak(ep, h, &h.consecGw, d.cfg.consecGwEnabled, d.cfg.consecutiveGw, d.ejectionsDetectedGw, d.ejectionsEnforcedGw, d.cfg.enforcingGw) {
+			return // gateway ejected → the 5xx detector does NOT fire this call (detected_5xx stays 0)
 		}
 	} else {
 		h.consecGw.Store(0) // a non-gateway 5xx breaks the gateway streak
 	}
 	// fall through to the 5xx detector (the 40.1 path, behavior-unchanged).
-	if !d.cfg.consec5xxEnabled {
-		return
-	}
-	if h.consec5xx.Add(1) >= d.cfg.consecutive5xx {
-		if d.ejectionsDetected5xx != nil {
-			d.ejectionsDetected5xx.Inc()
-		}
-		d.tryEject(ep, h, d.cfg.enforcing5xx, d.ejectionsEnforced5xx)
-	}
+	d.bumpStreak(ep, h, &h.consec5xx, d.cfg.consec5xxEnabled, d.cfg.consecutive5xx, d.ejectionsDetected5xx, d.ejectionsEnforced5xx, d.cfg.enforcing5xx)
 }
 
 // recordLocalOrigin applies one local-origin failure (connect/reset). When split
@@ -506,13 +510,5 @@ func (d *outlierDetector) recordLocalOrigin(ep Endpoint, h *hostHealth, statusCo
 		d.recordExternal5xx(ep, h, statusCode) // split=false: count as gateway-class 5xx (AMEND-OD2-3)
 		return
 	}
-	if !d.cfg.consecLOEnabled {
-		return
-	}
-	if h.consecLO.Add(1) >= d.cfg.consecutiveLO {
-		if d.ejectionsDetectedLO != nil {
-			d.ejectionsDetectedLO.Inc()
-		}
-		d.tryEject(ep, h, d.cfg.enforcingLO, d.ejectionsEnforcedLO)
-	}
+	d.bumpStreak(ep, h, &h.consecLO, d.cfg.consecLOEnabled, d.cfg.consecutiveLO, d.ejectionsDetectedLO, d.ejectionsEnforcedLO, d.cfg.enforcingLO)
 }

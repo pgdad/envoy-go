@@ -75,7 +75,6 @@ func New(tc *anypb.Any, _ envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFactory
 // async-resume contract.
 type filter struct {
 	dcb envoyhttp.DecoderFilterCallbacks
-	ecb envoyhttp.EncoderFilterCallbacks
 
 	// modeDefault is the filter-level config's mode_default field, set at
 	// factory time. Used when the per-request mode header is absent.
@@ -87,8 +86,12 @@ type filter struct {
 }
 
 func (f *filter) SetDecoderCallbacks(cb envoyhttp.DecoderFilterCallbacks) { f.dcb = cb }
-func (f *filter) SetEncoderCallbacks(cb envoyhttp.EncoderFilterCallbacks) { f.ecb = cb }
-func (f *filter) OnDestroy()                                              {}
+
+// SetEncoderCallbacks is a no-op retained to satisfy StreamEncoderFilter —
+// the encode-side probes mutate headers/body in place and read per-route
+// config through f.dcb (see routeCount), never the encoder callbacks.
+func (f *filter) SetEncoderCallbacks(envoyhttp.EncoderFilterCallbacks) {}
+func (f *filter) OnDestroy()                                           {}
 
 // DecodeHeaders is the entry point for per-request mode dispatch. The mode is
 // resolved from the x-envoy-go-test-mode header (case-insensitive match via
@@ -193,26 +196,24 @@ func (f *filter) EncodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 }
 
 // EncodeData is the encode-side body dispatch. Single mode has body-side
-// behavior: modify-encode-data (replace body bytes with "MODIFIED\n" written
-// in-place via copy + truncate semantics on the slice's backing array).
+// behavior: modify-encode-data (overwrite the leading body bytes with
+// "MODIFIED\n" in place on the slice's backing array).
 //
 // The probe writes up to len(data) bytes from "MODIFIED\n" — for slices
-// shorter than 9 bytes, only the prefix lands. The chain framework hands
-// filters the same backing array forward through the encode iteration, so
-// this in-place mutation is visible to subsequent encode-side filters / the
+// shorter than 9 bytes, only the prefix lands. The wire body keeps its
+// ORIGINAL length: the tail beyond the replacement is NUL-padded, not
+// truncated (the slice header cannot shrink through an in-place mutation,
+// and the fixture pins this padded shape). The chain framework hands filters
+// the same backing array forward through the encode iteration, so this
+// in-place mutation is visible to subsequent encode-side filters / the
 // wire-write layer.
 func (f *filter) EncodeData(data []byte, _ bool) envoyhttp.FilterDataStatus {
 	if f.mode == "modify-encode-data" {
 		const replacement = "MODIFIED\n"
 		n := copy(data, replacement)
-		// If data was longer than replacement, zero out the tail so the
-		// terminal observes only the replacement bytes (defensive — the
+		// NUL-pad the tail beyond the replacement — length preserved (the
 		// chain forwards the slice header, not just the content).
-		if n < len(data) {
-			for i := n; i < len(data); i++ {
-				data[i] = 0
-			}
-		}
+		clear(data[n:])
 	}
 	return envoyhttp.DataContinue
 }

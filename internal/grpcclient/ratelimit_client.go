@@ -39,12 +39,9 @@ package grpcclient
 import (
 	"context"
 	"errors"
-	"fmt"
-	"sync"
 	"time"
 
 	ratelimitv3 "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
-	"google.golang.org/grpc"
 )
 
 // ----------------------------------------------------------------------------
@@ -63,15 +60,10 @@ import (
 // manages its own transport-level reconnect via the sub-channel state
 // machine.
 type RateLimitClient struct {
-	conn   *grpc.ClientConn
-	stub   ratelimitv3.RateLimitServiceClient
-	target string // cluster_name — for logs/errors
+	connHolder
+	stub ratelimitv3.RateLimitServiceClient
 
 	timeout time.Duration // per-call timeout (applied via context.WithTimeout in ShouldRateLimit)
-
-	// closeOnce + closeErr guard the idempotent Close per SPEC §3.1.
-	closeOnce sync.Once
-	closeErr  error
 }
 
 // NewRateLimitClient dials the named cluster via `d.DialContext` and wraps
@@ -87,18 +79,14 @@ type RateLimitClient struct {
 // No `Dialer` API change: reuses the existing `(*Dialer).DialContext`
 // surface that `NewAuthClient` consumes.
 func NewRateLimitClient(d *Dialer, clusterName string, timeout time.Duration) (*RateLimitClient, error) {
-	if d == nil {
-		return nil, fmt.Errorf("grpcclient: new ratelimit client %q: dialer is nil", clusterName)
-	}
-	conn, err := d.DialContext(context.Background(), clusterName)
+	conn, err := dialConn(d, "ratelimit client", clusterName)
 	if err != nil {
 		return nil, err
 	}
 	return &RateLimitClient{
-		conn:    conn,
-		stub:    ratelimitv3.NewRateLimitServiceClient(conn),
-		target:  clusterName,
-		timeout: timeout,
+		connHolder: connHolder{conn: conn},
+		stub:       ratelimitv3.NewRateLimitServiceClient(conn),
+		timeout:    timeout,
 	}, nil
 }
 
@@ -136,7 +124,8 @@ func (r *RateLimitClient) ShouldRateLimit(ctx context.Context, req *ratelimitv3.
 
 // Close releases the underlying `*grpc.ClientConn`. Idempotent — repeated
 // calls (or concurrent calls) return the cached error from the first call
-// via an internal `sync.Once` guard.
+// via the shared `connHolder` sync.Once guard. A nil receiver is tolerated
+// (returns nil).
 //
 // MVP discipline (per ADR-0158 D2): in production the filter never calls
 // `Close()` — the `*grpc.ClientConn` is leaked-on-exit; the OS reclaims
@@ -146,10 +135,5 @@ func (r *RateLimitClient) Close() error {
 	if r == nil {
 		return nil
 	}
-	r.closeOnce.Do(func() {
-		if r.conn != nil {
-			r.closeErr = r.conn.Close()
-		}
-	})
-	return r.closeErr
+	return r.connHolder.close()
 }

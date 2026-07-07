@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"sync"
 	"time"
+
+	"github.com/pgdad/envoy-go/internal/filter/network"
 )
 
 // Special xids (upstream XidCodes; AMEND-A5). The decoder dispatches per-packet
@@ -98,12 +100,9 @@ func newDecoder(cfg *compiledConfig, rs *rosterStats) *decoder {
 // this selects byte-for-byte the same slice the 28.1a feed selected (the §3.3
 // equivalence — existing assertions unchanged).
 func (d *decoder) decodeOnData(chainBytes []byte, totalAppended int64) {
-	if newCount := totalAppended - d.chainConsumed; newCount > 0 {
-		d.readBuf = append(d.readBuf, chainBytes[int64(len(chainBytes))-newCount:]...)
-		d.chainConsumed = totalAppended
-	}
+	d.readBuf = append(d.readBuf, network.NewBytes(chainBytes, totalAppended, &d.chainConsumed)...)
 	for {
-		frame, ok := d.nextFrame()
+		frame, ok := d.nextFrame(&d.readBuf, d.decoderError)
 		if !ok {
 			return // no complete frame buffered (or buffer abandoned)
 		}
@@ -114,25 +113,29 @@ func (d *decoder) decodeOnData(chainBytes []byte, totalAppended int64) {
 	}
 }
 
-// nextFrame extracts one complete frame from readBuf (the 4-byte BE length
-// prefix EXCLUDES itself and is stripped from the returned frame). Returns
-// ok=false when no complete frame is buffered. Oversized frames
-// (len > max_packet_bytes) take the decoder_error path and abandon the buffer.
-func (d *decoder) nextFrame() ([]byte, bool) {
-	if len(d.readBuf) < 4 {
+// nextFrame extracts one complete frame from *buf (the 4-byte BE length prefix
+// EXCLUDES itself and is stripped from the returned frame; buf is &d.readBuf on
+// the request side and &d.writeBuf on the response side — the kafkabroker
+// nextFrame pointer-parameter shape). Returns ok=false when no complete frame
+// is buffered. Oversized frames (len > max_packet_bytes) take the direction's
+// decoder_error path (errFn: decoderError for reads, responseError for writes —
+// which also abandons that direction's buffer).
+func (d *decoder) nextFrame(buf *[]byte, errFn func(string)) ([]byte, bool) {
+	b := *buf
+	if len(b) < 4 {
 		return nil, false
 	}
-	frameLen := int32(binary.BigEndian.Uint32(d.readBuf[0:4]))
+	frameLen := int32(binary.BigEndian.Uint32(b[0:4]))
 	if frameLen < 0 || uint32(frameLen) > d.cfg.maxPacketBytes {
 		// "packet is too big" (parent §11.5) → decoder_error + abandon.
-		d.decoderError("")
+		errFn("")
 		return nil, false
 	}
-	if len(d.readBuf) < 4+int(frameLen) {
+	if len(b) < 4+int(frameLen) {
 		return nil, false // partial frame — wait for more bytes
 	}
-	frame := d.readBuf[4 : 4+frameLen]
-	d.readBuf = d.readBuf[4+frameLen:]
+	frame := b[4 : 4+frameLen]
+	*buf = b[4+frameLen:]
 	return frame, true
 }
 
@@ -377,7 +380,7 @@ func (d *decoder) onDataRequest(xid int32, frame []byte) bool {
 func (d *decoder) decodeOnWrite(p []byte) {
 	d.writeBuf = append(d.writeBuf, p...)
 	for {
-		frame, ok := d.nextWriteFrame()
+		frame, ok := d.nextFrame(&d.writeBuf, d.responseError)
 		if !ok {
 			return // no complete frame buffered (or buffer abandoned)
 		}
@@ -386,29 +389,6 @@ func (d *decoder) decodeOnWrite(p []byte) {
 			return
 		}
 	}
-}
-
-// nextWriteFrame extracts one complete frame from writeBuf (the 4-byte BE length
-// prefix EXCLUDES itself and is stripped from the returned frame). Returns
-// ok=false when no complete frame is buffered. Oversized frames
-// (len > max_packet_bytes) take the decoder_error path and abandon the buffer.
-// (D-S28.2-4: the nextFrame sibling — parallel methods, distinct buffer + error path.)
-func (d *decoder) nextWriteFrame() ([]byte, bool) {
-	if len(d.writeBuf) < 4 {
-		return nil, false
-	}
-	frameLen := int32(binary.BigEndian.Uint32(d.writeBuf[0:4]))
-	if frameLen < 0 || uint32(frameLen) > d.cfg.maxPacketBytes {
-		// "packet is too big" (parent §11.5) → decoder_error + abandon.
-		d.responseError("")
-		return nil, false
-	}
-	if len(d.writeBuf) < 4+int(frameLen) {
-		return nil, false // partial frame — wait for more bytes
-	}
-	frame := d.writeBuf[4 : 4+frameLen]
-	d.writeBuf = d.writeBuf[4+frameLen:]
-	return frame, true
 }
 
 // responseError runs the decoder_error path for the response side (AMEND-A8

@@ -13,7 +13,6 @@ package hcm
 // is GONE; this file builds and runs unconditionally.
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -241,15 +240,12 @@ func faultyH2Action(sentinel error) router.H2Action {
 
 // faultyAction is a routeAction whose asRouterActionH2 returns a faultyH2Action
 // closure. asRouterAction returns a no-op H1 action so the routeAction
-// interface is satisfied; do() is never invoked on the H2 dispatch path
-// (chain-mediated dispatch goes through asRouterActionH2 + RunAction).
+// interface is satisfied (chain-mediated dispatch goes through
+// asRouterActionH2 + RunAction).
 type faultyAction struct {
 	sentinel error
 }
 
-func (a *faultyAction) do(context.Context, *http.Request, *bufio.Writer) (int, error) {
-	return 500, nil
-}
 func (a *faultyAction) asRouterAction() router.Action {
 	return func(context.Context, *http.Request) (router.ActionResponse, cluster.Endpoint, error) {
 		return router.ActionResponse{Status: 500}, cluster.Endpoint{}, nil

@@ -71,18 +71,40 @@ import (
 // never-nil" contract anchored at parent §11.6 (string-returning
 // methods push the empty string on nil-cb).
 var streamInfoMethods = map[string]lua.LGFunction{
-	// 22.1 Task 8 — pragmatic-middle 4-method subset
-	"protocol":                      streamInfoProtocol,
-	"routeName":                     streamInfoRouteName,
-	"downstreamLocalAddress":        streamInfoDownstreamLocalAddress,
-	"downstreamDirectRemoteAddress": streamInfoDownstreamDirectRemoteAddress,
+	// 22.1 Task 8 — pragmatic-middle 4-method subset. All four are
+	// plain string accessors built via streamInfoStringAccessor:
+	//   - :protocol() — HTTP protocol version string ("HTTP/1.0" /
+	//     "HTTP/1.1" / "HTTP/2" / "HTTP/3" per upstream-parity literals;
+	//     "" for synthetic streams that did not exercise HCM dispatch).
+	//   - :routeName() — resolved route name or "" if no route is
+	//     selected / the framework adapter has no RouteName accessor.
+	//   - :downstreamLocalAddress() — the listener's bound "ip:port"
+	//     formatted via net.Addr.String(); "" for synthetic streams.
+	//   - :downstreamDirectRemoteAddress() — the connecting peer's
+	//     "ip:port" (envoy-go has no proxy-chain origin distinction yet,
+	//     so "remote" == "direct remote"); "" for synthetic streams.
+	"protocol":                      streamInfoStringAccessor(RequestHandleCallbacks.Protocol),
+	"routeName":                     streamInfoStringAccessor(RequestHandleCallbacks.RouteName),
+	"downstreamLocalAddress":        streamInfoStringAccessor(RequestHandleCallbacks.DownstreamLocalAddress),
+	"downstreamDirectRemoteAddress": streamInfoStringAccessor(RequestHandleCallbacks.DownstreamDirectRemoteAddress),
 	// 22.2 Task 9 — metadata bridge (bodies in metadata.go)
 	"dynamicMetadata":      streamInfoDynamicMetadata,
 	"dynamicTypedMetadata": streamInfoDynamicTypedMetadata,
-	// 22.2 Task 13 — full bridge surface completion
-	"upstreamHost":            streamInfoUpstreamHost,
-	"upstreamCluster":         streamInfoUpstreamCluster,
-	"requestedServerName":     streamInfoRequestedServerName,
+	// 22.2 Task 13 — full bridge surface completion. The three string
+	// accessors follow the same factory pattern:
+	//   - :upstreamHost() — the resolved upstream endpoint as
+	//     "host:port"; "" when no upstream has been selected. At phase
+	//     22.2 the framework adapter stubs this as "" (framework gap;
+	//     matches the RouteName pattern).
+	//   - :upstreamCluster() — the cluster name from which the upstream
+	//     endpoint was selected; same framework-gap disposition.
+	//   - :requestedServerName() — the TLS SNI server name surfaced by
+	//     the downstream handshake (per-stream
+	//     *tls.ConnectionState.ServerName) or "" on plaintext /
+	//     pre-handshake per SPEC §3.4 + §11.5.3 ADR-0144 plumbing.
+	"upstreamHost":            streamInfoStringAccessor(RequestHandleCallbacks.UpstreamHost),
+	"upstreamCluster":         streamInfoStringAccessor(RequestHandleCallbacks.UpstreamCluster),
+	"requestedServerName":     streamInfoStringAccessor(RequestHandleCallbacks.RequestedServerName),
 	"filterState":             streamInfoFilterState,
 	"downstreamSslConnection": streamInfoDownstreamSslConnection,
 }
@@ -182,120 +204,36 @@ func streamInfoCallbacksFromUD(L *lua.LState, idx int) RequestHandleCallbacks {
 }
 
 // ---------------------------------------------------------------------
-// 4 inherited 22.1 Task 8 methods
+// String-accessor factory (4 inherited 22.1 Task 8 methods + 3 of the
+// 5 NEW Task 13 methods — per-method semantics documented at the
+// streamInfoMethods dispatch table above)
 // ---------------------------------------------------------------------
 
-// streamInfoProtocol implements streamInfo:protocol() — returns the
-// HTTP protocol version string ("HTTP/1.0" / "HTTP/1.1" / "HTTP/2" /
-// "HTTP/3" per upstream-parity literals; "" for synthetic streams that
-// did not exercise HCM dispatch).
-func streamInfoProtocol(L *lua.LState) int {
-	cb := streamInfoCallbacksFromUD(L, 1)
-	if cb == nil {
-		L.Push(lua.LString(""))
+// streamInfoStringAccessor builds the LGFunction for a string-returning
+// streamInfo accessor. All seven string accessors share the identical
+// nil-cb-then-push-string body, differing only in which
+// RequestHandleCallbacks method supplies the value — the get parameter
+// is typically a method expression (e.g.
+// RequestHandleCallbacks.Protocol).
+//
+// Per the "always-string, never-nil" contract anchored at parent §11.6:
+// a nil cb (synthetic test path) pushes the empty string; otherwise the
+// callback's value is pushed verbatim.
+func streamInfoStringAccessor(get func(RequestHandleCallbacks) string) lua.LGFunction {
+	return func(L *lua.LState) int {
+		cb := streamInfoCallbacksFromUD(L, 1)
+		if cb == nil {
+			L.Push(lua.LString(""))
+			return 1
+		}
+		L.Push(lua.LString(get(cb)))
 		return 1
 	}
-	L.Push(lua.LString(cb.Protocol()))
-	return 1
-}
-
-// streamInfoRouteName implements streamInfo:routeName() — returns the
-// resolved route name string or "" if no route is selected / the
-// framework adapter has no RouteName accessor (the phase-22.1
-// condition — framework gap to be closed in a future phase per the
-// RequestHandleCallbacks interface docstring).
-func streamInfoRouteName(L *lua.LState) int {
-	cb := streamInfoCallbacksFromUD(L, 1)
-	if cb == nil {
-		L.Push(lua.LString(""))
-		return 1
-	}
-	L.Push(lua.LString(cb.RouteName()))
-	return 1
-}
-
-// streamInfoDownstreamLocalAddress implements
-// streamInfo:downstreamLocalAddress() — returns the listener's bound
-// "ip:port" formatted via net.Addr.String() (the adapter handles the
-// formatting); "" for synthetic streams.
-func streamInfoDownstreamLocalAddress(L *lua.LState) int {
-	cb := streamInfoCallbacksFromUD(L, 1)
-	if cb == nil {
-		L.Push(lua.LString(""))
-		return 1
-	}
-	L.Push(lua.LString(cb.DownstreamLocalAddress()))
-	return 1
-}
-
-// streamInfoDownstreamDirectRemoteAddress implements
-// streamInfo:downstreamDirectRemoteAddress() — returns the connecting
-// peer's "ip:port" formatted via net.Addr.String() (envoy-go has no
-// proxy-chain origin distinction yet, so "remote" == "direct remote").
-// "" for synthetic streams.
-func streamInfoDownstreamDirectRemoteAddress(L *lua.LState) int {
-	cb := streamInfoCallbacksFromUD(L, 1)
-	if cb == nil {
-		L.Push(lua.LString(""))
-		return 1
-	}
-	L.Push(lua.LString(cb.DownstreamDirectRemoteAddress()))
-	return 1
 }
 
 // ---------------------------------------------------------------------
-// 5 NEW Task 13 methods
+// 2 non-string Task 13 methods
 // ---------------------------------------------------------------------
-
-// streamInfoUpstreamHost implements streamInfo:upstreamHost() — returns
-// the resolved upstream endpoint as "host:port" (or just "host" if no
-// port surface is available). Empty string when no upstream has been
-// selected (e.g. pre-router dispatch, decode-only filters, or local-
-// reply paths). At phase 22.2 the framework adapter stubs this as ""
-// since the project's DecoderFilterCallbacks does NOT yet expose an
-// upstream-host accessor (framework gap; matches the RouteName
-// pattern). Future framework extension may light up the real value.
-func streamInfoUpstreamHost(L *lua.LState) int {
-	cb := streamInfoCallbacksFromUD(L, 1)
-	if cb == nil {
-		L.Push(lua.LString(""))
-		return 1
-	}
-	L.Push(lua.LString(cb.UpstreamHost()))
-	return 1
-}
-
-// streamInfoUpstreamCluster implements streamInfo:upstreamCluster() —
-// returns the cluster name from which the upstream endpoint was
-// selected. Same framework-gap disposition as :upstreamHost — empty
-// string at phase 22.2 unless the per-test test-double wires a canned
-// value. Future framework extension may light up the real value.
-func streamInfoUpstreamCluster(L *lua.LState) int {
-	cb := streamInfoCallbacksFromUD(L, 1)
-	if cb == nil {
-		L.Push(lua.LString(""))
-		return 1
-	}
-	L.Push(lua.LString(cb.UpstreamCluster()))
-	return 1
-}
-
-// streamInfoRequestedServerName implements
-// streamInfo:requestedServerName() — returns the TLS SNI server name
-// surfaced by the downstream handshake. The adapter sources this from
-// the per-stream *tls.ConnectionState.ServerName field (when the
-// connection is TLS) OR the empty string (plaintext / pre-handshake).
-// Per SPEC §3.4 + §11.5.3 ADR-0144 plumbing pattern — defensive nil-
-// state on plaintext.
-func streamInfoRequestedServerName(L *lua.LState) int {
-	cb := streamInfoCallbacksFromUD(L, 1)
-	if cb == nil {
-		L.Push(lua.LString(""))
-		return 1
-	}
-	L.Push(lua.LString(cb.RequestedServerName()))
-	return 1
-}
 
 // streamInfoFilterState implements streamInfo:filterState() — returns
 // a filterstate userdata wrapping the per-stream `map[string]any` per

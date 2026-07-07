@@ -129,9 +129,10 @@ func New(tree *matchv3.Matcher, supportedActionTypes []string) (*Matcher, error)
 
 // Evaluate walks the parsed tree at request time. Returns the matched
 // terminal action `*anypb.Any` on first match, or `(nil, nil)` on no-match
-// per the proto comment at `rbac.pb.go:43-46`. Errors surface only from
-// programmer-supplied MatchContext implementations panicking (which `Evaluate`
-// does not intercept — by design) or from the canonical no-error path.
+// per the proto comment at `rbac.pb.go:43-46`. The error return is always
+// nil today — the walk itself has no failure path — but the exported
+// signature keeps the error slot so future evaluator extensions can surface
+// one without breaking callers.
 //
 // Concurrent invocations are safe: the parsed tree is read-only post-New;
 // no shared state mutates on the evaluator side.
@@ -139,13 +140,13 @@ func (m *Matcher) Evaluate(ctx MatchContext) (*anypb.Any, error) {
 	if m == nil || m.root == nil {
 		return nil, nil
 	}
-	return evaluateNode(m.root, ctx)
+	return evaluateNode(m.root, ctx), nil
 }
 
-// evaluateNode is the recursive tree walker. Returns (matchedAny, nil) on
-// match, (nil, nil) on no-match (including when the node's `on_no_match`
+// evaluateNode is the recursive tree walker. Returns the matched terminal
+// action on match, nil on no-match (including when the node's `on_no_match`
 // is itself absent or yields no-match).
-func evaluateNode(node *compiledNode, ctx MatchContext) (*anypb.Any, error) {
+func evaluateNode(node *compiledNode, ctx MatchContext) *anypb.Any {
 	for _, f := range node.fields {
 		if f.predicate.matches(ctx) {
 			return evaluateOnMatch(f.onMatch, ctx)
@@ -154,22 +155,22 @@ func evaluateNode(node *compiledNode, ctx MatchContext) (*anypb.Any, error) {
 	if node.onNoMatch != nil {
 		return evaluateOnMatch(node.onNoMatch, ctx)
 	}
-	return nil, nil
+	return nil
 }
 
 // evaluateOnMatch dispatches a leaf on_match: terminal action OR nested
 // matcher recursion.
-func evaluateOnMatch(om *compiledOnMatch, ctx MatchContext) (*anypb.Any, error) {
+func evaluateOnMatch(om *compiledOnMatch, ctx MatchContext) *anypb.Any {
 	if om == nil {
-		return nil, nil
+		return nil
 	}
 	if om.action != nil {
-		return om.action, nil
+		return om.action
 	}
 	if om.nested != nil {
 		return evaluateNode(om.nested, ctx)
 	}
-	return nil, nil
+	return nil
 }
 
 // ----------------------------------------------------------------------------
@@ -431,7 +432,14 @@ func compileStringMatcher(sm *matchv3.StringMatcher) (stringMatcherEval, error) 
 	case *matchv3.StringMatcher_Suffix:
 		return &suffixStringMatcher{suffix: mp.Suffix, ignoreCase: ic}, nil
 	case *matchv3.StringMatcher_Contains:
-		return &containsStringMatcher{needle: mp.Contains, ignoreCase: ic}, nil
+		needle := mp.Contains
+		if ic {
+			// Lowercase the constant needle ONCE at compile time; the per-call
+			// matches() only lowercases the candidate. Results are identical
+			// (strings.ToLower is idempotent).
+			needle = strings.ToLower(needle)
+		}
+		return &containsStringMatcher{needle: needle, ignoreCase: ic}, nil
 	case *matchv3.StringMatcher_SafeRegex:
 		if mp.SafeRegex == nil {
 			return nil, errors.New("safe_regex: nil")
@@ -490,13 +498,15 @@ func (m *suffixStringMatcher) matches(s string) bool {
 }
 
 type containsStringMatcher struct {
+	// needle is pre-lowercased at compile time when ignoreCase=true (see
+	// compileStringMatcher) so matches() lowercases only the candidate.
 	needle     string
 	ignoreCase bool
 }
 
 func (m *containsStringMatcher) matches(s string) bool {
 	if m.ignoreCase {
-		return strings.Contains(strings.ToLower(s), strings.ToLower(m.needle))
+		return strings.Contains(strings.ToLower(s), m.needle)
 	}
 	return strings.Contains(s, m.needle)
 }

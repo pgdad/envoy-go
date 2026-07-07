@@ -552,10 +552,12 @@ func (f *filter) dispatchStage(s stage, req *extprocsvcv3.ProcessingRequest) {
 		}
 		// Publish the per-message cancel on the filter so
 		// handleOverrideMessageTimeout can fire it on override-accept per
-		// planner-time D4. Cleared on goroutine exit.
-		f.mu.Lock()
+		// planner-time D4. Cleared on goroutine exit. Guarded by the
+		// DEDICATED cancelMu (NOT f.mu) so completeStage below can hold
+		// f.mu across the whole disposition — see the cancelMu field doc.
+		f.cancelMu.Lock()
 		f.activeMsgCancel = msgCancel
-		f.mu.Unlock()
+		f.cancelMu.Unlock()
 		defer func() {
 			msgCancel()
 			// handleOverrideMessageTimeout CLEARS activeMsgCancel itself on
@@ -563,9 +565,9 @@ func (f *filter) dispatchStage(s stage, req *extprocsvcv3.ProcessingRequest) {
 			// behavioral lift); by the time this defer runs we either own
 			// the slot or it was already cleared — unconditional nil
 			// assignment is race-safe + idempotent.
-			f.mu.Lock()
+			f.cancelMu.Lock()
 			f.activeMsgCancel = nil
-			f.mu.Unlock()
+			f.cancelMu.Unlock()
 		}()
 
 		// Send the request. The gRPC client stream's Send is non-blocking
@@ -617,24 +619,14 @@ func (f *filter) dispatchStage(s stage, req *extprocsvcv3.ProcessingRequest) {
 		// handleOverrideMessageTimeout) OR doneCh closes (Recv completed
 		// normally + the dispatch goroutine signals the watchdog to exit).
 		// The watchdog NEVER blocks past the per-stage lifetime.
+		//
+		// streamCancel is captured into a local BEFORE the watchdog spawns:
+		// f.streamCancel was written by openProcessorStream on the HCM
+		// dispatch goroutine, which happens-before this dispatch goroutine's
+		// start — the local capture makes the watchdog's read race-free
+		// without a lock.
 		doneCh := make(chan struct{})
-		go func() {
-			select {
-			case <-msgCtx.Done():
-				// Per-message timer expired (deadline) OR
-				// override_message_timeout cascade-canceled the per-message
-				// timer. Cascade-cancel the stream so the in-flight Recv
-				// unblocks. On normal Recv completion the doneCh closes
-				// FIRST and msgCtx.Done is observed only by the goroutine
-				// exit path (no streamCancel fires).
-				if f.streamCancel != nil {
-					f.streamCancel()
-				}
-			case <-doneCh:
-				// Recv completed normally — exit the watchdog without
-				// touching streamCancel.
-			}
-		}()
+		go watchStageDeadline(msgCtx, doneCh, f.streamCancel)
 
 		resp, err := f.stream.Recv()
 		close(doneCh)
@@ -650,6 +642,44 @@ func (f *filter) dispatchStage(s stage, req *extprocsvcv3.ProcessingRequest) {
 		}
 		f.completeStage(s, resp, nil)
 	}()
+}
+
+// watchStageDeadline is the per-stage watchdog body spawned by dispatchStage.
+// It parks until EITHER msgCtx.Done fires (per-message deadline expiry OR
+// override-driven cancel — see handleOverrideMessageTimeout) OR doneCh closes
+// (Recv completed normally; the dispatch goroutine signals the watchdog to
+// exit). Only a genuine deadline expiry with the Recv still in flight
+// cascade-cancels the stream.
+//
+// The msgCtx.Done arm RE-CHECKS doneCh (non-blocking) before firing
+// cancelStream: when Recv completes at nearly the same instant the
+// per-message deadline expires, the select may take the msgCtx.Done arm even
+// though doneCh is also ready — without the re-check the watchdog would kill
+// the still-healthy bidi-stream for all subsequent stages of the transaction
+// (a successful stage silently poisoning the stream). The re-check makes the
+// completed-Recv outcome win deterministically; the cancel fires ONLY when
+// the Recv is genuinely still parked.
+//
+// cancelStream is nil-tolerant (test paths that bypass openProcessorStream).
+func watchStageDeadline(msgCtx context.Context, doneCh <-chan struct{}, cancelStream context.CancelFunc) {
+	select {
+	case <-msgCtx.Done():
+		// Per-message timer expired (deadline) OR override_message_timeout
+		// cascade-canceled the per-message timer. Re-check doneCh first: if
+		// the Recv already completed, exit without touching the stream.
+		select {
+		case <-doneCh:
+			return
+		default:
+		}
+		// Cascade-cancel the stream so the in-flight Recv unblocks.
+		if cancelStream != nil {
+			cancelStream()
+		}
+	case <-doneCh:
+		// Recv completed normally — exit the watchdog without touching
+		// cancelStream.
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -811,12 +841,24 @@ func (f *filter) completeStage(s stage, resp *extprocsvcv3.ProcessingResponse, r
 	// per-stream mutex covers the f.done flip + the dcb/ecb access — the
 	// dispatch goroutine acquires the mutex BEFORE touching dcb/ecb; OnDestroy
 	// acquires the mutex AFTER setting done=true (see OnDestroy below).
+	//
+	// f.mu is HELD ACROSS THE WHOLE DISPOSITION (applyProcessingResponseFn →
+	// emitImmediateResponse/SendLocalReply, deliverEncodeBodyMutation, and
+	// signalResume) — matching the phase-18.x ext_authz applyDisposition
+	// precedent this guard mirrors. Releasing after the done-check alone
+	// would leave a window where OnDestroy completes (chain teardown after
+	// parkDecode unblocks on ctx.Done) and the dispatch goroutine then calls
+	// SendLocalReply/ContinueDecoding on a destroyed chain. Holding f.mu is
+	// deadlock-free here: the framework's ContinueDecoding/ContinueEncoding
+	// are non-blocking (buffered-1 coalesced sends); the SendLocalReply
+	// encode-chain re-entry short-circuits via f.immediateResponseEmitted;
+	// and handleOverrideMessageTimeout guards activeMsgCancel with the
+	// DEDICATED f.cancelMu (see the cancelMu field doc), never f.mu.
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.done {
-		f.mu.Unlock()
 		return
 	}
-	f.mu.Unlock()
 
 	// Transport / timeout / cancel error → actError + failure-mode posture.
 	if recvErr != nil {
@@ -1006,11 +1048,14 @@ func (f *filter) handleOverrideMessageTimeout(s stage, ot *durationpb.Duration) 
 	// STREAM-FATAL by design — see the docstring "Stream-fatal cascade" note
 	// for the trade-off justification. CLEAR f.activeMsgCancel after fire so
 	// the deferred clear in dispatchStage does not double-fire on a
-	// non-owner slot.
-	f.mu.Lock()
+	// non-owner slot. Guarded by the DEDICATED f.cancelMu (NOT f.mu): this
+	// helper runs inside applyProcessingResponse, which completeStage
+	// invokes while HOLDING f.mu across the disposition — re-acquiring f.mu
+	// here would self-deadlock (see the cancelMu field doc).
+	f.cancelMu.Lock()
 	cancel := f.activeMsgCancel
 	f.activeMsgCancel = nil
-	f.mu.Unlock()
+	f.cancelMu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
@@ -1062,8 +1107,11 @@ func (f *filter) onDestroyImpl() {
 	}
 	f.closeOnce.Do(func() {
 		// D9: set f.done under f.mu so completeStage's pre-signal check
-		// observes the flag. The mutex is brief: only the flag flip + (in
-		// completeStage above) the flag read.
+		// observes the flag. completeStage holds f.mu across its whole
+		// per-stage disposition (the ext_authz precedent), so this Lock
+		// additionally serializes the done-flip AFTER any in-flight
+		// disposition completes — the dispatch goroutine never touches
+		// dcb/ecb on a chain whose teardown has begun.
 		f.mu.Lock()
 		f.done = true
 		f.mu.Unlock()

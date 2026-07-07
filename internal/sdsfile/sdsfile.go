@@ -142,7 +142,9 @@ type Watcher struct {
 
 	// started records whether Start() was called. Close() must short-circuit
 	// the wg.Wait when Start was never called (no goroutine was spawned).
-	started bool
+	// atomic.Bool because the documented filter-lifecycle ownership permits
+	// Start and Close to run on different goroutines (race-clean per D4).
+	started atomic.Bool
 
 	// reloadCount is incremented by reload() on every successful or attempted
 	// reload. Used by the debounce-collapse unit test to assert the
@@ -208,8 +210,13 @@ func New(path string) (*Watcher, error) {
 // the same fsnotify event stream). The consumer is expected to call Start
 // exactly once per Watcher lifecycle.
 func (w *Watcher) Start() error {
-	w.started = true
+	// wg.Add BEFORE the atomic started flip: Close only calls wg.Wait after
+	// observing started==true, and the atomic Store/Load pair then orders the
+	// first Add happens-before the Wait (the reverse order let a Close racing
+	// Start enter Wait before the first Add — the WaitGroup-misuse data race
+	// the detector deliberately reports).
 	w.wg.Add(1)
+	w.started.Store(true)
 	go w.run()
 	return nil
 }
@@ -265,7 +272,7 @@ func (w *Watcher) Close() error {
 		}
 		w.mu.Unlock()
 		closeErr = w.fsWatcher.Close()
-		if w.started {
+		if w.started.Load() {
 			w.wg.Wait()
 		}
 	})

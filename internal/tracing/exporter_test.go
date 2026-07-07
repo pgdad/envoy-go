@@ -553,6 +553,69 @@ func TestExporterProvider(t *testing.T) {
 		}
 	})
 
+	t.Run("same_cluster_different_provider_gets_own_exporter", func(t *testing.T) {
+		// The memoize key is (provider, cluster): a Zipkin config naming the SAME
+		// cluster as an earlier OTel config must get its own *ZipkinExporter, not
+		// the memoized *OTLPExporter (wrong wire format entirely).
+		reg := stats.NewRegistry()
+		fc := &fakeTracesClient{}
+		d := newFakeDialer(map[string]*fakeTracesClient{"shared": fc}, nil)
+		zt := &fakeZipkinTransport{hasCluster: true}
+		p := NewExporterProvider(d, zt, reg, 0, time.Hour)
+
+		e1, err := p.ExporterFor(otelCfg("shared", ""))
+		if err != nil {
+			t.Fatalf("ExporterFor otel: %v", err)
+		}
+		if _, ok := e1.(*OTLPExporter); !ok {
+			t.Fatalf("otel arm returned %T, want *OTLPExporter", e1)
+		}
+		zk := zkCfg("shared")
+		e2, err := p.ExporterFor(zk)
+		if err != nil {
+			t.Fatalf("ExporterFor zipkin (same cluster): %v", err)
+		}
+		if _, ok := e2.(*ZipkinExporter); !ok {
+			t.Fatalf("zipkin arm returned %T, want *ZipkinExporter (got the memoized OTel exporter?)", e2)
+		}
+		// Each arm stays independently memoized.
+		if e3, err := p.ExporterFor(otelCfg("shared", "")); err != nil || e3 != e1 {
+			t.Errorf("otel re-request = (%v, %v), want the memoized (%v, nil)", e3, err, e1)
+		}
+		if e4, err := p.ExporterFor(zk); err != nil || e4 != e2 {
+			t.Errorf("zipkin re-request = (%v, %v), want the memoized (%v, nil)", e4, err, e2)
+		}
+		_ = p.CloseAll()
+	})
+
+	t.Run("conflicting_settings_same_key_rejected", func(t *testing.T) {
+		reg := stats.NewRegistry()
+		fc := &fakeTracesClient{}
+		d := newFakeDialer(map[string]*fakeTracesClient{"c": fc}, nil)
+		zt := &fakeZipkinTransport{hasCluster: true}
+		p := NewExporterProvider(d, zt, reg, 0, time.Hour)
+
+		// OTel: a second config with the same cluster but a different
+		// service_name must error, not silently reuse the first exporter.
+		if _, err := p.ExporterFor(otelCfg("c", "svc-a")); err != nil {
+			t.Fatalf("ExporterFor otel: %v", err)
+		}
+		if _, err := p.ExporterFor(otelCfg("c", "svc-b")); err == nil {
+			t.Error("expected conflict error for same-cluster different service_name, got nil")
+		}
+
+		// Zipkin: same cluster, different collector endpoint must error too.
+		if _, err := p.ExporterFor(zkCfg("zk")); err != nil {
+			t.Fatalf("ExporterFor zipkin: %v", err)
+		}
+		conflicting := zkCfg("zk")
+		conflicting.Zipkin.CollectorEndpoint = "/api/v2/other"
+		if _, err := p.ExporterFor(conflicting); err == nil {
+			t.Error("expected conflict error for same-cluster different zipkin endpoint, got nil")
+		}
+		_ = p.CloseAll()
+	})
+
 	// ─────────────────── Zipkin dispatch arm ───────────────────
 
 	t.Run("zipkin_memoized_per_cluster", func(t *testing.T) {

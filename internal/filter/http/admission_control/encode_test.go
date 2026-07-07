@@ -26,7 +26,7 @@ package admission_control
 // # Fakes consumed (from test-scope files per Task 3 — NOT redefined here)
 //
 //   - fakeRand (rand_test.go): fakeRand{v: uint64}
-//   - fakeClock (clock_test.go): newFakeClock(start) + Advance(d)
+//   - clock.FakeClock (internal/clock): clock.NewFakeClock(start) + Advance(d)
 //
 // # testCompiledConfigAC / testFilterStatsAC consumed from controller_test.go.
 //
@@ -40,6 +40,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pgdad/envoy-go/internal/clock"
 	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 	"github.com/pgdad/envoy-go/internal/stats"
@@ -80,7 +81,7 @@ func (e *encodeTestCB) ResponseStatus() int                                { ret
 func newEncodeTestFilter(t *testing.T, rnd Rand, recordEnabled bool) (*filter, *controller) {
 	t.Helper()
 	cfg := testCompiledConfigAC()
-	clock := newFakeClock(time.Unix(0, 0))
+	clock := clock.NewFakeClock(time.Unix(0, 0))
 	st := newFilterStats(stats.NewRegistry(), "http.test")
 	ctrl := newController(cfg, st, clock, rnd)
 	f := &filter{

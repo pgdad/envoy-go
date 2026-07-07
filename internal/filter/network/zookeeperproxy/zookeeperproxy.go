@@ -49,8 +49,6 @@ type filter struct {
 	network.Marker
 	cfg     *compiledConfig // shared, boot-parsed (incl. the roster counters)
 	decoder *decoder        // per-connection (reassembly bufs + correlation structures + mu)
-	cb      network.ReadFilterCallbacks
-	wcb     network.WriteFilterCallbacks
 }
 
 // OnNewConnection is a no-op Continue: an OnNewConnection StopIteration would
@@ -82,12 +80,12 @@ func (f *filter) OnWrite(buf *network.Buffer, _ bool) network.Status {
 	return network.Continue
 }
 
-// SetReadFilterCallbacks stores the per-connection read callbacks.
-func (f *filter) SetReadFilterCallbacks(cb network.ReadFilterCallbacks) { f.cb = cb }
-
-// SetWriteFilterCallbacks stores the per-connection write callbacks
-// (the both-directions dual injection — D-P2/§3.3).
-func (f *filter) SetWriteFilterCallbacks(cb network.WriteFilterCallbacks) { f.wcb = cb }
+// SetReadFilterCallbacks / SetWriteFilterCallbacks satisfy the ReadFilter /
+// WriteFilter interfaces (the both-directions dual injection — D-P2/§3.3). The
+// pure sniffer never closes/continues/reads dynamic metadata, so the callbacks
+// are deliberately not retained (dead state otherwise).
+func (f *filter) SetReadFilterCallbacks(network.ReadFilterCallbacks)   {}
+func (f *filter) SetWriteFilterCallbacks(network.WriteFilterCallbacks) {}
 
 // OnDestroy drops the per-connection decoder (the correlation structures +
 // reassembly buffer die with the connection). The chain runtime calls this

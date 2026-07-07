@@ -1,8 +1,7 @@
 package zookeeperproxy
 
 import (
-	"fmt"
-
+	"github.com/pgdad/envoy-go/internal/filter/network/statroster"
 	"github.com/pgdad/envoy-go/internal/stats"
 )
 
@@ -184,39 +183,26 @@ type rosterStats struct {
 }
 
 // newRosterStats eagerly creates all 201 macro counters under
-// <statPrefix>.zookeeper. via NewCounterIfAbsent — post-Freeze-permitted
-// and idempotent across listeners sharing a stat_prefix
-// (the rbac newFilterStats precedent; ADR-0222 §4.4; D-P5).
+// <statPrefix>.zookeeper. via the shared statroster scaffold (NewCounterIfAbsent
+// — post-Freeze-permitted and idempotent across listeners sharing a stat_prefix;
+// the rbac newFilterStats precedent; ADR-0222 §4.4; D-P5).
 func newRosterStats(reg *stats.Registry, statPrefix string) *rosterStats {
-	rs := &rosterStats{
-		prefix:   statPrefix + ".zookeeper.",
+	prefix := statPrefix + ".zookeeper."
+	return &rosterStats{
+		prefix:   prefix,
 		reg:      reg,
-		counters: make(map[string]*stats.Counter, 201),
+		counters: statroster.New(reg, prefix, rosterSuffixes()),
 	}
-	for _, suffix := range rosterSuffixes() {
-		rs.counters[suffix] = reg.NewCounterIfAbsent(rs.prefix + suffix)
-	}
-	return rs
 }
 
 // inc increments the macro counter for suffix. Unknown suffix is a programming
 // error → panic (the roster is closed; dynamic names go through authSchemeCounter).
-func (rs *rosterStats) inc(suffix string) {
-	c, ok := rs.counters[suffix]
-	if !ok {
-		panic(fmt.Sprintf("zookeeperproxy: unknown roster suffix %q", suffix))
-	}
-	c.Inc()
-}
+func (rs *rosterStats) inc(suffix string) { statroster.Inc("zookeeperproxy", rs.counters, suffix) }
 
 // add adds delta to the macro counter for suffix (the *_bytes accounting).
 // Unknown suffix is a programming error → panic.
 func (rs *rosterStats) add(suffix string, delta uint64) {
-	c, ok := rs.counters[suffix]
-	if !ok {
-		panic(fmt.Sprintf("zookeeperproxy: unknown roster suffix %q", suffix))
-	}
-	c.Add(delta)
+	statroster.Add("zookeeperproxy", rs.counters, suffix, delta)
 }
 
 // authSchemeBuiltins is the upstream builtin auth-scheme set (filter.cc:45-46 at

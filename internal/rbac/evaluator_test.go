@@ -360,6 +360,67 @@ func TestPermSNI_StringMatcher(t *testing.T) {
 	}
 }
 
+func TestPermSNI_SafeRegex_PrecompiledAtBuildTime(t *testing.T) {
+	// The SafeRegex arm is compiled ONCE in buildOnePermission (via
+	// compileStringMatcher); runtime evaluation must match/deny identically
+	// to the historical per-call compile.
+	sm := &matcherv3.StringMatcher{
+		MatchPattern: &matcherv3.StringMatcher_SafeRegex{
+			SafeRegex: &matcherv3.RegexMatcher{Regex: "ex.*\\.com"},
+		},
+	}
+	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_RequestedServerName{RequestedServerName: sm}}
+	ev, err := buildOnePermission(p, ProfileHTTP)
+	if err != nil {
+		t.Fatalf("buildOnePermission(requested_server_name safe_regex): want success, got %v", err)
+	}
+	if !ev.evaluatePermission(&stubEvalContext{serverName: "example.com"}) {
+		t.Error("SNI=example.com vs ex.*\\.com: want match true")
+	}
+	if ev.evaluatePermission(&stubEvalContext{serverName: "other.org"}) {
+		t.Error("SNI=other.org vs ex.*\\.com: want match false")
+	}
+}
+
+func TestPermSNI_SafeRegex_CompileFailure_RuntimeFalse(t *testing.T) {
+	// Historical contract: an uncompilable SafeRegex pattern does NOT
+	// PARSE-REJECT — build succeeds and every runtime evaluation returns
+	// false. The build-time precompilation must preserve that disposition
+	// (nil compiled program → false).
+	sm := &matcherv3.StringMatcher{
+		MatchPattern: &matcherv3.StringMatcher_SafeRegex{
+			SafeRegex: &matcherv3.RegexMatcher{Regex: "("}, // unbalanced paren → compile error
+		},
+	}
+	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_RequestedServerName{RequestedServerName: sm}}
+	ev, err := buildOnePermission(p, ProfileHTTP)
+	if err != nil {
+		t.Fatalf("buildOnePermission(bad safe_regex): want build success (runtime-false contract), got %v", err)
+	}
+	if ev.evaluatePermission(&stubEvalContext{serverName: "anything"}) {
+		t.Error("bad safe_regex: want runtime match false")
+	}
+}
+
+func TestPermDestIP_CIDR_UnparseablePrefix_RuntimeFalse(t *testing.T) {
+	// Historical contract: an unparseable address_prefix does NOT
+	// PARSE-REJECT — build succeeds and every runtime evaluation returns
+	// false. The build-time compileCidr must preserve that disposition
+	// (nil ipNet → false).
+	cidr := &corev3.CidrRange{
+		AddressPrefix: "not-an-ip",
+		PrefixLen:     wrapperspb.UInt32(24),
+	}
+	p := &rbacconfigv3.Permission{Rule: &rbacconfigv3.Permission_DestinationIp{DestinationIp: cidr}}
+	ev, err := buildOnePermission(p, ProfileHTTP)
+	if err != nil {
+		t.Fatalf("buildOnePermission(bad destination_ip prefix): want build success (runtime-false contract), got %v", err)
+	}
+	if ev.evaluatePermission(&stubEvalContext{destIP: net.ParseIP("10.0.0.1")}) {
+		t.Error("unparseable address_prefix: want runtime match false")
+	}
+}
+
 func TestPermAndRules_Recursive_AllMatch(t *testing.T) {
 	// Per SPEC §6.5: Permission_AndRules{rules: [...]} short-circuits to FALSE
 	// on first child returning FALSE. Test exercises a 4-level deep AND chain:

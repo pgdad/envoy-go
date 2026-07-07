@@ -86,11 +86,7 @@ func (lr *leastRequest) Pick(_ uint64, _ bool, _ SubsetMatch, _ bool) (Endpoint,
 	if n == 0 {
 		return Endpoint{}, noopRelease, errNoEndpoints
 	}
-	panicMode := lr.health == nil
-	if lr.health != nil && lr.health.inPanic(lr.endpoints) {
-		lr.health.panicInc()
-		panicMode = true
-	}
+	panicMode := lr.health.panicGate(lr.endpoints)
 	// draw returns a candidate endpoint index. In panic/no-health mode it returns
 	// a uniform draw (the byte-stable pre-39.1 path). Otherwise it scans forward
 	// from a random start to the next healthy index; (0,false) when none.
@@ -99,13 +95,7 @@ func (lr *leastRequest) Pick(_ uint64, _ bool, _ SubsetMatch, _ bool) (Endpoint,
 		if panicMode {
 			return i, true
 		}
-		for k := 0; k < n; k++ {
-			j := (i + k) % n
-			if lr.health.available(lr.endpoints[j]) {
-				return j, true
-			}
-		}
-		return 0, false
+		return lr.health.nextAvailable(lr.endpoints, i)
 	}
 	best, ok := draw()
 	if !ok {

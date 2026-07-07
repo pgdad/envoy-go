@@ -1,11 +1,8 @@
 package router
 
 import (
-	"bufio"
 	"context"
 	"errors"
-	"log"
-	"net/http"
 	"strings"
 
 	"github.com/pgdad/envoy-go/internal/cluster"
@@ -259,34 +256,16 @@ func h2HeaderVal(req h2.H2Request) func(name string) (string, bool) {
 // serverStream.recvTrailingHeaders. The router itself emits END_STREAM on
 // the response HEADERS or final DATA, never via a trailing HEADERS frame.
 //
-// Method namespace note: the live H2 dispatch runs through the H2ClusterAction
-// closure → doH2ClusterAction (a package function, not a method); a separate
-// do(...) method exists with the routeAction-interface signature so
-// *routerActionH2 also satisfies routeAction (defensive — never reached in
-// well-formed bootstraps; see the do method's docstring for the rationale).
+// The live H2 dispatch runs through the H2ClusterAction closure →
+// doH2ClusterAction (a package function, not a method). The legacy defensive
+// do(...) stub (routeAction-interface shape for an H2-cluster route reached
+// on an H1 path) was deleted along with the direct-write do path: variant
+// selection at filter-build time guarantees H2-clusters get the H2 closure,
+// and the hcm routeAction interface no longer carries a do method.
 type routerActionH2 struct {
 	cluster      *cluster.Cluster
 	hashPolicies []HashPolicy        // 36.2: stored at H2ClusterAction; per-request fold lands in Task 4 (applyHashKey).
 	subsetMatch  cluster.SubsetMatch // 38.1: route-static metadata_match threaded onto ctx at dispatch (ADR-0239).
 	rp           *RetryPolicy        // 42.1: effective retry_policy; nil when none. Stored here; the retry loop lands in Task 8.
 	hp           *HedgePolicy        // 42.2b: effective hedge_policy; nil when none. Read by hedgeExecutorH2 (the concurrent first-acceptable-wins racer); the H1 sibling field is live via hedgeExecutorH1.
-}
-
-// do (defensive) — *routerActionH2 satisfies the hcm-package routeAction
-// interface so the H1 driver's entry.action.do(...) call site does not
-// type-fault if an H2-cluster route is ever reached on an H1 path. In
-// well-formed bootstraps this is unreachable: variant selection at
-// filter-build time guarantees H2-clusters get *routerActionH2 and the
-// HCM-level codec dispatch picks the H2 driver for those listeners. If
-// somehow reached (invalid bootstrap shape — e.g. a codec_type=AUTO
-// listener with alpn_protocols=["h2","http/1.1"] that negotiates
-// "http/1.1" to a route pointing at an H2-only cluster), the stub
-// writes a 500 status line + logs the misconfiguration so an operator
-// debugging the resulting 500 sees the cause without having to grep
-// the codec-dispatch path. Per the "Two interfaces, two separate
-// decisions" note in PLAN Task 11; closes REVIEW I-2 (observability
-// gap on the unreachable defensive stub).
-func (r *routerActionH2) do(_ context.Context, _ *http.Request, bw *bufio.Writer) (int, error) {
-	log.Printf("router: routerActionH2.do reached on H1 path — bootstrap misconfiguration; route variant selection should have produced *routerAction, not *routerActionH2 (cluster=%q)", r.cluster.Name())
-	return 500, writeStatusReply(bw, 500, "")
 }

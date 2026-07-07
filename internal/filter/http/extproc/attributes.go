@@ -33,18 +33,15 @@ package extproc
 //     thin wrappers that bind the per-side accessor closures + the
 //     per-stage HttpHeaders construction.
 //
-//   - lowercaseHeaderMap(http.Header) → map[string]string (single-value
-//     per key; multi-value joined with `,`). Mirrors the phase-18.2
-//     ext_authz attributes.go precedent — the reference Envoy v1.37.2
-//     internal lowercase + comma-join discipline for the per-stage
-//     headers carrier. UNLIKE the phase-18.2 ext_authz `request.http.headers`
-//     map (which is the AttributeContext field), the 19.1 ext_proc
-//     `HttpHeaders.headers` field is a `*core.HeaderMap` — an ORDERED list
-//     of (key, value) pairs (proto type `repeated HeaderValue`). The
-//     lowercaseHeaderMap helper is consumed via a separate
-//     `headerMapToHeaderMap(http.Header) *corev3.HeaderMap` conversion
-//     below; the map form is kept for symmetry with the phase-18.2
-//     helper + for future fuzzer/test consumers.
+//   - headerMapToHeaderMap(http.Header) → *corev3.HeaderMap. The per-stage
+//     header projection: UNLIKE the phase-18.2 ext_authz
+//     `request.http.headers` map (which is the AttributeContext field), the
+//     19.1 ext_proc `HttpHeaders.headers` field is a `*core.HeaderMap` — an
+//     ORDERED list of (key, value) pairs (proto type `repeated HeaderValue`)
+//     with lowercased keys per the reference Envoy v1.37.2 convention. (A
+//     former lowercaseHeaderMap map[string]string mirror of the ext_authz
+//     helper was deleted as production-dead — the HeaderMap projection below
+//     is the sole live carrier.)
 //
 //   - sourcePrincipalFirstOrEmpty([]string) → string. The first-or-empty
 //     helper used by the `source.principal` attribute extraction on the
@@ -633,36 +630,11 @@ func buildBodyAttributeEnvelope(
 // Helpers — header-map projection, scalar-struct wrap, principal first-or-empty.
 // ---------------------------------------------------------------------------
 
-// lowercaseHeaderMap converts an http.Header (canonicalized keys) into a
-// map[string]string with lowercased keys, joining multi-value headers with
-// `,` per the reference Envoy v1.37.2 internal lowercase + comma-join
-// discipline. Mirrors the phase-18.2 ext_authz attributes.go helper
-// verbatim (same signature, same semantics).
-//
-// HTTP/2 pseudo-headers (:authority, :method, :path, :scheme) are INCLUDED
-// (NOT skipped) — the ext_proc HttpHeaders.headers carrier accepts
-// :-prefixed names verbatim (per the proto's `*core.HeaderMap` shape +
-// the reference Envoy v1.37.2 behavior of forwarding pseudo-headers into
-// the per-stage payload).
-//
-// A nil input returns a non-nil empty map (the proto-faithful contract —
-// the per-stage map field is rendered as `{}` rather than absent).
-func lowercaseHeaderMap(h http.Header) map[string]string {
-	out := make(map[string]string, len(h))
-	for k, vs := range h {
-		lk := strings.ToLower(k)
-		if len(vs) == 0 {
-			out[lk] = ""
-			continue
-		}
-		if len(vs) == 1 {
-			out[lk] = vs[0]
-			continue
-		}
-		out[lk] = strings.Join(vs, ",")
-	}
-	return out
-}
+// (The former lowercaseHeaderMap helper — a verbatim mirror of the
+// phase-18.2 ext_authz map[string]string projection — was DELETED as dead
+// code: the real per-stage header projection goes through
+// headerMapToHeaderMap below; the ext_authz original remains the tested
+// home of the map-projection behavior.)
 
 // headerMapToHeaderMap converts an http.Header into the proto-required
 // *corev3.HeaderMap (an ordered list of HeaderValue {Key, Value} pairs).

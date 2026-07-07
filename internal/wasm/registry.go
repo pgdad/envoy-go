@@ -61,6 +61,12 @@ func makeVMKeyHex(vmID string, vmConfig, code []byte) string {
 type registryEntry struct {
 	rootVM   *RootVM
 	refcount int
+	// pending is non-nil while the entry is a construction SENTRY: the
+	// factory for this key is still running OUTSIDE r.mu (see AcquireRootVM).
+	// Closed exactly once when construction completes — publish (rootVM set)
+	// or removal (factory error). Concurrent same-key acquirers block on it
+	// outside r.mu, then re-check the map. nil once published.
+	pending chan struct{}
 }
 
 // Registry is the process-global VM-sharing registry per AMEND-C2 + ADR-0211.
@@ -87,18 +93,60 @@ func NewRegistry() *Registry {
 // AcquireRootVM returns the *RootVM for key, incrementing its refcount. On a
 // cache miss the factory is called to construct a new *RootVM (refcount starts
 // at 1). On a cache hit the factory is NOT called (refcount incremented).
+//
+// The factory runs OUTSIDE the registry mutex via a per-key pending-sentry:
+// the factory performs a full wazero compile + host-module registration +
+// instantiation + guest Configure (guest code executes), so holding the
+// process-global r.mu across it would stall every unrelated Acquire /
+// Release / AcquireSharedData for the whole VM boot. Concurrent acquirers of
+// the SAME key wait on the sentry (the factory still runs exactly once per
+// successful construction); acquirers of OTHER keys proceed immediately.
 func (r *Registry) AcquireRootVM(key string, factory func() (*RootVM, error)) (*RootVM, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if e, ok := r.entries[key]; ok {
-		e.refcount++
-		return e.rootVM, nil
+	for {
+		e, ok := r.entries[key]
+		if !ok {
+			break
+		}
+		if e.pending == nil {
+			// Published entry — plain cache hit.
+			e.refcount++
+			r.mu.Unlock()
+			return e.rootVM, nil
+		}
+		// Same-key construction in flight — wait OUTSIDE r.mu, then
+		// re-check the map: on publish this becomes a cache hit; on
+		// factory failure the sentry is removed and this acquirer runs
+		// its own factory (miss path).
+		wait := e.pending
+		r.mu.Unlock()
+		<-wait
+		r.mu.Lock()
 	}
+
+	// Miss: insert the pending sentry + run the factory outside r.mu.
+	sentry := &registryEntry{refcount: 1, pending: make(chan struct{})}
+	r.entries[key] = sentry
+	r.mu.Unlock()
+
 	vm, err := factory()
+
+	r.mu.Lock()
+	if err != nil {
+		// Failed factory result must NOT be cached — remove the sentry so
+		// waiters (and later acquirers) take a fresh miss.
+		delete(r.entries, key)
+	} else {
+		sentry.rootVM = vm
+	}
+	pending := sentry.pending
+	sentry.pending = nil
+	r.mu.Unlock()
+	close(pending)
+
 	if err != nil {
 		return nil, err
 	}
-	r.entries[key] = &registryEntry{rootVM: vm, refcount: 1}
 	return vm, nil
 }
 
@@ -138,6 +186,11 @@ func (r *Registry) Release(key string) error {
 	}
 	delete(r.entries, key)
 	r.mu.Unlock()
+	if e.rootVM == nil {
+		// Unbalanced Release against a still-pending construction sentry
+		// (caller misuse per the doc above) — nothing to Close yet.
+		return nil
+	}
 	return e.rootVM.Close()
 }
 
@@ -173,7 +226,9 @@ func (r *Registry) ResetForTest() {
 	r.sharedData = map[string]*sharedDataStore{}
 	r.mu.Unlock()
 	for _, e := range entries {
-		_ = e.rootVM.Close()
+		if e.rootVM != nil {
+			_ = e.rootVM.Close()
+		}
 	}
 }
 

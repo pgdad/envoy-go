@@ -13,7 +13,9 @@
 //     (StringMatcher.exact only — non-exact matchers silent-ignored).
 //  3. Percentage rolls: delay + abort independently; 0% short-circuits to
 //     false; 100% short-circuits to true; intermediate values consult the
-//     per-instance *math/rand.Rand seeded by time.Now().UnixNano().
+//     per-instance *math/rand.Rand, allocated lazily on the first
+//     non-boundary roll and seeded by wall-clock nanoseconds mixed with a
+//     process-global counter.
 //  4. max_active_faults check: if > 0 AND *atomic.Int64 active >= cap,
 //     increment fault.faults_overflow and SKIP (no fault injected; return
 //     Continue).

@@ -892,3 +892,54 @@ func TestClient_ClusterDispatch_context_cancellation_propagates(t *testing.T) {
 		}
 	}
 }
+
+// TestClient_ClusterDispatch_does_not_mutate_caller_request verifies the
+// documented "don't mutate the caller's request state in-place" contract:
+// the LB-endpoint URL rewrite must land on ClusterDispatch's internal shallow
+// copy (created by WithContext BEFORE the rewrite), leaving the caller's
+// *http.Request — URL pointer, Host, Scheme — untouched so the request can be
+// reused across calls. Before the fix, request.URL was overwritten before the
+// WithContext copy, permanently pointing the caller's request at the picked
+// endpoint.
+func TestClient_ClusterDispatch_does_not_mutate_caller_request(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	host, port := splitHostPort(t, srv.Listener.Addr().String())
+	cm := mkPlainClusterMgr(t, "c_nomut", host, port)
+
+	c := httpclient.New(httpclient.Options{Timeout: 5 * time.Second})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://placeholder.invalid/x?q=1", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	origURL := req.URL
+
+	resp, err := c.ClusterDispatch(req.Context(), "c_nomut", req, cm)
+	if err != nil {
+		t.Fatalf("ClusterDispatch: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if req.URL != origURL {
+		t.Errorf("caller req.URL pointer was replaced (got %p, want %p)", req.URL, origURL)
+	}
+	if got := req.URL.Host; got != "placeholder.invalid" {
+		t.Errorf("caller req.URL.Host = %q, want %q (must not observe the LB-picked endpoint)", got, "placeholder.invalid")
+	}
+	if got := req.URL.Scheme; got != "http" {
+		t.Errorf("caller req.URL.Scheme = %q, want %q", got, "http")
+	}
+
+	// The caller's request must be reusable verbatim for a second dispatch.
+	resp2, err := c.ClusterDispatch(req.Context(), "c_nomut", req, cm)
+	if err != nil {
+		t.Fatalf("second ClusterDispatch on the reused request: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("second dispatch status: want 200, got %d", resp2.StatusCode)
+	}
+}

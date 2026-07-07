@@ -546,7 +546,7 @@ type compiledConfig struct {
 	// (fail_open==true ⇒ FailOpen). Consumed at Task 9 dispatch to gate the
 	// RuntimeError disposition (FAIL_RELOAD → reload; FAIL_CLOSED → 503;
 	// FAIL_OPEN → bypass). Task 7 stores it; Task 9 reads it.
-	failurePolicy internalwasm.FailurePolicy //nolint:unused // stored at Task 7; consumed at Task 9 RuntimeError-gating dispatch
+	failurePolicy internalwasm.FailurePolicy
 
 	// reloadBaseInterval is the operator-configured FAIL_RELOAD backoff base
 	// interval parsed from PluginConfig.reload_config.backoff.base_interval per

@@ -213,8 +213,10 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 			// endStream. The script's post-:body() code (including any
 			// header mutations + respond capture) lands inside the
 			// inner Resume driven from DecodeData, BEFORE RunAction
-			// sends upstream. No respond can be captured at this point
-			// yet (the script hasn't reached the respond call site).
+			// sends upstream. Any respond captured by the continuation
+			// (or captured before the :body() call site) is handled by
+			// DecodeData's post-resume respond-state check (lua.go) —
+			// this dispatcher never sees it.
 			return envoyhttp.Continue
 		} else {
 			// Yielded with no pending slot — defensive; treat as error.

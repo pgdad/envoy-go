@@ -54,9 +54,8 @@ const filterName = "envoy.filters.http.ext_proc"
 // Core types per SPEC §6.1 + §6.2 + ADR-0167 + ADR-0168.
 // ---------------------------------------------------------------------------
 
-// processorClient is the mode-agnostic outbound-processor interface. The two
-// concrete implementations (one per transport arm) are produced at
-// config-load time inside buildCompiledConfig (Task 11):
+// The two concrete outbound-processor transports (one per arm) are produced
+// at config-load time inside buildCompiledConfig (Task 11):
 //
 //   - gRPC mode: *grpcclient.ProcessorClient (lands at Task 4 per ADR-0169).
 //     Wraps a bidi-streaming Process RPC; one *ClientConn per (cluster,
@@ -67,18 +66,11 @@ const filterName = "envoy.filters.http.ext_proc"
 //     an *http.Client with the parsed base URL + path_prefix; each stage
 //     does a one-shot POST with a protojson-encoded ProcessingRequest.
 //
-// The interface itself is intentionally narrow at Task 2 (lands as a marker
-// type). The per-stage dispatcher at processor.go (Task 7) + check.go (Task 8)
-// settles the exact method set once both arms are wired.
-//
 // Both arms are mutually exclusive per ADR-0168 §Decision — exactly one of
-// compiledConfig.grpcClient / compiledConfig.httpClient is non-nil.
-type processorClient interface {
-	// Close releases any underlying transport resource (gRPC ClientConn /
-	// HTTP idle connections). Idempotent + concurrent-safe (mirrors
-	// grpcclient.AuthClient.Close discipline).
-	Close() error
-}
+// compiledConfig.grpcClient / compiledConfig.httpClient is non-nil. (The
+// Task-2 `processorClient` marker interface that once documented this pair
+// was deleted as dead code — the dispatch sites consume the concrete types
+// directly.)
 
 // httpProcessorClient is the filter-local http_service-mode transport per
 // SPEC §6.5 buildHTTPProcessorClient (real body lands at Task 8 in check.go).
@@ -99,17 +91,7 @@ type httpProcessorClient struct {
 	baseURL string
 }
 
-// Compile-time interface-satisfaction assertion — anchors the
-// `processorClient` marker interface against its HTTP-mode implementation.
-// Per Carryforward P (Task 14), this replaces the now-retired
-// TestSkeletonReachability anchor; the gRPC-mode arm uses the concrete
-// `*grpcclient.ProcessorClient` type directly (per Task 11 retirement of the
-// Task-2 `grpcProcessorClient` placeholder), so the interface is
-// documentation-only at 19.1 — the assertion keeps it referenced so the
-// unused linter does not flag it.
-var _ processorClient = (*httpProcessorClient)(nil)
-
-// Close implements processorClient. Closes idle connections via
+// Close closes idle connections via
 // Transport.CloseIdleConnections (best-effort; mirrors phase-18.1 extauthz
 // httpAuthClient.Close shape — though that one was a noop placeholder; at
 // 19.1 the explicit CloseIdleConnections call is preserved for the
@@ -195,16 +177,12 @@ type resolvedMutationRules struct {
 	DisallowAll bool
 }
 
-// resolvedForwardRules is the pre-compiled form of *HeaderForwardingRules
-// per the proto's allowed_headers / disallowed_headers matcher lists.
-// Filters which request-side headers are forwarded into the
-// ProcessingRequest's `headers` field on each stage (Task 8 / Task 9).
-//
-// Real fields land at Task 11 (compilation) and are consumed at Task 9
-// (buildAttributeEnvelope + the header-population call sites).
-type resolvedForwardRules struct {
-	// Placeholder — populated at Task 11.
-}
+// (The former resolvedForwardRules placeholder struct — an empty
+// pre-compiled stand-in for the proto's forward_rules allowed_headers /
+// disallowed_headers matcher lists — was deleted as dead code: it carried no
+// fields and was never read. forward_rules compilation remains DEFERRED to a
+// future regex-matcher promotion path per parent §5.P3; the proto field is
+// silently ignored, with parse behavior unchanged.)
 
 // resolvedPerRoute is the parsed *ExtProcPerRoute per-route override per
 // ADR-0173. Two arms per the PGV-required `override` oneof:
@@ -376,9 +354,10 @@ type compiledConfig struct {
 	maxMessageTimeout        time.Duration // 0 = override disabled (PGV gte=0s lte=1h)
 	disableImmediateResponse bool          // when true, ImmediateResponse → spurious_msgs_received++ + drop
 
-	// Mutation + forward discipline per parent §5.P3.
+	// Mutation discipline per parent §5.P3. (forward_rules has NO compiled
+	// field — the proto field is silently ignored; compilation is deferred
+	// to a future regex-matcher promotion path per parent §5.P3.)
 	mutationRules *resolvedMutationRules // pre-compiled allow/deny matchers for header-mutation safety
-	forwardRules  *resolvedForwardRules  // pre-compiled allowed/disallowed header matchers for forwarding
 
 	// Attribute envelopes per parent §5.P1 + SPEC §6.6.
 	requestAttributes  []string // CEL attribute names for request_headers stage
@@ -526,6 +505,16 @@ type filter struct {
 	activeMsgTimeout time.Duration
 	activeMsgCancel  context.CancelFunc
 
+	// cancelMu guards activeMsgCancel (published by the dispatchStage
+	// goroutine; read+cleared by handleOverrideMessageTimeout on
+	// override-accept; cleared by the dispatchStage deferred exit). A
+	// DEDICATED mutex — NOT f.mu — so completeStage can hold f.mu across
+	// the whole per-stage disposition (applyProcessingResponse →
+	// handleOverrideMessageTimeout included) without self-deadlocking,
+	// matching the phase-18.x ext_authz hold-mu-across-disposition
+	// precedent (extauthz.go applyDisposition).
+	cancelMu sync.Mutex
+
 	// streamStartTime is the wall-clock instant of DecodeHeaders entry —
 	// the canonical anchor for ProcessingRequest.attributes.request.time
 	// per SPEC §6.6 hypothesis-table. Captured at DecodeHeaders entry per
@@ -544,9 +533,13 @@ type filter struct {
 	// decision pattern (mirrors phase-18.x ext_authz mu/done pattern). The
 	// decode-side and encode-side dispatch goroutines (one at a time per
 	// the framework's sequential decode→encode dispatch invariant) check
-	// `done` under `mu` before touching dcb/ecb; OnDestroy sets `done=true`
-	// under `mu` + invokes streamCancel + the bidi-stream CloseSend. Full
-	// wiring at Task 7 + Task 12 race-tests.
+	// `done` under `mu` and HOLD `mu` across the entire per-stage
+	// disposition (applyProcessingResponse + SendLocalReply/OverwriteBody +
+	// resume signal — the ext_authz applyDisposition precedent) so
+	// OnDestroy cannot destroy the chain between the done-check and the
+	// dcb/ecb touches; OnDestroy sets `done=true` under `mu` + invokes
+	// streamCancel + the bidi-stream CloseSend. Full wiring at Task 7 +
+	// Task 12 race-tests.
 	mu   sync.Mutex
 	done bool
 
@@ -746,9 +739,9 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 //     resolveProcessingMode (body-mode != NONE PARSE-REJECT; trailer-mode !=
 //     SKIP PARSE-REJECT; http_service + body-mode != NONE PARSE-REJECT;
 //     DEFAULT → SEND for header-modes).
-//  7. Resolve mutation_rules (#9) via Task 8's resolveMutationRules + capture
-//     forward_rules (#12) raw pointer (compile is a 19.1 no-op — the
-//     resolvedForwardRules struct is a placeholder).
+//  7. Resolve mutation_rules (#9) via Task 8's resolveMutationRules.
+//     forward_rules (#12) is DEFERRED — silently ignored (no compiled field;
+//     a future regex-matcher promotion path lands the compilation).
 //  8. allow_mode_override (#14) + allowed_override_modes (#22): resolve the
 //     per-mode allowlist (each entry validated through resolveProcessingMode).
 //  9. Attribute envelopes: request_attributes (#5) + response_attributes (#6)
@@ -827,12 +820,12 @@ func buildCompiledConfig(raw *extprocv3.ExternalProcessor, ctx envoyhttp.Factory
 	}
 	cc.processingMode = pm
 
-	// Step 7: mutation_rules (Task 8 helper) + forward_rules (placeholder at
-	// 19.1; the resolvedForwardRules struct is a forward-compat anchor —
-	// allowed_headers / disallowed_headers compilation deferred to a future
-	// regex-matcher promotion path per parent §5.P3).
+	// Step 7: mutation_rules (Task 8 helper). forward_rules is DEFERRED —
+	// silently ignored with parse behavior unchanged; allowed_headers /
+	// disallowed_headers compilation awaits a future regex-matcher promotion
+	// path per parent §5.P3 (the former empty resolvedForwardRules
+	// placeholder allocation was deleted as dead code).
 	cc.mutationRules = resolveMutationRules(raw.GetMutationRules())
-	cc.forwardRules = &resolvedForwardRules{}
 
 	// Step 8: allow_mode_override + allowed_override_modes (per parent §5.P1
 	// + ADR-0171). Each entry validated through resolveProcessingMode (same
@@ -949,15 +942,12 @@ func (f *filter) DecodeHeaders(headers http.Header, endStream bool) envoyhttp.Fi
 	if f.cc.grpcClient != nil {
 		if err := f.openProcessorStream(); err != nil {
 			// Transport-open failure: classify per failure_mode_allow. The
-			// dispatch goroutine never starts; the resume signal fires
-			// synchronously via mapTransportError's classifier.
-			act := mapTransportError(f, stageRequestHeaders, err)
-			if act == actContinue {
-				return envoyhttp.Continue
-			}
-			// actImmediate: SendLocalReply already fired; treat as Continue
-			// so the chain unwinds (the local-reply enters at filter[len-1]
-			// per ADR-0075).
+			// dispatch goroutine never starts; the classifier's side effects
+			// are the substance (failureModeAllowed++ on the fail-open arm;
+			// SendLocalReply on the fail-closed arm). EVERY disposition
+			// unwinds the chain with Continue — on actImmediate the
+			// local-reply enters at filter[len-1] per ADR-0075.
+			mapTransportError(f, stageRequestHeaders, err)
 			return envoyhttp.Continue
 		}
 	}
@@ -1169,10 +1159,10 @@ func (f *filter) EncodeHeaders(headers http.Header, endStream bool) envoyhttp.Fi
 	// yet — open it here.
 	if f.cc.grpcClient != nil && f.stream == nil {
 		if err := f.openProcessorStream(); err != nil {
-			act := mapTransportError(f, stageResponseHeaders, err)
-			if act == actContinue {
-				return envoyhttp.Continue
-			}
+			// Classify per failure_mode_allow; the classifier's side effects
+			// are the substance — every disposition unwinds with Continue
+			// (mirrors the DecodeHeaders open-failure branch).
+			mapTransportError(f, stageResponseHeaders, err)
 			return envoyhttp.Continue
 		}
 	}

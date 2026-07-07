@@ -30,6 +30,7 @@ type AsyncFileSink struct {
 	dropped     *stats.Counter
 	lastDropLog atomic.Int64
 	closeOnce   sync.Once
+	closeErr    error
 	path        string
 	formatter   Formatter // nil → the Default(*Record) adapter (byte-identical HCM path)
 }
@@ -84,15 +85,16 @@ func (s *AsyncFileSink) Submit(r any) {
 }
 
 // Close closes the channel, waits for the writer goroutine to drain, then closes
-// the file descriptor. Idempotent and threadsafe via sync.Once.
+// the file descriptor. Idempotent and threadsafe via sync.Once; the first call's
+// error is cached and replayed by subsequent calls (the shared Sink idempotent-
+// Close contract every other sink follows).
 func (s *AsyncFileSink) Close() error {
-	var err error
 	s.closeOnce.Do(func() {
 		close(s.ch)
 		<-s.done
-		err = s.f.Close()
+		s.closeErr = s.f.Close()
 	})
-	return err
+	return s.closeErr
 }
 
 // run is the writer goroutine: drain channel-receives into per-record file

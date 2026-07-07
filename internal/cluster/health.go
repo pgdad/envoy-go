@@ -29,7 +29,6 @@ type hostHealth struct {
 	// active-HC-healthy and vice versa; availability is the AND of both.
 	ejected        atomic.Bool   // outlier-ejected (separate from healthy)
 	unejectAtNanos atomic.Int64  // un-eject deadline (UnixNano); 0 when not ejected
-	ejectCount     atomic.Uint32 // ejections so far (stats + future backoff)
 	consec5xx      atomic.Uint32 // consecutive 5xx (reset by a 2xx from this host)
 	consecGw       atomic.Uint32 // consecutive gateway-class 5xx {502,503,504} (ADR-0246)
 	consecLO       atomic.Uint32 // consecutive local-origin failures (split=true only) (ADR-0246)
@@ -120,6 +119,13 @@ func (ch *clusterHealth) isEjected(ep Endpoint) bool {
 	if !ok {
 		return false
 	}
+	return ch.isEjectedState(h)
+}
+
+// isEjectedState is the *hostHealth-shaped body of isEjected (the lazy un-eject
+// included), shared with available so the pick hot path does a SINGLE registry
+// lookup per host instead of one for isHealthy plus one for isEjected.
+func (ch *clusterHealth) isEjectedState(h *hostHealth) bool {
 	if !h.ejected.Load() {
 		return false
 	}
@@ -133,9 +139,20 @@ func (ch *clusterHealth) isEjected(ep Endpoint) bool {
 }
 
 // available reports whether the host may receive traffic: active-HC-healthy AND
-// not outlier-ejected. The LB pick sites (Task 3) consult this instead of
-// isHealthy once outlier detection is wired.
-func (ch *clusterHealth) available(ep Endpoint) bool { return ch.isHealthy(ep) && !ch.isEjected(ep) }
+// not outlier-ejected. Semantically isHealthy(ep) && !isEjected(ep), fused into
+// one map lookup (Pick scans call this per host — the hot path). The ordering
+// is load-bearing: an unhealthy host short-circuits BEFORE the ejection check,
+// so its lazy un-eject side effect stays deferred exactly as before.
+func (ch *clusterHealth) available(ep Endpoint) bool {
+	h, ok := ch.states[ep.Addr()]
+	if !ok {
+		return true // unknown addr: healthy (isHealthy) and not ejected (isEjected)
+	}
+	if !h.healthy.Load() {
+		return false
+	}
+	return !ch.isEjectedState(h)
+}
 
 // availableCount is the available-host tally (the panic-denominator successor to
 // healthyCount once outlier detection is wired).
@@ -182,6 +199,40 @@ func (ch *clusterHealth) panicInc() {
 	if ch.panicCounter != nil {
 		ch.panicCounter.Inc()
 	}
+}
+
+// panicGate is the shared leaf-LB health gate: it reports whether the pick
+// bypasses per-host availability entirely — either no health registry at all
+// (nil receiver: a cluster with no health_checks, the byte-stable fast path)
+// or cluster-wide panic (blind pick; increments lb_healthy_panic). Every leaf
+// Pick calls this before its availability scan; the per-policy indexing
+// (counter/draw/ring/table) stays at the call sites so pick sequences are
+// bit-identical to the pre-extraction copies. (ADR-0243)
+func (ch *clusterHealth) panicGate(eps []Endpoint) bool {
+	if ch == nil {
+		return true
+	}
+	if ch.inPanic(eps) {
+		ch.panicInc()
+		return true
+	}
+	return false
+}
+
+// nextAvailable scans forward from start (wrapping) to the first available
+// endpoint index; ok=false when no host is available. Shared by the leaf LBs
+// whose scan order is "endpoint index + offset" (random, least_request);
+// round_robin re-draws its counter per try and ring_hash/maglev walk ring
+// points/table slots, so those keep their own loops. (ADR-0243)
+func (ch *clusterHealth) nextAvailable(eps []Endpoint, start int) (int, bool) {
+	n := len(eps)
+	for k := 0; k < n; k++ {
+		j := (start + k) % n
+		if ch.available(eps[j]) {
+			return j, true
+		}
+	}
+	return 0, false
 }
 
 type statusRange struct{ start, end int64 } // [start, end) per Int64Range
@@ -291,12 +342,10 @@ type checkerSpec struct {
 }
 
 type healthChecker struct {
-	endpoints          []Endpoint
-	health             *clusterHealth
-	interval           time.Duration
-	unhealthy, healthy uint32
-	prober             prober
-	firstDone          map[string]bool
+	endpoints   []Endpoint
+	health      *clusterHealth
+	checkerSpec // the parsed timing/threshold envelope + codec (promoted fields: interval/unhealthy/healthy/prober)
+	firstDone   map[string]bool
 
 	attempt, success, failure, networkFailure *stats.Counter
 	healthyGauge                              *stats.Gauge // health_check.healthy
@@ -304,13 +353,10 @@ type healthChecker struct {
 
 func newHealthChecker(eps []Endpoint, ch *clusterHealth, spec checkerSpec) *healthChecker {
 	return &healthChecker{
-		endpoints: eps,
-		health:    ch,
-		interval:  spec.interval,
-		unhealthy: spec.unhealthy,
-		healthy:   spec.healthy,
-		prober:    spec.prober,
-		firstDone: make(map[string]bool, len(eps)),
+		endpoints:   eps,
+		health:      ch,
+		checkerSpec: spec,
+		firstDone:   make(map[string]bool, len(eps)),
 	}
 }
 
@@ -368,8 +414,16 @@ func parseHealthChecks(c *clusterv3.Cluster, name string) ([]checkerSpec, bool, 
 		if hc.GetInterval() == nil {
 			return nil, false, fmt.Errorf("cluster: %q: health_check: interval is required", name)
 		}
+		// PGV requires gt:0s for interval/timeout (a 0s interval would panic
+		// time.NewTicker in healthChecker.run; a 0s timeout dials unbounded).
+		if hc.GetInterval().AsDuration() <= 0 {
+			return nil, false, fmt.Errorf("cluster: %q: health_check: interval: value must be greater than 0s", name)
+		}
 		if hc.GetTimeout() == nil {
 			return nil, false, fmt.Errorf("cluster: %q: health_check: timeout is required", name)
+		}
+		if hc.GetTimeout().AsDuration() <= 0 {
+			return nil, false, fmt.Errorf("cluster: %q: health_check: timeout: value must be greater than 0s", name)
 		}
 		if hc.GetUnhealthyThreshold() == nil {
 			return nil, false, fmt.Errorf("cluster: %q: health_check: unhealthy_threshold is required", name)

@@ -77,6 +77,17 @@ type ListenerFilter interface {
 	OnDestroy()
 }
 
+// InitialReadBufferSizer is an OPTIONAL interface a ListenerFilter
+// implements to hint how many connection-preamble bytes it needs to Peek
+// (tls_inspector reports its parsed initial_read_buffer_size). The listener
+// manager probes one sample instance per filter at build time and sizes the
+// per-connection peekerConn to the LARGEST hint (via NewPeekerConnSize), so
+// a configured size > the 4096 default is actually honored. Filters without
+// the interface fall back to the default-size peek buffer.
+type InitialReadBufferSizer interface {
+	InitialReadBufferSize() int
+}
+
 // FactoryCtx carries the parsed-config context a ListenerFilterFactory
 // needs to resolve the typed_config Any. Currently empty; reserved for
 // future extensions (e.g., a Registry pointer for filters that compose).

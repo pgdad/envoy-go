@@ -119,6 +119,36 @@ func TestMaglev_EmptySet(t *testing.T) {
 	}
 }
 
+// TestMaglev_HealthAware_WalkToNextHealthy mirrors the ring_hash health test
+// (ADR-0243): when the host a fixed key's slot resolves to is unhealthy, the
+// SAME key resolves to a different, healthy host via the forward slot walk;
+// pick sequences stay bit-identical across the panicGate extraction.
+func TestMaglev_HealthAware_WalkToNextHealthy(t *testing.T) {
+	e := eps(3)
+	mg := newMaglevWithRNG(e, maglevCfg{tableSize: 65537}, seqRNG(0))
+	const key = uint64(0xABCDEF)
+
+	// Baseline: the key's primary host (no health -> fast path).
+	primary, _, _ := mg.Pick(key, true, SubsetMatch{}, false)
+
+	// Attach a health registry and mark the primary unhealthy. 2/3 healthy = 66%
+	// > 50% -> NOT in panic; the slot walk skips the unhealthy primary.
+	ch := newClusterHealth(e, 0.5)
+	mg.health = ch
+	ch.states[primary.Addr()].healthy.Store(false)
+
+	got, _, err := mg.Pick(key, true, SubsetMatch{}, false)
+	if err != nil {
+		t.Fatalf("health-aware pick: %v", err)
+	}
+	if got.Addr() == primary.Addr() {
+		t.Fatalf("table returned the unhealthy primary %q; expected a walk to the next healthy host", primary.Addr())
+	}
+	if !ch.isHealthy(got) {
+		t.Fatalf("table returned an unhealthy host %q", got.Addr())
+	}
+}
+
 func TestMaglev_RandomKeysNeverPanicAlwaysValid(t *testing.T) {
 	// D-S37-5: the unit-level property test in lieu of a fuzzer.
 	mg := newMaglevWithRNG(eps(3), maglevCfg{tableSize: 65537}, seqRNG(0))

@@ -311,6 +311,19 @@ func (s *ServerConn) onHeaders(f *http2.HeadersFrame) error {
 		if err := existing.recvTrailingHeaders(headers, f.StreamEnded()); err != nil {
 			return err
 		}
+		if f.StreamEnded() {
+			// Trailing HEADERS carried END_STREAM: the request is now complete,
+			// so queue the dispatch exactly as the HEADERS/DATA END_STREAM paths
+			// do (the trailer fields themselves were observed-and-discarded
+			// above per SPEC §2.1). Without this the stream would never be
+			// dispatched: no response would be written and the stream would
+			// occupy its MAX_CONCURRENT_STREAMS slot forever.
+			ctx := s.ctx
+			s.pendingDispatch = append(s.pendingDispatch, func() {
+				existing.dispatch(ctx, s.dispatcher)
+				s.doneCh <- streamID
+			})
+		}
 		return nil
 	}
 

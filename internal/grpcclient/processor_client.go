@@ -51,11 +51,9 @@ package grpcclient
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
-	"google.golang.org/grpc"
 )
 
 // ProcessStream is the bidi-stream surface returned by
@@ -84,9 +82,8 @@ type ProcessStream interface {
 // machine. Concurrent `Process` calls multiplex over the underlying HTTP/2
 // transport per the gRPC concurrency model.
 type ProcessorClient struct {
-	conn   *grpc.ClientConn
-	stub   extprocv3.ExternalProcessorClient
-	target string // cluster_name — for logs/errors
+	connHolder
+	stub extprocv3.ExternalProcessorClient
 
 	// perMessageTimeout is the per-MESSAGE timeout captured at
 	// `NewProcessorClient` time. It is STORED here for the filter's
@@ -94,10 +91,6 @@ type ProcessorClient struct {
 	// itself does NOT apply any timeout around stream operations.
 	// See file-level design notes above + ADR-0169 §Decision.
 	perMessageTimeout time.Duration
-
-	// closeOnce + closeErr guard the idempotent Close per SPEC §3.1.
-	closeOnce sync.Once
-	closeErr  error
 }
 
 // NewProcessorClient dials the named cluster via `d.DialContext` and wraps
@@ -116,17 +109,13 @@ type ProcessorClient struct {
 // (`extprocv3.NewExternalProcessorClient` vs `authv3.NewAuthorizationClient`)
 // and the timeout semantics (per-MESSAGE here vs per-CALL there).
 func NewProcessorClient(d *Dialer, clusterName string, perMessageTimeout time.Duration) (*ProcessorClient, error) {
-	if d == nil {
-		return nil, fmt.Errorf("grpcclient: new processor client %q: dialer is nil", clusterName)
-	}
-	conn, err := d.DialContext(context.Background(), clusterName)
+	conn, err := dialConn(d, "processor client", clusterName)
 	if err != nil {
 		return nil, err
 	}
 	return &ProcessorClient{
-		conn:              conn,
+		connHolder:        connHolder{conn: conn},
 		stub:              extprocv3.NewExternalProcessorClient(conn),
-		target:            clusterName,
 		perMessageTimeout: perMessageTimeout,
 	}, nil
 }
@@ -171,7 +160,7 @@ func (c *ProcessorClient) Process(ctx context.Context) (ProcessStream, error) {
 
 // Close releases the underlying `*grpc.ClientConn`. Idempotent — repeated
 // calls (or concurrent calls) return the cached error from the first call
-// via an internal `sync.Once` guard.
+// via the shared `connHolder` sync.Once guard.
 //
 // MVP discipline (per ADR-0158 §Decision (vi) + ADR-0169 §Decision): in
 // production the filter NEVER calls `Close()` — the `*grpc.ClientConn` is
@@ -183,10 +172,5 @@ func (c *ProcessorClient) Close() error {
 	if c == nil {
 		return nil
 	}
-	c.closeOnce.Do(func() {
-		if c.conn != nil {
-			c.closeErr = c.conn.Close()
-		}
-	})
-	return c.closeErr
+	return c.connHolder.close()
 }

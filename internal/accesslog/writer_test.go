@@ -108,6 +108,29 @@ func TestAsyncFileSink_Close_Idempotent(t *testing.T) {
 	}
 }
 
+// TestAsyncFileSink_Close_ReplaysFirstError pins the idempotent-Close contract
+// shared with every other sink: a second Close returns the FIRST call's cached
+// error, not nil. The file is closed out from under the sink so the sink's own
+// f.Close() inside the Once fails.
+func TestAsyncFileSink_Close_ReplaysFirstError(t *testing.T) {
+	dir := t.TempDir()
+	_, c := newTestRegistryAndCounter(t)
+	s, err := NewAsyncFileSink(filepath.Join(dir, "x.log"), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.f.Close(); err != nil { // force the sink's own Close to error
+		t.Fatalf("pre-close file: %v", err)
+	}
+	first := s.Close()
+	if first == nil {
+		t.Fatal("first Close = nil, want the double-close error")
+	}
+	if second := s.Close(); second != first {
+		t.Errorf("second Close = %v, want the cached first error %v", second, first)
+	}
+}
+
 func TestAsyncFileSink_Close_DrainsPending(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "x.log")

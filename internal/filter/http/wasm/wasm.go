@@ -98,7 +98,7 @@ type filter struct {
 	// pluginName + stats). Closure-captured at Task 9 New's FilterInstanceFactory.
 	// Type added at Task 9 (compiled_config.go); at Task 8 the field is typed
 	// `*compiledConfig` and points to nil until the type lands.
-	cfg *compiledConfig //nolint:unused // closure-captured at Task 9 New's FilterInstanceFactory
+	cfg *compiledConfig
 
 	// eff is the EFFECTIVE per-stream compiledConfig resolved ONCE at
 	// DecodeHeaders entry (per-route override > listener default) per phase-25.3
@@ -110,7 +110,7 @@ type filter struct {
 	// pointer is stable per route; resolving per-callback would risk a split
 	// decode/encode VM). nil until DecodeHeaders runs; EncodeHeaders / OnDestroy
 	// fall back to f.cfg on the encode-only / never-decoded edge.
-	eff *compiledConfig //nolint:unused // resolved at Task 9 DecodeHeaders; consumed by EncodeHeaders + OnDestroy
+	eff *compiledConfig
 
 	// NOTE: the 25.1 `vm *wasm.VM` field was REMOVED at 25.2 IMPL Task 18
 	// alongside the deletion of internal/wasm/vm.go (Task 1 per D-P-PLAN-6).
@@ -125,14 +125,14 @@ type filter struct {
 	// proxy-wasm callbacks. Allocated at DecodeHeaders entry (Task 12) as a
 	// monotonically-increasing per-VM u32 counter; the parent context is
 	// cfg.rootContextID.
-	streamContextID uint32 //nolint:unused // allocated at Task 12 DecodeHeaders entry
+	streamContextID uint32
 
 	// sentLocalResponse holds the captured `proxy_send_local_response` payload
 	// until the host-side filter dispatch handoffs to `FilterCallbacks.SendLocalReply`.
 	// Populated by abi_callbacks.SendLocalResponse (Task 11); consumed by
 	// DecodeHeaders/EncodeHeaders (Task 12) — non-nil signals the dispatcher
 	// should return StopIteration + call decoderCb/encoderCb.SendLocalReply.
-	sentLocalResponse *capturedLocalResponse //nolint:unused // populated at Task 11 SendLocalResponse abi_callbacks; consumed at Task 12
+	sentLocalResponse *capturedLocalResponse
 
 	// requestHeaders + responseHeaders hold per-side header maps captured by
 	// DecodeHeaders / EncodeHeaders entry (Task 12) so the per-stream
@@ -143,8 +143,8 @@ type filter struct {
 	// http.Header passed into DecodeHeaders/EncodeHeaders — mutations by the
 	// guest propagate to the chain through the same map. Per ADR-0071 single-
 	// goroutine-per-stream invariant: no cross-goroutine mutation surface.
-	requestHeaders  http.Header //nolint:unused // populated at Task 12 DecodeHeaders entry; consumed by Task 11 abi_callbacks
-	responseHeaders http.Header //nolint:unused // populated at Task 12 EncodeHeaders entry; consumed by Task 11 abi_callbacks
+	requestHeaders  http.Header
+	responseHeaders http.Header
 
 	// decoderCb + encoderCb store the framework-supplied per-stream callbacks
 	// from SetDecoderCallbacks / SetEncoderCallbacks (Task 12). Consumed by the
@@ -153,8 +153,8 @@ type filter struct {
 	// property tree, TLS-state property surface, etc.) read both sides. Nil
 	// before SetX dispatch + on the side that does not exist for this stream
 	// (encode-only / decode-only filter shapes).
-	decoderCb envoyhttp.DecoderFilterCallbacks //nolint:unused // populated at Task 12 SetDecoderCallbacks; consumed by Task 11 abi_callbacks
-	encoderCb envoyhttp.EncoderFilterCallbacks //nolint:unused // populated at Task 12 SetEncoderCallbacks; consumed by Task 11 abi_callbacks GetStatus (ADR-0196 D-P3 first co-consumer)
+	decoderCb envoyhttp.DecoderFilterCallbacks
+	encoderCb envoyhttp.EncoderFilterCallbacks
 
 	// downstreamFilterState + upstreamFilterState hold the per-stream
 	// filterstate.Bucket references per ADR-0207 + 25.2 SPEC §3.2 + AMEND-B4.
@@ -168,8 +168,8 @@ type filter struct {
 	// paths AND in pre-Task-18 wiring — the abi_callbacks resolver is
 	// nil-tolerant per ADR-0085 (nil bucket → NotFound for every
 	// filter_state.<key> probe).
-	downstreamFilterState *filterstate.Bucket //nolint:unused // populated at Task 18 per-stream construction; consumed by Task 15 abi_callbacks filterPropertyResolver
-	upstreamFilterState   *filterstate.Bucket //nolint:unused // populated at Task 18 per-stream construction; consumed by Task 15 abi_callbacks filterPropertyResolver
+	downstreamFilterState *filterstate.Bucket
+	upstreamFilterState   *filterstate.Bucket
 
 	// -------------------------------------------------------------------------
 	// 25.2 IMPL Task 16 EXTENSIONS (per 25.2 SPEC §4.3 + Q1 + Q2).
@@ -191,7 +191,7 @@ type filter struct {
 	// stream_context.go EXTEND. Production callers populate the field at
 	// Task 18; test callers populate it directly in body_test.go +
 	// trailers_test.go.
-	streamCtx *wasm.StreamContext //nolint:unused // populated at Task 18 decode_headers.go; consumed by Task 16 body.go + trailers.go
+	streamCtx *wasm.StreamContext
 
 	// decodeBody + encodeBody hold the per-stream accumulated body bytes per
 	// 25.2 SPEC §4.3 + Q1. Grow on each DecodeData / EncodeData call BEFORE
@@ -204,8 +204,8 @@ type filter struct {
 	// (uint32(len(decodeBody)) / uint32(len(encodeBody))), NOT the just-new-
 	// chunk delta. The proxy-wasm v0.2.1 contract is per-chunk-invoke +
 	// guest reads the accumulated buffer; envoy-go follows this verbatim.
-	decodeBody []byte //nolint:unused // populated at Task 16 body.go DecodeData; consumed at Task 16 abi_callbacks.GetBuffer
-	encodeBody []byte //nolint:unused // populated at Task 16 body.go EncodeData; consumed at Task 16 abi_callbacks.GetBuffer
+	decodeBody []byte
+	encodeBody []byte
 
 	// decodeBodyCapExceeded + encodeBodyCapExceeded are sticky flags set to
 	// true on the FIRST cap-exceeded event per Q2 + 25.2 SPEC §4.3. Once set,
@@ -217,8 +217,8 @@ type filter struct {
 	// SendLocalReply is unavailable (EncoderFilterCallbacks does not expose
 	// it); the sticky flag short-circuits to StopAllIteration so the chain
 	// terminates the response early.
-	decodeBodyCapExceeded bool //nolint:unused // populated at Task 16 body.go DecodeData on first cap-exceeded
-	encodeBodyCapExceeded bool //nolint:unused // populated at Task 16 body.go EncodeData on first cap-exceeded
+	decodeBodyCapExceeded bool
+	encodeBodyCapExceeded bool
 }
 
 // capturedLocalResponse holds the proxy_send_local_response payload until the
@@ -233,15 +233,15 @@ type filter struct {
 // consumes REUSE 5 (`SendLocalReply` per parent §3.3) to emit the local reply.
 type capturedLocalResponse struct {
 	// statusCode is the HTTP status code from the guest (e.g. 403, 503).
-	statusCode uint32 //nolint:unused // populated at Task 11 SendLocalResponse abi_callbacks
+	statusCode uint32
 	// statusMsg is the HTTP status reason-phrase from the guest
 	// (typically empty; the framework re-derives from statusCode).
 	statusMsg string //nolint:unused // populated at Task 11
 	// body is the response body bytes from the guest (may be empty).
-	body string //nolint:unused // populated at Task 11
+	body string
 	// additionalHeaders is the guest-supplied additional header set, decoded
 	// via internal/wasm pairs.DecodePairs at Task 11.
-	additionalHeaders []wasm.HeaderPair //nolint:unused // populated at Task 11
+	additionalHeaders []wasm.HeaderPair
 	// grpcStatus is the gRPC status code (-1 if not gRPC; per proxy-wasm
 	// v0.2.1 spec the guest passes a signed i32 here).
 	grpcStatus int32 //nolint:unused // populated at Task 11

@@ -90,6 +90,55 @@ type ClientConn struct {
 	// stats-agnostic (no internal/stats import). (phase 43.2b, ADR-0254)
 	onRxReset func()
 	onTxReset func()
+	// resetStreams tracks stream ids this conn has locally reset (RST_STREAM
+	// (CANCEL) sent from RoundTrip's ctx-cancel branch). Response HEADERS/DATA
+	// frames already in flight from the server for such a stream race our
+	// RST_STREAM and would otherwise miss lookupStream; RFC 9113 §5.1 requires
+	// tolerating frames on a stream "for a short period" after sending
+	// RST_STREAM, so dispatchFrame silently discards frames for these ids
+	// instead of escalating to a connection error (which would tear down every
+	// other in-flight stream on this pooled multiplexed conn). Guarded by
+	// resetMu; entries are pruned on observed stream completion (END_STREAM /
+	// RST_STREAM) and by the resetRetainWindow monotonic-id horizon in markReset.
+	resetMu      sync.Mutex
+	resetStreams map[uint32]struct{}
+}
+
+// resetRetainWindow bounds resetStreams growth: when a new id is marked reset,
+// entries more than this many stream-id units behind it are pruned. Stream ids
+// are monotonic (odd, +2 per RoundTrip), so 256 units ≈ 128 RoundTrips — far
+// past RFC 9113 §5.1's "short period" tolerance for post-reset frames.
+const resetRetainWindow = 256
+
+// markReset records id as locally reset, pruning entries beyond the retain
+// window. Called from RoundTrip's ctx-cancel branch BEFORE the stream-map
+// delete so the readLoop can never observe the stream as neither live nor reset.
+func (cc *ClientConn) markReset(id uint32) {
+	cc.resetMu.Lock()
+	if cc.resetStreams == nil {
+		cc.resetStreams = make(map[uint32]struct{})
+	}
+	cc.resetStreams[id] = struct{}{}
+	for old := range cc.resetStreams {
+		if old+resetRetainWindow < id {
+			delete(cc.resetStreams, old)
+		}
+	}
+	cc.resetMu.Unlock()
+}
+
+// wasReset reports whether id was locally reset and is still within the
+// tolerance window. done=true additionally clears the entry (the peer's frame
+// carried END_STREAM or was an RST_STREAM — the stream is finished on both
+// sides and no further frames need tolerating).
+func (cc *ClientConn) wasReset(id uint32, done bool) bool {
+	cc.resetMu.Lock()
+	_, ok := cc.resetStreams[id]
+	if ok && done {
+		delete(cc.resetStreams, id)
+	}
+	cc.resetMu.Unlock()
+	return ok
 }
 
 // ClientConnOption configures a ClientConn at construction, applied BEFORE the
@@ -274,6 +323,32 @@ func (cc *ClientConn) lookupStream(id uint32) (*clientStream, bool) {
 	return cs, true
 }
 
+// debitConnRecvWindow accounts dataLen inbound DATA bytes against the
+// connection-level recv window and emits the half-window conn-level
+// WINDOW_UPDATE when the running debit crosses the threshold (ADR-0055 I-3).
+// Called from the readLoop for every inbound DATA frame — including frames
+// discarded for locally-reset streams, whose bytes still consumed the shared
+// conn-level window on the peer's side. No-op for dataLen <= 0.
+func (cc *ClientConn) debitConnRecvWindow(dataLen int32) error {
+	if dataLen <= 0 {
+		return nil
+	}
+	cc.recvW.replenish(-dataLen)
+	cc.recvDebitSinceLastUpdate += dataLen
+	if cc.recvDebitSinceLastUpdate >= recvWindowUpdateThreshold {
+		delta := cc.recvDebitSinceLastUpdate
+		cc.recvDebitSinceLastUpdate = 0
+		cc.recvW.replenish(delta)
+		cc.mu.Lock()
+		werr := cc.fr.WriteWindowUpdate(0, uint32(delta))
+		cc.mu.Unlock()
+		if werr != nil {
+			return translateFramerErr(werr)
+		}
+	}
+	return nil
+}
+
 // emitGoaway sends a GOAWAY frame with the given error code, once. Mirrors
 // (*ServerConn).emitGoaway. The mutex is held across the framer write so
 // the GOAWAY is serialized against any concurrent encodeAndWriteHeaders or
@@ -331,6 +406,17 @@ func (cc *ClientConn) dispatchFrame(f http2.Frame) error {
 	case *http2.HeadersFrame:
 		cs, ok := cc.lookupStream(fr.StreamID)
 		if !ok {
+			if cc.wasReset(fr.StreamID, fr.StreamEnded()) {
+				// Late response HEADERS racing our RST_STREAM(CANCEL) — tolerated
+				// per RFC 9113 §5.1. The block MUST still be HPACK-decoded (the
+				// decoder's dynamic table is connection-scoped state shared with
+				// every other stream's HEADERS); the decoded fields are discarded.
+				if _, err := cc.hp.decodeBlock(fr.HeaderBlockFragment(), fr.HeadersEnded()); err != nil {
+					cc.emitGoaway(ErrCompressionError)
+					return err
+				}
+				return nil
+			}
 			// Server-initiated HEADERS (PUSH_PROMISE-class) — we advertise
 			// ENABLE_PUSH=0 so this is a peer protocol violation.
 			cc.emitGoaway(ErrProtocolError)
@@ -360,6 +446,14 @@ func (cc *ClientConn) dispatchFrame(f http2.Frame) error {
 	case *http2.DataFrame:
 		cs, ok := cc.lookupStream(fr.StreamID)
 		if !ok {
+			if cc.wasReset(fr.StreamID, fr.StreamEnded()) {
+				// Late response DATA racing our RST_STREAM(CANCEL) — tolerated
+				// per RFC 9113 §5.1 and discarded. The bytes still counted
+				// against the shared conn-level recv window on the peer's side,
+				// so account them (keeping the conn-level WINDOW_UPDATE
+				// replenishment flowing for the other in-flight streams).
+				return cc.debitConnRecvWindow(int32(len(fr.Data())))
+			}
 			// Stream gone (we already finished it) — DATA after END_STREAM.
 			// Returning a connection-level STREAM_CLOSED here is symmetric
 			// with ServerConn's recently-closed handling and forces the
@@ -371,20 +465,10 @@ func (cc *ClientConn) dispatchFrame(f http2.Frame) error {
 			cs.respBody.Write(fr.Data())
 			// Recv-window debit + half-window WINDOW_UPDATE emission per
 			// ADR-0055 / I-3 (mirror of ServerConn.onData).
-			cc.recvW.replenish(-dataLen)
 			cs.recvW.replenish(-dataLen)
 			// Conn-level debit + WINDOW_UPDATE(0, delta). Mutates cc.recvDebitSinceLastUpdate.
-			cc.recvDebitSinceLastUpdate += dataLen
-			if cc.recvDebitSinceLastUpdate >= recvWindowUpdateThreshold {
-				delta := cc.recvDebitSinceLastUpdate
-				cc.recvDebitSinceLastUpdate = 0
-				cc.recvW.replenish(delta)
-				cc.mu.Lock()
-				werr := cc.fr.WriteWindowUpdate(0, uint32(delta))
-				cc.mu.Unlock()
-				if werr != nil {
-					return translateFramerErr(werr)
-				}
+			if err := cc.debitConnRecvWindow(dataLen); err != nil {
+				return err
 			}
 			// Stream-level debit + WINDOW_UPDATE(streamID, delta). Independent
 			// from the conn-level block above; mutates cs.recvDebitSinceLastUpdate
@@ -412,7 +496,11 @@ func (cc *ClientConn) dispatchFrame(f http2.Frame) error {
 	case *http2.RSTStreamFrame:
 		cs, ok := cc.lookupStream(fr.StreamID)
 		if !ok {
-			return nil // stream gone; ignore
+			// Stream gone; ignore. A peer RST_STREAM also terminates the reset-
+			// tolerance window for a locally-reset stream (both sides now agree
+			// the stream is dead), so clear the entry if present.
+			cc.wasReset(fr.StreamID, true)
+			return nil
 		}
 		cs.finish(streamError(ErrCode(fr.ErrCode), fr.StreamID, "client: peer RST_STREAM"))
 		// Fired per RST_STREAM frame, not per stream-lifetime; exactly-once holds
@@ -562,6 +650,11 @@ func (cc *ClientConn) RoundTrip(ctx context.Context, req H2Request) (H2Response,
 		}, nil
 	case <-ctx.Done():
 		// Emit RST_STREAM(CANCEL) on the upstream stream; return ctx error.
+		// Mark the stream reset FIRST (before the RST write and before the
+		// deferred cc.streams.Delete runs at return) so late response frames
+		// racing our reset are discarded by the readLoop per RFC 9113 §5.1
+		// instead of tearing down the whole conn.
+		cc.markReset(id)
 		cc.mu.Lock()
 		_ = cc.fr.WriteRSTStream(id, http2.ErrCodeCancel)
 		cc.mu.Unlock()

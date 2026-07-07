@@ -1,11 +1,8 @@
 package router
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"math/bits"
 	"net/http"
@@ -14,7 +11,6 @@ import (
 
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/pgdad/envoy-go/internal/accesslog"
 	"github.com/pgdad/envoy-go/internal/cluster"
 	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
 	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
@@ -27,22 +23,19 @@ const TypeURL = "type.googleapis.com/envoy.extensions.filters.http.router.v3.Rou
 
 // bad502Body is the local-reply body for upstream-failure 502 emissions per
 // SPEC §11.9. The constant is the single source of truth so the H2 router's
-// 502 prose cannot drift from any future H1 router 502 prose; phase-04's H1
-// 502 currently uses an empty body via writeStatusReply(bw, 502, "") and is
-// NOT touched by 05.2 (no regression). The shared-constant pattern future-
-// proofs the migration. Migrated verbatim from internal/filter/hcm/actions.go
-// at phase 07.1 Task 11; the duplication with the hcm-package constant is
-// intentional per the PLAN's Task 11 → Task 12 split.
+// 502 prose cannot drift from any future H1 router 502 prose. Migrated
+// verbatim from internal/filter/hcm/actions.go at phase 07.1 Task 11; the
+// duplication with the hcm-package constant is intentional per the PLAN's
+// Task 11 → Task 12 split.
 const bad502Body = "bad gateway\n"
 
-// errCloseAfterAction is returned by routerAction.do when the action's
-// response carried Connection: close (or the equivalent semantic on the
-// upstream-routed response). The connection loop checks for this sentinel
-// via errors.Is and closes the downstream after the current iteration.
+// errCloseAfterAction signals that the action's response carried
+// Connection: close (or the equivalent semantic on the upstream-routed
+// response). The HCM connection loop checks for this sentinel (via the
+// exported ErrCloseAfterAction alias) and closes the downstream after the
+// current iteration.
 //
-// SPEC §10 #3 settled to the sentinel-error mechanism (option (a)). Other
-// non-nil errors from do trigger downstream close + log (the connection
-// loop handles).
+// SPEC §10 #3 settled to the sentinel-error mechanism (option (a)).
 var errCloseAfterAction = errors.New("router: action requested connection close")
 
 // serverHeader returns the canonical Server header value for HCM-locally-
@@ -56,39 +49,6 @@ func serverHeader() string { return "envoy" }
 // IMF-fixdate (e.g. "Sun, 06 Nov 2024 08:49:37 GMT"). Per-response computation
 // (no caching) per SPEC §10 #8 settled.
 func dateHeader() string { return time.Now().UTC().Format(http.TimeFormat) }
-
-// writeStatusReply writes a complete HTTP/1.1 local-reply response to w. The
-// status line uses http.StatusText for the reason phrase; if the status is
-// unknown to stdlib, the reason phrase is empty. Headers in fixed order:
-// Content-Type, Content-Length, Server, Date. A CRLF blank line then the body.
-func writeStatusReply(w io.Writer, status int, body string) error {
-	reason := http.StatusText(status)
-	if _, err := fmt.Fprintf(w, "HTTP/1.1 %d %s\r\n", status, reason); err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(w,
-		"Content-Type: text/plain\r\nContent-Length: %d\r\nServer: %s\r\nDate: %s\r\n\r\n",
-		len(body), serverHeader(), dateHeader()); err != nil {
-		return err
-	}
-	if body != "" {
-		if _, err := io.WriteString(w, body); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// upstreamHostString renders cluster.Endpoint as `host:port` for the access-log
-// UPSTREAM_HOST operator. Zero-valued Endpoint (host == "") yields empty
-// string; the formatter then emits the literal `-` per accesslog Decision A.
-// Duplicated from internal/filter/hcm/accesslog_emit.go.
-func upstreamHostString(ep cluster.Endpoint) string {
-	if ep.Host == "" {
-		return ""
-	}
-	return ep.Host + ":" + strconv.Itoa(int(ep.Port))
-}
 
 // ActionResponse is the logical response shape produced by an Action. It is
 // the unit fed to the encode chain (Phase 07.1 Task 18 prereq P2): HCM
@@ -190,12 +150,6 @@ type H2Action func(ctx context.Context, req h2.H2Request) (resp ActionResponse, 
 // SetWriter setter and the (status, bytesSent) tuple — wire-bytes
 // serialization is now HCM dispatch's responsibility post-encode-chain.
 //
-// The accessLog field carries the access-log sink slice plumbed in via the
-// per-request factory (Task 14 wires the HCM Filter's accessLog through to
-// the router instance). Tests (`router_test.go`) exercise the access-log
-// emit directly by constructing &Filter{accessLog: []accesslog.Sink{...}}
-// — this matches the byte-preserved shape from internal/filter/hcm.
-//
 // Per-request lifecycle (single-goroutine-per-stream — see ADR-0071's
 // "single dispatch goroutine drives the chain" invariant):
 //
@@ -225,10 +179,6 @@ type H2Action func(ctx context.Context, req h2.H2Request) (resp ActionResponse, 
 type Filter struct {
 	dcb envoyhttp.DecoderFilterCallbacks
 	ecb envoyhttp.EncoderFilterCallbacks
-
-	// accessLog holds the configured access-log sinks plumbed through from
-	// the HCM Filter (Task 14). Nil when no sinks are configured.
-	accessLog []accesslog.Sink
 
 	// Per-request injection (Task 15). HCM dispatch sets these before
 	// chain.RunDecodeHeaders begins iteration.
@@ -287,19 +237,17 @@ func (f *Filter) SetH2Action(a H2Action) { f.h2Action = a }
 // iteration.
 func (f *Filter) SetH2Request(r h2.H2Request) { f.h2Req = r }
 
-// Status / Response / Picked / ActionErr expose the action's terminal
-// outcome so HCM dispatch can Inc the downstream_rq_<Nxx> bucket, populate
-// the access-log record, run the encode chain over the response, and write
-// wire bytes after chain return. Zero values when the action did not run
-// (e.g. SendLocalReply pre-empted the terminal filter).
+// Response / Picked / ActionErr expose the action's terminal outcome so HCM
+// dispatch can Inc the downstream_rq_<Nxx> bucket, populate the access-log
+// record, run the encode chain over the response, and write wire bytes after
+// chain return. Zero values when the action did not run (e.g. SendLocalReply
+// pre-empted the terminal filter).
 //
 // Phase 07.1 Task 18 prereq P1: BytesSent() getter REMOVED — HCM dispatch
 // reads len(rf.Response().Body) directly when populating the access-log
 // record. Response() returns the logical response struct surfaced by the
 // action; HCM dispatch feeds it through the encode chain BEFORE wire-write.
-// Status returns the action response status code (0 if action did not run).
-func (f *Filter) Status() int { return f.actionResponse.Status }
-
+//
 // Response returns the logical action response captured at RunAction time.
 func (f *Filter) Response() ActionResponse { return f.actionResponse }
 
@@ -370,32 +318,6 @@ func (f *Filter) RunAction(ctx context.Context) {
 		f.actionErr = err
 	default:
 		panic("router.Filter.RunAction: neither SetAction nor SetH2Action was called before RunAction (per *Filter lifecycle doc; ADR-0071 single-goroutine-per-stream invariant)")
-	}
-}
-
-// emitAccessLog constructs an accesslog.Record from H1 primitives and submits
-// to each sink in f.accessLog. Per SPEC §2.1, a zero statusCode is the H2
-// ctx-cancel sentinel and skips emission; H1 path never produces a zero
-// statusCode in normal flow, but the guard is uniform across H1+H2 callers.
-// Migrated verbatim from internal/filter/hcm/accesslog_emit.go.
-func (f *Filter) emitAccessLog(r *http.Request, statusCode int, bytesSent int64, picked cluster.Endpoint, start time.Time) {
-	if statusCode == 0 || len(f.accessLog) == 0 {
-		return
-	}
-	rec := &accesslog.Record{
-		StartTime:    start,
-		Method:       r.Method,
-		Path:         r.URL.Path,
-		Protocol:     r.Proto,
-		ResponseCode: statusCode,
-		BytesSent:    bytesSent,
-		Duration:     time.Since(start),
-		Authority:    r.Host,
-		UserAgent:    r.Header.Get("User-Agent"),
-		UpstreamHost: upstreamHostString(picked),
-	}
-	for _, s := range f.accessLog {
-		s.Submit(rec)
 	}
 }
 
@@ -751,14 +673,12 @@ func localReplyHeaders(bodyLen int) envoyhttp.OrderedHeaders {
 	}
 }
 
-// routerAction proxies the request to the named cluster's selected endpoint.
-// Per ADR-0039, every routed request opens a fresh upstream connection via
-// Cluster.Dial(ctx); no pooling at phase 04. Per-failure-class mapping:
+// routerAction proxies the request to the named cluster's selected endpoint
+// (via the doH1ClusterAction driver above). Per-failure-class mapping:
 //
-//	Cluster.Dial error      → 503 local reply, do returns nil
-//	Request.Write error     → 502 local reply, do returns nil
-//	http.ReadResponse error → 502 local reply, do returns nil
-//	resp.Write error        → propagated up (downstream is broken)
+//	AcquireH1 error         → 503 local reply, driver returns nil err
+//	Request.Write error     → 502 local reply, driver returns nil err
+//	http.ReadResponse error → 502 local reply, driver returns nil err
 //
 // The router does NOT inject x-envoy-*, x-forwarded-*, or x-request-id
 // headers (SPEC §2). The upstream sees the unmodified downstream request
@@ -772,126 +692,16 @@ func localReplyHeaders(bodyLen int) envoyhttp.OrderedHeaders {
 // "unmodified downstream request" statement holds for the no-tracing path and
 // is scoped to the router's own behavior under a provider.
 //
-// Migrated from internal/filter/hcm/actions.go at phase 07.1 Task 11 with
-// signatures preserved byte-for-byte so the byte-preserved tests in
-// router_test.go exercise the same shape (`a.do(ctx, req, bw)`).
+// The legacy direct-write do(ctx, req, bw) method (migrated at phase 07.1
+// Task 11) was production-unreachable after Tasks 15+16 moved both codecs
+// onto the chain-mediated H1ClusterAction/doH1ClusterAction path and has been
+// deleted; the byte-preservation tests now drive the Action closure.
 type routerAction struct {
 	cluster      *cluster.Cluster
-	filter       *Filter             // set post-build by routeTable.bindFilter; nil when no sinks configured.
 	hashPolicies []HashPolicy        // 36.2: stored at H1ClusterAction; per-request fold lands in Task 4 (applyHashKey).
 	subsetMatch  cluster.SubsetMatch // 38.1: route-static metadata_match threaded onto ctx at dispatch (ADR-0239).
 	rp           *RetryPolicy        // 42.1: effective retry_policy; nil when none. Stored here; the retry loop lands in Task 7.
 	hp           *HedgePolicy        // 42.2b: effective hedge_policy; nil when none. The concurrent hedgeExecutor dispatches on it in Task 8 (closure switch). Set by the widened H{1,2}ClusterAction constructor (Task 8); nil/unset until then.
-}
-
-// do drives one upstream H1 round-trip. Phase 06.1 Task 11 wires the cluster-
-// scope upstream_rq_total + upstream_rq_<Nxx> counters per SPEC §5.5: total
-// Inc's at dispatch entry (once per attempt, BEFORE Dial); the status-class
-// counter Inc's after the response code is finalized. On the dial-failure /
-// write-failure / read-failure local-reply paths, the synthesized 5xx status
-// (503 for dial, 502 for write/read) is the bucket the cluster-scope counter
-// reflects per the "5xx Inc lands on the dial-failure local-reply path too"
-// annotation in PLAN Task 11.
-//
-// Returns (statusCode, error). statusCode is the finalized HTTP response code
-// (503/502 on local-reply paths; resp.StatusCode on a successful proxy);
-// err is the routeAction error (errCloseAfterAction sentinel or a real
-// write-side failure).
-func (a *routerAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
-	start := time.Now()
-
-	// bytesSent counts only the response body bytes for BYTES_SENT per SPEC
-	// §12 #3 option (a). We do NOT wrap bw in a byteCounterWriter because
-	// resp.Write writes the full HTTP/1.1 wire bytes (status line + headers +
-	// body), which would inflate the count. Instead, we read the body into a
-	// buffer, record its length, replace resp.Body with the buffered reader, and
-	// let resp.Write drain the buffer through bw directly.
-	bytesSent := int64(0)
-
-	// statusCode and picked are captured by the deferred access-log emit so
-	// the closure always reads the final values after all writes have completed.
-	statusCode := 0
-	picked := cluster.Endpoint{}
-	if a.filter != nil {
-		defer func() { a.filter.emitAccessLog(req, statusCode, bytesSent, picked, start) }()
-	}
-
-	a.cluster.IncUpstreamRqTotal()
-
-	// 36.2: fold the route's hash_policy list into a ring_hash key carried on
-	// ctx (cluster.WithHashKey) → ringHashLB.Pick reads it in Dial. See
-	// doH1ClusterAction for the source_ip ctx-carry rationale. ADR-0237.
-	ctx, _, _ = applyHashKey(ctx, a.hashPolicies, func(n string) (string, bool) {
-		v := req.Header.Get(n)
-		return v, v != ""
-	}, downstreamRemoteAddrFrom(ctx))
-
-	upstream, ep, err := a.cluster.Dial(ctx)
-	if err != nil {
-		if cluster.IsConnPoolOverflow(err) {
-			// ADR-0252: connection-pool overflow → fail fast 503 (load-shed).
-			// upstream_rq_total was already incremented above (as on the live path);
-			// upstream_rq_pending_overflow already incremented in the pool: NO
-			// IncStatusClass (the dedicated overflow counter is the signal).
-			// (Legacy direct-write path; the live H1 HCM dispatch goes through
-			// doH1ClusterAction's overflow branch — kept here for consistency.)
-			statusCode = 503
-			return 503, writeStatusReply(bw, 503, "")
-		}
-		a.cluster.IncStatusClass(503)
-		statusCode = 503
-		return 503, writeStatusReply(bw, 503, "")
-	}
-	defer func() { _ = upstream.Close() }()
-	picked = ep
-
-	// Propagate the downstream ctx deadline (if any) to the upstream socket
-	// so a stalled upstream cannot hold the action past the ctx's deadline
-	// during req.Write or http.ReadResponse — both of which are otherwise
-	// ctx-unaware (REVIEW.md I-3 from REVIEW.md 04527eb).
-	if dl, ok := ctx.Deadline(); ok {
-		_ = upstream.SetDeadline(dl)
-	}
-
-	if err := req.Write(upstream); err != nil {
-		a.cluster.IncStatusClass(502)
-		statusCode = 502
-		return 502, writeStatusReply(bw, 502, "")
-	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(upstream), req)
-	if err != nil {
-		a.cluster.IncStatusClass(502)
-		statusCode = 502
-		return 502, writeStatusReply(bw, 502, "")
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	a.cluster.IncStatusClass(resp.StatusCode)
-	statusCode = resp.StatusCode
-
-	// Read the entire response body to count body bytes for BYTES_SENT.
-	// Replace resp.Body with a bytes.Reader so resp.Write drains the same
-	// bytes downstream without a second upstream read.
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return resp.StatusCode, err
-	}
-	bytesSent = int64(len(bodyBytes))
-	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
-	if err := resp.Write(bw); err != nil {
-		return resp.StatusCode, err
-	}
-	// Honor the upstream's Connection: close (and HTTP/1.0 close-by-default)
-	// by signaling the connection loop via errCloseAfterAction. http.ReadResponse
-	// populates resp.Close from the wire-level signals (Connection: close on
-	// HTTP/1.1, default-close on HTTP/1.0). SPEC §5.3 / SPEC §10 #3 settled.
-	// REVIEW.md I-1 from REVIEW.md 04527eb.
-	if resp.Close {
-		return resp.StatusCode, errCloseAfterAction
-	}
-	return resp.StatusCode, nil
 }
 
 // Compile-time interface conformance assertions. *Filter must satisfy both

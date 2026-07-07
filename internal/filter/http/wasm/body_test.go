@@ -394,3 +394,72 @@ func TestBody_DecodeData_NilCfg_PassesThrough(t *testing.T) {
 		t.Errorf("EncodeData (nil cfg) = %v; want DataContinue", got)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Per-route effective config: cap + stats must bind to f.eff, not f.cfg.
+// -----------------------------------------------------------------------------
+
+// TestBody_DecodeData_PerRouteOverride_UsesEffectiveConfig asserts that when
+// a per-route override is active (f.eff resolved at DecodeHeaders), body-cap
+// enforcement uses the OVERRIDE's cap and the body_buffer_cap_exceeded /
+// envoy_go.failures counters increment on the OVERRIDE plugin's stat scope —
+// not the listener config's (which `executions` already bound to correctly;
+// pre-fix the body path read f.cfg for both).
+func TestBody_DecodeData_PerRouteOverride_UsesEffectiveConfig(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	// Listener config: generous 1 MiB cap. Per-route override: tiny 8-byte cap.
+	listener := newBodyTestCompiledConfig(t, 1<<20, "plugin_listener", reg)
+	override := newBodyTestCompiledConfig(t, 8, "plugin_route", reg)
+	rdcb := &recordingDecoderCbCap{}
+	f := &filter{cfg: listener, eff: override, decoderCb: rdcb}
+
+	// 16-byte chunk: exceeds the override's 8-byte cap but NOT the
+	// listener's 1 MiB cap — pre-fix this passed through untouched.
+	chunk := make([]byte, 16)
+	if got := f.DecodeData(chunk, false); got != envoyhttp.DataStopIterationNoBuffer {
+		t.Fatalf("DecodeData over override cap = %v; want DataStopIterationNoBuffer (override cap must apply)", got)
+	}
+	if !f.decodeBodyCapExceeded {
+		t.Error("decodeBodyCapExceeded = false; want true (override's 8-byte cap exceeded)")
+	}
+	if rdcb.calls != 1 || rdcb.lastStatus != 413 {
+		t.Errorf("SendLocalReply calls=%d status=%d; want 1 call with 413", rdcb.calls, rdcb.lastStatus)
+	}
+
+	// Counters land on the OVERRIDE plugin's scope...
+	if got := findStatCounterValue(reg, "wasm.plugin_route.body_buffer_cap_exceeded"); got != 1 {
+		t.Errorf("wasm.plugin_route.body_buffer_cap_exceeded = %d; want 1", got)
+	}
+	if got := findStatCounterValue(reg, "wasm.plugin_route.envoy_go.failures"); got != 1 {
+		t.Errorf("wasm.plugin_route.envoy_go.failures = %d; want 1", got)
+	}
+	// ...and NOT on the listener plugin's scope.
+	if got := findStatCounterValue(reg, "wasm.plugin_listener.body_buffer_cap_exceeded"); got != 0 {
+		t.Errorf("wasm.plugin_listener.body_buffer_cap_exceeded = %d; want 0 (wrong plugin scope)", got)
+	}
+	if got := findStatCounterValue(reg, "wasm.plugin_listener.envoy_go.failures"); got != 0 {
+		t.Errorf("wasm.plugin_listener.envoy_go.failures = %d; want 0 (wrong plugin scope)", got)
+	}
+}
+
+// TestBody_EncodeData_PerRouteOverride_UsesEffectiveConfig mirrors the
+// decode-side per-route assertion for EncodeData.
+func TestBody_EncodeData_PerRouteOverride_UsesEffectiveConfig(t *testing.T) {
+	t.Parallel()
+	reg := stats.NewRegistry()
+	listener := newBodyTestCompiledConfig(t, 1<<20, "plugin_enc_listener", reg)
+	override := newBodyTestCompiledConfig(t, 8, "plugin_enc_route", reg)
+	f := &filter{cfg: listener, eff: override}
+
+	chunk := make([]byte, 16)
+	if got := f.EncodeData(chunk, false); got != envoyhttp.DataStopIterationNoBuffer {
+		t.Fatalf("EncodeData over override cap = %v; want DataStopIterationNoBuffer (override cap must apply)", got)
+	}
+	if got := findStatCounterValue(reg, "wasm.plugin_enc_route.body_buffer_cap_exceeded"); got != 1 {
+		t.Errorf("wasm.plugin_enc_route.body_buffer_cap_exceeded = %d; want 1", got)
+	}
+	if got := findStatCounterValue(reg, "wasm.plugin_enc_listener.body_buffer_cap_exceeded"); got != 0 {
+		t.Errorf("wasm.plugin_enc_listener.body_buffer_cap_exceeded = %d; want 0 (wrong plugin scope)", got)
+	}
+}

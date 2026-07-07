@@ -1,6 +1,9 @@
 package thriftproxy
 
-import "github.com/pgdad/envoy-go/internal/stats"
+import (
+	"github.com/pgdad/envoy-go/internal/filter/network/statroster"
+	"github.com/pgdad/envoy-go/internal/stats"
+)
 
 // counterSuffixes is the fixed 24-counter roster under thrift.<stat_prefix>.
 // Pinned name-for-name against ALL_THRIFT_FILTER_STATS + the 5 router counters
@@ -50,19 +53,16 @@ type thriftStats struct {
 // under thrift.<statPrefix>. so the differential /stats scrape sees them present-
 // at-0 even when never incremented.
 func newThriftStats(reg *stats.Registry, statPrefix string) *thriftStats {
-	ts := &thriftStats{
-		prefix:   "thrift." + statPrefix + ".",
-		counters: make(map[string]*stats.Counter, len(counterSuffixes)),
+	prefix := "thrift." + statPrefix + "."
+	return &thriftStats{
+		prefix:   prefix,
+		counters: statroster.New(reg, prefix, counterSuffixes),
+		active:   reg.NewGaugeIfAbsent(prefix + "request_active"),
 	}
-	for _, suf := range counterSuffixes {
-		ts.counters[suf] = reg.NewCounterIfAbsent(ts.prefix + suf)
-	}
-	ts.active = reg.NewGaugeIfAbsent(ts.prefix + "request_active")
-	return ts
 }
 
 // inc increments the roster counter for suf (the Task-8 pump's classify verdicts).
-func (ts *thriftStats) inc(suf string) { ts.counters[suf].Inc() }
+func (ts *thriftStats) inc(suf string) { statroster.Inc("thriftproxy", ts.counters, suf) }
 
 // incActive / decActive drive the request_active gauge (request-received /
 // reply-sent in the Task-8 pump).

@@ -30,18 +30,19 @@ import (
 const namespacePrefix = "wasmcustom"
 
 // -----------------------------------------------------------------------------
-// User-name validation — mirrors parent stats.nameRE but is local to the
-// dynamic-stats package so the proxy-wasm guest's raw user name can be
-// validated at the boundary before composing the full underlying stats
-// name. Parent stats.nameRE rejects empty + leading-dot + trailing-dot +
+// User-name validation — the parent stats package's pattern, compiled
+// locally so the proxy-wasm guest's raw user name can be validated at the
+// boundary before composing the full underlying stats name. Parent
+// stats.NamePattern rejects empty + leading-dot + trailing-dot +
 // non-alphanumeric-non-underscore-non-dot.
 // -----------------------------------------------------------------------------
 
 // userNameRE is the validation regex applied to every user-supplied
-// custom name at Register. Matches parent stats.IsValidName's regex:
-// ASCII-letter-or-underscore prefix followed by ASCII-alphanumerics,
-// underscores, and dots; trailing dot rejected.
-var userNameRE = regexp.MustCompile(`^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$`)
+// custom name at Register: the parent stats.NamePattern (the SAME regex
+// stats.IsValidName enforces — one definition, no drift): ASCII-letter-or-
+// underscore prefix followed by ASCII-alphanumerics, underscores, and
+// dots; trailing dot rejected.
+var userNameRE = regexp.MustCompile(stats.NamePattern)
 
 // -----------------------------------------------------------------------------
 // Public types per 25.2 SPEC §3.3.

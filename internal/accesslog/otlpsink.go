@@ -205,7 +205,9 @@ func (s *OTLPAccessLogSink) run() {
 			}
 			lr := buildLogRecord(rec, s.body, s.attrs)
 			buf = append(buf, lr)
-			bufBytes += proto.Size(lr)
+			if s.bufferSizeBytes > 0 { // skip the proto.Size walk when the accumulated size is never consulted
+				bufBytes += proto.Size(lr)
+			}
 			if bufBytes >= s.bufferSizeBytes { // SIZE trigger; 0 ⇒ every record flushes
 				flush()
 			}

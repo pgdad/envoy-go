@@ -2542,14 +2542,56 @@ func TestStatsNamespace_RequestCountersRegisteredAtZero(t *testing.T) {
 	}
 }
 
-// TestStatsNamespace_NilRegistry_ReturnsNil verifies the nil-tolerance contract
-// per ADR-0085 nil-tolerance pattern (referenced from newFilterStats doc): when
-// reg == nil, newFilterStats returns nil (caller's responsibility to guard).
-// Documents the test-code path for non-stat-bearing test scenarios that may
-// still want to exercise the production newFilterStats without a real registry.
-func TestStatsNamespace_NilRegistry_ReturnsNil(t *testing.T) {
-	if fs := newFilterStats(nil, "ingress_p14", "text_optimized"); fs != nil {
-		t.Errorf("newFilterStats(nil, ...) = %+v; want nil", fs)
+// TestStatsNamespace_NilRegistry_ReturnsEmptyStruct verifies the nil-tolerance
+// contract per ADR-0085 nil-tolerance pattern (referenced from newFilterStats
+// doc): when reg == nil, newFilterStats returns a non-nil all-nil-fields
+// *filterStats (matching fault's registerFaultStats shape) so the
+// EncodeHeaders/EncodeData counter blocks' unconditional f.stats.<Field>
+// selections stay panic-free; incCounter's per-counter nil-guard absorbs the
+// Inc calls.
+func TestStatsNamespace_NilRegistry_ReturnsEmptyStruct(t *testing.T) {
+	fs := newFilterStats(nil, "ingress_p14", "text_optimized")
+	if fs == nil {
+		t.Fatal("newFilterStats(nil, ...) = nil; want non-nil all-nil-fields struct")
+	}
+	if fs.NoAcceptHeader != nil || fs.ResponseCompressed != nil {
+		t.Errorf("newFilterStats(nil, ...) = %+v; want all-nil fields", fs)
+	}
+}
+
+// TestNilStatsRegistry_RequestDoesNotPanic drives a full
+// DecodeHeaders→EncodeHeaders→EncodeData cycle through a filter built by New
+// with a nil ctx.Stats. Before newFilterStats returned the all-nil-fields
+// struct, EncodeHeaders panicked on the f.stats.<Field> selection of the nil
+// *filterStats — contradicting the documented ADR-0085 nil-tolerance contract
+// in the incCounter comment.
+func TestNilStatsRegistry_RequestDoesNotPanic(t *testing.T) {
+	cfg := newGzipCompressor(t, &gzipv3.Gzip{}, &compressorv3.Compressor_ResponseDirectionConfig{}, "text_optimized")
+	factory, err := New(mustAny(t, cfg), envoyhttp.FactoryCtx{}) // Stats: nil
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	hf := factory()
+	f := hf.Encoder.(*filter)
+	reqHeaders := http.Header{"Accept-Encoding": []string{"gzip"}}
+	if st := f.DecodeHeaders(reqHeaders, true); st != envoyhttp.Continue {
+		t.Fatalf("DecodeHeaders = %v; want Continue", st)
+	}
+	respHeaders := http.Header{"Content-Type": []string{"text/html"}}
+	if st := f.EncodeHeaders(respHeaders, false); st != envoyhttp.Continue {
+		t.Fatalf("EncodeHeaders = %v; want Continue", st)
+	}
+	if !f.willCompress {
+		t.Fatal("expected willCompress=true on compress path")
+	}
+	cb := &fakeCallbacks{}
+	f.SetEncoderCallbacks(cb)
+	body := bytes.Repeat([]byte("nil-stats body payload "), 8)
+	if st := f.EncodeData(body, true); st != envoyhttp.DataContinue {
+		t.Fatalf("EncodeData = %v; want DataContinue", st)
+	}
+	if cb.overwriteBodyCallCount != 1 {
+		t.Fatalf("OverwriteBody calls = %d; want 1", cb.overwriteBodyCallCount)
 	}
 }
 
@@ -2572,6 +2614,196 @@ func TestStatsNamespace_NewFactoryRegistersAllSeventeen(t *testing.T) {
 	for _, name := range stats17ExpectedNames("ingress_p14", "text_optimized") {
 		if !registryHasCounter(reg, name) {
 			t.Errorf("counter %q NOT registered after New", name)
+		}
+	}
+}
+
+// --- Pooled gzip.Writer output equivalence (maintenance pass 2026-07-07) ---
+
+// TestEncodeData_PooledWriterOutputByteIdentical verifies that the sync.Pool
+// reuse of *gzip.Writer cannot change the compressed output bytes:
+// gzip.Writer.Reset is documented to make the writer equivalent to a fresh
+// NewWriterLevel result at the same level. Two filters sharing one
+// compiledConfig compress the same body — the first acquire constructs a
+// fresh writer (and releases it into the pool); the second acquire Resets the
+// pooled writer. Both outputs must be byte-identical to each other AND to a
+// from-scratch gzip.NewWriterLevel run.
+func TestEncodeData_PooledWriterOutputByteIdentical(t *testing.T) {
+	for _, level := range []int{-1, 1, 6, 9} {
+		cc := defaultCompiledConfig()
+		cc.gzip = &compiledGzipConfig{level: level}
+		body := bytes.Repeat([]byte("pooled-writer equivalence payload 0123456789 "), 32)
+
+		// Reference: fresh writer, no pooling.
+		var want bytes.Buffer
+		w, err := gzip.NewWriterLevel(&want, level)
+		if err != nil {
+			t.Fatalf("level %d: NewWriterLevel: %v", level, err)
+		}
+		if _, err := w.Write(body); err != nil {
+			t.Fatalf("level %d: Write: %v", level, err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("level %d: Close: %v", level, err)
+		}
+
+		// First pass: pool is empty → acquireWriter constructs fresh, then
+		// releases the writer into the pool.
+		f1, cb1 := freshEncodeDataFilter(t, cc)
+		f1.willCompress = true
+		if st := f1.EncodeData(body, true); st != envoyhttp.DataContinue {
+			t.Fatalf("level %d: first EncodeData = %v; want DataContinue", level, st)
+		}
+		if cb1.overwriteBodyCallCount != 1 {
+			t.Fatalf("level %d: first OverwriteBody calls = %d; want 1", level, cb1.overwriteBodyCallCount)
+		}
+		// Second pass: shares cc → acquireWriter Resets the pooled writer.
+		f2, cb2 := freshEncodeDataFilter(t, cc)
+		f2.willCompress = true
+		if st := f2.EncodeData(body, true); st != envoyhttp.DataContinue {
+			t.Fatalf("level %d: second EncodeData = %v; want DataContinue", level, st)
+		}
+		if cb2.overwriteBodyCallCount != 1 {
+			t.Fatalf("level %d: second OverwriteBody calls = %d; want 1", level, cb2.overwriteBodyCallCount)
+		}
+
+		if !bytes.Equal(cb1.overwriteBodyCalls[0], want.Bytes()) {
+			t.Errorf("level %d: fresh-acquire output differs from reference writer output", level)
+		}
+		if !bytes.Equal(cb2.overwriteBodyCalls[0], want.Bytes()) {
+			t.Errorf("level %d: pooled-acquire output differs from reference writer output", level)
+		}
+	}
+}
+
+// TestAcquireWriter_ResetReuseByteIdentical pins the property the pool relies
+// on, without depending on sync.Pool handing back the same instance (under
+// -race the runtime deliberately randomizes pool reuse): a writer that
+// already compressed one body and is then Reset onto a fresh buffer — the
+// exact acquireWriter reuse path — produces output byte-identical to a fresh
+// gzip.NewWriterLevel writer.
+func TestAcquireWriter_ResetReuseByteIdentical(t *testing.T) {
+	g := &compiledGzipConfig{level: 6}
+	body := bytes.Repeat([]byte("reset-equivalence payload "), 16)
+
+	var first bytes.Buffer
+	w, err := g.acquireWriter(&first)
+	if err != nil {
+		t.Fatalf("acquireWriter: %v", err)
+	}
+	if _, err := w.Write(body); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reuse path: Reset the used writer onto a fresh buffer (what
+	// acquireWriter does with a pooled writer) and compress the same body.
+	var reused bytes.Buffer
+	w.Reset(&reused)
+	if _, err := w.Write(body); err != nil {
+		t.Fatalf("Write (reused): %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close (reused): %v", err)
+	}
+
+	var fresh bytes.Buffer
+	fw, err := gzip.NewWriterLevel(&fresh, 6)
+	if err != nil {
+		t.Fatalf("NewWriterLevel: %v", err)
+	}
+	if _, err := fw.Write(body); err != nil {
+		t.Fatalf("Write (fresh): %v", err)
+	}
+	if err := fw.Close(); err != nil {
+		t.Fatalf("Close (fresh): %v", err)
+	}
+
+	if !bytes.Equal(reused.Bytes(), fresh.Bytes()) {
+		t.Error("Reset-reused writer output differs from fresh writer output")
+	}
+	if !bytes.Equal(first.Bytes(), fresh.Bytes()) {
+		t.Error("first-use writer output differs from fresh writer output")
+	}
+}
+
+// --- Late min_content_length gate: uint64 widening (maintenance pass) ---
+
+// TestBelowMinContentLength_NoUint32Wrap verifies the late gate compares at
+// uint64 width: a body of 2^32+5 bytes used to wrap to uint32(5) < 30 and
+// spuriously skip compression AFTER EncodeHeaders had already set
+// Content-Encoding: gzip (declared-encoding/body mismatch on the wire).
+func TestBelowMinContentLength_NoUint32Wrap(t *testing.T) {
+	const huge = int(1<<32 + 5) // wraps to 5 under uint32 truncation
+	if belowMinContentLength(huge, defaultMinContentLength) {
+		t.Errorf("belowMinContentLength(2^32+5, 30) = true; uint32 wrap regressed")
+	}
+	if !belowMinContentLength(5, defaultMinContentLength) {
+		t.Errorf("belowMinContentLength(5, 30) = false; want true")
+	}
+	if belowMinContentLength(30, defaultMinContentLength) {
+		t.Errorf("belowMinContentLength(30, 30) = true; want false (>= threshold compresses)")
+	}
+}
+
+// TestComputeSkipReason_Bucket11_ContentLengthBeyond32Bits pins the bitSize-64
+// Content-Length parse: a CL ≥ 2^32 is "large" (compress path), matching the
+// pre-change outcome where the 32-bit parse error also fell through — the
+// widened parse keeps the classification on the parse-success path.
+func TestComputeSkipReason_Bucket11_ContentLengthBeyond32Bits(t *testing.T) {
+	cc := defaultCompiledConfig()
+	headers := http.Header{
+		"Content-Type":   []string{"text/html"},
+		"Content-Length": []string{"4294967301"}, // 2^32 + 5
+	}
+	if got := computeSkipReason(headers, cc, "compressor_used", "gzip", false); got != "" {
+		t.Errorf("skipReason = %q; want \"\" (compress path) for CL >= 2^32", got)
+	}
+}
+
+// --- ETag string-check helpers replacing the anchored regexes ---
+
+// TestEtagHelpers_MatchFormerRegexSemantics pins isStrongEtag/isWeakEtag
+// against the exact language of the former `^"[^"]*"$` / `^W/"[^"]*"$`
+// patterns so the regex→string-check swap stays byte-identical in behavior.
+func TestEtagHelpers_MatchFormerRegexSemantics(t *testing.T) {
+	cases := []struct {
+		v      string
+		strong bool
+		weak   bool
+	}{
+		{`"abc123"`, true, false},
+		{`""`, true, false}, // empty quoted string is a valid strong validator
+		{`W/"abc123"`, false, true},
+		{`W/""`, false, true},
+		{`abc123`, false, false},     // unquoted
+		{`"abc`, false, false},       // missing closing quote
+		{`abc"`, false, false},       // missing opening quote
+		{`"`, false, false},          // single quote (regex required both anchors)
+		{`"a"b"`, false, false},      // interior quote violates [^"]*
+		{`W/"a"b"`, false, false},    // interior quote in weak form
+		{`w/"abc"`, false, false},    // lowercase w/ is not a weak validator
+		{`W/abc`, false, false},      // weak prefix without quotes
+		{`W/`, false, false},         // bare prefix
+		{` "abc"`, false, false},     // leading space breaks the ^ anchor
+		{`"abc" `, false, false},     // trailing space breaks the $ anchor
+		{`W/ "abc"`, false, false},   // space after W/ breaks the pattern
+		{`"abc""def"`, false, false}, // two quoted strings
+		{`W/W/"abc"`, false, false},  // double prefix
+		{`"W/abc"`, true, false},     // W/ inside quotes is a strong validator
+		{`"abc\"def"`, false, false}, // backslash does not escape in the regex language
+		{`"日本語"`, true, false},       // non-ASCII interior bytes were fine under [^"]*
+		{`W/"日本語"`, false, true},     // same for the weak form
+		{``, false, false},           // empty string
+	}
+	for _, c := range cases {
+		if got := isStrongEtag(c.v); got != c.strong {
+			t.Errorf("isStrongEtag(%q) = %v; want %v", c.v, got, c.strong)
+		}
+		if got := isWeakEtag(c.v); got != c.weak {
+			t.Errorf("isWeakEtag(%q) = %v; want %v", c.v, got, c.weak)
 		}
 	}
 }

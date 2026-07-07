@@ -15,11 +15,12 @@ const (
 	StateLive State = iota
 	// StateDraining is the post-Drain() state. The proxy rejects new
 	// connections via accept-then-FIN; in-flight requests complete normally.
+	//
+	// There is deliberately no "drained" State value: the post-rendezvous
+	// condition is NOT exposed via State() per SPEC §5.9 design — it is
+	// observable only via the Done() channel close. State() continues to
+	// return StateDraining post-rendezvous.
 	StateDraining
-	// StateDrained is the post-rendezvous state. NOT publicly exposed via
-	// State() per SPEC §5.9 design; observable only via Done() channel
-	// close. State() continues to return StateDraining post-rendezvous.
-	StateDrained
 )
 
 // Manager is the drain-state machine. Allocated once at boot per phase 08.2
@@ -56,8 +57,8 @@ func New(timeout time.Duration) *Manager {
 }
 
 // State atomically loads the current state. Lock-free. Returns StateLive or
-// StateDraining (StateDrained is NOT publicly exposed via this method per
-// SPEC §5.9).
+// StateDraining (the post-rendezvous "drained" condition is NOT exposed via
+// this method per SPEC §5.9; observe it via Done() instead).
 func (m *Manager) State() State {
 	return State(m.state.Load())
 }

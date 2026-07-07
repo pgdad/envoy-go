@@ -3,20 +3,17 @@ package lua
 // compile_test.go — Task 4 full IMPL tests per 22.1 PLAN Task 4 +
 // 22.1 SPEC §3.1 production discipline. Covers cache hit-on-same-
 // content-hash + cache-miss-on-different-source + nil-cache nil-
-// tolerance per ADR-0085 + content-hash identity (sha256 verified
-// against an independent crypto/sha256 computation) + compile-error
-// PARSE-REJECT-equivalent wording-prefix discipline (`"lua compile: "`
-// prefix; the actual filter at Task 2 wraps with `"lua:
-// default_source_code: compile: %w"` for arm 16 — this lower-level
-// IMPL only stamps the framework-primitive prefix).
+// tolerance per ADR-0085 + compile-error PARSE-REJECT-equivalent
+// wording-prefix discipline (`"lua compile: "` prefix; the actual
+// filter at Task 2 wraps with `"lua: default_source_code: compile:
+// %w"` for arm 16 — this lower-level IMPL only stamps the
+// framework-primitive prefix).
 //
 // Concurrent-read/add tests are DEFERRED to Task 12 per 22.1 PLAN
 // Step 12 + 22.1 SPEC §6 Task 12 (race + `-race` flag concurrency
 // coverage lands there with N=100 goroutines).
 
 import (
-	"bytes"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -171,23 +168,6 @@ func TestCompileScript_NilCache_ErrorPath(t *testing.T) {
 	}
 }
 
-// TestCompileScript_HashIdentity pins the content-hash semantics:
-// the *Chunk's hash field MUST equal sha256(src) computed
-// independently via crypto/sha256. Verifies sha256(src) is the cache
-// key (not fnv-1a or md5 or any other digest).
-func TestCompileScript_HashIdentity(t *testing.T) {
-	src := []byte("return 42")
-	chunk, err := CompileScript(src, nil)
-	if err != nil {
-		t.Fatalf("CompileScript err = %v; want nil", err)
-	}
-	want := sha256.Sum256(src)
-	got := chunkHash(chunk)
-	if !bytes.Equal(want[:], got[:]) {
-		t.Fatalf("Chunk hash = %x; want sha256(src) = %x", got, want)
-	}
-}
-
 // TestCompileScript_CacheHit_AcrossDistinctByteSlicesWithSameContent
 // pins the content-addressed (not identity-addressed) cache semantics:
 // two CompileScript calls with byte-slice-DISTINCT-but-content-equal
@@ -235,13 +215,12 @@ func TestCompileScript_CompileError_WrapsUnderlyingErrorViaPercentW(t *testing.T
 	}
 }
 
-// chunkProto + chunkHash are test-only accessors for the unexported
-// Chunk fields. Defined in compile_test.go (same-package _test.go)
-// where test code may legitimately reach into unexported fields of
-// production types — keeps the production API surface clean while
-// permitting field-level test assertions.
+// chunkProto is a test-only accessor for the unexported Chunk proto
+// field. Defined in compile_test.go (same-package _test.go) where test
+// code may legitimately reach into unexported fields of production
+// types — keeps the production API surface clean while permitting
+// field-level test assertions.
 func chunkProto(c *Chunk) interface{} { return c.proto }
-func chunkHash(c *Chunk) [32]byte     { return c.hash }
 
 // ----------------------------------------------------------------------
 // Task 12 — CompileCache concurrent read/add tests per 22.1 PLAN Task 12

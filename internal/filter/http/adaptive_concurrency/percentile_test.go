@@ -147,3 +147,27 @@ func TestPercentile_SortedSlice_100Sample_Linear(t *testing.T) {
 		t.Errorf("Quantile([1..100]ns, 0.5) = %v; want 50ns (idx=49)", got)
 	}
 }
+
+// TestQuantileInPlace_MatchesQuantile verifies the in-place production
+// variant returns the same value as the exported copy-first Quantile for a
+// spread of sample shapes + percentiles (maintenance-pass item: the two
+// gradientController call sites use quantileInPlace since they reset the
+// source slice immediately after aggregating).
+func TestQuantileInPlace_MatchesQuantile(t *testing.T) {
+	cases := [][]time.Duration{
+		nil,
+		{7 * time.Millisecond},
+		{5 * time.Millisecond, 1 * time.Millisecond, 3 * time.Millisecond},
+		{40 * time.Millisecond, 60 * time.Millisecond, 80 * time.Millisecond, 20 * time.Millisecond},
+	}
+	for _, p := range []float64{-0.5, 0, 0.5, 0.95, 1, 2} {
+		for _, samples := range cases {
+			want := Quantile(samples, p) // computes on a copy; samples untouched
+			in := make([]time.Duration, len(samples))
+			copy(in, samples)
+			if got := quantileInPlace(in, p); got != want {
+				t.Errorf("quantileInPlace(%v, %v) = %v; Quantile = %v", samples, p, got, want)
+			}
+		}
+	}
+}

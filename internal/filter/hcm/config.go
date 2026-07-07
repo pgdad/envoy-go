@@ -511,10 +511,19 @@ func buildPerRouteFromHCM(rc *routev3.RouteConfiguration, chainNames []string, h
 	// one vhost so the per-route scopes vector is well-shaped for ADR-0073's
 	// 3-tier merge cache.
 	var scopes []filter_http.RouteScope
-	for _, vh := range rc.GetVirtualHosts() {
+	for vhIdx, vh := range rc.GetVirtualHosts() {
 		vhMap := vh.GetTypedPerFilterConfig()
-		for _, r := range vh.GetRoutes() {
-			scopes = append(scopes, filter_http.RouteScope{VHost: vhMap, Route: r.GetTypedPerFilterConfig()})
+		for rIdx, r := range vh.GetRoutes() {
+			// VHostIndex/RouteIndex feed BuildPerRouteConfig's boot-error
+			// location strings — the real (vhost, route) coordinates, not the
+			// flat scope index (which misreported both for any vhost with
+			// more than one route).
+			scopes = append(scopes, filter_http.RouteScope{
+				VHost:      vhMap,
+				Route:      r.GetTypedPerFilterConfig(),
+				VHostIndex: vhIdx,
+				RouteIndex: rIdx,
+			})
 		}
 	}
 	hasAny := len(rcMap) > 0

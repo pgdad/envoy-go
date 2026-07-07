@@ -198,6 +198,12 @@ func TestParseHealthChecks(t *testing.T) {
 	noUnhealthy.UnhealthyThreshold = nil
 	noHealthy := withHTTP(baseHC(), "/h")
 	noHealthy.HealthyThreshold = nil
+	zeroInterval := withHTTP(baseHC(), "/h")
+	zeroInterval.Interval = durationpb.New(0)
+	zeroTimeout := withHTTP(baseHC(), "/h")
+	zeroTimeout.Timeout = durationpb.New(0)
+	negInterval := withHTTP(baseHC(), "/h")
+	negInterval.Interval = durationpb.New(-time.Second)
 
 	tests := []struct {
 		name    string
@@ -210,6 +216,11 @@ func TestParseHealthChecks(t *testing.T) {
 		{"no_timeout", noTimeout, "health_check: timeout is required"},
 		{"no_unhealthy_threshold", noUnhealthy, "health_check: unhealthy_threshold is required"},
 		{"no_healthy_threshold", noHealthy, "health_check: healthy_threshold is required"},
+		// PGV gt:0s parity: a 0s interval would panic time.NewTicker at
+		// StartHealthChecks; a 0s timeout dials unbounded.
+		{"zero_interval", zeroInterval, "health_check: interval: value must be greater than 0s"},
+		{"zero_timeout", zeroTimeout, "health_check: timeout: value must be greater than 0s"},
+		{"negative_interval", negInterval, "health_check: interval: value must be greater than 0s"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -545,6 +556,60 @@ func TestLazyUneject(t *testing.T) {
 	}
 	if ch.ejectionsActive.Load() != 0 {
 		t.Fatalf("gauge = %d after second isEjected, want 0 (no double-dec)", ch.ejectionsActive.Load())
+	}
+}
+
+// TestAvailable_LazyUnejects proves the fused single-lookup available performs
+// the same lazy un-eject as isEjected: past the deadline it clears the flag and
+// decrements ejections_active exactly once.
+func TestAvailable_LazyUnejects(t *testing.T) {
+	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}}
+	ch := newClusterHealth(eps, 0.5)
+	reg := stats.NewRegistry()
+	ch.ejectionsActive = reg.NewGauge("ejections_active")
+	base := int64(2_000_000_000)
+	uneject := base + int64(30*time.Second)
+	now := base
+	ch.nowNanos = func() int64 { return now }
+	h := ch.states["10.0.0.1:80"]
+	h.ejected.Store(true)
+	h.unejectAtNanos.Store(uneject)
+	ch.ejectionsActive.Inc()
+
+	if ch.available(eps[0]) {
+		t.Fatal("ejected host must be unavailable before the deadline")
+	}
+	now = uneject
+	if !ch.available(eps[0]) {
+		t.Fatal("available must lazily un-eject at/after the deadline")
+	}
+	if h.ejected.Load() {
+		t.Fatal("ejected flag must clear on lazy un-eject via available")
+	}
+	if got := ch.ejectionsActive.Load(); got != 0 {
+		t.Fatalf("ejections_active = %d after available's lazy un-eject, want 0", got)
+	}
+}
+
+// TestAvailable_UnhealthyShortCircuitsEjectionCheck pins the load-bearing
+// ordering of available: an active-HC-unhealthy host returns false WITHOUT
+// evaluating the ejection state, so its lazy un-eject stays deferred (the
+// pre-fusion isHealthy && !isEjected short-circuit).
+func TestAvailable_UnhealthyShortCircuitsEjectionCheck(t *testing.T) {
+	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}}
+	ch := newClusterHealth(eps, 0.5)
+	now := int64(3_000_000_000)
+	ch.nowNanos = func() int64 { return now }
+	h := ch.states["10.0.0.1:80"]
+	h.healthy.Store(false)
+	h.ejected.Store(true)
+	h.unejectAtNanos.Store(now - 1) // deadline already elapsed
+
+	if ch.available(eps[0]) {
+		t.Fatal("unhealthy host must be unavailable")
+	}
+	if !h.ejected.Load() {
+		t.Fatal("available must NOT lazily un-eject an unhealthy host (short-circuit ordering)")
 	}
 }
 

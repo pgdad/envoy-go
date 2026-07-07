@@ -193,12 +193,14 @@ func TestTick_PeriodCancellation(t *testing.T) {
 	rv.SetTickPeriod(0) // CANCEL
 	before := fires.Load()
 
-	// After cancel, the tick goroutine has exited (SetTickPeriod(0) waits
-	// on the WaitGroup). FakeClock.PendingLen should drop to 0 (the
-	// goroutine's pending After is orphaned — it never gets fired because
-	// nobody reads the channel, but it stays in the pending list until
-	// the next Advance covers its deadline). Advance to clear + assert no
+	// After cancel, the tick goroutine exits on its own (SetTickPeriod no
+	// longer joins — the deadlock fix; join for determinism before the
+	// no-more-fires assertion). Even if the goroutine had consumed a
+	// pending After fire before observing the closed stop channel, the
+	// stale-generation check in lockAndDispatchTick suppresses the
+	// dispatch. Advance to clear any orphaned pending After + assert no
 	// more fires.
+	rv.tickWG.Wait()
 	fc.Advance(500 * time.Millisecond) // would fire 10 times if not canceled
 	time.Sleep(20 * time.Millisecond)
 	if got := fires.Load(); got != before {
@@ -227,6 +229,12 @@ func TestTick_RescheduleWithNewPeriod(t *testing.T) {
 	// the select). Cancel + drain the orphan first so the next
 	// SetTickPeriod(10ms) starts from a clean slate.
 	rv.SetTickPeriod(0)
+	// SetTickPeriod no longer joins the old goroutine (the deadlock fix) —
+	// join explicitly so the pending-entry accounting below is
+	// deterministic (the old goroutine registers its next After inside the
+	// select; an un-joined goroutine could register AFTER our PendingLen
+	// probe).
+	rv.tickWG.Wait()
 	// Advance past the orphan's deadline (100ms = 50ms more from current
 	// 50ms) so the orphan's pending After-entry drains. The send fires into
 	// a buffered (cap=1) channel that nobody reads; the channel becomes
@@ -398,6 +406,61 @@ func TestTick_ClosesAtRootVMClose(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close did NOT return within 5s (tick goroutine likely leaked or deadlocked at Close)")
+	}
+}
+
+// --- TestTick_RearmFromInsideTickDispatch ---------------------------------
+
+// TestTick_RearmFromInsideTickDispatch: the tick handler re-arms the tick
+// (SetTickPeriod with a NEW period) from INSIDE the dispatchMu-held tick
+// dispatch frame — the standard proxy-wasm one-shot-timer pattern (a guest
+// calling proxy_set_tick_period_milliseconds from proxy_on_tick takes this
+// exact path: the abi shim runs inside the tick goroutine's own dispatch
+// frame).
+//
+// Before the deadlock fix, SetTickPeriod closed the stop channel and then
+// tickWG.Wait()ed — waiting on the calling tick goroutine's OWN Done, a
+// guaranteed self-deadlock: the first tick would never complete, no
+// subsequent tick could fire, and Close would hang forever. This test
+// asserts (a) the re-arm returns (fires reaches 1 within the bounded wait)
+// and (b) the NEW period's goroutine dispatches the next tick.
+func TestTick_RearmFromInsideTickDispatch(t *testing.T) {
+	fc := clock.NewFakeClock(time.Unix(0, 0))
+	var fires atomic.Uint64
+	var rv *RootVM
+	handler := func() {
+		if fires.Add(1) == 1 {
+			// One-shot re-arm from inside the tick dispatch frame.
+			rv.SetTickPeriod(20 * time.Millisecond)
+		}
+	}
+	rv = newRootVMForTick(t, fc, WithRootTickHandler(handler))
+	h := &fakeClockHelper{fc: fc}
+
+	rv.SetTickPeriod(10 * time.Millisecond)
+	h.waitForPending(t, 1, 1*time.Second)
+
+	// First tick: the handler re-arms to 20ms from inside the dispatch.
+	// With the pre-fix self-deadlock this wait times out (the dispatch
+	// never returns).
+	fc.Advance(10 * time.Millisecond)
+	waitForTickInvocations(t, fires.Load, 1, 5*time.Second)
+
+	// The superseded 10ms goroutine exits on its own; the NEW 20ms
+	// goroutine must be the live one. Both the orphan's final After(10ms)
+	// registration and the new goroutine's first After(20ms) registration
+	// race with this test goroutine, so advance in 20ms steps until the
+	// second fire lands (each step covers a 20ms entry registered at any
+	// earlier instant). The superseded goroutine cannot produce the fire —
+	// its stale stop snapshot fails the generation check in
+	// lockAndDispatchTick.
+	deadline := time.Now().Add(5 * time.Second)
+	for fires.Load() < 2 && time.Now().Before(deadline) {
+		fc.Advance(20 * time.Millisecond)
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := fires.Load(); got < 2 {
+		t.Fatalf("fires = %d; want >= 2 (re-armed 20ms tick never dispatched)", got)
 	}
 }
 

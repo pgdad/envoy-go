@@ -3,6 +3,8 @@ package cluster
 import (
 	"sync"
 	"testing"
+
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 func TestRandom_FollowsDrawExactly(t *testing.T) {
@@ -74,6 +76,52 @@ func TestRandom_DoesNotAvoidHeldEndpoint(t *testing.T) {
 	}
 	for _, rel := range held {
 		rel()
+	}
+}
+
+// TestRandom_HealthAware_PickSequenceUnchanged pins the health-gated pick
+// sequence bit-identically across the panicGate/nextAvailable extraction: one
+// rng draw per pick, forward wrap-scan from the drawn index to the next
+// available host ("b" unhealthy: draw 1 walks to "c").
+func TestRandom_HealthAware_PickSequenceUnchanged(t *testing.T) {
+	e := eps(3)
+	ch := newClusterHealth(e, 0.5)
+	ch.states[e[1].Addr()].healthy.Store(false) // "b" out; 2/3 = 66% > 50% -> no panic
+	r := newRandomWithRNG(e, seqRNG(0, 1, 2, 4))
+	r.health = ch
+	want := []string{"a", "c", "c", "c"} // 0→a; 1→b unhealthy→c; 2→c; 4%3=1→b unhealthy→c
+	for i, w := range want {
+		ep, _, err := r.Pick(0, false, SubsetMatch{}, false)
+		if err != nil {
+			t.Fatalf("pick %d: %v", i, err)
+		}
+		if ep.Host != w {
+			t.Errorf("pick %d: got %q, want %q (health-gated sequence must be unchanged)", i, ep.Host, w)
+		}
+	}
+}
+
+// TestRandom_PanicMode_BlindDraw pins panic mode: below the threshold the pick
+// blindly follows the draw (unhealthy hosts included) and lb_healthy_panic
+// increments once per pick.
+func TestRandom_PanicMode_BlindDraw(t *testing.T) {
+	e := eps(3)
+	ch := newClusterHealth(e, 0.5)
+	reg := stats.NewRegistry()
+	ch.panicCounter = reg.NewCounter("lb_healthy_panic")
+	ch.states[e[0].Addr()].healthy.Store(false)
+	ch.states[e[1].Addr()].healthy.Store(false) // 1/3 = 33% < 50% -> panic
+	r := newRandomWithRNG(e, seqRNG(1))
+	r.health = ch
+	ep, _, err := r.Pick(0, false, SubsetMatch{}, false)
+	if err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	if ep.Host != "b" {
+		t.Errorf("panic-mode pick = %q, want %q (blind draw, unhealthy included)", ep.Host, "b")
+	}
+	if got := ch.panicCounter.Load(); got != 1 {
+		t.Errorf("lb_healthy_panic = %d, want 1", got)
 	}
 }
 

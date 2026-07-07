@@ -557,44 +557,19 @@ func luaToAny(L *lua.LState, lv lua.LValue) any {
 // luaTableToAny detects whether the table is a list-shape (contiguous
 // 1..N integer keys; at least one entry) OR a map-shape (string-keyed
 // OR empty), then dispatches to the appropriate Go-side type. Mirrors
-// the structpb marshaling helper at metadata.go (luaTableToStructpb).
+// the structpb marshaling helper at metadata.go (luaTableToStructpb);
+// shape detection is shared via luaTableListShape (metadata.go). Empty
+// tables fall through to map-shape (Lua has no intrinsic
+// empty-list-vs-empty-map distinction; we prefer map as the default
+// for envoy-go-strict match with the dynamicMetadata helper).
 func luaTableToAny(L *lua.LState, t *lua.LTable) any {
-	// Detect list-shape: at least one numeric 1-indexed key AND every
-	// key is a contiguous integer in [1, N]. Empty tables fall through
-	// to map-shape (Lua has no intrinsic empty-list-vs-empty-map
-	// distinction; we prefer map as the default for envoy-go-strict
-	// match with the dynamicMetadata helper).
-	maxIdx := 0
-	allIntKeys := true
-	hasAnyKey := false
-	t.ForEach(func(k, _ lua.LValue) {
-		hasAnyKey = true
-		if n, ok := k.(lua.LNumber); ok {
-			i := int(n)
-			if float64(i) == float64(n) && i >= 1 {
-				if i > maxIdx {
-					maxIdx = i
-				}
-				return
-			}
+	if isList, maxIdx := luaTableListShape(t); isList {
+		values := make([]any, 0, maxIdx)
+		for i := 1; i <= maxIdx; i++ {
+			lv := t.RawGetInt(i)
+			values = append(values, luaToAny(L, lv))
 		}
-		allIntKeys = false
-	})
-	if hasAnyKey && allIntKeys && maxIdx > 0 {
-		count := 0
-		t.ForEach(func(k, _ lua.LValue) {
-			if _, ok := k.(lua.LNumber); ok {
-				count++
-			}
-		})
-		if count == maxIdx {
-			values := make([]any, 0, maxIdx)
-			for i := 1; i <= maxIdx; i++ {
-				lv := t.RawGetInt(i)
-				values = append(values, luaToAny(L, lv))
-			}
-			return values
-		}
+		return values
 	}
 	// Map-shape (covers empty + hash + mixed-skipping-non-string).
 	out := map[string]any{}

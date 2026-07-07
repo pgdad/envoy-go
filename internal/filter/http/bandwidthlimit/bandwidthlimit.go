@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
 	bandwidthlimitv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/bandwidth_limit/v3"
@@ -82,14 +81,17 @@ type filterStats struct {
 // per-route lazy-resolve time per ADR-0117 post-Freeze idempotency.
 type factoryState struct {
 	listenerRC *compiledConfig
-	perRoute   sync.Map // map[*bandwidthlimitv3.BandwidthLimit]*compiledConfig — per ADR-0117 + IMPL-1 + ADR-0125 §(xi)
-	reg        *stats.Registry
+	// perRoute is the shared generic lazy-cache (Load → build → LoadOrStore,
+	// inherit-listener-on-error) keyed by *BandwidthLimit pointer — per
+	// ADR-0117 + IMPL-1 + ADR-0125 §(xi).
+	perRoute envoyhttp.PerRouteCache[*bandwidthlimitv3.BandwidthLimit, compiledConfig]
+	reg      *stats.Registry
 }
 
 // filter is the per-stream filter instance allocated by the factory closure.
 // State is request-scoped; *factoryState is the closure-captured shared
-// state (immutable post-construction except for the sync.Map lazy-cache;
-// race-safe per sync.Map's contract).
+// state (immutable post-construction except for the PerRouteCache lazy-cache;
+// race-safe per its sync.Map-backed contract).
 //
 // Both decode + encode-side state live on the same struct; ENCODER+DECODER
 // HTTPFilter value pairs the same *filter on both sides per ADR-0135 +
@@ -107,18 +109,24 @@ type filter struct {
 	// Decode-side state (per-stream; populated at DecodeHeaders +
 	// DecodeData per SPEC §6.7). Wired live at Task 4 (this commit); the
 	// requestTimer Stop-races-Fire OnDestroy discipline lands at Task 6.
-	requestRC     *compiledConfig
-	requestActive bool
-	requestBody   []byte
-	requestTimer  *time.Timer
+	//
+	// requestBodyLen is a byte COUNTER, not a buffer: only the accumulated
+	// length feeds the throttle decision (bodyLen + throttleDuration input);
+	// the framework's bodyBuf (connection.go) already holds the actual bytes,
+	// so duplicating them here would double memory per throttled stream.
+	requestRC      *compiledConfig
+	requestActive  bool
+	requestBodyLen int
+	requestTimer   *time.Timer
 
 	// Encode-side state (per-stream; populated at DecodeHeaders cascade +
 	// EncodeData per SPEC §6.8). responseTimer's Stop-races-Fire OnDestroy
-	// discipline lands at Task 6.
-	responseRC     *compiledConfig
-	responseActive bool
-	responseBody   []byte
-	responseTimer  *time.Timer
+	// discipline lands at Task 6. responseBodyLen mirrors requestBodyLen
+	// (length-only accumulator; see the decode-side comment above).
+	responseRC      *compiledConfig
+	responseActive  bool
+	responseBodyLen int
+	responseTimer   *time.Timer
 }
 
 // Statically assert the both-sides interface conformance (matches the
@@ -302,10 +310,9 @@ func parsePerRoute(tc *anypb.Any) (proto.Message, error) {
 
 // resolvePerRouteConfig returns the *compiledConfig for the given resolved
 // per-route TPFC message (returned by f.dcb.RequestRouteConfig() at
-// DecodeHeaders). Mirrors phase-11 resolvePerRouteConfig at
-// internal/filter/http/localratelimit/local_ratelimit.go:305-337 verbatim,
-// with *LocalRateLimit replaced by *BandwidthLimit and buildRuntimeConfig*
-// by buildCompiledConfig*.
+// DecodeHeaders). Shares the phase-11 lazy-cache shape with localratelimit
+// via the generic envoyhttp.PerRouteCache, with *LocalRateLimit replaced by
+// *BandwidthLimit and buildRuntimeConfig* by buildCompiledConfig*.
 //
 // Per ADR-0117 + ADR-0125 §(xi) + ADR-0139 IMPL-1: keyed by
 // *bandwidthlimitv3.BandwidthLimit pointer-identity (NO BandwidthLimit-
@@ -316,26 +323,12 @@ func parsePerRoute(tc *anypb.Any) (proto.Message, error) {
 // full lazy-cache parity + listener-vs-per-route stats parity test lands at
 // Task 7 per ADR-0139.
 func (s *factoryState) resolvePerRouteConfig(msg proto.Message) *compiledConfig {
-	if msg == nil {
-		return s.listenerRC
-	}
-	perRoute, ok := msg.(*bandwidthlimitv3.BandwidthLimit)
-	if !ok {
-		return s.listenerRC
-	}
-	if cached, ok := s.perRoute.Load(perRoute); ok {
-		return cached.(*compiledConfig)
-	}
-	fresh, err := buildCompiledConfigPerRoute(perRoute, s.reg)
-	if err != nil {
-		// Per-route TPFC parsing failed at lazy resolve. Treat as inherit-
-		// listener to keep request flow alive (per phase-11 precedent +
-		// ADR-0072: boot-time-fail-fast applies at New, not at request
-		// time; NO panic).
-		return s.listenerRC
-	}
-	actual, _ := s.perRoute.LoadOrStore(perRoute, fresh)
-	return actual.(*compiledConfig)
+	// Lazy construction + inherit-listener-on-error via the shared generic
+	// PerRouteCache (Load → buildCompiledConfigPerRoute → LoadOrStore).
+	return s.perRoute.Resolve(msg, s.listenerRC,
+		func(pr *bandwidthlimitv3.BandwidthLimit) (*compiledConfig, error) {
+			return buildCompiledConfigPerRoute(pr, s.reg)
+		})
 }
 
 // newFilterStats registers the 14 bandwidth_limit stats on the supplied
@@ -357,29 +350,12 @@ func (s *factoryState) resolvePerRouteConfig(msg proto.Message) *compiledConfig 
 // (iii); the inline-prefix detection sits in the default-branch fallback
 // alongside the SN9 local_ratelimit detection but without label promotion).
 //
-// Finalized at Task 8 per ADR-0138. The 14 names below MUST stay in lockstep
-// with internal/stats/name.go's blSegment switch (the canonical name set is
-// duplicated there for Prometheus rendering — KEEP IN SYNC).
+// Finalized at Task 8 per ADR-0138. The 14 names live in newFilterStatsWith
+// below and MUST stay in lockstep with internal/stats/name.go's blSegment
+// switch (the canonical name set is duplicated there for Prometheus rendering
+// — KEEP IN SYNC).
 func newFilterStats(reg *stats.Registry, prefix string) *filterStats {
-	p := prefix + ".http_bandwidth_limit."
-	return &filterStats{
-		// 8 counters.
-		requestEnabled:            reg.NewCounter(p + "request_enabled"),
-		requestEnforced:           reg.NewCounter(p + "request_enforced"),
-		requestIncomingTotalSize:  reg.NewCounter(p + "request_incoming_total_size"),
-		requestAllowedTotalSize:   reg.NewCounter(p + "request_allowed_total_size"),
-		responseEnabled:           reg.NewCounter(p + "response_enabled"),
-		responseEnforced:          reg.NewCounter(p + "response_enforced"),
-		responseIncomingTotalSize: reg.NewCounter(p + "response_incoming_total_size"),
-		responseAllowedTotalSize:  reg.NewCounter(p + "response_allowed_total_size"),
-		// 6 gauges.
-		requestPending:       reg.NewGauge(p + "request_pending"),
-		requestIncomingSize:  reg.NewGauge(p + "request_incoming_size"),
-		requestAllowedSize:   reg.NewGauge(p + "request_allowed_size"),
-		responsePending:      reg.NewGauge(p + "response_pending"),
-		responseIncomingSize: reg.NewGauge(p + "response_incoming_size"),
-		responseAllowedSize:  reg.NewGauge(p + "response_allowed_size"),
-	}
+	return newFilterStatsWith(reg.NewCounter, reg.NewGauge, prefix)
 }
 
 // newFilterStatsIfAbsent constructs filterStats via NewCounterIfAbsent +
@@ -405,25 +381,33 @@ func newFilterStats(reg *stats.Registry, prefix string) *filterStats {
 // fresh; LoadOrStore loser observes the winner's instances). Verified at
 // Task 8 via TestStatsNamespace_NewFilterStatsIfAbsent_Idempotent.
 func newFilterStatsIfAbsent(reg *stats.Registry, prefix string) *filterStats {
+	return newFilterStatsWith(reg.NewCounterIfAbsent, reg.NewGaugeIfAbsent, prefix)
+}
+
+// newFilterStatsWith holds the single canonical 14-stat name list (8 counters
+// + 6 gauges); the two public constructors differ only in the registry
+// factory methods they pass (NewCounter/NewGauge at boot;
+// NewCounterIfAbsent/NewGaugeIfAbsent post-Freeze per ADR-0117 + ADR-0139),
+// so the name set cannot drift between them. Stat names unchanged.
+func newFilterStatsWith(newCounter func(string) *stats.Counter, newGauge func(string) *stats.Gauge, prefix string) *filterStats {
 	p := prefix + ".http_bandwidth_limit."
 	return &filterStats{
-		// 8 counters via post-Freeze-idempotent NewCounterIfAbsent.
-		requestEnabled:            reg.NewCounterIfAbsent(p + "request_enabled"),
-		requestEnforced:           reg.NewCounterIfAbsent(p + "request_enforced"),
-		requestIncomingTotalSize:  reg.NewCounterIfAbsent(p + "request_incoming_total_size"),
-		requestAllowedTotalSize:   reg.NewCounterIfAbsent(p + "request_allowed_total_size"),
-		responseEnabled:           reg.NewCounterIfAbsent(p + "response_enabled"),
-		responseEnforced:          reg.NewCounterIfAbsent(p + "response_enforced"),
-		responseIncomingTotalSize: reg.NewCounterIfAbsent(p + "response_incoming_total_size"),
-		responseAllowedTotalSize:  reg.NewCounterIfAbsent(p + "response_allowed_total_size"),
-		// 6 gauges via post-Freeze-idempotent NewGaugeIfAbsent (added at this
-		// commit; mirrors NewCounterIfAbsent per ADR-0139).
-		requestPending:       reg.NewGaugeIfAbsent(p + "request_pending"),
-		requestIncomingSize:  reg.NewGaugeIfAbsent(p + "request_incoming_size"),
-		requestAllowedSize:   reg.NewGaugeIfAbsent(p + "request_allowed_size"),
-		responsePending:      reg.NewGaugeIfAbsent(p + "response_pending"),
-		responseIncomingSize: reg.NewGaugeIfAbsent(p + "response_incoming_size"),
-		responseAllowedSize:  reg.NewGaugeIfAbsent(p + "response_allowed_size"),
+		// 8 counters.
+		requestEnabled:            newCounter(p + "request_enabled"),
+		requestEnforced:           newCounter(p + "request_enforced"),
+		requestIncomingTotalSize:  newCounter(p + "request_incoming_total_size"),
+		requestAllowedTotalSize:   newCounter(p + "request_allowed_total_size"),
+		responseEnabled:           newCounter(p + "response_enabled"),
+		responseEnforced:          newCounter(p + "response_enforced"),
+		responseIncomingTotalSize: newCounter(p + "response_incoming_total_size"),
+		responseAllowedTotalSize:  newCounter(p + "response_allowed_total_size"),
+		// 6 gauges.
+		requestPending:       newGauge(p + "request_pending"),
+		requestIncomingSize:  newGauge(p + "request_incoming_size"),
+		requestAllowedSize:   newGauge(p + "request_allowed_size"),
+		responsePending:      newGauge(p + "response_pending"),
+		responseIncomingSize: newGauge(p + "response_incoming_size"),
+		responseAllowedSize:  newGauge(p + "response_allowed_size"),
 	}
 }
 
@@ -467,7 +451,7 @@ func (f *filter) DecodeHeaders(_ http.Header, _ bool) envoyhttp.FilterHeadersSta
 
 // DecodeData implements the Path B-async buffer-then-delayed-emit body
 // algorithm per SPEC §6.7 + ADR-0137. Inactive direction passes through;
-// pre-endStream chunks accumulate on f.requestBody and return
+// pre-endStream chunk lengths accumulate on f.requestBodyLen and return
 // DataStopIterationAndBuffer; on endStream=true the kbps-per-tick
 // throttleDuration is computed, *_enabled + *_incoming_total_size +
 // *_incoming_size are bumped, and either the fast path (throttle==0; empty
@@ -480,26 +464,26 @@ func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 	if !f.requestActive {
 		return envoyhttp.DataContinue
 	}
-	f.requestBody = append(f.requestBody, data...)
+	f.requestBodyLen += len(data)
 	if !endStream {
 		// envoy-go HCM dispatch reads body chunks sequentially in the same
 		// goroutine that runs the chain (per ADR-0076 + connection.go's
 		// hasBody loop): a DataStopIterationAndBuffer here would deadlock
 		// the dispatch goroutine (chain parks waiting for ContinueDecoding
-		// that the same goroutine must dispatch). Accumulate locally and
-		// return DataContinue — the framework's bodyBuf (connection.go)
-		// holds the bytes for the post-chain upstream dial. The throttle
-		// engages on the terminal (endStream=true) chunk below.
+		// that the same goroutine must dispatch). Accumulate the length
+		// locally and return DataContinue — the framework's bodyBuf
+		// (connection.go) holds the bytes for the post-chain upstream dial.
+		// The throttle engages on the terminal (endStream=true) chunk below.
 		return envoyhttp.DataContinue
 	}
 	// endStream=true: stream engaged → bump *_enabled + *_incoming_total_size + *_incoming_size.
-	bodyLen := uint64(len(f.requestBody))
+	bodyLen := uint64(f.requestBodyLen)
 	if f.requestRC.stats != nil {
 		f.requestRC.stats.requestEnabled.Inc()
 		f.requestRC.stats.requestIncomingTotalSize.Add(bodyLen)
 		f.requestRC.stats.requestIncomingSize.Set(int64(bodyLen)) // transient
 	}
-	throttle, ticks := throttleDuration(len(f.requestBody), f.requestRC.limitKbps, f.requestRC.fillInterval)
+	throttle, ticks := throttleDuration(f.requestBodyLen, f.requestRC.limitKbps, f.requestRC.fillInterval)
 	if throttle == 0 {
 		// No throttle needed (empty body — throttleDuration's only ==0 return is bodySize=0). Forward immediately.
 		// *_pending NOT bumped on the fast path: the gauge tracks streams actively waiting on a timer; an empty-body stream never waits.
@@ -545,8 +529,8 @@ func (f *filter) EncodeHeaders(_ http.Header, _ bool) envoyhttp.FilterHeadersSta
 // EncodeData is the line-for-line mirror of DecodeData with response-side
 // substitutions per SPEC §6.8. Implements the Path B-async buffer-then-delayed-
 // emit body algorithm symmetric to the decode side: inactive direction passes
-// through; pre-endStream chunks accumulate on f.responseBody and return
-// DataStopIterationAndBuffer; on endStream=true the kbps-per-tick
+// through; pre-endStream chunk lengths accumulate on f.responseBodyLen and
+// return DataStopIterationAndBuffer; on endStream=true the kbps-per-tick
 // throttleDuration is computed, *_enabled + *_incoming_total_size +
 // *_incoming_size are bumped, and either the fast path (throttle==0; empty
 // body) hits DataContinue immediately or the timer arm path bumps *_pending +
@@ -565,23 +549,23 @@ func (f *filter) EncodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 	if !f.responseActive {
 		return envoyhttp.DataContinue
 	}
-	f.responseBody = append(f.responseBody, data...)
+	f.responseBodyLen += len(data)
 	if !endStream {
 		// Symmetric mirror of the decode-side fix (see DecodeData above).
 		// envoy-go HCM encode-side dispatch is synchronous in the same
 		// goroutine as the chain: returning DataStopIterationAndBuffer
-		// here would deadlock the goroutine. Accumulate locally; the
-		// throttle engages on the terminal (endStream=true) chunk below.
+		// here would deadlock the goroutine. Accumulate the length locally;
+		// the throttle engages on the terminal (endStream=true) chunk below.
 		return envoyhttp.DataContinue
 	}
 	// endStream=true: stream engaged → bump *_enabled + *_incoming_total_size + *_incoming_size.
-	bodyLen := uint64(len(f.responseBody))
+	bodyLen := uint64(f.responseBodyLen)
 	if f.responseRC.stats != nil {
 		f.responseRC.stats.responseEnabled.Inc()
 		f.responseRC.stats.responseIncomingTotalSize.Add(bodyLen)
 		f.responseRC.stats.responseIncomingSize.Set(int64(bodyLen)) // transient
 	}
-	throttle, ticks := throttleDuration(len(f.responseBody), f.responseRC.limitKbps, f.responseRC.fillInterval)
+	throttle, ticks := throttleDuration(f.responseBodyLen, f.responseRC.limitKbps, f.responseRC.fillInterval)
 	if throttle == 0 {
 		// No throttle needed (empty body — throttleDuration's only ==0 return is bodySize=0). Forward immediately.
 		// *_pending NOT bumped on the fast path: the gauge tracks streams actively waiting on a timer; an empty-body stream never waits.

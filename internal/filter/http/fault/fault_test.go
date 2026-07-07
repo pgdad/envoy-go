@@ -722,3 +722,44 @@ func TestFault_DelayTimerRace(t *testing.T) {
 		fl.OnDestroy()
 	}
 }
+
+// --- Lazy RNG allocation (maintenance pass 2026-07-07) ---
+
+// TestRollPercent_BoundaryRollsDoNotAllocateRNG verifies the lazy-RNG
+// discipline: 0% and 100% rolls short-circuit without touching f.rng, so the
+// per-request ~5 KB rngSource allocation is skipped entirely on the common
+// boundary-percentage fixtures.
+func TestRollPercent_BoundaryRollsDoNotAllocateRNG(t *testing.T) {
+	fl, _ := makeFilter(t, 503, 100, nil)
+	if fl.rng != nil {
+		t.Fatal("expected f.rng nil at construction (lazy allocation)")
+	}
+	if fl.rollPercent(0) {
+		t.Error("rollPercent(0) = true; want false")
+	}
+	if !fl.rollPercent(100) {
+		t.Error("rollPercent(100) = false; want true")
+	}
+	if fl.rng != nil {
+		t.Error("boundary rolls allocated f.rng; expected short-circuit without RNG")
+	}
+	fl.rollPercent(50) // non-boundary roll forces the lazy allocation
+	if fl.rng == nil {
+		t.Error("rollPercent(50) left f.rng nil; expected lazy allocation")
+	}
+}
+
+// TestNextRNGSeed_DistinctAcrossCalls pins the seed derivation: consecutive
+// calls must yield distinct seeds even within the same wall-clock nanosecond
+// (the counter word differs), fixing the former identical-sequence flaw for
+// same-nanosecond requests.
+func TestNextRNGSeed_DistinctAcrossCalls(t *testing.T) {
+	seen := make(map[int64]struct{}, 1000)
+	for i := 0; i < 1000; i++ {
+		s := nextRNGSeed()
+		if _, dup := seen[s]; dup {
+			t.Fatalf("nextRNGSeed produced duplicate seed %d at iteration %d", s, i)
+		}
+		seen[s] = struct{}{}
+	}
+}

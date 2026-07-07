@@ -2,13 +2,8 @@ package statssink
 
 import (
 	"fmt"
-	"log"
 	"net"
-	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 
 	dto "github.com/prometheus/client_model/go"
 
@@ -53,16 +48,13 @@ import (
 // Writer shape (D-DSD-LIFECYCLE): SYNCHRONOUS, identical to StatsdSink — a UDP
 // Write is fire-and-forget and the Flusher calls Submit serially, so Submit
 // writes each datagram inline. This is a SECOND, INDEPENDENT *net.UDPConn from
-// StatsdSink's (never shared).
+// StatsdSink's (never shared). The line formatting, UDP write, and Close are the
+// udpWriter + emitStatsdLines helpers shared with StatsdSink (udp.go).
 type DogStatsdSink struct {
-	conn                *net.UDPConn
+	udpWriter
 	prefix              string
 	delta               *deltaState // always non-nil — a SECOND, independent instance from StatsdSink's
 	maxBytesPerDatagram uint64      // NEW (ADR-0267): 0 means "one metric per datagram" (phase-49 behavior)
-
-	closeOnce   sync.Once
-	closeErr    error
-	lastDropLog atomic.Int64
 }
 
 // NewDogStatsdSink resolves udpAddr (a host:port literal), dials a connected UDP
@@ -80,7 +72,12 @@ func NewDogStatsdSink(udpAddr string, prefix string, maxBytesPerDatagram uint64)
 	if err != nil {
 		return nil, fmt.Errorf("statssink: dial dog_statsd udp %q: %w", udpAddr, err)
 	}
-	return &DogStatsdSink{conn: conn, prefix: prefix, delta: newDeltaState(), maxBytesPerDatagram: maxBytesPerDatagram}, nil
+	return &DogStatsdSink{
+		udpWriter:           udpWriter{conn: conn, sinkLabel: "dog_statsd"},
+		prefix:              prefix,
+		delta:               newDeltaState(),
+		maxBytesPerDatagram: maxBytesPerDatagram,
+	}, nil
 }
 
 // Submit applies the sink-private deltaState (COUNTER -> per-flush delta, GAUGE/
@@ -92,35 +89,17 @@ func NewDogStatsdSink(udpAddr string, prefix string, maxBytesPerDatagram uint64)
 func (s *DogStatsdSink) Submit(batch []*dto.MetricFamily) {
 	batch = s.delta.apply(batch)
 	var buf strings.Builder // a PER-CALL buffer — batching never spans across flushes
-	for _, fam := range batch {
-		var suffix string
-		switch fam.GetType() {
-		case dto.MetricType_COUNTER:
-			suffix = "|c"
-		case dto.MetricType_GAUGE:
-			suffix = "|g"
-		default:
-			continue // no other family type exists (no histograms — ADR-0060)
-		}
+	emitStatsdLines(batch, func(fam *dto.MetricFamily) (string, string) {
 		residual, labels, err := stats.ExtractTags(fam.GetName())
 		if err != nil {
 			// Defensive: can't happen for a registered name (the label.go labelMapper
 			// precedent) — fall back to the full untransformed name, no tags.
 			residual, labels = fam.GetName(), nil
 		}
-		name := s.prefix + "." + residual
-		tagSuffix := formatTagSuffix(labels)
-		for _, m := range fam.GetMetric() {
-			var v float64
-			if fam.GetType() == dto.MetricType_GAUGE {
-				v = m.GetGauge().GetValue()
-			} else {
-				v = m.GetCounter().GetValue()
-			}
-			line := name + ":" + strconv.FormatInt(int64(v), 10) + suffix + tagSuffix
-			s.appendLine(&buf, line) // REPLACES the phase-49 s.write(line) call site
-		}
-	}
+		return s.prefix + "." + residual, formatTagSuffix(labels)
+	}, func(line string) {
+		s.appendLine(&buf, line) // REPLACES the phase-49 s.write(line) call site
+	})
 	s.flush(&buf) // flush any remaining partial buffer at the end of the batch
 }
 
@@ -185,27 +164,4 @@ func formatTagSuffix(labels []stats.Label) string {
 		b.WriteString(l.Value)
 	}
 	return b.String()
-}
-
-// write sends one DogStatsd line as one UDP datagram. A Write error is
-// rate-limit-logged (at most once per second — the accesslog lastDropLog idiom)
-// and dropped.
-func (s *DogStatsdSink) write(line string) {
-	if _, err := s.conn.Write([]byte(line)); err != nil {
-		now := time.Now().UnixNano()
-		last := s.lastDropLog.Load()
-		if now-last >= dropLogIntervalNanos && s.lastDropLog.CompareAndSwap(last, now) {
-			log.Printf("statssink: dog_statsd udp write failed, dropping line: %v", err)
-		}
-	}
-}
-
-// Close closes the UDP socket. Idempotent via sync.Once.
-func (s *DogStatsdSink) Close() error {
-	s.closeOnce.Do(func() {
-		if s.conn != nil {
-			s.closeErr = s.conn.Close()
-		}
-	})
-	return s.closeErr
 }

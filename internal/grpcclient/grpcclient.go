@@ -146,6 +146,59 @@ func (d *Dialer) DialContext(ctx context.Context, clusterName string) (*grpc.Cli
 }
 
 // ----------------------------------------------------------------------------
+// connHolder + dialConn — the shared skeleton every typed wrapper builds on.
+// ----------------------------------------------------------------------------
+
+// connHolder is the shared `*grpc.ClientConn` + idempotent-close base embedded
+// by every typed wrapper in this package (AuthClient, ALSClient,
+// MetricsServiceClient, OTLPLogsClient, OTLPTracesClient, RateLimitClient,
+// ProcessorClient). It consolidates the previously seven byte-identical
+// `closeOnce`-guarded Close bodies into one implementation.
+//
+// The close body is guarded by `sync.Once` per SPEC §3.1 so repeated calls
+// (or concurrent calls) return the cached error from the first call. The
+// underlying `*grpc.ClientConn.Close()` is itself idempotent per the gRPC
+// library, but the sync.Once guard normalizes the error return + is
+// concurrent-safe.
+//
+// Each wrapper keeps its own nil-receiver-tolerant Close() method that
+// delegates here — method promotion alone would panic on a nil outer pointer,
+// and the nil-tolerance contract is part of every wrapper's documented API.
+type connHolder struct {
+	conn *grpc.ClientConn
+
+	// closeOnce + closeErr guard the idempotent close per SPEC §3.1.
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// close releases the underlying `*grpc.ClientConn`. Idempotent — repeated
+// calls (or concurrent calls) return the cached error from the first call
+// via the internal `sync.Once` guard.
+func (h *connHolder) close() error {
+	h.closeOnce.Do(func() {
+		if h.conn != nil {
+			h.closeErr = h.conn.Close()
+		}
+	})
+	return h.closeErr
+}
+
+// dialConn is the shared nil-dialer-check + background-context dial performed
+// by every wrapper constructor. `kind` is the constructor-specific error-noun
+// (e.g. "auth client", "processor client") parameterizing the nil-dialer
+// error so every constructor's existing error string stays byte-identical.
+//
+// On dial error the error is passed through verbatim (already includes the
+// cluster name via `DialContext`'s error wrapping).
+func dialConn(d *Dialer, kind, clusterName string) (*grpc.ClientConn, error) {
+	if d == nil {
+		return nil, fmt.Errorf("grpcclient: new %s %q: dialer is nil", kind, clusterName)
+	}
+	return d.DialContext(context.Background(), clusterName)
+}
+
+// ----------------------------------------------------------------------------
 // AuthClient — the typed `Authorization/Check` wrapper.
 // ----------------------------------------------------------------------------
 
@@ -159,15 +212,10 @@ func (d *Dialer) DialContext(ctx context.Context, clusterName string) (*grpc.Cli
 // `*grpc.ClientConn` is goroutine-safe per the gRPC library and manages its
 // own transport-level reconnect via the sub-channel state machine.
 type AuthClient struct {
-	conn   *grpc.ClientConn
-	stub   authv3.AuthorizationClient
-	target string // cluster_name — for logs/errors
+	connHolder
+	stub authv3.AuthorizationClient
 
 	timeout time.Duration // per-Check timeout (applied via context.WithTimeout in Check)
-
-	// closeOnce + closeErr guard the idempotent Close per SPEC §3.1.
-	closeOnce sync.Once
-	closeErr  error
 }
 
 // NewAuthClient dials the named cluster via `d.DialContext` and wraps the
@@ -180,18 +228,14 @@ type AuthClient struct {
 // passed through verbatim (already includes the cluster name via
 // `DialContext`'s error wrapping).
 func NewAuthClient(d *Dialer, clusterName string, timeout time.Duration) (*AuthClient, error) {
-	if d == nil {
-		return nil, fmt.Errorf("grpcclient: new auth client %q: dialer is nil", clusterName)
-	}
-	conn, err := d.DialContext(context.Background(), clusterName)
+	conn, err := dialConn(d, "auth client", clusterName)
 	if err != nil {
 		return nil, err
 	}
 	return &AuthClient{
-		conn:    conn,
-		stub:    authv3.NewAuthorizationClient(conn),
-		target:  clusterName,
-		timeout: timeout,
+		connHolder: connHolder{conn: conn},
+		stub:       authv3.NewAuthorizationClient(conn),
+		timeout:    timeout,
 	}, nil
 }
 
@@ -227,7 +271,8 @@ func (a *AuthClient) Check(ctx context.Context, req *authv3.CheckRequest) (*auth
 
 // Close releases the underlying `*grpc.ClientConn`. Idempotent — repeated
 // calls (or concurrent calls) return the cached error from the first call
-// via an internal `sync.Once` guard.
+// via the shared `connHolder` sync.Once guard. A nil receiver is tolerated
+// (returns nil).
 //
 // MVP discipline (D2): in production the filter never calls `Close()` — the
 // `*grpc.ClientConn` is leaked-on-exit; the OS reclaims it. `Close()` exists
@@ -236,12 +281,7 @@ func (a *AuthClient) Close() error {
 	if a == nil {
 		return nil
 	}
-	a.closeOnce.Do(func() {
-		if a.conn != nil {
-			a.closeErr = a.conn.Close()
-		}
-	})
-	return a.closeErr
+	return a.connHolder.close()
 }
 
 // ----------------------------------------------------------------------------
@@ -260,13 +300,8 @@ func (a *AuthClient) Close() error {
 // AccessLogService_StreamAccessLogsClient is NOT itself concurrency-safe and is
 // driven by a single writer goroutine per the sink's discipline.)
 type ALSClient struct {
-	conn   *grpc.ClientConn
-	stub   accesslogv3.AccessLogServiceClient
-	target string // cluster_name — for logs/errors
-
-	// closeOnce + closeErr guard the idempotent Close (the AuthClient precedent).
-	closeOnce sync.Once
-	closeErr  error
+	connHolder
+	stub accesslogv3.AccessLogServiceClient
 }
 
 // NewALSClient dials the named cluster via d.DialContext and wraps the
@@ -278,17 +313,13 @@ type ALSClient struct {
 // through verbatim (already includes the cluster name via DialContext's error
 // wrapping).
 func NewALSClient(d *Dialer, clusterName string) (*ALSClient, error) {
-	if d == nil {
-		return nil, fmt.Errorf("grpcclient: new ALS client %q: dialer is nil", clusterName)
-	}
-	conn, err := d.DialContext(context.Background(), clusterName)
+	conn, err := dialConn(d, "ALS client", clusterName)
 	if err != nil {
 		return nil, err
 	}
 	return &ALSClient{
-		conn:   conn,
-		stub:   accesslogv3.NewAccessLogServiceClient(conn),
-		target: clusterName,
+		connHolder: connHolder{conn: conn},
+		stub:       accesslogv3.NewAccessLogServiceClient(conn),
 	}, nil
 }
 
@@ -303,18 +334,14 @@ func (a *ALSClient) StreamAccessLogs(ctx context.Context) (accesslogv3.AccessLog
 }
 
 // Close releases the underlying *grpc.ClientConn. Idempotent — repeated (or
-// concurrent) calls return the cached error from the first call via an internal
-// sync.Once guard (the AuthClient precedent).
+// concurrent) calls return the cached error from the first call via the shared
+// connHolder sync.Once guard (the AuthClient precedent). A nil receiver is
+// tolerated (returns nil).
 func (a *ALSClient) Close() error {
 	if a == nil {
 		return nil
 	}
-	a.closeOnce.Do(func() {
-		if a.conn != nil {
-			a.closeErr = a.conn.Close()
-		}
-	})
-	return a.closeErr
+	return a.connHolder.close()
 }
 
 // ----------------------------------------------------------------------------
@@ -336,13 +363,8 @@ func (a *ALSClient) Close() error {
 // MetricsService_StreamMetricsClient is NOT itself concurrency-safe and is
 // driven by a single writer goroutine per the sink's discipline.)
 type MetricsServiceClient struct {
-	conn   *grpc.ClientConn
-	stub   metricsv3.MetricsServiceClient
-	target string // cluster_name — for logs/errors
-
-	// closeOnce + closeErr guard the idempotent Close (the ALSClient precedent).
-	closeOnce sync.Once
-	closeErr  error
+	connHolder
+	stub metricsv3.MetricsServiceClient
 }
 
 // NewMetricsServiceClient dials the named cluster via d.DialContext and wraps the
@@ -350,17 +372,13 @@ type MetricsServiceClient struct {
 // returns (nil, err) verbatim (already cluster-named via DialContext). The
 // NewALSClient shape.
 func NewMetricsServiceClient(d *Dialer, clusterName string) (*MetricsServiceClient, error) {
-	if d == nil {
-		return nil, fmt.Errorf("grpcclient: new metrics service client %q: dialer is nil", clusterName)
-	}
-	conn, err := d.DialContext(context.Background(), clusterName)
+	conn, err := dialConn(d, "metrics service client", clusterName)
 	if err != nil {
 		return nil, err
 	}
 	return &MetricsServiceClient{
-		conn:   conn,
-		stub:   metricsv3.NewMetricsServiceClient(conn),
-		target: clusterName,
+		connHolder: connHolder{conn: conn},
+		stub:       metricsv3.NewMetricsServiceClient(conn),
 	}, nil
 }
 
@@ -373,18 +391,13 @@ func (c *MetricsServiceClient) StreamMetrics(ctx context.Context) (metricsv3.Met
 	return c.stub.StreamMetrics(ctx)
 }
 
-// Close releases the underlying *grpc.ClientConn. Idempotent (sync.Once), the
-// ALSClient.Close shape.
+// Close releases the underlying *grpc.ClientConn. Idempotent (shared connHolder
+// sync.Once), the ALSClient.Close shape. A nil receiver is tolerated (returns nil).
 func (c *MetricsServiceClient) Close() error {
 	if c == nil {
 		return nil
 	}
-	c.closeOnce.Do(func() {
-		if c.conn != nil {
-			c.closeErr = c.conn.Close()
-		}
-	})
-	return c.closeErr
+	return c.connHolder.close()
 }
 
 // ----------------------------------------------------------------------------
@@ -397,29 +410,21 @@ func (c *MetricsServiceClient) Close() error {
 // OTLPAccessLogSink and Close()d at sink close. The ALSClient precedent
 // (ADR-0255) but UNARY — Export is a plain unary RPC (no stream lifecycle).
 type OTLPLogsClient struct {
-	conn   *grpc.ClientConn
-	stub   collogspb.LogsServiceClient
-	target string // cluster_name — for logs/errors
-
-	closeOnce sync.Once
-	closeErr  error
+	connHolder
+	stub collogspb.LogsServiceClient
 }
 
 // NewOTLPLogsClient dials the named cluster via d.DialContext and wraps the
 // resulting *grpc.ClientConn in a typed OTLPLogsClient. On dial error returns
 // (nil, err) verbatim (already cluster-named via DialContext's wrapping).
 func NewOTLPLogsClient(d *Dialer, clusterName string) (*OTLPLogsClient, error) {
-	if d == nil {
-		return nil, fmt.Errorf("grpcclient: new OTLP logs client %q: dialer is nil", clusterName)
-	}
-	conn, err := d.DialContext(context.Background(), clusterName)
+	conn, err := dialConn(d, "OTLP logs client", clusterName)
 	if err != nil {
 		return nil, err
 	}
 	return &OTLPLogsClient{
-		conn:   conn,
-		stub:   collogspb.NewLogsServiceClient(conn),
-		target: clusterName,
+		connHolder: connHolder{conn: conn},
+		stub:       collogspb.NewLogsServiceClient(conn),
 	}, nil
 }
 
@@ -432,17 +437,13 @@ func (c *OTLPLogsClient) Export(ctx context.Context, req *collogspb.ExportLogsSe
 	return c.stub.Export(ctx, req)
 }
 
-// Close releases the underlying *grpc.ClientConn. Idempotent (sync.Once).
+// Close releases the underlying *grpc.ClientConn. Idempotent (shared connHolder
+// sync.Once). A nil receiver is tolerated (returns nil).
 func (c *OTLPLogsClient) Close() error {
 	if c == nil {
 		return nil
 	}
-	c.closeOnce.Do(func() {
-		if c.conn != nil {
-			c.closeErr = c.conn.Close()
-		}
-	})
-	return c.closeErr
+	return c.connHolder.close()
 }
 
 // ----------------------------------------------------------------------------
@@ -456,29 +457,21 @@ func (c *OTLPLogsClient) Close() error {
 // (ADR-0258) but for traces — Export is a plain unary RPC (no stream
 // lifecycle).
 type OTLPTracesClient struct {
-	conn   *grpc.ClientConn
-	stub   coltracepb.TraceServiceClient
-	target string // cluster_name — for logs/errors
-
-	closeOnce sync.Once
-	closeErr  error
+	connHolder
+	stub coltracepb.TraceServiceClient
 }
 
 // NewOTLPTracesClient dials the named cluster via d.DialContext and wraps the
 // resulting *grpc.ClientConn in a typed OTLPTracesClient. On dial error returns
 // (nil, err) verbatim (already cluster-named via DialContext's wrapping).
 func NewOTLPTracesClient(d *Dialer, clusterName string) (*OTLPTracesClient, error) {
-	if d == nil {
-		return nil, fmt.Errorf("grpcclient: new OTLP traces client %q: dialer is nil", clusterName)
-	}
-	conn, err := d.DialContext(context.Background(), clusterName)
+	conn, err := dialConn(d, "OTLP traces client", clusterName)
 	if err != nil {
 		return nil, err
 	}
 	return &OTLPTracesClient{
-		conn:   conn,
-		stub:   coltracepb.NewTraceServiceClient(conn),
-		target: clusterName,
+		connHolder: connHolder{conn: conn},
+		stub:       coltracepb.NewTraceServiceClient(conn),
 	}, nil
 }
 
@@ -492,15 +485,11 @@ func (c *OTLPTracesClient) Export(ctx context.Context, req *coltracepb.ExportTra
 	return c.stub.Export(ctx, req)
 }
 
-// Close releases the underlying *grpc.ClientConn. Idempotent (sync.Once).
+// Close releases the underlying *grpc.ClientConn. Idempotent (shared connHolder
+// sync.Once). A nil receiver is tolerated (returns nil).
 func (c *OTLPTracesClient) Close() error {
 	if c == nil {
 		return nil
 	}
-	c.closeOnce.Do(func() {
-		if c.conn != nil {
-			c.closeErr = c.conn.Close()
-		}
-	})
-	return c.closeErr
+	return c.connHolder.close()
 }

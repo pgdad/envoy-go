@@ -115,8 +115,9 @@ func NewVM(opts ...VMOption) *VM {
 // output. Mirrors Lua's standard `print` semantics: stringifies each
 // argument via tostring (delegated via the *lua.LState's metamethod
 // dispatch) + joins with tabs + appends `\n`. When printSink is nil
-// the args are still walked to honor any `__tostring` side effects
-// that scripts might rely on, then discarded.
+// the closure returns immediately WITHOUT stringifying the args — any
+// `__tostring` metamethod side effects are skipped in the default
+// (nil-sink) configuration.
 func (vm *VM) installPrintRedirect() {
 	sink := vm.printSink
 	vm.state.SetGlobal("print", vm.state.NewFunction(func(L *lua.LState) int {

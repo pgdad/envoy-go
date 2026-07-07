@@ -58,13 +58,16 @@ const (
 // identifier); a stream-open failure or a second-Send failure drops the batch
 // (logged, not counted).
 //
-// When constructed with reportCountersAsDeltas=true, Submit rewrites COUNTER
-// families to per-flush deltas via a per-sink deltaState before enqueue (ADR-0263);
-// gauges stay absolute. When constructed with emitTagsAsLabels=true, Submit then
-// rewrites each family's Name to the tag-residual and emits the extracted tags as
-// metric[].label[] LabelPairs via a per-sink labelMapper (ADR-0264); applied AFTER
-// the delta so labels ride the (possibly delta-rewritten) value. Both transforms
-// build the sink's own batch and never mutate the shared snapshot slice.
+// When constructed with reportCountersAsDeltas=true, the writer goroutine rewrites
+// COUNTER families to per-flush deltas via a per-sink deltaState just before flush
+// (ADR-0263); gauges stay absolute. When constructed with emitTagsAsLabels=true,
+// the writer then rewrites each family's Name to the tag-residual and emits the
+// extracted tags as metric[].label[] LabelPairs via a per-sink labelMapper
+// (ADR-0264); applied AFTER the delta so labels ride the (possibly delta-rewritten)
+// value. Both transforms build the sink's own batch and never mutate the shared
+// snapshot slice. Applying the delta in the writer (not Submit) means an
+// enqueue-drop never latches deltaState — the dropped increments ride the next
+// successfully-enqueued flush instead of being silently lost.
 type MetricsServiceSink struct {
 	ch          chan []*dto.MetricFamily
 	client      metricsClient
@@ -110,17 +113,14 @@ func newSinkWithCapacity(client metricsClient, node *corev3.Node, reportCounters
 
 // Submit non-blocking-sends batch on the channel. On a full channel the batch is
 // dropped and at most one diagnostic emitted per second (the accesslog drop-
-// newest idiom). Drops are logged, not counted (D-MS-STATS-FINAL).
+// newest idiom). Drops are logged, not counted (D-MS-STATS-FINAL). The delta/
+// labels transforms run in the writer goroutine (just before flush), so an
+// enqueue-drop never latches deltaState — the dropped increments are carried by
+// the next successfully-enqueued flush's delta instead of being lost.
 //
 // Lifecycle contract: callers MUST NOT call Submit once Close has begun — a send
 // on the now-closed channel would panic (the Flusher stops before Close).
 func (s *MetricsServiceSink) Submit(batch []*dto.MetricFamily) {
-	if s.delta != nil {
-		batch = s.delta.apply(batch) // build the sink's OWN delta batch; never mutate the shared slice
-	}
-	if s.labels != nil {
-		batch = s.labels.apply(batch) // rewrite Name+Label; orthogonal to delta's VALUE rewrite (delta-then-labels)
-	}
 	select {
 	case s.ch <- batch:
 	default:
@@ -190,6 +190,17 @@ func (s *MetricsServiceSink) run() {
 	}
 
 	for batch := range s.ch {
+		// Apply the delta/labels transforms HERE (single writer goroutine — the
+		// no-lock deltaState contract holds) so that a batch dropped at enqueue
+		// never latched deltaState: the delta of the next flushed batch is
+		// relative to the last batch that REACHED this point, and wire bytes for
+		// every successfully-sent batch are unchanged.
+		if s.delta != nil {
+			batch = s.delta.apply(batch) // build the sink's OWN delta batch; never mutate the shared slice
+		}
+		if s.labels != nil {
+			batch = s.labels.apply(batch) // rewrite Name+Label; orthogonal to delta's VALUE rewrite (delta-then-labels)
+		}
 		flush(batch)
 	}
 	if stream != nil {

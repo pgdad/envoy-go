@@ -10,7 +10,7 @@ package admission_control
 //  1. TestShouldReject_Boundary_* — per AMEND-2 + PD-6: knife-edge + P=0 cross-side
 //  2. TestProbabilityFormula_* — per AMEND-1: vector tests over formula params
 //  3. TestController_FAKE_TIME_Window_* — per AMEND-6 + PD-7: bucket rollover +
-//     stale-purge + requestCounts + averageRps via fakeClock.Advance
+//     stale-purge + requestCounts + averageRps via clock.FakeClock.Advance
 //  4. TestRpsSuppression_* — per §4.1: averageRps correctness feeding the gate
 //  5. TestRecordDiscipline_* — per AMEND-11: classify counter + window increments
 //  6. TestController_Concurrent_* — race tests: concurrent operations under mu
@@ -18,9 +18,9 @@ package admission_control
 // # Fakes consumed (from test-scope files per Task 3 — NOT redefined here)
 //
 //   - fakeRand (rand_test.go): fakeRand{v: uint64} — deterministic Rand seam
-//   - fakeClock (clock_test.go): newFakeClock(start) + Advance(d) — step-driven Clock
+//   - clock.FakeClock (internal/clock): clock.NewFakeClock(start) + Advance(d) — step-driven Clock
 //
-// DO NOT redefine fakeRand or fakeClock here — doing so causes duplicate-symbol
+// DO NOT redefine fakeRand here — doing so causes duplicate-symbol
 // build errors.
 
 import (
@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pgdad/envoy-go/internal/clock"
 	"github.com/pgdad/envoy-go/internal/stats"
 )
 
@@ -61,7 +62,7 @@ func testFilterStatsAC() *filterStats {
 func newTestController(
 	cfg *compiledConfig,
 	st *filterStats,
-	clk Clock,
+	clk clock.Clock,
 	rnd Rand,
 ) *controller {
 	if cfg == nil {
@@ -126,7 +127,7 @@ func TestShouldReject_Boundary_AtKnifeEdge_Admits(t *testing.T) {
 	// floor(10000 * 0.80) = 8000
 	// At r%10000 == 8000: float64(10000)*0.80 == 8000.0 > 8000.0 is FALSE → ADMIT
 	const n, s = uint64(100), uint64(0)
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	// Inject r such that r%10000 == 8000 (the knife-edge value for P=0.80)
 	rnd := fakeRand{v: 8000} // 8000 % 10000 = 8000
@@ -145,7 +146,7 @@ func TestShouldReject_Boundary_OneLessThanKnifeEdge_Rejects(t *testing.T) {
 	// Same setup: P=0.80, floor(10000*0.80)=8000
 	// At r%10000 == 7999: float64(10000)*0.80 == 8000.0 > 7999.0 is TRUE → REJECT
 	const n, s = uint64(100), uint64(0)
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	rnd := fakeRand{v: 7999} // 7999 % 10000 = 7999
 	c := newTestController(cfg, nil, clk, rnd)
@@ -179,7 +180,7 @@ func TestShouldReject_Boundary_PZero_NeverRejects(t *testing.T) {
 
 	for _, tc := range testCases {
 		for _, rv := range rValues {
-			clk := newFakeClock(time.Unix(0, 0))
+			clk := clock.NewFakeClock(time.Unix(0, 0))
 			cfg := testCompiledConfigAC()
 			cfg.srThreshold = tc.srThreshold
 			rnd := fakeRand{v: rv}
@@ -213,7 +214,7 @@ func TestShouldReject_Boundary_HighR_WithModulo(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		clk := newFakeClock(time.Unix(0, 0))
+		clk := clock.NewFakeClock(time.Unix(0, 0))
 		cfg := testCompiledConfigAC()
 		rnd := fakeRand{v: tc.r}
 		c := newTestController(cfg, nil, clk, rnd)
@@ -258,7 +259,7 @@ func TestProbabilityFormula_DefaultParams(t *testing.T) {
 		// Now test via shouldReject with r=0 (r%10000=0):
 		// if P>0 → 10000*P > 0 → REJECT (since P>0 means 10000*P >= 1)
 		// if P=0 → 0 > 0 = false → ADMIT
-		clk := newFakeClock(time.Unix(0, 0))
+		clk := clock.NewFakeClock(time.Unix(0, 0))
 		cfg := testCompiledConfigAC()
 		// Use r that will reject if P>0, admit if P=0:
 		// We use r=0 so r%10000=0: reject iff P>0
@@ -322,7 +323,7 @@ func TestProbabilityFormula_AggressionExponentSkippedAt1_0(t *testing.T) {
 		r := firstAdmit1
 		// agg1 admits at firstAdmit1
 		{
-			clk := newFakeClock(time.Unix(0, 0))
+			clk := clock.NewFakeClock(time.Unix(0, 0))
 			cfg := testCompiledConfigAC()
 			cfg.aggression = 1.0
 			cfg.srThreshold = 1.0
@@ -336,7 +337,7 @@ func TestProbabilityFormula_AggressionExponentSkippedAt1_0(t *testing.T) {
 		}
 		// agg2 rejects at firstAdmit1 (since firstAdmit1 < firstAdmit2 means 10000*pAgg2 > r)
 		{
-			clk := newFakeClock(time.Unix(0, 0))
+			clk := clock.NewFakeClock(time.Unix(0, 0))
 			cfg := testCompiledConfigAC()
 			cfg.aggression = 2.0
 			cfg.srThreshold = 1.0
@@ -378,7 +379,7 @@ func TestProbabilityFormula_SrThresholdDividesSuccesses(t *testing.T) {
 
 	// Controller with srThreshold=0.90 and r=0 → admit (P=0)
 	{
-		clk := newFakeClock(time.Unix(0, 0))
+		clk := clock.NewFakeClock(time.Unix(0, 0))
 		cfg := testCompiledConfigAC()
 		cfg.srThreshold = 0.90
 		rnd := fakeRand{v: 0}
@@ -391,7 +392,7 @@ func TestProbabilityFormula_SrThresholdDividesSuccesses(t *testing.T) {
 
 	// Controller with srThreshold=0.95 and r=0 → reject (P>0)
 	{
-		clk := newFakeClock(time.Unix(0, 0))
+		clk := clock.NewFakeClock(time.Unix(0, 0))
 		cfg := testCompiledConfigAC()
 		cfg.srThreshold = 0.95
 		rnd := fakeRand{v: 0}
@@ -415,7 +416,7 @@ func TestProbabilityFormula_AggressionFloor(t *testing.T) {
 	const n, s = uint64(20), uint64(0)
 	pExpected := computeExpectedP(n, s, 0.95, 1.0, 0.80)
 
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	cfg.aggression = 1.0 // already floored value
 	// Use r such that knife-edge at floor(10000*pExpected) admits
@@ -442,7 +443,7 @@ func TestProbabilityFormula_MaxRejPClamp(t *testing.T) {
 	// Test maxRejP=0.80 → knife-edge at 8000
 	{
 		floor := uint64(8000)
-		clk := newFakeClock(time.Unix(0, 0))
+		clk := clock.NewFakeClock(time.Unix(0, 0))
 		cfg := testCompiledConfigAC()
 		cfg.maxRejectionProbability = 0.80
 		rnd := fakeRand{v: floor} // admits at knife-edge
@@ -456,7 +457,7 @@ func TestProbabilityFormula_MaxRejPClamp(t *testing.T) {
 	// Test maxRejP=0.50 → knife-edge at 5000
 	{
 		floor := uint64(5000)
-		clk := newFakeClock(time.Unix(0, 0))
+		clk := clock.NewFakeClock(time.Unix(0, 0))
 		cfg := testCompiledConfigAC()
 		cfg.maxRejectionProbability = 0.50
 		rnd := fakeRand{v: floor} // admits at knife-edge
@@ -467,7 +468,7 @@ func TestProbabilityFormula_MaxRejPClamp(t *testing.T) {
 		}
 		// One below knife-edge → REJECT
 		rnd2 := fakeRand{v: floor - 1}
-		c2 := newTestController(cfg, nil, newFakeClock(time.Unix(0, 0)), rnd2)
+		c2 := newTestController(cfg, nil, clock.NewFakeClock(time.Unix(0, 0)), rnd2)
 		primeWindow(t, c2, n, s)
 		if !c2.shouldReject() {
 			t.Errorf("maxRejP=0.50 r%%10000=%d (one below knife-edge): shouldReject()=false; want true", floor-1)
@@ -489,7 +490,7 @@ func TestProbabilityFormula_MaxPZeroFloor(t *testing.T) {
 	}
 
 	// r=0 → r%10000=0 → 0 > 0 = false → ADMIT
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	rnd := fakeRand{v: 0}
 	c := newTestController(cfg, nil, clk, rnd)
@@ -542,7 +543,7 @@ func TestProbabilityFormula_VectorTests(t *testing.T) {
 
 		// At firstAdmit: ADMIT (10000*P <= float64(firstAdmit))
 		{
-			clk := newFakeClock(time.Unix(0, 0))
+			clk := clock.NewFakeClock(time.Unix(0, 0))
 			cfg := testCompiledConfigAC()
 			cfg.srThreshold = tc.srThreshold
 			cfg.aggression = tc.aggression
@@ -557,7 +558,7 @@ func TestProbabilityFormula_VectorTests(t *testing.T) {
 
 		// One below firstAdmit: REJECT (only if P > 0 and firstAdmit > 0)
 		if pExpected > 0 && firstAdmit > 0 {
-			clk := newFakeClock(time.Unix(0, 0))
+			clk := clock.NewFakeClock(time.Unix(0, 0))
 			cfg := testCompiledConfigAC()
 			cfg.srThreshold = tc.srThreshold
 			cfg.aggression = tc.aggression
@@ -579,7 +580,7 @@ func TestProbabilityFormula_VectorTests(t *testing.T) {
 // TestController_FAKE_TIME_Window_SingleBucket verifies that requests in the
 // same second land in the same bucket and are aggregated in global.
 func TestController_FAKE_TIME_Window_SingleBucket(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	c := newTestController(cfg, nil, clk, defaultRand{})
 
@@ -603,7 +604,7 @@ func TestController_FAKE_TIME_Window_SingleBucket(t *testing.T) {
 // TestController_FAKE_TIME_Window_BucketRollover verifies that advancing >=1s
 // causes a new bucket to be created.
 func TestController_FAKE_TIME_Window_BucketRollover(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	c := newTestController(cfg, nil, clk, defaultRand{})
 
@@ -632,7 +633,7 @@ func TestController_FAKE_TIME_Window_BucketRollover(t *testing.T) {
 // TestController_FAKE_TIME_Window_StalePurge verifies that buckets older than
 // samplingWindow are purged and decremented from global.
 func TestController_FAKE_TIME_Window_StalePurge(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	cfg.samplingWindow = 5 * time.Second // small window for test
 	c := newTestController(cfg, nil, clk, defaultRand{})
@@ -670,7 +671,7 @@ func TestController_FAKE_TIME_Window_StalePurge(t *testing.T) {
 // TestController_FAKE_TIME_Window_MultiSecondRollover verifies bucket rollover
 // across multiple seconds.
 func TestController_FAKE_TIME_Window_MultiSecondRollover(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	cfg.samplingWindow = 10 * time.Second
 	c := newTestController(cfg, nil, clk, defaultRand{})
@@ -693,7 +694,7 @@ func TestController_FAKE_TIME_Window_MultiSecondRollover(t *testing.T) {
 // TestController_FAKE_TIME_Window_EmptyAfterFullPurge verifies that requestCounts
 // returns (0,0) after all buckets are purged.
 func TestController_FAKE_TIME_Window_EmptyAfterFullPurge(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	cfg.samplingWindow = 5 * time.Second
 	c := newTestController(cfg, nil, clk, defaultRand{})
@@ -712,7 +713,7 @@ func TestController_FAKE_TIME_Window_EmptyAfterFullPurge(t *testing.T) {
 // TestController_FAKE_TIME_Window_RequestCounts_Purges verifies that
 // requestCounts triggers a purge, not just reads the global.
 func TestController_FAKE_TIME_Window_RequestCounts_Purges(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	cfg.samplingWindow = 3 * time.Second
 	c := newTestController(cfg, nil, clk, defaultRand{})
@@ -733,7 +734,7 @@ func TestController_FAKE_TIME_Window_RequestCounts_Purges(t *testing.T) {
 // TestRpsSuppression_EmptyWindow_ReturnsZero verifies averageRps() returns 0
 // when the window is empty per SPEC §4.2.
 func TestRpsSuppression_EmptyWindow_ReturnsZero(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	c := newTestController(cfg, nil, clk, defaultRand{})
 
@@ -746,7 +747,7 @@ func TestRpsSuppression_EmptyWindow_ReturnsZero(t *testing.T) {
 // requests in a sub-second window: denominator = max(samplingWindow, age of
 // oldest bucket) = samplingWindow (30s); so rps = n/30.
 func TestRpsSuppression_SingleSecond_EqualsCount(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	cfg.samplingWindow = 30 * time.Second
 	c := newTestController(cfg, nil, clk, defaultRand{})
@@ -767,7 +768,7 @@ func TestRpsSuppression_SingleSecond_EqualsCount(t *testing.T) {
 // TestRpsSuppression_MultiSecond verifies averageRps() when the window spans
 // multiple seconds with the age denominator kicking in.
 func TestRpsSuppression_MultiSecond(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	cfg.samplingWindow = 30 * time.Second
 	c := newTestController(cfg, nil, clk, defaultRand{})
@@ -797,7 +798,7 @@ func TestRpsSuppression_MultiSecond(t *testing.T) {
 // (i.e. max(samplingWindow, age) = samplingWindow). Age=2s < window=5s, so
 // denominator = 5s; total=10 requests → rps=10/5=2.
 func TestRpsSuppression_SamplingWindowDenominator(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	cfg.samplingWindow = 5 * time.Second
 	c := newTestController(cfg, nil, clk, defaultRand{})
@@ -828,7 +829,7 @@ func TestRpsSuppression_SamplingWindowDenominator(t *testing.T) {
 // TestRecordDiscipline_Classify_Success increments rqSuccess counter and
 // records into window on classify(true).
 func TestRecordDiscipline_Classify_Success(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	reg := stats.NewRegistry()
 	st := newFilterStats(reg, "http.test")
@@ -852,7 +853,7 @@ func TestRecordDiscipline_Classify_Success(t *testing.T) {
 // TestRecordDiscipline_Classify_Failure increments rqFailure counter and
 // records into window on classify(false).
 func TestRecordDiscipline_Classify_Failure(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	reg := stats.NewRegistry()
 	st := newFilterStats(reg, "http.test")
@@ -876,7 +877,7 @@ func TestRecordDiscipline_Classify_Failure(t *testing.T) {
 // TestRecordDiscipline_Classify_Multiple verifies multiple classify calls
 // accumulate correctly.
 func TestRecordDiscipline_Classify_Multiple(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	reg := stats.NewRegistry()
 	st := newFilterStats(reg, "http.test")
@@ -905,7 +906,7 @@ func TestRecordDiscipline_Classify_Multiple(t *testing.T) {
 // recordRequest (which is called by the controller internally) does NOT
 // increment the stats counters — only classify() does.
 func TestRecordDiscipline_RecordRequest_DoesNotIncrement_Stats(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	reg := stats.NewRegistry()
 	st := newFilterStats(reg, "http.test")
@@ -935,7 +936,7 @@ func TestRecordDiscipline_RecordRequest_DoesNotIncrement_Stats(t *testing.T) {
 // TestController_Concurrent_RecordAndCount exercises concurrent recordRequest +
 // requestCounts under the race detector. Verifies no data race + consistent totals.
 func TestController_Concurrent_RecordAndCount(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	cfg.samplingWindow = 10 * time.Second
 	c := newTestController(cfg, nil, clk, defaultRand{})
@@ -969,7 +970,7 @@ func TestController_Concurrent_RecordAndCount(t *testing.T) {
 // TestController_Concurrent_ClassifyAndShouldReject exercises concurrent
 // classify + shouldReject. Verifies no data race + no deadlock.
 func TestController_Concurrent_ClassifyAndShouldReject(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	c := newTestController(cfg, nil, clk, defaultRand{})
 
@@ -1008,7 +1009,7 @@ func TestController_Concurrent_ClassifyAndShouldReject(t *testing.T) {
 // TestController_Concurrent_NoDeadlock exercises all three public methods
 // concurrently to confirm no deadlock under the race detector.
 func TestController_Concurrent_NoDeadlock(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	c := newTestController(cfg, nil, clk, defaultRand{})
 
@@ -1038,7 +1039,7 @@ func TestController_Concurrent_NoDeadlock(t *testing.T) {
 // TestController_Concurrent_AverageRps exercises averageRps concurrently with
 // recordRequest. Verifies no data race.
 func TestController_Concurrent_AverageRps(t *testing.T) {
-	clk := newFakeClock(time.Unix(0, 0))
+	clk := clock.NewFakeClock(time.Unix(0, 0))
 	cfg := testCompiledConfigAC()
 	c := newTestController(cfg, nil, clk, defaultRand{})
 
@@ -1063,4 +1064,67 @@ func TestController_Concurrent_AverageRps(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// -----------------------------------------------------------------------------
+// windowSnapshot — single-lock/purge triple must agree with the individual
+// requestCounts + averageRps accessors (maintenance-pass consolidation: the
+// DecodeHeaders gates now consume one snapshot instead of two lock/purge
+// round-trips).
+// -----------------------------------------------------------------------------
+
+// TestWindowSnapshot_AgreesWithIndividualAccessors seeds a multi-bucket
+// window (including stale buckets that the purge must drop) and asserts
+// windowSnapshot returns exactly the (n, s, rps) triple the pre-existing
+// requestCounts + averageRps accessors report at the same fake-clock instant.
+func TestWindowSnapshot_AgreesWithIndividualAccessors(t *testing.T) {
+	cfg := testCompiledConfigAC()
+	cfg.samplingWindow = 5 * time.Second
+	clk := clock.NewFakeClock(time.Unix(0, 0))
+	c := newTestController(cfg, nil, clk, fakeRand{v: 0})
+
+	// Seed: 3 buckets, then advance far enough that the first goes stale.
+	for i := 0; i < 4; i++ {
+		c.recordRequest(true)
+	}
+	c.recordRequest(false)
+	clk.Advance(2 * time.Second)
+	c.recordRequest(true)
+	clk.Advance(2 * time.Second)
+	c.recordRequest(false)
+	clk.Advance(2 * time.Second) // oldest bucket now 6s old > 5s window
+
+	n, s, rps := c.windowSnapshot()
+	wantN, wantS := c.requestCounts()
+	wantRPS := c.averageRps()
+	if n != wantN || s != wantS {
+		t.Errorf("windowSnapshot counts = (%d, %d); requestCounts = (%d, %d)", n, s, wantN, wantS)
+	}
+	if rps != wantRPS {
+		t.Errorf("windowSnapshot rps = %d; averageRps = %d", rps, wantRPS)
+	}
+	// Sanity: the purge inside the snapshot dropped the stale first bucket
+	// (5 of the 7 recorded requests survive: buckets at t=2s and t=4s).
+	if n != 2 {
+		t.Errorf("post-purge requests = %d; want 2 (first bucket stale)", n)
+	}
+}
+
+// TestRejectDecision_MatchesShouldReject asserts the split-out
+// rejectDecision(n, s) is byte-equivalent to shouldReject() for the same
+// window state + deterministic dice roll (shouldReject is rejectDecision
+// over requestCounts).
+func TestRejectDecision_MatchesShouldReject(t *testing.T) {
+	for _, v := range []uint64{0, 1, 4999, 5000, 9999} {
+		clk := clock.NewFakeClock(time.Unix(0, 0))
+		c := newTestController(nil, nil, clk, fakeRand{v: v})
+		// 10 requests, 2 successes → heavy failure window.
+		for i := 0; i < 10; i++ {
+			c.recordRequest(i < 2)
+		}
+		n, s := c.requestCounts()
+		if got, want := c.rejectDecision(n, s), c.shouldReject(); got != want {
+			t.Errorf("v=%d: rejectDecision(%d, %d) = %v; shouldReject() = %v", v, n, s, got, want)
+		}
+	}
 }

@@ -349,3 +349,81 @@ func TestBuildPerRouteConfig_PerRouteValidator_OnlyConsultedForRegisteredFilters
 		t.Errorf("unrelated filter's config should not trigger validator; got %v", err)
 	}
 }
+
+// --- Multi-route location-string coordinates (maintenance pass 2026-07-07) ---
+//
+// Scopes are one-per-route; the boot-error location strings previously reused
+// the flat scope index for BOTH the virtual_hosts[...] and routes[...]
+// coordinates, so route 1 of vhost 0 misreported as
+// virtual_hosts[1].routes[1]. The tests below pin the corrected coordinates
+// threaded through RouteScope.VHostIndex/RouteIndex.
+
+func TestPerRoute_Build_MultiRoute_UnknownFilterName_ReportsRealCoordinates(t *testing.T) {
+	chainNames := []string{"envoy.filters.http.cors"}
+	okCfg := map[string]*anypb.Any{"envoy.filters.http.cors": mustAny(t, wrapperspb.String("ok"))}
+	badCfg := map[string]*anypb.Any{"envoy.filters.http.bogus": mustAny(t, wrapperspb.String("oops"))}
+	// vhost 0 carries routes 0+1; the unknown-filter map sits on route 1.
+	scopes := []routeScope{
+		{VHost: nil, Route: okCfg, VHostIndex: 0, RouteIndex: 0},
+		{VHost: nil, Route: badCfg, VHostIndex: 0, RouteIndex: 1},
+	}
+	_, err := BuildPerRouteConfig(nil, scopes, chainNames, nil)
+	if err == nil {
+		t.Fatal("expected error on unknown filter name")
+	}
+	if !strings.Contains(err.Error(), "route_config.virtual_hosts[0].routes[1]") {
+		t.Errorf("expected location virtual_hosts[0].routes[1]; got %q", err.Error())
+	}
+}
+
+func TestPerRoute_Build_SecondVHost_UnknownFilterName_ReportsRealCoordinates(t *testing.T) {
+	chainNames := []string{"envoy.filters.http.cors"}
+	badVH := map[string]*anypb.Any{"envoy.filters.http.bogus": mustAny(t, wrapperspb.String("oops"))}
+	// vhost 0 has 2 clean routes; vhost 1's route 0 carries the unknown-filter
+	// vhost-tier map. The flat scope index of that scope is 2 — the old code
+	// would have reported virtual_hosts[2].
+	scopes := []routeScope{
+		{VHostIndex: 0, RouteIndex: 0},
+		{VHostIndex: 0, RouteIndex: 1},
+		{VHost: badVH, VHostIndex: 1, RouteIndex: 0},
+	}
+	_, err := BuildPerRouteConfig(nil, scopes, chainNames, nil)
+	if err == nil {
+		t.Fatal("expected error on unknown filter name")
+	}
+	if !strings.Contains(err.Error(), "route_config.virtual_hosts[1]:") {
+		t.Errorf("expected location virtual_hosts[1]; got %q", err.Error())
+	}
+}
+
+func TestBuildPerRouteConfig_PerRouteValidator_MultiRoute_ErrorCarriesRealCoordinates(t *testing.T) {
+	r := NewHTTPRegistry()
+	r.RegisterPerRouteValidator("envoy.filters.http.header_mutation", func(m proto.Message) error {
+		if s, ok := m.(*wrapperspb.StringValue); ok && s.GetValue() == "triggers-error" {
+			return errors.New("validator-rejection")
+		}
+		return nil
+	})
+	r.Freeze()
+	chainNames := []string{"envoy.filters.http.header_mutation"}
+	okCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("ok"))}
+	badCfg := map[string]*anypb.Any{"envoy.filters.http.header_mutation": mustAny(t, wrapperspb.String("triggers-error"))}
+	// The rejected per-route config sits at vhost 1, route 2 (flat scope
+	// index 3 — the old code would have reported virtual_hosts[3].routes[3]).
+	scopes := []routeScope{
+		{Route: okCfg, VHostIndex: 0, RouteIndex: 0},
+		{VHostIndex: 1, RouteIndex: 0},
+		{Route: okCfg, VHostIndex: 1, RouteIndex: 1},
+		{Route: badCfg, VHostIndex: 1, RouteIndex: 2},
+	}
+	_, err := BuildPerRouteConfig(nil, scopes, chainNames, r)
+	if err == nil {
+		t.Fatal("expected error; got nil")
+	}
+	if !strings.Contains(err.Error(), "route_config.virtual_hosts[1].routes[2]") {
+		t.Errorf("expected location virtual_hosts[1].routes[2]; got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "validator-rejection") {
+		t.Errorf("error should wrap validator error; got %q", err.Error())
+	}
+}

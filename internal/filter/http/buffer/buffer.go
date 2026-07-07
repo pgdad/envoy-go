@@ -28,8 +28,16 @@ const cap1MiB uint32 = 1 << 20 // 1048576
 // compiledConfig captures the single consumed field from the Buffer proto
 // per SPEC §6.1 + ADR-0126. No *filterStats field — phase 13 emits no
 // filter-specific counters (SPEC §1.1 amendment 5).
+//
+// perRoute is the shared generic lazy-cache keyed by *BufferPerRoute pointer
+// identity (the parse result is deterministic per proto pointer, so the
+// per-request re-parse the pre-cache code paid is pure waste). The
+// compiledConfig is closure-captured at New time and shared across streams,
+// so the cache is per-listener-filter-instance — mirroring the
+// localratelimit/bandwidthlimit factoryState discipline.
 type compiledConfig struct {
 	maxRequestBytes uint32
+	perRoute        envoyhttp.PerRouteCache[*bufferv3.BufferPerRoute, compiledPerRoute]
 }
 
 // compiledPerRoute captures the parsed-and-validated per-route override per
@@ -172,17 +180,23 @@ func (f *filter) DecodeHeaders(headers http.Header, endStream bool) envoyhttp.Fi
 // Returns (cap, disabled). Listener fallback applies when no per-route config is present.
 // Per ADR-0127 v2 §Decision (i): called once per stream from DecodeHeaders; result is
 // cached in f.effectiveMax + f.passthrough for use by DecodeData (Task 4).
+//
+// The compiled per-route config is lazily cached by *BufferPerRoute pointer
+// identity via the shared envoyhttp.PerRouteCache (same discipline as
+// localratelimit/bandwidthlimit): nil / non-*BufferPerRoute / unparseable
+// per-route configs all fall back to the listener config, exactly as the
+// pre-cache per-request parsePerRoute path did.
 func (f *filter) resolveEffective() (effectiveMax uint32, disabled bool) {
 	if f.dcb == nil {
 		return f.config.maxRequestBytes, false
 	}
 	resolved := f.dcb.RequestRouteConfig() // returns proto.Message or nil
-	if resolved == nil {
-		return f.config.maxRequestBytes, false
-	}
-	cpr, err := parsePerRoute(resolved)
-	if err != nil {
-		// Unparseable per-route — fall back to listener config.
+	cpr := f.config.perRoute.Resolve(resolved, nil,
+		func(pr *bufferv3.BufferPerRoute) (*compiledPerRoute, error) {
+			return parsePerRoute(pr)
+		})
+	if cpr == nil {
+		// No per-route config (or unparseable) — fall back to listener config.
 		return f.config.maxRequestBytes, false
 	}
 	if cpr.disabled {

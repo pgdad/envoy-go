@@ -14,6 +14,10 @@ package lua
 //   - Test_body_buffered_bytes_total_counter_increments
 //   - Test_coroutine_yields_total_counter_increments
 //   - Test_ResponseHandleBody_symmetric
+//
+// Plus 6 maintenance-pass tests for the post-:body()-resume continuation
+// paths (respond-state re-check at DecodeData + inner-Resume error
+// capture on both sides) — Tests 9-14 at the bottom of this file.
 
 import (
 	"bytes"
@@ -24,6 +28,7 @@ import (
 
 	lua "github.com/yuin/gopher-lua"
 
+	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 	luaprim "github.com/pgdad/envoy-go/internal/lua"
 	"github.com/pgdad/envoy-go/internal/stats"
 )
@@ -338,5 +343,236 @@ func Test_ResponseHandleBody_symmetric(t *testing.T) {
 	got := getStrGlobal(t, f, "result")
 	if got != "encoded-response" {
 		t.Fatalf("resp:body() = %q; want %q", got, "encoded-response")
+	}
+}
+
+// -----------------------------------------------------------------------
+// Respond-after-:body()-yield + inner-Resume error-capture tests.
+//
+// The DecodeHeaders dispatcher's step-9 respond-state check runs only
+// when its own Resume completes; when the script suspends on :body(),
+// the continuation runs inside the inner Resume driven from DecodeData
+// — so DecodeData must (a) re-run the respond-state check (request
+// side) and (b) capture any script runtime error raised after the
+// resume (both sides; the outer dispatch site never sees it).
+// -----------------------------------------------------------------------
+
+// suspendBodyCoroutine compiles + runs src (which must define global
+// function fnName), mints a child coroutine and resumes it up to the
+// :body() yield point. Fails the test unless the first Resume reports
+// (ResumeYield, nil). Mirrors the production DecodeHeaders /
+// EncodeHeaders dispatch path.
+func suspendBodyCoroutine(t *testing.T, f *filter, src, fnName string) {
+	t.Helper()
+	chunk, err := luaprim.CompileScript([]byte(src), nil)
+	if err != nil {
+		t.Fatalf("CompileScript err = %v", err)
+	}
+	if err := f.vm.Run(chunk); err != nil {
+		t.Fatalf("vm.Run err = %v", err)
+	}
+	child, cancel := f.vm.NewThread()
+	if cancel != nil {
+		t.Cleanup(cancel)
+	}
+	fnVal := f.vm.State().GetGlobal(fnName)
+	fn, ok := fnVal.(*lua.LFunction)
+	if !ok {
+		t.Fatalf("global %q is not a function (got %v)", fnName, fnVal)
+	}
+	state, rerr, _ := f.vm.Resume(child, fn)
+	if rerr != nil {
+		t.Fatalf("Resume[1] err = %v; want nil", rerr)
+	}
+	if state != lua.ResumeYield {
+		t.Fatalf("Resume[1] state = %v; want ResumeYield (body not yet ready)", state)
+	}
+}
+
+// Test 9: request_handle:respond() called AFTER the :body() yield/resume
+// (the canonical upstream body-inspection pattern) must fire
+// SendLocalReply + increment respond_calls + stop decode iteration.
+func Test_DecodeData_respond_after_body_yield_fires_SendLocalReply(t *testing.T) {
+	f := newBodyBridgeFilter(t)
+	dcb := &recordedDCB{}
+	f.dcb = dcb
+
+	suspendBodyCoroutine(t, f, `
+		function consume()
+			local b = rh:body()
+			if b == "bad-body" then
+				rh:respond({[":status"]="403", ["x-lua-deny"]="1"}, "denied")
+			end
+		end
+	`, "consume")
+
+	respondBefore := f.cc.stats.respondCalls.Load()
+	status := f.DecodeData([]byte("bad-body"), true)
+	if status != envoyhttp.DataStopIterationNoBuffer {
+		t.Fatalf("DecodeData status = %v; want DataStopIterationNoBuffer (respond captured post-resume)", status)
+	}
+	if delta := f.cc.stats.respondCalls.Load() - respondBefore; delta != 1 {
+		t.Fatalf("respond_calls delta = %d; want 1", delta)
+	}
+	dcb.mu.Lock()
+	lr := dcb.localReply
+	dcb.mu.Unlock()
+	if lr == nil {
+		t.Fatal("SendLocalReply not invoked; want (403, \"denied\")")
+	}
+	if lr.status != 403 {
+		t.Fatalf("SendLocalReply status = %d; want 403", lr.status)
+	}
+	if lr.body != "denied" {
+		t.Fatalf("SendLocalReply body = %q; want %q", lr.body, "denied")
+	}
+	var sawDeny bool
+	for _, h := range lr.headers {
+		if h.Name == "x-lua-deny" && h.Value == "1" {
+			sawDeny = true
+		}
+	}
+	if !sawDeny {
+		t.Fatalf("SendLocalReply headers = %v; want x-lua-deny: 1 present", lr.headers)
+	}
+}
+
+// Test 10: a benign post-:body() continuation (no respond) keeps the
+// DataContinue status + does NOT touch respond_calls / SendLocalReply.
+func Test_DecodeData_no_respond_after_body_yield_continues(t *testing.T) {
+	f := newBodyBridgeFilter(t)
+	dcb := &recordedDCB{}
+	f.dcb = dcb
+
+	suspendBodyCoroutine(t, f, `
+		function consume()
+			captured = rh:body()
+		end
+	`, "consume")
+
+	respondBefore := f.cc.stats.respondCalls.Load()
+	status := f.DecodeData([]byte("good-body"), true)
+	if status != envoyhttp.DataContinue {
+		t.Fatalf("DecodeData status = %v; want DataContinue", status)
+	}
+	if delta := f.cc.stats.respondCalls.Load() - respondBefore; delta != 0 {
+		t.Fatalf("respond_calls delta = %d; want 0", delta)
+	}
+	dcb.mu.Lock()
+	lr := dcb.localReply
+	dcb.mu.Unlock()
+	if lr != nil {
+		t.Fatalf("SendLocalReply invoked = %+v; want none", lr)
+	}
+	if got := getStrGlobal(t, f, "captured"); got != "good-body" {
+		t.Fatalf("captured = %q; want %q", got, "good-body")
+	}
+}
+
+// Test 11: respond captured BEFORE the :body() yield (respond-then-
+// inspect ordering) is ALSO delivered at the resume — the DecodeHeaders
+// dispatcher returned Continue on the body-yield path without the
+// respond-state check, so DecodeData owns delivery for this ordering
+// too.
+func Test_DecodeData_respond_before_body_yield_fires_SendLocalReply(t *testing.T) {
+	f := newBodyBridgeFilter(t)
+	dcb := &recordedDCB{}
+	f.dcb = dcb
+
+	suspendBodyCoroutine(t, f, `
+		function consume()
+			rh:respond({[":status"]="503"}, "early")
+			local b = rh:body()
+		end
+	`, "consume")
+
+	status := f.DecodeData([]byte("whatever"), true)
+	if status != envoyhttp.DataStopIterationNoBuffer {
+		t.Fatalf("DecodeData status = %v; want DataStopIterationNoBuffer", status)
+	}
+	dcb.mu.Lock()
+	lr := dcb.localReply
+	dcb.mu.Unlock()
+	if lr == nil || lr.status != 503 || lr.body != "early" {
+		t.Fatalf("SendLocalReply = %+v; want (503, \"early\")", lr)
+	}
+}
+
+// Test 12: a script runtime error raised AFTER the :body() resume must
+// increment stats.errors (the outer dispatch site's Resume already
+// returned ResumeYield and never sees this error).
+func Test_DecodeData_error_after_body_yield_increments_errors(t *testing.T) {
+	f := newBodyBridgeFilter(t)
+
+	suspendBodyCoroutine(t, f, `
+		function consume()
+			local b = rh:body()
+			error("boom after resume")
+		end
+	`, "consume")
+
+	errorsBefore := f.cc.stats.errors.Load()
+	status := f.DecodeData([]byte("payload"), true)
+	if status != envoyhttp.DataContinue {
+		t.Fatalf("DecodeData status = %v; want DataContinue (no respond captured)", status)
+	}
+	if delta := f.cc.stats.errors.Load() - errorsBefore; delta != 1 {
+		t.Fatalf("errors delta = %d; want 1 (inner-Resume error capture)", delta)
+	}
+}
+
+// Test 13: response-side symmetry — response_handle:respond() after the
+// :body() yield raises the AMEND-8 runtime error inside the inner
+// Resume driven from EncodeData; the error is captured via stats.errors
+// and NO local reply fires (encode-side :respond() never captures
+// state).
+func Test_EncodeData_respond_after_body_yield_raises_and_counts_error(t *testing.T) {
+	f := newBodyBridgeFilter(t)
+	dcb := &recordedDCB{}
+	f.dcb = dcb
+
+	suspendBodyCoroutine(t, f, `
+		function consume_resp()
+			local b = resp:body()
+			resp:respond({[":status"]="403"}, "denied")
+		end
+	`, "consume_resp")
+
+	errorsBefore := f.cc.stats.errors.Load()
+	respondBefore := f.cc.stats.respondCalls.Load()
+	status := f.EncodeData([]byte("resp-body"), true)
+	if status != envoyhttp.DataContinue {
+		t.Fatalf("EncodeData status = %v; want DataContinue", status)
+	}
+	if delta := f.cc.stats.errors.Load() - errorsBefore; delta != 1 {
+		t.Fatalf("errors delta = %d; want 1 (AMEND-8 reject captured at inner Resume)", delta)
+	}
+	if delta := f.cc.stats.respondCalls.Load() - respondBefore; delta != 0 {
+		t.Fatalf("respond_calls delta = %d; want 0 (encode-side respond never captures)", delta)
+	}
+	dcb.mu.Lock()
+	lr := dcb.localReply
+	dcb.mu.Unlock()
+	if lr != nil {
+		t.Fatalf("SendLocalReply invoked = %+v; want none on encode side", lr)
+	}
+}
+
+// Test 14: response-side generic runtime error after the :body() resume
+// increments stats.errors (symmetric to Test 12).
+func Test_EncodeData_error_after_body_yield_increments_errors(t *testing.T) {
+	f := newBodyBridgeFilter(t)
+
+	suspendBodyCoroutine(t, f, `
+		function consume_resp()
+			local b = resp:body()
+			error("resp boom after resume")
+		end
+	`, "consume_resp")
+
+	errorsBefore := f.cc.stats.errors.Load()
+	f.EncodeData([]byte("resp-payload"), true)
+	if delta := f.cc.stats.errors.Load() - errorsBefore; delta != 1 {
+		t.Fatalf("errors delta = %d; want 1 (inner-Resume error capture)", delta)
 	}
 }

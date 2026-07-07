@@ -14,6 +14,12 @@ import (
 const (
 	maxBulkLen  = 512 * 1024 * 1024 // 512 MiB
 	maxArrayLen = 1024 * 1024       // 1 Mi elements
+	// maxReplyDepth caps reply-array nesting. decodeReplyInto recurses once per
+	// nesting level (4 wire bytes per chained "*1\r\n" header), so an unbounded
+	// depth would let a crafted upstream reply exhaust the goroutine stack — an
+	// unrecoverable runtime panic. 128 comfortably exceeds any real reply's
+	// nesting; deeper input takes the normal errProtocol path.
+	maxReplyDepth = 128
 )
 
 // errProtocol is the catch-all RESP framing error. Wording is internal-only
@@ -86,15 +92,19 @@ var (
 // not re-encode. Blocks on partial frames; never panics on arbitrary bytes.
 func decodeReply(r *bufio.Reader) (raw []byte, err error) {
 	var buf bytes.Buffer
-	if err := decodeReplyInto(r, &buf); err != nil {
+	if err := decodeReplyInto(r, &buf, 0); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
 }
 
 // decodeReplyInto reads one reply frame, appending consumed bytes to raw. Arrays
-// recurse (nested-array support).
-func decodeReplyInto(r *bufio.Reader, raw *bytes.Buffer) error {
+// recurse (nested-array support) with depth+1, bounded by maxReplyDepth
+// (stack-exhaustion guard → errProtocol).
+func decodeReplyInto(r *bufio.Reader, raw *bytes.Buffer, depth int) error {
+	if depth >= maxReplyDepth {
+		return errProtocol
+	}
 	t, err := r.ReadByte()
 	if err != nil {
 		return err
@@ -156,7 +166,7 @@ func decodeReplyInto(r *bufio.Reader, raw *bytes.Buffer) error {
 			return errProtocol
 		}
 		for i := 0; i < n; i++ {
-			if err := decodeReplyInto(r, raw); err != nil {
+			if err := decodeReplyInto(r, raw, depth+1); err != nil {
 				return err
 			}
 		}

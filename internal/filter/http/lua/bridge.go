@@ -82,6 +82,7 @@ import (
 	"strings"
 
 	lua "github.com/yuin/gopher-lua"
+	"github.com/yuin/gopher-lua/parse"
 
 	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
@@ -503,21 +504,44 @@ func installDynamicMetadataMetatable(L *lua.LState) *lua.LTable {
 //  2. Else fall back to the standard 5.1 pairs(table) semantics.
 //
 // The override is in-Lua to avoid the gopher-lua API overhead of
-// switching between LGFunction registration + return-pushing. Bound
-// directly via L.DoString of a 6-line Lua chunk. Done at install time
-// (cheap one-shot; the resulting Lua function is the new `pairs`
-// global for the rest of the VM's lifetime).
+// switching between LGFunction registration + return-pushing. The shim
+// source is a compile-time constant, so it is parsed + compiled ONCE at
+// package init (pairsShimProto below); per-VM install is a cheap
+// NewFunctionFromProto + PCall — no parser run per stream, identical
+// Lua semantics (the same parse.Parse + lua.Compile pipeline that
+// L.DoString would drive, with the same "<string>" chunk name so any
+// script-observable error locations stay byte-identical).
 func installPairsShim(L *lua.LState) {
+	if pairsShimProto == nil {
+		// Defensive: if for some reason the shim chunk failed to compile
+		// at package init, fall back to the gopher-lua default pairs (the
+		// userdata path will surface "attempt to call ... (a userdata
+		// value)" at script-time, which is at least debuggable). We do
+		// NOT panic here — the rest of the bridge surface is still
+		// usable.
+		return
+	}
+
 	// Stash the original pairs as __builtin_pairs (so the shim can
 	// fall back when __pairs is absent — preserves stdlib pairs()
 	// semantics for plain tables).
 	origPairs := L.GetGlobal("pairs")
 	L.SetGlobal("__builtin_pairs", origPairs)
 
-	// Lua-side shim definition; safer than juggling LUserData wrap +
-	// closure capture from Go (Lua's native 5.2-compat pairs is 4
-	// lines).
-	const shim = `
+	fn := L.NewFunctionFromProto(pairsShimProto)
+	L.Push(fn)
+	if err := L.PCall(0, 0, nil); err != nil {
+		// Defensive: execution of the constant shim chunk cannot fail in
+		// practice; mirror the historical DoString-error tolerance (keep
+		// the VM usable with the default pairs).
+		_ = err
+	}
+}
+
+// pairsShimSrc is the Lua-side shim definition; safer than juggling
+// LUserData wrap + closure capture from Go (Lua's native 5.2-compat
+// pairs is 4 lines).
+const pairsShimSrc = `
 local _builtin = __builtin_pairs
 function pairs(t)
     local mt = getmetatable(t)
@@ -528,16 +552,28 @@ function pairs(t)
 end
 __builtin_pairs = nil
 `
-	if err := L.DoString(shim); err != nil {
-		// Defensive: if for some reason the shim chunk fails to compile
-		// or execute, fall back to the gopher-lua default pairs (the
-		// userdata path will surface "attempt to call ... (a userdata
-		// value)" at script-time, which is at least debuggable). We do
-		// NOT panic here — the rest of the bridge surface is still
-		// usable.
-		_ = err
+
+// pairsShimProto is the once-compiled bytecode for pairsShimSrc,
+// produced at package init. A *lua.FunctionProto is bytecode-only
+// (no LState-specific state) and is safe to share across N concurrent
+// per-stream *lua.LStates via NewFunctionFromProto — same discipline
+// as internal/lua's CompileScript chunk sharing. Nil only if the
+// constant source failed to compile (never in practice; installPairsShim
+// degrades to the gopher-lua default pairs in that case).
+var pairsShimProto = func() *lua.FunctionProto {
+	// "<string>" matches the chunk name L.DoString would stamp
+	// (gopher-lua LoadString), keeping error-location strings from the
+	// shim chunk byte-identical to the historical DoString path.
+	ast, err := parse.Parse(strings.NewReader(pairsShimSrc), "<string>")
+	if err != nil {
+		return nil
 	}
-}
+	proto, err := lua.Compile(ast, "<string>")
+	if err != nil {
+		return nil
+	}
+	return proto
+}()
 
 // ---------------------------------------------------------------------
 // Method dispatch tables
@@ -646,16 +682,17 @@ var requestHandleMethods = map[string]lua.LGFunction{
 var responseHandleMethods = map[string]lua.LGFunction{
 	"headers": responseHandleHeaders,
 	// Task 7 — same 6 log methods on the encode side; script authors
-	// may want to log from envoy_on_response. Per-handle separate stubs
-	// (rather than reusing the request_handle functions) to keep the
-	// L.CheckUserData(1) discipline crisp for future Task 8/9 extensions
-	// that may consult the handle context.
-	"logTrace":    responseHandleLogTrace,
-	"logDebug":    responseHandleLogDebug,
-	"logInfo":     responseHandleLogInfo,
-	"logWarn":     responseHandleLogWarn,
-	"logErr":      responseHandleLogErr,
-	"logCritical": responseHandleLogCritical,
+	// may want to log from envoy_on_response. The request-side Go
+	// functions are registered directly (the `append`→`add` alias below
+	// sets the precedent, as do the crypto/misc delegating stubs):
+	// logAtLevel only checks that the receiver IS a userdata, never its
+	// concrete type, so dispatch is identical for both handles.
+	"logTrace":    requestHandleLogTrace,
+	"logDebug":    requestHandleLogDebug,
+	"logInfo":     requestHandleLogInfo,
+	"logWarn":     requestHandleLogWarn,
+	"logErr":      requestHandleLogErr,
+	"logCritical": requestHandleLogCritical,
 	// Task 8 — response-side :streamInfo() parity; same accessor
 	// surface as the request handle (script authors writing
 	// envoy_on_response will reasonably want to read stream metadata).
@@ -763,16 +800,27 @@ func responseHandleHeaders(L *lua.LState) int {
 	return pushHeadersUD(L, ctx.headers)
 }
 
+// pushHeaderLikeUD allocates a fresh LUserData wrapping the supplied
+// http.Header + attaches the metatable registered under typeName +
+// pushes it onto the stack. Returns 1 (number of pushed return values
+// per LGFunction convention). Shared by pushHeadersUD (envoy_headers)
+// and pushTrailersUD (envoy_trailers) — the two userdata kinds differ
+// ONLY in the metatable registry key (a Lua-side type marker); the Go-
+// side value is http.Header in both cases.
+func pushHeaderLikeUD(L *lua.LState, h http.Header, typeName string) int {
+	ud := L.NewUserData()
+	ud.Value = h
+	L.SetMetatable(ud, L.GetTypeMetatable(typeName))
+	L.Push(ud)
+	return 1
+}
+
 // pushHeadersUD allocates a fresh LUserData wrapping the supplied
 // http.Header + attaches the envoy_headers metatable + pushes it onto
 // the stack. Returns 1 (number of pushed return values per LGFunction
 // convention).
 func pushHeadersUD(L *lua.LState, h http.Header) int {
-	ud := L.NewUserData()
-	ud.Value = h
-	L.SetMetatable(ud, L.GetTypeMetatable(headersTypeName))
-	L.Push(ud)
-	return 1
+	return pushHeaderLikeUD(L, h, headersTypeName)
 }
 
 // getHeadersFromUD type-checks + extracts the http.Header from the
@@ -899,10 +947,11 @@ func headersReplace(L *lua.LState) int {
 // NOT as a format string. Any %verbs in the msg are inert characters
 // in the output (no format-string-injection attack surface).
 //
-// Per-handle separate stubs (rather than a single Go function
-// registered under both maps) keep the L.CheckUserData(1) discipline
-// crisp for future Tasks 8-9 extensions that may consult per-handle
-// context (e.g. log-prefix scoping, request-id stamping).
+// The same 6 Go functions are registered under BOTH dispatch maps —
+// log emission is context-free, so per-handle stubs would be pure
+// duplication. A future extension that consults per-handle context
+// (e.g. log-prefix scoping, request-id stamping) would split
+// per-handle helpers at that point.
 
 // logAtLevel is the shared body for all 12 :logXxx methods (6 levels
 // × {request, response} handle). Type-checks the receiver userdata,
@@ -942,25 +991,9 @@ func requestHandleLogErr(L *lua.LState) int { return logAtLevel(L, "ERROR") }
 // requestHandleLogCritical implements request_handle:logCritical(msg).
 func requestHandleLogCritical(L *lua.LState) int { return logAtLevel(L, "CRIT") }
 
-// responseHandleLogTrace implements response_handle:logTrace(msg).
-// Encode-side parity for the 6 :logXxx methods — script authors may
-// want to log from envoy_on_response.
-func responseHandleLogTrace(L *lua.LState) int { return logAtLevel(L, "DEBUG") }
-
-// responseHandleLogDebug implements response_handle:logDebug(msg).
-func responseHandleLogDebug(L *lua.LState) int { return logAtLevel(L, "DEBUG") }
-
-// responseHandleLogInfo implements response_handle:logInfo(msg).
-func responseHandleLogInfo(L *lua.LState) int { return logAtLevel(L, "INFO") }
-
-// responseHandleLogWarn implements response_handle:logWarn(msg).
-func responseHandleLogWarn(L *lua.LState) int { return logAtLevel(L, "WARN") }
-
-// responseHandleLogErr implements response_handle:logErr(msg).
-func responseHandleLogErr(L *lua.LState) int { return logAtLevel(L, "ERROR") }
-
-// responseHandleLogCritical implements response_handle:logCritical(msg).
-func responseHandleLogCritical(L *lua.LState) int { return logAtLevel(L, "CRIT") }
+// The response_handle :logXxx entries reuse the request-side functions
+// directly (registered in responseHandleMethods) — logAtLevel is
+// receiver-type-agnostic, so no encode-side stubs are needed.
 
 // ---------------------------------------------------------------------
 // __pairs metamethod — alphabetical-snapshot iterator (per §11.2 D7)

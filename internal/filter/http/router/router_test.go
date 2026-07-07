@@ -2,15 +2,12 @@ package router
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"math/bits"
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,7 +19,6 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	"github.com/pgdad/envoy-go/internal/accesslog"
 	"github.com/pgdad/envoy-go/internal/cluster"
 	"github.com/pgdad/envoy-go/internal/stats"
 )
@@ -140,73 +136,84 @@ func singleEndpointClusterCB(t *testing.T, addr string, cb *clusterv3.CircuitBre
 	return c, reg
 }
 
-func TestRouterAction_DoHappy(t *testing.T) {
+// TestH1ClusterAction_Happy drives the live Action closure (the shape HCM
+// dispatch injects via *Filter.SetAction) against a loopback echo backend.
+// Ported from the deleted legacy direct-write do() test: the logical
+// ActionResponse carries the same status/body bytes the dispatch layer
+// serializes via writeH1Reply, and the upstream's `Connection: close` is
+// surfaced on resp.Close (the closure never returns errCloseAfterAction —
+// the field replaced the sentinel on this path at Task 18 prereq P1).
+func TestH1ClusterAction_Happy(t *testing.T) {
 	addr, stop := loopbackHTTPEcho(t)
 	defer stop()
 
 	c := singleEndpointCluster(t, addr)
-	a := &routerAction{cluster: c}
+	action := H1ClusterAction(c, nil, cluster.SubsetMatch{}, nil, nil)
 
 	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
 	req.URL.Path = "/x"
 
-	var buf bytes.Buffer
-	bw := bufio.NewWriter(&buf)
-	// loopbackHTTPEcho writes `Connection: close` in its response, so the
-	// router action correctly signals close via errCloseAfterAction (per
-	// SPEC §5.3 / SPEC §10 #3 settled). Any other error is a real failure.
-	if _, err := a.do(req.Context(), req, bw); err != nil && !errors.Is(err, errCloseAfterAction) {
-		t.Fatalf("do: %v", err)
+	resp, picked, err := action(req.Context(), req)
+	if err != nil {
+		t.Fatalf("action: %v", err)
 	}
-	_ = bw.Flush()
-	if !strings.Contains(buf.String(), "echo:/x") {
-		t.Errorf("expected echo:/x in response, got: %q", buf.String())
+	if resp.Status != 200 {
+		t.Errorf("Status = %d, want 200", resp.Status)
+	}
+	if string(resp.Body) != "echo:/x" {
+		t.Errorf("Body = %q, want %q", resp.Body, "echo:/x")
+	}
+	if !resp.Close {
+		t.Errorf("Close = false, want true (backend sent Connection: close)")
+	}
+	if picked.IsZero() {
+		t.Errorf("picked = zero Endpoint, want the dialed backend")
 	}
 }
 
-func TestRouterAction_DoDialFailureReturns503(t *testing.T) {
+func TestH1ClusterAction_DialFailureReturns503(t *testing.T) {
 	// Cluster with an unreachable endpoint (port 1 is always rejected).
 	c := singleEndpointCluster(t, "127.0.0.1:1")
-	a := &routerAction{cluster: c}
+	action := H1ClusterAction(c, nil, cluster.SubsetMatch{}, nil, nil)
 
 	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
 	req.URL.Path = "/x"
 
-	var buf bytes.Buffer
-	bw := bufio.NewWriter(&buf)
-	if _, err := a.do(req.Context(), req, bw); err != nil {
-		// dial-failure becomes a 503 LOCAL REPLY; do() should NOT error
-		// (it writes the local reply and returns nil).
-		if !errors.Is(err, errCloseAfterAction) {
-			t.Errorf("dial failure should write 503 and return nil (or sentinel), got: %v", err)
-		}
+	resp, picked, err := action(req.Context(), req)
+	if err != nil {
+		// dial-failure becomes a 503 LOCAL REPLY shape; the closure must NOT
+		// error (dispatch serializes the synthesized response).
+		t.Fatalf("dial failure should synthesize 503 and return nil err, got: %v", err)
 	}
-	_ = bw.Flush()
-	if !strings.HasPrefix(buf.String(), "HTTP/1.1 503 ") {
-		t.Errorf("expected 503 local reply on dial failure, got: %q", buf.String())
+	if resp.Status != 503 {
+		t.Errorf("Status = %d, want 503 local reply on dial failure", resp.Status)
+	}
+	if !resp.localOrigin {
+		t.Errorf("localOrigin = false, want true (router-synthesized connect failure)")
+	}
+	if !picked.IsZero() {
+		t.Errorf("picked = %+v, want zero Endpoint on dial failure", picked)
 	}
 }
 
-func TestRouterAction_DoCtxCancel(t *testing.T) {
+func TestH1ClusterAction_CtxCancel(t *testing.T) {
 	addr, stop := loopbackHTTPEcho(t)
 	defer stop()
 
 	c := singleEndpointCluster(t, addr)
-	a := &routerAction{cluster: c}
+	action := H1ClusterAction(c, nil, cluster.SubsetMatch{}, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel before do — Cluster.Dial(ctx) should return ctx.Err()
+	cancel() // cancel before the action — AcquireH1(ctx) should fail
 	req, _ := http.NewRequestWithContext(ctx, "GET", "http://upstream/x", nil)
 	req.URL.Path = "/x"
 
-	var buf bytes.Buffer
-	bw := bufio.NewWriter(&buf)
-	if _, err := a.do(ctx, req, bw); err != nil {
-		t.Errorf("ctx-cancel should map to 503 local reply, not propagate err: %v", err)
+	resp, _, err := action(ctx, req)
+	if err != nil {
+		t.Errorf("ctx-cancel should map to a 503 local-reply shape, not propagate err: %v", err)
 	}
-	_ = bw.Flush()
-	if !strings.HasPrefix(buf.String(), "HTTP/1.1 503 ") {
-		t.Errorf("ctx cancel should produce 503 local reply, got: %q", buf.String())
+	if resp.Status != 503 {
+		t.Errorf("Status = %d, want 503 on pre-canceled ctx", resp.Status)
 	}
 }
 
@@ -227,26 +234,24 @@ func counterValue(t *testing.T, r *stats.Registry, name string) int64 {
 	return got
 }
 
-// TestRouterAction_Do_IncsUpstreamRqTotalAndStatusClass — Phase 06.1 Task 11
-// hot path (H1 router): driving routerAction.do against a backend returning
-// 200 Inc's c.upstreamRqTotal by 1 AND c.upstreamRq2xx by 1, per SPEC §5.5
-// (Increment paths table, "routerAction.do (H1)" row).
-func TestRouterAction_Do_IncsUpstreamRqTotalAndStatusClass(t *testing.T) {
+// TestH1ClusterAction_IncsUpstreamRqTotalAndStatusClass — Phase 06.1 Task 11
+// hot path (H1 router): driving the live Action closure against a backend
+// returning 200 Inc's c.upstreamRqTotal by 1 AND c.upstreamRq2xx by 1, per
+// SPEC §5.5 (Increment paths table). Ported from the deleted routerAction.do
+// direct-write test.
+func TestH1ClusterAction_IncsUpstreamRqTotalAndStatusClass(t *testing.T) {
 	addr, stop := loopbackHTTPEcho(t)
 	defer stop()
 
 	c, reg := singleEndpointClusterWithRegistry(t, addr)
-	a := &routerAction{cluster: c}
+	action := H1ClusterAction(c, nil, cluster.SubsetMatch{}, nil, nil)
 
 	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
 	req.URL.Path = "/x"
 
-	var buf bytes.Buffer
-	bw := bufio.NewWriter(&buf)
-	if _, err := a.do(req.Context(), req, bw); err != nil && !errors.Is(err, errCloseAfterAction) {
-		t.Fatalf("do: %v", err)
+	if _, _, err := action(req.Context(), req); err != nil {
+		t.Fatalf("action: %v", err)
 	}
-	_ = bw.Flush()
 
 	if got := counterValue(t, reg, "cluster.c_test.upstream_rq_total"); got != 1 {
 		t.Errorf("upstream_rq_total = %d, want 1", got)
@@ -256,22 +261,19 @@ func TestRouterAction_Do_IncsUpstreamRqTotalAndStatusClass(t *testing.T) {
 	}
 }
 
-// TestRouterAction_Do_DialFailureInc5xx — Phase 06.1 Task 11: on a Dial
-// failure path the action emits a 503 local reply; the cluster-scope
+// TestH1ClusterAction_DialFailureInc5xx — Phase 06.1 Task 11: on a dial-
+// failure path the action synthesizes a 503 local reply; the cluster-scope
 // status-class counter for the 5xx class Inc's once. This mirrors the
 // "5xx Inc lands on the dial-failure local-reply path too" annotation in
-// PLAN Task 11 Step 3.
-func TestRouterAction_Do_DialFailureInc5xx(t *testing.T) {
+// PLAN Task 11 Step 3. Ported from the deleted routerAction.do test.
+func TestH1ClusterAction_DialFailureInc5xx(t *testing.T) {
 	c, reg := singleEndpointClusterWithRegistry(t, "127.0.0.1:1") // unreachable
-	a := &routerAction{cluster: c}
+	action := H1ClusterAction(c, nil, cluster.SubsetMatch{}, nil, nil)
 
 	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
 	req.URL.Path = "/x"
 
-	var buf bytes.Buffer
-	bw := bufio.NewWriter(&buf)
-	_, _ = a.do(req.Context(), req, bw)
-	_ = bw.Flush()
+	_, _, _ = action(req.Context(), req)
 
 	if got := counterValue(t, reg, "cluster.c_test.upstream_rq_total"); got != 1 {
 		t.Errorf("upstream_rq_total on dial-failure = %d, want 1", got)
@@ -281,77 +283,55 @@ func TestRouterAction_Do_DialFailureInc5xx(t *testing.T) {
 	}
 }
 
-// emitCaptureSink is a minimal accesslog.Sink test double that records
-// submitted records in-memory. Mirrors the hcm-package emitCaptureSink so
-// the byte-preserved tests below compile in this package. Per BRAINSTORM
-// §6.8: tests are byte-preserved; private helpers like this one are
-// duplicated rather than exported across the package boundary.
-type emitCaptureSink struct{ recs []*accesslog.Record }
-
-func (s *emitCaptureSink) Submit(r any) { s.recs = append(s.recs, r.(*accesslog.Record)) }
-func (s *emitCaptureSink) Close() error { return nil }
-
-// TestRouterAction_EmitsAccessLog_HappyPath verifies that routerAction.do
-// submits one access-log record with a non-empty UpstreamHost and BytesSent > 0
-// when the upstream responds successfully.
-func TestRouterAction_EmitsAccessLog_HappyPath(t *testing.T) {
+// TestH1ClusterAction_AccessLogInputs_HappyPath verifies the Action closure
+// surfaces the exact triple the HCM chain-completion access-log emit consumes
+// (Decision §3.1: status → ResponseCode, len(resp.Body) → BytesSent, picked →
+// UpstreamHost): a routed 200 carries a non-empty body and a non-zero picked
+// Endpoint. Ported from the deleted router-side emitAccessLog test — the emit
+// itself now lives in HCM dispatch (covered by connection_test.go's
+// TestDispatchRequest_ChainMediatedAccessLogEmit).
+func TestH1ClusterAction_AccessLogInputs_HappyPath(t *testing.T) {
 	addr, stop := loopbackHTTPEcho(t)
 	defer stop()
 
-	cs := &emitCaptureSink{}
-	f := &Filter{accessLog: []accesslog.Sink{cs}}
 	c := singleEndpointCluster(t, addr)
-	a := &routerAction{cluster: c, filter: f}
+	action := H1ClusterAction(c, nil, cluster.SubsetMatch{}, nil, nil)
 
 	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
 	req.URL.Path = "/x"
-	var buf bytes.Buffer
-	bw := bufio.NewWriter(&buf)
-	if _, err := a.do(req.Context(), req, bw); err != nil && !errors.Is(err, errCloseAfterAction) {
-		t.Fatalf("do: %v", err)
+	resp, picked, err := action(req.Context(), req)
+	if err != nil {
+		t.Fatalf("action: %v", err)
 	}
-	_ = bw.Flush()
-
-	if len(cs.recs) != 1 {
-		t.Fatalf("captured %d records, want 1", len(cs.recs))
+	if resp.Status != 200 {
+		t.Errorf("Status = %d, want 200", resp.Status)
 	}
-	r := cs.recs[0]
-	if r.ResponseCode != 200 {
-		t.Errorf("ResponseCode = %d, want 200", r.ResponseCode)
+	if len(resp.Body) <= 0 {
+		t.Errorf("len(Body) = %d, want > 0 (feeds BytesSent)", len(resp.Body))
 	}
-	if r.BytesSent <= 0 {
-		t.Errorf("BytesSent = %d, want > 0", r.BytesSent)
-	}
-	if r.UpstreamHost == "" {
-		t.Errorf("UpstreamHost is empty, want non-empty (routed request)")
+	if picked.Host == "" {
+		t.Errorf("picked.Host is empty, want non-empty (feeds UpstreamHost)")
 	}
 }
 
-// TestRouterAction_EmitsAccessLog_DialFailure verifies that routerAction.do
-// emits an access-log record with status 503 and an empty UpstreamHost on
-// the dial-failure path (port 1 is always rejected).
-func TestRouterAction_EmitsAccessLog_DialFailure(t *testing.T) {
-	cs := &emitCaptureSink{}
-	f := &Filter{accessLog: []accesslog.Sink{cs}}
+// TestH1ClusterAction_AccessLogInputs_DialFailure verifies the dial-failure
+// shape the access-log emit consumes: status 503 with a zero picked Endpoint
+// (UpstreamHost renders empty → the formatter's literal `-`).
+func TestH1ClusterAction_AccessLogInputs_DialFailure(t *testing.T) {
 	c := singleEndpointCluster(t, "127.0.0.1:1")
-	a := &routerAction{cluster: c, filter: f}
+	action := H1ClusterAction(c, nil, cluster.SubsetMatch{}, nil, nil)
 
 	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://upstream/x", nil)
 	req.URL.Path = "/x"
-	var buf bytes.Buffer
-	bw := bufio.NewWriter(&buf)
-	_, _ = a.do(req.Context(), req, bw)
-	_ = bw.Flush()
-
-	if len(cs.recs) != 1 {
-		t.Fatalf("captured %d records, want 1", len(cs.recs))
+	resp, picked, err := action(req.Context(), req)
+	if err != nil {
+		t.Fatalf("action: %v", err)
 	}
-	r := cs.recs[0]
-	if r.ResponseCode != 503 {
-		t.Errorf("ResponseCode = %d, want 503 (dial-failure local-reply)", r.ResponseCode)
+	if resp.Status != 503 {
+		t.Errorf("Status = %d, want 503 (dial-failure local-reply)", resp.Status)
 	}
-	if r.UpstreamHost != "" {
-		t.Errorf("UpstreamHost = %q, want empty on dial failure", r.UpstreamHost)
+	if picked.Host != "" {
+		t.Errorf("picked.Host = %q, want empty on dial failure", picked.Host)
 	}
 }
 

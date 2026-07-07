@@ -349,6 +349,17 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 	}
 	chain := filter_http.NewFilterChain(chainHF, f.perRouteConfig)
 	chain.SetRequestCtx(ctx, routeIdx)
+	// Snapshot the downstream TLS connection state ONCE per request. The three
+	// TLS-derived chain seeds below (principals, full conn-state, SNI/peer-cert)
+	// previously each type-asserted the conn and copied the large
+	// tls.ConnectionState struct (re-walking PeerCertificates) — one snapshot
+	// derives all three with identical values. nil for plaintext / non-*tls.Conn
+	// (including the nil-downstream unit-test path).
+	var tlsState *stdtls.ConnectionState
+	if tc, ok := downstream.(*stdtls.Conn); ok {
+		state := tc.ConnectionState()
+		tlsState = &state
+	}
 	// Phase 16 Task 6 (ADR-0144): seed the per-stream TLS principal-name
 	// candidates BEFORE RunDecodeHeaders dispatch so decode-side filters
 	// (rbac, future jwt_authn / ext_authz / oauth2 / ext_proc) reading
@@ -356,23 +367,26 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 	// DNS SAN → Subject DN CN list. Returns nil for plaintext / non-mTLS /
 	// no-client-cert connections (the chain field stays nil; the accessor
 	// returns nil per ADR-0143 §Decision (vi) case (c)).
-	chain.SetTLSPrincipals(downstreamTLSPrincipals(downstream))
+	chain.SetTLSPrincipals(extractTLSPrincipals(tlsState))
 	// Phase 22.2 Task 6 (ADR-0192): seed the per-stream FULL *tls.ConnectionState
 	// BEFORE RunDecodeHeaders dispatch — symmetric to SetTLSPrincipals above per
 	// SPEC §11.5.3 + ADR-0144 plumbing-pattern extension. The state powers the
 	// phase-22.2 lua bridge's 12 ssl methods (PEM-encoded certs, cipher suite,
 	// TLS version, etc. per SPEC §11.5.4) and is observable from all decode +
 	// encode filters via {decoder,encoder}CB.DownstreamTLSConnectionState().
-	// Returns nil for plaintext / non-*tls.Conn / pre-handshake — the
-	// SetTLSConnectionState(nil) call is the documented nil-passthrough so the
-	// chain field stays nil and consumers nil-tolerate per ADR-0085. Per Q13
-	// WEAK HOLD the chain-side extension lives INSIDE ADR-0192; no separate ADR.
+	// Stays nil for plaintext / non-*tls.Conn / pre-handshake — the documented
+	// nil-passthrough so the chain field stays nil and consumers nil-tolerate
+	// per ADR-0085 (same HandshakeComplete gate as the downstreamTLSConnectionState
+	// helper the H2 path uses). Per Q13 WEAK HOLD the chain-side extension lives
+	// INSIDE ADR-0192; no separate ADR.
 	//
 	// dynamicMetadata is NOT seeded here — chain.go's NewFilterChain
 	// constructor initializes it at chain build time per ADR-0190 + ADR-0192
 	// §Decision body anticipation (chain.go owns the bucket lifecycle). HCM
 	// does NOT touch dynamicMetadata directly.
-	chain.SetTLSConnectionState(downstreamTLSConnectionState(downstream))
+	if tlsState != nil && tlsState.HandshakeComplete {
+		chain.SetTLSConnectionState(tlsState)
+	}
 	// Phase 18.2 Task 4 (ADR-0165): seed the 6 per-stream callback-surface
 	// extension fields BEFORE RunDecodeHeaders dispatch — the cross-phase
 	// reusable framework primitives for ext_authz gRPC-mode AttributeContext
@@ -424,11 +438,10 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 	// AMEND-5). Mirrors the SetRouteMetadata set-once-by-dispatch discipline;
 	// false-passthrough when the route does not carry the legacy bool.
 	chain.SetRouteIncludeVhRateLimits(entry.includeVhRateLimits)
-	if tlsConn, ok := downstream.(*stdtls.Conn); ok {
-		state := tlsConn.ConnectionState()
-		chain.SetDownstreamTLSServerName(state.ServerName)
-		if len(state.PeerCertificates) > 0 {
-			chain.SetDownstreamTLSPeerCertDER(state.PeerCertificates[0].Raw)
+	if tlsState != nil {
+		chain.SetDownstreamTLSServerName(tlsState.ServerName)
+		if len(tlsState.PeerCertificates) > 0 {
+			chain.SetDownstreamTLSPeerCertDER(tlsState.PeerCertificates[0].Raw)
 		}
 	}
 	defer chain.Destroy()

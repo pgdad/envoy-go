@@ -258,6 +258,28 @@ func buildCheckFnClosure(hac *httpAuthClient, allowedUpstream, allowedUpstreamAp
 	}
 }
 
+// maxDrainBytes caps how much of an unread auth-service response body is
+// drained before Close on the non-deny paths (allow + unrecognized-status).
+// Draining to EOF lets net/http return the underlying connection to its
+// keep-alive pool — without it every allow check pays a fresh TCP (and TLS)
+// handshake to the auth server. The cap bounds the work when the auth
+// service ships an unexpectedly large body (past the cap, Close discards
+// the connection instead — the pre-drain behavior). No downstream-observable
+// bytes change.
+const maxDrainBytes = 64 * 1024
+
+// drainResponseBody drains up to maxDrainBytes from the auth-service
+// response body so the keep-alive connection is reusable. Nil-tolerant on
+// the body (hand-crafted test responses); read errors are ignored (the
+// disposition is already decided — Close discards the connection on a
+// partially-read body exactly as before).
+func drainResponseBody(body io.Reader) {
+	if body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxDrainBytes))
+}
+
 // mapHTTPResponseWithMatchers maps an HTTP response from the auth service to a
 // checkDisposition per the §5.P10 error-classification boundary + ADR-0161
 // bidirectional header-mutation discipline:
@@ -284,7 +306,11 @@ func mapHTTPResponseWithMatchers(
 ) (checkDisposition, error) {
 	switch resp.StatusCode {
 	case http.StatusOK: // 200
-		// Allow path: extract response headers matching allowed_upstream_headers
+		// Allow path: the auth response body is unused — drain (capped) so
+		// the keep-alive connection is reusable by the next check.
+		drainResponseBody(resp.Body)
+
+		// Extract response headers matching allowed_upstream_headers
 		// (set/overwrite) and allowed_upstream_headers_to_append (append) per ADR-0161.
 		upstreamSet := extractMatchingHeaders(resp.Header, allowedUpstream)
 		upstreamApp := extractMatchingHeaders(resp.Header, allowedUpstreamApp)
@@ -334,7 +360,9 @@ func mapHTTPResponseWithMatchers(
 		}, nil
 
 	default:
-		// Unrecognized status → dispError per §5.P10.
+		// Unrecognized status → dispError per §5.P10. The body is unused —
+		// drain (capped) so the keep-alive connection is reusable.
+		drainResponseBody(resp.Body)
 		return checkDisposition{class: dispError},
 			fmt.Errorf("ext_authz: unrecognized auth response status %d", resp.StatusCode)
 	}
@@ -395,28 +423,10 @@ func buildDenyHeaders(headers http.Header, allowedClient *stringMatcherList) []h
 	return decisionHeaders
 }
 
-// buildTargetURL constructs the outbound POST target URL by combining a
-// pre-stripped base URL, the path_prefix, and the request path. The
-// path_prefix is prepended to the request path per SPEC §6.5 + §18.P4.
-//
-// base must already have its path component stripped (i.e. scheme+host only,
-// as returned by stripPath). This function is used by unit tests for the
-// path-joining surface; the live closure uses hac.baseURL + joinPaths directly.
-//
-// Rules:
-//   - base is the scheme+host (e.g. "http://auth.example.com:9191").
-//   - The path_prefix is prepended to path to form the full outbound path.
-//   - Double-slash is avoided (path_prefix trailing slash + path leading slash).
-//
-// Example: base="http://auth:9191", pathPrefix="/auth-prefix", path="/api"
-// → "http://auth:9191/auth-prefix/api"
-func buildTargetURL(base, pathPrefix, path string) string {
-	// Build the outbound path: path_prefix + request path.
-	// Avoid double-slash between prefix and path.
-	outPath := joinPaths(pathPrefix, path)
-
-	return base + outPath
-}
+// (The former buildTargetURL helper was deleted as production-dead code: the
+// live closure composes the outbound POST target directly as
+// hac.baseURL + joinPaths(hac.pathPrefix, req.path) — see buildCheckFnClosure
+// above. The unit tests exercise the same live expression.)
 
 // stripPath returns the scheme+host portion of a URI (dropping any path).
 // E.g. "http://auth.example.com:9191/some/path" → "http://auth.example.com:9191".

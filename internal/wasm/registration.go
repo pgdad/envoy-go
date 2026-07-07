@@ -106,7 +106,6 @@ package wasm
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"strings"
 
@@ -1026,12 +1025,3 @@ func writeReturnBuffer(ctx context.Context, mod api.Module, data []byte, ptrPtr,
 // required by the wasi.go shims (IsAllowed + LogProxy methods). The 25.1
 // *VM equivalent guard moved here as part of D-P-PLAN-6.
 var _ wasiHost = (*RootVM)(nil)
-
-// Compile-time guard: ensure HeaderPair is the shared type from pairs.go
-// (Task 3) — re-confirms cross-file identity for the ABICallbacks interface.
-var _ = HeaderPair{}
-
-// Compile-time guard: keep encoding/binary imported even if no helper
-// directly uses it (the writeReturnBuffer helper goes via the wazero
-// Memory methods that already encode u32-LE internally).
-var _ = binary.LittleEndian

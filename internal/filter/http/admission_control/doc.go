@@ -52,7 +52,9 @@
 //
 // # Cross-references
 //
-//   - ADR-0194 (algorithm + package shape + inline Rand/Clock seams +
+//   - ADR-0194 (algorithm + package shape + inline Rand seam [the Clock
+//     seam has since been adopted from internal/clock — the third-consumer
+//     convergence trigger the original inline Clock deferred to] +
 //     deque-window + integer-modulo decision + classification +
 //     3-counter stat surface + deterministic-regime differential strategy;
 //     line-cited against admission_control.cc + thread_local_controller.cc +

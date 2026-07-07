@@ -52,7 +52,12 @@ func decodeFrame(r *bufio.Reader) (*thriftMessage, error) {
 	if frameLen <= 0 || int64(frameLen) > maxFrameSize {
 		return nil, errDecode
 	}
-	payload := make([]byte, frameLen)
+	// One allocation carries the whole raw frame (length prefix + payload);
+	// payload aliases raw[4:] — identical bytes to the former two-allocation
+	// copy, without the extra full-frame copy on the hot path.
+	raw := make([]byte, 4+frameLen)
+	copy(raw[:4], lenBuf[:])
+	payload := raw[4:]
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, errDecode // a mid-frame short read is a framing error
 	}
@@ -74,9 +79,6 @@ func decodeFrame(r *bufio.Reader) (*thriftMessage, error) {
 	off := 8 + nameLen
 	seqID := int32(binary.BigEndian.Uint32(payload[off : off+4]))
 	off += 4
-	raw := make([]byte, 0, 4+len(payload))
-	raw = append(raw, lenBuf[:]...)
-	raw = append(raw, payload...)
 	return &thriftMessage{msgType: mt, method: method, seqID: seqID, raw: raw, body: payload[off:]}, nil
 }
 

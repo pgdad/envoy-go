@@ -183,3 +183,22 @@ func TestDecodeRequest_ExposesArgs(t *testing.T) {
 		})
 	}
 }
+
+// The reply-array depth guard: nesting at the limit parses; one level beyond
+// returns errProtocol (stack-exhaustion guard — a chained "*1\r\n" reply at 4
+// bytes/level would otherwise recurse until the goroutine stack dies, an
+// unrecoverable runtime panic).
+func TestDecodeReply_NestingDepthLimit(t *testing.T) {
+	deep := strings.Repeat("*1\r\n", maxReplyDepth-1) + ":1\r\n"
+	raw, err := decodeReply(reqReader(deep))
+	if err != nil {
+		t.Fatalf("nesting at the limit (depth %d) must parse: %v", maxReplyDepth-1, err)
+	}
+	if string(raw) != deep {
+		t.Errorf("raw = %q, want the verbatim frame", raw)
+	}
+	tooDeep := strings.Repeat("*1\r\n", maxReplyDepth) + ":1\r\n"
+	if _, err := decodeReply(reqReader(tooDeep)); !errors.Is(err, errProtocol) {
+		t.Fatalf("err = %v, want errProtocol beyond maxReplyDepth", err)
+	}
+}

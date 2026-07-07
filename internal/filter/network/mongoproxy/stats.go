@@ -1,8 +1,7 @@
 package mongoproxy
 
 import (
-	"fmt"
-
+	"github.com/pgdad/envoy-go/internal/filter/network/statroster"
 	"github.com/pgdad/envoy-go/internal/stats"
 )
 
@@ -33,32 +32,23 @@ type mongoStats struct {
 }
 
 // newMongoStats eagerly creates all 23 fixed stats under mongo.<statPrefix>. via
-// NewCounterIfAbsent / NewGaugeIfAbsent — post-Freeze-permitted and idempotent
-// across listeners sharing a stat_prefix (the zookeeper newRosterStats precedent;
-// D-P1). The boot-window departure vs upstream's per-connection creation is a
-// BEHAVIOR_CONTRACT record (§7.5), unobservable to the differential.
+// the shared statroster scaffold + NewGaugeIfAbsent — post-Freeze-permitted and
+// idempotent across listeners sharing a stat_prefix (the zookeeper newRosterStats
+// precedent; D-P1). The boot-window departure vs upstream's per-connection
+// creation is a BEHAVIOR_CONTRACT record (§7.5), unobservable to the differential.
 func newMongoStats(reg *stats.Registry, statPrefix string) *mongoStats {
-	ms := &mongoStats{
-		prefix:   "mongo." + statPrefix + ".",
-		reg:      reg,
-		counters: make(map[string]*stats.Counter, 22),
+	prefix := "mongo." + statPrefix + "."
+	return &mongoStats{
+		prefix:        prefix,
+		reg:           reg,
+		counters:      statroster.New(reg, prefix, rosterSuffixes()),
+		opQueryActive: reg.NewGaugeIfAbsent(prefix + "op_query_active"),
 	}
-	for _, suf := range rosterSuffixes() {
-		ms.counters[suf] = reg.NewCounterIfAbsent(ms.prefix + suf)
-	}
-	ms.opQueryActive = reg.NewGaugeIfAbsent(ms.prefix + "op_query_active")
-	return ms
 }
 
 // inc increments the fixed counter for suffix. Unknown suffix is a programming
 // error → panic (the roster is closed; dynamic names go through the helpers).
-func (ms *mongoStats) inc(suffix string) {
-	c, ok := ms.counters[suffix]
-	if !ok {
-		panic(fmt.Sprintf("mongoproxy: unknown roster suffix %q", suffix))
-	}
-	c.Inc()
-}
+func (ms *mongoStats) inc(suffix string) { statroster.Inc("mongoproxy", ms.counters, suffix) }
 
 // cmdTotal returns mongo.<sp>.cmd.<cmd>.total (lazy; post-Freeze-permitted —
 // the zookeeper auth.<scheme>_rq / rbac per-policy precedent). <cmd> is the

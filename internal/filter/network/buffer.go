@@ -44,3 +44,26 @@ func (b *Buffer) Drain(n int) {
 	}
 	b.data = b.data[n:]
 }
+
+// NewBytes returns ONLY the never-before-seen trailing bytes of the cumulative
+// chain buffer (the bytes beyond *consumed), then advances *consumed to
+// totalAppended — the TotalAppended high-water-mark discipline shared by the
+// copying-sniffer decoders (kafkabroker/mongoproxy/zookeeperproxy). Callers
+// pass chain = Buffer.Bytes() (the WHOLE undrained buffer) and totalAppended =
+// Buffer.TotalAppended() (the monotonic cumulative count); the new bytes are
+// always the trailing (totalAppended − consumed) bytes because bytes are only
+// ever appended at the tail and drained at the head, and the runtime never
+// drains bytes the filters have not yet been shown (the §3.3 soundness
+// invariant). The defensive clamp never fires on that invariant.
+func NewBytes(chain []byte, totalAppended int64, consumed *int64) []byte {
+	newCount := totalAppended - *consumed
+	if newCount <= 0 {
+		return nil
+	}
+	if newCount > int64(len(chain)) {
+		newCount = int64(len(chain)) // defensive: never slice before the buffer start
+	}
+	out := chain[int64(len(chain))-newCount:]
+	*consumed = totalAppended
+	return out
+}

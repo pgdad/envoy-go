@@ -213,7 +213,9 @@ func (e *OTLPExporter) run() {
 			}
 			sp := span.toProto()
 			buf = append(buf, sp)
-			bufBytes += proto.Size(sp)
+			if e.bufferSizeBytes > 0 { // skip the proto.Size walk when the accumulated size is never consulted
+				bufBytes += proto.Size(sp)
+			}
 			if bufBytes >= e.bufferSizeBytes { // SIZE trigger; 0 ⇒ every span flushes
 				flush()
 			}
@@ -235,16 +237,18 @@ type tracesClientDialer interface {
 	NewTracesClient(clusterName string) (TracesClient, error)
 }
 
-// ExporterProvider is the per-cluster memoizing factory for tracing Exporter
-// instances (D-TRACE-EXPORTER-WIRING / D-TRACE-ZIPKIN-TRANSPORT-WIRING). It
-// dispatches on the parsed TracingConfig.Provider: ProviderOTel builds an
-// *OTLPExporter over the dialer; ProviderZipkin builds a *ZipkinExporter over the
-// injected ZipkinTransport behind a HasCluster boot-reject gate. One Exporter is
-// built per unique cluster name (across both arms); repeated ExporterFor calls for
-// the same cluster return the same pointer (pointer identity). The two counter
-// rosters register lazily on the FIRST successful build of their kind (separate
-// sync.Once guards) so a provider that never builds an exporter of a kind leaves
-// that kind's registry surface unchanged.
+// ExporterProvider is the memoizing factory for tracing Exporter instances
+// (D-TRACE-EXPORTER-WIRING / D-TRACE-ZIPKIN-TRANSPORT-WIRING). It dispatches on
+// the parsed TracingConfig.Provider: ProviderOTel builds an *OTLPExporter over
+// the dialer; ProviderZipkin builds a *ZipkinExporter over the injected
+// ZipkinTransport behind a HasCluster boot-reject gate. One Exporter is built per
+// unique (provider, cluster name) pair; repeated ExporterFor calls with the same
+// config return the same pointer (pointer identity), while a same-key config with
+// CONFLICTING settings (service_name / Zipkin knobs) is rejected with an error
+// rather than silently handed an exporter built for a different config. The two
+// counter rosters register lazily on the FIRST successful build of their kind
+// (separate sync.Once guards) so a provider that never builds an exporter of a
+// kind leaves that kind's registry surface unchanged.
 type ExporterProvider struct {
 	dialer   tracesClientDialer
 	zt       ZipkinTransport
@@ -257,8 +261,42 @@ type ExporterProvider struct {
 	zipkinOnce     sync.Once
 	zipkinCounters *ZipkinCounters
 
-	mu        sync.Mutex
-	byCluster map[string]Exporter
+	mu    sync.Mutex
+	byKey map[exporterKey]exporterEntry
+}
+
+// exporterKey is the memoization key: the same cluster may legitimately back
+// both an OTel and a Zipkin provider, and keying by cluster alone would silently
+// hand the second config the first config's exporter — including an OTLP
+// exporter for a Zipkin config (wrong wire format entirely).
+type exporterKey struct {
+	provider ProviderKind
+	cluster  string
+}
+
+// exporterEntry pairs a memoized Exporter with the distinguishing settings of
+// the config it was built from, so a later same-key config with conflicting
+// settings is rejected instead of silently receiving a mismatched exporter.
+type exporterEntry struct {
+	exp      Exporter
+	settings exporterSettings
+}
+
+// exporterSettings are the TracingConfig fields baked into a built Exporter
+// beyond the memoize key (everything ExporterFor forwards to the constructors).
+// Comparable so a conflicting re-request is a plain != check.
+type exporterSettings struct {
+	serviceName string
+	zipkin      ZipkinSettings // zero value on the OTel arm
+}
+
+// settingsOf extracts the comparable exporterSettings from cfg.
+func settingsOf(cfg *TracingConfig) exporterSettings {
+	s := exporterSettings{serviceName: cfg.ServiceName}
+	if cfg.Zipkin != nil {
+		s.zipkin = *cfg.Zipkin
+	}
+	return s
 }
 
 // NewExporterProvider builds an ExporterProvider backed by dialer (the OTel arm)
@@ -270,18 +308,20 @@ type ExporterProvider struct {
 // first successful Zipkin build.
 func NewExporterProvider(d tracesClientDialer, zt ZipkinTransport, reg *stats.Registry, bufBytes int, bufFlush time.Duration) *ExporterProvider {
 	return &ExporterProvider{
-		dialer:    d,
-		zt:        zt,
-		reg:       reg,
-		bufBytes:  bufBytes,
-		bufFlush:  bufFlush,
-		byCluster: make(map[string]Exporter),
+		dialer:   d,
+		zt:       zt,
+		reg:      reg,
+		bufBytes: bufBytes,
+		bufFlush: bufFlush,
+		byKey:    make(map[exporterKey]exporterEntry),
 	}
 }
 
-// ExporterFor returns the Exporter for cfg.ClusterName, building it on the first
-// call and dispatching on cfg.Provider. A second call for the same cluster returns
-// the SAME pointer (memoized; the memoize key is cfg.ClusterName for both arms).
+// ExporterFor returns the Exporter for cfg, building it on the first call and
+// dispatching on cfg.Provider. A second call with the same (provider, cluster)
+// key and the same settings returns the SAME pointer (memoized); a same-key call
+// whose remaining settings (service_name / Zipkin knobs) CONFLICT with the
+// memoized build returns an error instead of a mismatched exporter.
 //
 // ProviderOTel: the dialer builds a TracesClient for the cluster (an error — unknown
 // or non-H2 cluster — is the boot-reject, returned directly); the 2 tracing.opentelemetry.*
@@ -294,8 +334,13 @@ func NewExporterProvider(d tracesClientDialer, zt ZipkinTransport, reg *stats.Re
 func (p *ExporterProvider) ExporterFor(cfg *TracingConfig) (Exporter, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byCluster[cfg.ClusterName]; ok {
-		return e, nil
+	key := exporterKey{provider: cfg.Provider, cluster: cfg.ClusterName}
+	settings := settingsOf(cfg)
+	if ent, ok := p.byKey[key]; ok {
+		if ent.settings != settings {
+			return nil, fmt.Errorf("tracing: cluster %q already has an exporter built from a conflicting tracing config", cfg.ClusterName)
+		}
+		return ent.exp, nil
 	}
 
 	var e Exporter
@@ -320,7 +365,7 @@ func (p *ExporterProvider) ExporterFor(cfg *TracingConfig) (Exporter, error) {
 		return nil, fmt.Errorf("tracing: unknown provider %v", cfg.Provider)
 	}
 
-	p.byCluster[cfg.ClusterName] = e
+	p.byKey[key] = exporterEntry{exp: e, settings: settings}
 	return e, nil
 }
 
@@ -332,8 +377,8 @@ func (p *ExporterProvider) CloseAll() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var firstErr error
-	for _, e := range p.byCluster {
-		if err := e.Close(); err != nil && firstErr == nil {
+	for _, ent := range p.byKey {
+		if err := ent.exp.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

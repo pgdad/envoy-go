@@ -2300,3 +2300,30 @@ func TestDescriptors_AxisA_EarlyReturn_PerRoute(t *testing.T) {
 	proj := projectDescriptors(got)
 	assertDescriptorEntries(t, proj[0].entries, []kv{{key: "pr", value: "pr_value"}})
 }
+
+// TestCachedRegex_CompileOncePerPattern pins the maintenance-pass regex cache
+// semantics: (a) the same pattern string yields the same compiled *Regexp
+// pointer on repeat lookups (compile-once), and (b) a compile ERROR is cached
+// as nil — repeat lookups of a bad pattern also return nil, preserving the
+// engine's swallow-to-false matcher semantics byte-identically.
+func TestCachedRegex_CompileOncePerPattern(t *testing.T) {
+	const good = "^cached-regex-test-[0-9]+$"
+	re1 := cachedRegex(good)
+	if re1 == nil {
+		t.Fatalf("cachedRegex(%q) = nil; want compiled regexp", good)
+	}
+	if re2 := cachedRegex(good); re2 != re1 {
+		t.Errorf("cachedRegex(%q) second lookup = %p; want cache hit %p", good, re2, re1)
+	}
+	if !re1.MatchString("cached-regex-test-42") {
+		t.Errorf("compiled pattern must match its own vector")
+	}
+
+	const bad = "(cached-regex-test-unclosed"
+	if got := cachedRegex(bad); got != nil {
+		t.Errorf("cachedRegex(%q) = %v; want nil (compile error)", bad, got)
+	}
+	if got := cachedRegex(bad); got != nil {
+		t.Errorf("cachedRegex(%q) cached-error lookup = %v; want nil", bad, got)
+	}
+}

@@ -14,8 +14,9 @@ import "google.golang.org/protobuf/types/known/structpb"
 // within a stream); NOT goroutine-safe across streams.
 type Bucket struct {
 	// m holds the nested (filterName → key → *structpb.Value) map.
-	// Allocated lazily by Set; Get + Snapshot + Reset tolerate a nil
-	// inner map. Initialized at NewBucket.
+	// Allocated eagerly by NewBucket; Set re-allocates a nil map only
+	// for a zero-value Bucket{} (which no production caller constructs).
+	// Get + Snapshot + Reset tolerate a nil map.
 	m map[string]map[string]*structpb.Value
 }
 

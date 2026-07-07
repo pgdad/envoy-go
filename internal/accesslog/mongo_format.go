@@ -29,7 +29,7 @@ func MongoFormat(rec any) []byte {
 	b.WriteString(`,"message":`)
 	b.WriteString(strconv.Quote(r.Message))
 	b.WriteString(`,"upstream_host":`)
-	b.WriteString(strconv.Quote(orEmptyDash(r.UpstreamHost)))
+	b.WriteString(strconv.Quote(orDash(r.UpstreamHost)))
 	b.WriteString("}\n")
 	return b.Bytes()
 }

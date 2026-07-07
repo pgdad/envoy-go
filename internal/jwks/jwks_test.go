@@ -262,6 +262,37 @@ func TestGet_AfterClose_ReturnsErrJwksClosed(t *testing.T) {
 	}
 }
 
+func TestGet_CancelledContext_ReadyKeys_ReturnsCached(t *testing.T) {
+	// Regression: Get's readiness select must NOT carry a ctx.Done() arm —
+	// with keys cached (ready closed) AND ctx already canceled, Go's random
+	// pick among ready select cases would nondeterministically return
+	// ctx.Err() even though the cached keys are available. Iterate to catch
+	// the (previously random) failure deterministically.
+	ensureTestKeys(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(rsaJWKSetJSON(t))
+	}))
+	defer srv.Close()
+
+	f, err := New(srv.URL, 1*time.Minute, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < 100; i++ {
+		set, err := f.Get(ctx)
+		if err != nil {
+			t.Fatalf("Get(canceled ctx) iteration %d: err = %v; want cached keys", i, err)
+		}
+		if set == nil || len(set.Keys) != 1 {
+			t.Fatalf("Get(canceled ctx) iteration %d: set = %+v; want 1 cached key", i, set)
+		}
+	}
+}
+
 func TestRefresh_FiresAtCacheDurationMinus5s(t *testing.T) {
 	ensureTestKeys(t)
 	// With cacheDuration=100ms, refresh fires at max(0, 100ms-5s) = 0ms → immediate

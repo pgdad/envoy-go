@@ -64,6 +64,8 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	"github.com/pgdad/envoy-go/internal/clock"
 )
 
 // controller is the per-HCM-instance sliding-window success-rate controller per
@@ -76,7 +78,7 @@ import (
 type controller struct {
 	cfg   *compiledConfig
 	stats *filterStats
-	clock Clock
+	clock clock.Clock
 	rand  Rand
 
 	mu      sync.Mutex
@@ -99,11 +101,11 @@ type bucket struct {
 // newController constructs the controller per SPEC §6.2. The controller starts
 // with an empty window (zero global + empty buckets slice). All window state
 // is built up lazily by the first recordRequest call.
-func newController(cfg *compiledConfig, st *filterStats, clock Clock, rnd Rand) *controller {
+func newController(cfg *compiledConfig, st *filterStats, clk clock.Clock, rnd Rand) *controller {
 	return &controller{
 		cfg:   cfg,
 		stats: st,
-		clock: clock,
+		clock: clk,
 		rand:  rnd,
 	}
 }
@@ -163,6 +165,13 @@ func (c *controller) averageRps() uint32 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.purgeStaleLocked(now)
+	return c.averageRpsLocked(now)
+}
+
+// averageRpsLocked is the post-purge RPS math shared by averageRps and
+// windowSnapshot. Caller MUST hold mu AND have already run purgeStaleLocked
+// with the same now.
+func (c *controller) averageRpsLocked(now time.Time) uint32 {
 	if len(c.buckets) == 0 {
 		return 0
 	}
@@ -190,6 +199,21 @@ func (c *controller) averageRps() uint32 {
 	return uint32(c.global.requests / uint64(denomSecs))
 }
 
+// windowSnapshot returns the (requests, successes, averageRps) triple from a
+// SINGLE clock read + mutex acquisition + stale-bucket purge. DecodeHeaders'
+// gate 2 (RPS suppression) + gate 3 (probabilistic reject) previously each
+// took the lock and re-ran the purge (averageRps, then
+// shouldReject→requestCounts); this snapshot halves that to one lock/purge
+// per enabled request. The reject formula and RPS math are unchanged — only
+// the sub-microsecond now-skew between the two reads disappears.
+func (c *controller) windowSnapshot() (n, s uint64, rps uint32) {
+	now := c.clock.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.purgeStaleLocked(now)
+	return c.global.requests, c.global.successes, c.averageRpsLocked(now)
+}
+
 // shouldReject computes the rejection probability P_reject over the current
 // window and returns true if the draw rejects per SPEC §4.1 + AMEND-1 +
 // AMEND-2 + PD-6.
@@ -210,7 +234,15 @@ func (c *controller) averageRps() uint32 {
 // STRICT >. P=0 → 0 > (r%10000) is FALSE for every r → NEVER REJECT.
 func (c *controller) shouldReject() bool {
 	n, s := c.requestCounts()
+	return c.rejectDecision(n, s)
+}
 
+// rejectDecision is shouldReject's formula + dice-roll over caller-supplied
+// window counts. Split out so DecodeHeaders can feed it the counts from a
+// windowSnapshot (one lock/purge for both gates) while shouldReject keeps
+// its self-contained shape for direct callers/tests. The formula body is
+// unchanged (AMEND-1 + AMEND-2 + PD-6).
+func (c *controller) rejectDecision(n, s uint64) bool {
 	totalRequests := float64(n)
 	successfulRequests := float64(s)
 

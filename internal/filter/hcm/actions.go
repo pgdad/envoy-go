@@ -1,13 +1,13 @@
 package hcm
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/net/http2/hpack"
 
@@ -17,10 +17,10 @@ import (
 	"github.com/pgdad/envoy-go/internal/filter/http/router"
 )
 
-// errCloseAfterAction is returned by routeAction.do when the action's
-// response carried Connection: close (or the equivalent semantic on the
-// upstream-routed response). The connection loop checks for this sentinel
-// via errors.Is and closes the downstream after the current iteration.
+// errCloseAfterAction signals that the response carried Connection: close
+// (or the equivalent semantic on the upstream-routed response). The
+// connection loop checks for this sentinel via errors.Is and closes the
+// downstream after the current iteration.
 //
 // SPEC §10 #3 settled to the sentinel-error mechanism (option (a)). Other
 // non-nil errors from do trigger downstream close + log (the connection
@@ -138,22 +138,6 @@ func (a *directResponseAction) writeH2(sw h2.StreamWriter) error {
 	return sw.WriteData(body, true /* end stream */)
 }
 
-// do is the legacy direct-call shape preserved for the routeAction interface
-// (H2 dispatch + tests still reach it directly). The H1 dispatch path
-// post-Task-15 invokes directResponseAction via the chain-mediated path —
-// asRouterAction returns a router.Action closure that calls writeH1 and
-// surfaces (status, bytesSent, picked={}, err) to HCM dispatch's
-// chain-completion hook (where the access-log emit fires per Decision §3.1).
-//
-// Phase 06.1 Task 11: returns (a.status, error). The configured direct_response
-// status is the finalized response code; runConnection Inc's the matching
-// downstream_rq_<Nxx> bucket from this return.
-//
-// Phase 07.1 Task 15: access-log emit-deferral hook REMOVED per Decision §3.1.
-func (a *directResponseAction) do(_ context.Context, _ *http.Request, bw *bufio.Writer) (int, error) {
-	return a.status, a.writeH1(bw)
-}
-
 // asRouterAction returns a router.Action closure that surfaces the
 // direct-response shape as a logical ActionResponse for the chain-mediated H1
 // dispatch path (Task 15). Phase 07.1 Task 18 prereq P1: wire-bytes
@@ -188,59 +172,47 @@ func (a *directResponseAction) asRouterActionH2() router.H2Action {
 
 // clusterRouteAction is the H1 cluster-dial bridge introduced at Task 15.
 // It wraps a *cluster.Cluster handle and satisfies the routeAction interface
-// by delegating BOTH do() and asRouterAction() to the canonical H1
+// by delegating asRouterAction() / asRouterActionH2() to the canonical
 // upstream-driving logic in internal/filter/http/router. The router-package
 // holds the byte-preserved upstream-dial / req.Write / ReadResponse /
 // resp.Write loop migrated at Task 11; this bridge is the seam HCM dispatch
 // uses to plumb cluster-routed actions into the chain-mediated dispatch path.
 //
 // Replaces the deleted *routerAction type that lived in actions.go pre-Task-12.
-// The H2-side equivalent (clusterRouteActionH2 wrapping routerActionH2) is
-// Task 16's territory; the H2 type-switch in h2dispatch.go:62,119 stays
-// dangling until Task 16 lands.
 type clusterRouteAction struct {
 	cluster      *cluster.Cluster
 	hashPolicies []router.HashPolicy // 36.2: route RouteAction.hash_policy producer (ADR-0237)
 	subsetMatch  cluster.SubsetMatch // 38.1: route-static metadata_match; empty when no metadata_match (ADR-0239)
 	retryPolicy  *router.RetryPolicy // 42.1: effective retry_policy (route⊕vhost); nil when none — executor runs in Task 7
 	// 42.2b: effective hedge_policy (route⊕vhost); nil when none. CONSUMED by the
-	// closure builders below (Task 8): do/asRouterAction/asRouterActionH2 pass it
+	// closure builders below (Task 8): asRouterAction/asRouterActionH2 pass it
 	// as the 5th arg to H{1,2}ClusterAction, which dispatch the concurrent
 	// hedgeExecutor when it triggers. nil/non-triggering ⇒ the byte-stable path.
 	hedgePolicy *router.HedgePolicy
-}
 
-// do invokes the per-request cluster-dial action via the router-package
-// closure. Phase 07.1 Task 18 prereq P1: the action no longer takes a
-// *bufio.Writer; instead it surfaces an ActionResponse and HCM dispatch
-// writes wire bytes. The do method preserves the legacy direct-call shape
-// (status int + error) for the routeAction interface; the chain-mediated H1
-// path goes through asRouterAction(), not do().
-func (a *clusterRouteAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
-	resp, _, err := router.H1ClusterAction(a.cluster, a.hashPolicies, a.subsetMatch, a.retryPolicy, a.hedgePolicy)(ctx, req)
-	if err != nil {
-		return resp.Status, err
-	}
-	// The legacy direct-call path emits wire bytes via bw. Phase 07.1's
-	// chain-mediated dispatch goes through dispatchRequest which runs the
-	// encode chain + does its own wire-write — not this method. Preserved
-	// for the routeAction interface only; the HCM dispatch loop never
-	// invokes this on the H1 path post-Task-15.
-	if err := writeStatusReply(bw, resp.Status, string(resp.Body)); err != nil {
-		return resp.Status, err
-	}
-	if resp.Close {
-		return resp.Status, errCloseAfterAction
-	}
-	return resp.Status, nil
+	// h1Once/h1 + h2Once/h2 memoize the router closures built from the fields
+	// above. Every closure input is a config-time constant, so re-invoking
+	// router.H{1,2}ClusterAction once per request (as asRouterAction{,H2} did
+	// pre-memoization) allocated an identical struct + closure on the hot path
+	// for no benefit; weightedClusterRouteAction already demonstrates the
+	// build-once pattern. sync.Once keeps the lazy build race-free across
+	// concurrent requests sharing the routeEntry.
+	h1Once sync.Once
+	h1     router.Action
+	h2Once sync.Once
+	h2     router.H2Action
 }
 
 // asRouterAction returns the router.Action closure built by the router
-// package's H1ClusterAction constructor. This is the seam HCM dispatch's
+// package's H1ClusterAction constructor (built once, then memoized — the
+// closure is stateless per request). This is the seam HCM dispatch's
 // chain-mediated H1 path (Task 15 connection.go) plumbs into the terminal
 // router filter via *Filter.SetAction.
 func (a *clusterRouteAction) asRouterAction() router.Action {
-	return router.H1ClusterAction(a.cluster, a.hashPolicies, a.subsetMatch, a.retryPolicy, a.hedgePolicy)
+	a.h1Once.Do(func() {
+		a.h1 = router.H1ClusterAction(a.cluster, a.hashPolicies, a.subsetMatch, a.retryPolicy, a.hedgePolicy)
+	})
+	return a.h1
 }
 
 // asRouterActionH2 returns the router.H2Action closure built by the router
@@ -253,33 +225,20 @@ func (a *clusterRouteAction) asRouterAction() router.Action {
 // H1/H2 routerAction variant selection into a single bridge type whose
 // router-package backend handles both protocols.
 func (a *clusterRouteAction) asRouterActionH2() router.H2Action {
-	return router.H2ClusterAction(a.cluster, a.hashPolicies, a.subsetMatch, a.retryPolicy, a.hedgePolicy)
+	a.h2Once.Do(func() {
+		a.h2 = router.H2ClusterAction(a.cluster, a.hashPolicies, a.subsetMatch, a.retryPolicy, a.hedgePolicy)
+	})
+	return a.h2
 }
 
 // weightedClusterRouteAction is the per-request weighted-random cluster-SELECTION
 // route action (ADR-0241), the sibling of clusterRouteAction. The producer
 // (buildWeightedRouterAction) pre-builds the H1/H2 closures (each carrying the N
 // entries + the SHARED selector); the bridge just hands them to the chain-mediated
-// dispatch via asRouterAction/asRouterActionH2. The do() arm mirrors
-// clusterRouteAction.do (run the H1 closure → write the reply) for the legacy
-// direct-call interface.
+// dispatch via asRouterAction/asRouterActionH2.
 type weightedClusterRouteAction struct {
 	h1 router.Action
 	h2 router.H2Action
-}
-
-func (a *weightedClusterRouteAction) do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error) {
-	resp, _, err := a.h1(ctx, req)
-	if err != nil {
-		return resp.Status, err
-	}
-	if err := writeStatusReply(bw, resp.Status, string(resp.Body)); err != nil {
-		return resp.Status, err
-	}
-	if resp.Close {
-		return resp.Status, errCloseAfterAction
-	}
-	return resp.Status, nil
 }
 
 func (a *weightedClusterRouteAction) asRouterAction() router.Action     { return a.h1 }

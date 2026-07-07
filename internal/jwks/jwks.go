@@ -243,11 +243,8 @@ func New(uri string, cacheDuration time.Duration, asyncFetch *AsyncFetch, retryP
 	// §Decision (iii) + planner-time decision 3).
 	set, err := f.doFetch(context.Background())
 	if err != nil {
-		// Ensure ready is closed so any future Get sees the error (not a hang).
-		f.readyOnce.Do(func() { close(f.ready) })
-		f.mu.Lock()
-		f.notReadyErr = err
-		f.mu.Unlock()
+		// The Fetcher is discarded on this path (New returns nil), so no
+		// ready/notReadyErr state needs recording — no caller can ever Get.
 		return nil, err
 	}
 	f.mu.Lock()
@@ -270,12 +267,14 @@ func (f *Fetcher) Get(ctx context.Context) (*JWKSet, error) {
 		return nil, ErrJwksClosed
 	}
 	// Snapshot the ready-channel state non-blockingly; if not yet ready, the
-	// initial fetch is still in flight.
+	// initial fetch is still in flight. NO ctx.Done() arm: with the `default`
+	// arm present the not-ready case can never block on ctx, and a ctx arm
+	// would race nondeterministically against a closed ready channel (Go picks
+	// randomly among ready select cases), randomly failing a Get whose keys
+	// are already cached.
 	select {
 	case <-f.ready:
 		// fall-through to load
-	case <-ctx.Done():
-		return nil, ctx.Err()
 	default:
 		return nil, ErrJwksNotReady
 	}

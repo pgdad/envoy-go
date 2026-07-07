@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
 	localratelimitv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/local_ratelimit/v3"
@@ -76,18 +75,20 @@ type filterStats struct {
 // therefore *localratelimitv3.LocalRateLimit (pointer identity = distinct per-route entry).
 type factoryState struct {
 	listenerRC *runtimeConfig
-	perRoute   sync.Map // map[*localratelimitv3.LocalRateLimit]*runtimeConfig — IMPL-1: LocalRateLimit (not LocalRateLimitPerRoute) per PROGRESS.md preamble
-	reg        *stats.Registry
+	// perRoute is the shared generic lazy-cache (Load → build → LoadOrStore,
+	// inherit-listener-on-error) keyed by *LocalRateLimit pointer — IMPL-1:
+	// LocalRateLimit (not LocalRateLimitPerRoute) per PROGRESS.md preamble.
+	perRoute envoyhttp.PerRouteCache[*localratelimitv3.LocalRateLimit, runtimeConfig]
+	reg      *stats.Registry
 }
 
 // filter is the per-request filter instance allocated by the factory closure.
 // State is request-scoped; *factoryState is the closure-captured shared state
-// (immutable post-construction except for the sync.Map lazy-cache; race-safe
-// per sync.Map's contract).
+// (immutable post-construction except for the PerRouteCache lazy-cache;
+// race-safe per its sync.Map-backed contract).
 type filter struct {
 	state *factoryState
 	dcb   envoyhttp.DecoderFilterCallbacks
-	ecb   envoyhttp.EncoderFilterCallbacks // unused per SPEC §6.5 NOTE; kept per planner-time decision 2 for chain-of-conformance
 }
 
 // Statically assert the both-sides interface conformance (matches cors precedent).
@@ -101,7 +102,12 @@ var (
 // SetDecoderCallbacks once per stream; the filter stores the reference for
 // later use during DecodeHeaders.
 func (f *filter) SetDecoderCallbacks(cb envoyhttp.DecoderFilterCallbacks) { f.dcb = cb }
-func (f *filter) SetEncoderCallbacks(cb envoyhttp.EncoderFilterCallbacks) { f.ecb = cb }
+
+// SetEncoderCallbacks is a no-op discard: local_ratelimit's encode side is
+// pure pass-through (SPEC §6.5 NOTE), so the callbacks are never consumed.
+// The interface method MUST exist for the StreamEncoderFilter assertion to
+// compile (matches the adaptive_concurrency precedent at filter.go).
+func (f *filter) SetEncoderCallbacks(_ envoyhttp.EncoderFilterCallbacks) {}
 
 // New is the HTTPFilterFactory exposed at boot. Per ADR-0114 + ADR-0115:
 //
@@ -129,7 +135,7 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 	if err := tc.UnmarshalTo(&c); err != nil {
 		return nil, fmt.Errorf("local_ratelimit: unmarshal: %w", err)
 	}
-	rc, err := buildRuntimeConfig(&c, ctx)
+	rc, err := buildRuntimeConfig(&c, ctx, false /*isPerRoute*/)
 	if err != nil {
 		return nil, err
 	}
@@ -151,10 +157,17 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 // LocalRateLimit proto. Per planner-time decision 3: six explicit checks.
 // Per ADR-0115.
 //
+// The isPerRoute flag selects the stats-registration path only (the six
+// validation checks + error strings are identical at both positions, matching
+// the bandwidthlimit buildCompiledConfig shape): at the listener position
+// newFilterStats is used (boot-time registration); at the per-route position
+// newFilterStatsIfAbsent is used (post-Freeze idempotent per ADR-0117).
+//
 // The bucket + stats fields are wired here (Task 2+3 combined commit):
-// tokenBucket is constructed via newTokenBucket; filterStats via newFilterStats
-// when ctx.Stats is non-nil (nil-tolerance per ADR-0085 test-code path).
-func buildRuntimeConfig(c *localratelimitv3.LocalRateLimit, ctx envoyhttp.FactoryCtx) (*runtimeConfig, error) {
+// tokenBucket is constructed via newTokenBucket; filterStats via the selected
+// constructor when ctx.Stats is non-nil (nil-tolerance per ADR-0085
+// test-code path).
+func buildRuntimeConfig(c *localratelimitv3.LocalRateLimit, ctx envoyhttp.FactoryCtx, isPerRoute bool) (*runtimeConfig, error) {
 	// Check 1 (PGV per §11.1): stat_prefix non-empty.
 	statPrefix := c.GetStatPrefix()
 	if statPrefix == "" {
@@ -203,7 +216,11 @@ func buildRuntimeConfig(c *localratelimitv3.LocalRateLimit, ctx envoyhttp.Factor
 	// Task 2+3 combined commit registers the counters; nil-tolerance for test code paths).
 	var fs *filterStats
 	if ctx.Stats != nil {
-		fs = newFilterStats(ctx.Stats, statPrefix)
+		if isPerRoute {
+			fs = newFilterStatsIfAbsent(ctx.Stats, statPrefix) // post-Freeze idempotent per ADR-0117
+		} else {
+			fs = newFilterStats(ctx.Stats, statPrefix)
+		}
 	}
 	return &runtimeConfig{
 		statPrefix: statPrefix,
@@ -216,78 +233,42 @@ func buildRuntimeConfig(c *localratelimitv3.LocalRateLimit, ctx envoyhttp.Factor
 
 // buildRuntimeConfigPerRoute is buildRuntimeConfig's per-route variant; it
 // uses NewCounterIfAbsent for stats registration so per-route counters can
-// be allocated post-Freeze (per ADR-0117).
+// be allocated post-Freeze (per ADR-0117). Thin wrapper: delegates to
+// buildRuntimeConfig with a synthetic FactoryCtx carrying the captured
+// registry pointer (the per-route path has no envoyhttp.FactoryCtx in scope)
+// — the six validation checks + error strings are shared byte-identically.
 //
 // IMPL-1: takes *localratelimitv3.LocalRateLimit directly (no LocalRateLimitPerRoute
 // wrapper — that proto does not exist in upstream Envoy v1.37.2; per-route TPFC
 // entries reuse the same LocalRateLimit message per PROGRESS.md preamble IMPL-1).
 func buildRuntimeConfigPerRoute(c *localratelimitv3.LocalRateLimit, reg *stats.Registry) (*runtimeConfig, error) {
-	// Same 6 explicit checks as buildRuntimeConfig (callable independently).
-	statPrefix := c.GetStatPrefix()
-	if statPrefix == "" {
-		return nil, errors.New("local_ratelimit: stat_prefix required")
-	}
-	tb := c.GetTokenBucket()
-	if tb == nil {
-		return nil, errors.New("local_ratelimit: token_bucket required")
-	}
-	if tb.GetMaxTokens() == 0 {
-		return nil, errors.New("local_ratelimit: token_bucket.max_tokens must be > 0")
-	}
-	maxTokens := int64(tb.GetMaxTokens())
-	var tokensPerFill int64 = 1
-	if v := tb.GetTokensPerFill(); v != nil {
-		if v.GetValue() == 0 {
-			return nil, errors.New("local_ratelimit: token_bucket.tokens_per_fill must be > 0 if specified")
-		}
-		tokensPerFill = int64(v.GetValue())
-	}
-	fillInterval := tb.GetFillInterval().AsDuration()
-	if fillInterval < minFillInterval {
-		return nil, errors.New("local rate limit token bucket fill timer must be >= 50ms")
-	}
-	statusCode := 429
-	if c.GetStatus() != nil {
-		statusCode = int(c.GetStatus().GetCode())
-		if statusCode < 400 || statusCode >= 600 {
-			return nil, fmt.Errorf("local_ratelimit: status.code must be in [400, 600); got %d", statusCode)
-		}
-	}
-	var fs *filterStats
-	if reg != nil {
-		fs = newFilterStatsIfAbsent(reg, statPrefix)
-	}
-	return &runtimeConfig{
-		statPrefix: statPrefix,
-		bucket:     newTokenBucket(maxTokens, tokensPerFill, fillInterval),
-		statusCode: statusCode,
-		body:       rateLimitedBody,
-		stats:      fs,
-	}, nil
+	return buildRuntimeConfig(c, envoyhttp.FactoryCtx{Stats: reg}, true /*isPerRoute*/)
 }
 
 // newFilterStats registers the 4 local_ratelimit stat counters on the supplied
-// Registry per ADR-0118 + SPEC §11.5. Tolerates nil registry (test code per
-// ADR-0085 nil-tolerance — callers guard with ctx.Stats != nil check above).
+// Registry per ADR-0118 + SPEC §11.5. Callers guard against nil registry with
+// the ctx.Stats != nil check above (ADR-0085 nil-tolerance is caller-side).
 func newFilterStats(reg *stats.Registry, prefix string) *filterStats {
-	p := prefix + ".http_local_rate_limit."
-	return &filterStats{
-		enabled:     reg.NewCounter(p + "enabled"),
-		ok:          reg.NewCounter(p + "ok"),
-		rateLimited: reg.NewCounter(p + "rate_limited"),
-		enforced:    reg.NewCounter(p + "enforced"),
-	}
+	return newFilterStatsWith(reg.NewCounter, prefix)
 }
 
 // newFilterStatsIfAbsent constructs filterStats via NewCounterIfAbsent for
 // post-Freeze idempotent registration (per ADR-0117).
 func newFilterStatsIfAbsent(reg *stats.Registry, prefix string) *filterStats {
+	return newFilterStatsWith(reg.NewCounterIfAbsent, prefix)
+}
+
+// newFilterStatsWith holds the single canonical 4-counter name list; the two
+// public constructors differ only in the registry factory method they pass
+// (NewCounter at boot; NewCounterIfAbsent post-Freeze per ADR-0117), so the
+// name set cannot drift between them. Stat names unchanged.
+func newFilterStatsWith(newCounter func(string) *stats.Counter, prefix string) *filterStats {
 	p := prefix + ".http_local_rate_limit."
 	return &filterStats{
-		enabled:     reg.NewCounterIfAbsent(p + "enabled"),
-		ok:          reg.NewCounterIfAbsent(p + "ok"),
-		rateLimited: reg.NewCounterIfAbsent(p + "rate_limited"),
-		enforced:    reg.NewCounterIfAbsent(p + "enforced"),
+		enabled:     newCounter(p + "enabled"),
+		ok:          newCounter(p + "ok"),
+		rateLimited: newCounter(p + "rate_limited"),
+		enforced:    newCounter(p + "enforced"),
 	}
 }
 
@@ -303,37 +284,12 @@ func newFilterStatsIfAbsent(reg *stats.Registry, prefix string) *filterStats {
 // — that message does not exist in upstream Envoy v1.37.2; per-route TPFC entries
 // ARE LocalRateLimit directly per PROGRESS.md preamble IMPL-1).
 func (s *factoryState) resolvePerRouteConfig(msg proto.Message) *runtimeConfig {
-	if msg == nil {
-		return s.listenerRC
-	}
-	perRoute, ok := msg.(*localratelimitv3.LocalRateLimit)
-	if !ok {
-		return s.listenerRC
-	}
-	if cached, ok := s.perRoute.Load(perRoute); ok {
-		return cached.(*runtimeConfig)
-	}
-	// Lazy construction. Race-safe via sync.Map's LoadOrStore: if two goroutines
-	// race to construct the per-route rc, only one allocation wins; the loser's
-	// rc is GC'd (its registered counters are NOT GC'd since they're already in
-	// the Registry, but they're idempotent and equivalent to the winner's via
-	// NewCounterIfAbsent's pointer-identity guarantee, so the winner and loser
-	// observe the same Counter instances).
-	//
-	// Future optimization for high-cardinality per-route maps under heavy initial
-	// concurrency: a singleflight wrapper would dedupe the duplicate
-	// buildRuntimeConfigPerRoute call. Not justified for the current low-
-	// cardinality workload; revisit if profiling at fixture-0013-scale shows
-	// repeated wasted allocations under cold-start fan-out.
-	fresh, err := buildRuntimeConfigPerRoute(perRoute, s.reg)
-	if err != nil {
-		// Per-route TPFC parsing failed. Treat as "inherit listener" to keep
-		// request flow alive (NO panic per ADR-0072 boot-fail-fast applies only
-		// to boot-time, not request-time).
-		return s.listenerRC
-	}
-	actual, _ := s.perRoute.LoadOrStore(perRoute, fresh)
-	return actual.(*runtimeConfig)
+	// Lazy construction + inherit-listener-on-error via the shared generic
+	// PerRouteCache (Load → buildRuntimeConfigPerRoute → LoadOrStore).
+	return s.perRoute.Resolve(msg, s.listenerRC,
+		func(pr *localratelimitv3.LocalRateLimit) (*runtimeConfig, error) {
+			return buildRuntimeConfigPerRoute(pr, s.reg)
+		})
 }
 
 // DecodeHeaders implements the rate-limit decision per SPEC §6.5 + ADR-0119.
@@ -342,7 +298,8 @@ func (s *factoryState) resolvePerRouteConfig(msg proto.Message) *runtimeConfig {
 //
 // Discipline:
 //  1. Resolve per-route config via dcb.RequestRouteConfig(); fall back to listener.
-//  2. Increment rc.stats.enabled (unconditional per-request).
+//  2. Increment rc.stats.enabled (per-request; nil-guarded — rc.stats is
+//     nil when the filter was built with nil ctx.Stats per ADR-0085).
 //  3. Call rc.bucket.tryConsume().
 //  4. If true: increment rc.stats.ok; return Continue.
 //  5. If false: increment rc.stats.rateLimited AND rc.stats.enforced
@@ -360,13 +317,22 @@ func (f *filter) DecodeHeaders(_ http.Header, _ bool) envoyhttp.FilterHeadersSta
 		perRouteMsg = f.dcb.RequestRouteConfig()
 	}
 	rc := f.state.resolvePerRouteConfig(perRouteMsg)
-	rc.stats.enabled.Inc()
+	// rc.stats is nil when the filter was built with a nil ctx.Stats (test
+	// path per the runtimeConfig contract + ADR-0085 nil-tolerance) — guard
+	// every stat touch (matches the bandwidthlimit sibling discipline).
+	if rc.stats != nil {
+		rc.stats.enabled.Inc()
+	}
 	if rc.bucket.tryConsume() {
-		rc.stats.ok.Inc()
+		if rc.stats != nil {
+			rc.stats.ok.Inc()
+		}
 		return envoyhttp.Continue
 	}
-	rc.stats.rateLimited.Inc()
-	rc.stats.enforced.Inc() // lockstep MVP per ADR-0118
+	if rc.stats != nil {
+		rc.stats.rateLimited.Inc()
+		rc.stats.enforced.Inc() // lockstep MVP per ADR-0118
+	}
 	f.dcb.SendLocalReply(rc.statusCode, rc.body, envoyhttp.OrderedHeaders{
 		{Name: "Content-Type", Value: "text/plain"},
 	})

@@ -126,19 +126,15 @@ func responseHandleTrailers(L *lua.LState) int {
 // the Lua stack. Returns 1 (number of pushed return values per
 // LGFunction convention).
 //
-// Mirrors pushHeadersUD exactly with the metatable registry key
-// swapped — the underlying value type is http.Header in both cases (Go
-// map type — passed by reference; embedding directly in LUserData.Value
-// preserves mutate-through semantics for :add / :remove / :replace
-// without an extra indirection). The trailers methods dispatch via
-// getHeadersFromUD UNCHANGED (it casts the LUserData.Value to
-// http.Header without consulting the metatable's registry key — the
-// type-distinct metatable is purely a Lua-side marker, not a Go-side
-// dispatch discriminator).
+// Delegates to pushHeaderLikeUD (bridge.go) with the metatable registry
+// key swapped — the underlying value type is http.Header in both cases
+// (Go map type — passed by reference; embedding directly in
+// LUserData.Value preserves mutate-through semantics for :add /
+// :remove / :replace without an extra indirection). The trailers
+// methods dispatch via getHeadersFromUD UNCHANGED (it casts the
+// LUserData.Value to http.Header without consulting the metatable's
+// registry key — the type-distinct metatable is purely a Lua-side
+// marker, not a Go-side dispatch discriminator).
 func pushTrailersUD(L *lua.LState, h http.Header) int {
-	ud := L.NewUserData()
-	ud.Value = h
-	L.SetMetatable(ud, L.GetTypeMetatable(trailersTypeName))
-	L.Push(ud)
-	return 1
+	return pushHeaderLikeUD(L, h, trailersTypeName)
 }

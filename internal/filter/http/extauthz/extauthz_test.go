@@ -1779,9 +1779,9 @@ func TestNew_HttpService_ValidConfig(t *testing.T) {
 // review-fix (Issue 5) — the sole keeper is TestNew_HttpService_ValidConfig.
 
 // -------------------------------------------------------------------------
-// Group 4 — stripPath / joinPaths / buildTargetURL unit tests (no server needed)
-// Added at Task 3 review-fix (Issue 4): table-driven tests for the path-strip
-// and path-join surface used by httpAuthClient.
+// Group 4 — stripPath / joinPaths / outbound-URL composition unit tests (no
+// server needed). Added at Task 3 review-fix (Issue 4): table-driven tests
+// for the path-strip and path-join surface used by httpAuthClient.
 // -------------------------------------------------------------------------
 
 // TestStripPath verifies stripPath strips the path component from a server URI,
@@ -1900,9 +1900,10 @@ func TestJoinPaths(t *testing.T) {
 	}
 }
 
-// TestBuildTargetURL verifies buildTargetURL combines a pre-stripped base,
-// a path_prefix, and a request path into the correct outbound URL.
-// buildTargetURL now accepts a pre-stripped base (no stripPath inside).
+// TestBuildTargetURL verifies the LIVE outbound-URL composition — the
+// base + joinPaths(pathPrefix, path) expression buildCheckFnClosure uses
+// verbatim (the former buildTargetURL wrapper was deleted as production-dead;
+// this test now pins the expression that actually ships).
 func TestBuildTargetURL(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -1949,10 +1950,42 @@ func TestBuildTargetURL(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildTargetURL(tc.base, tc.pathPrefix, tc.path)
+			// The live buildCheckFnClosure expression: base + joinPaths(prefix, path).
+			got := tc.base + joinPaths(tc.pathPrefix, tc.path)
 			if got != tc.want {
-				t.Errorf("buildTargetURL(%q, %q, %q) = %q; want %q",
+				t.Errorf("%q + joinPaths(%q, %q) = %q; want %q",
 					tc.base, tc.pathPrefix, tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMapHTTPResponse_DrainsBodyOnNonDenyPaths asserts the allow (200) and
+// unrecognized-status (dispError) dispositions drain the unread auth-service
+// response body before the caller's deferred Close — so net/http can return
+// the connection to its keep-alive pool instead of paying a fresh TCP (and
+// TLS) handshake on every allow check. No downstream-observable bytes change;
+// the deny path (401/403) already consumes the body verbatim via io.ReadAll.
+func TestMapHTTPResponse_DrainsBodyOnNonDenyPaths(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		status int
+	}{
+		{"allow-200", http.StatusOK},
+		{"unrecognized-status-500", http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.NewReader("auth-service body bytes the filter never consumes")
+			resp := &http.Response{
+				StatusCode: tc.status,
+				Header:     http.Header{},
+				Body:       io.NopCloser(body),
+			}
+			_, _ = mapHTTPResponseWithMatchers(resp, nil, nil, nil, false)
+			if body.Len() != 0 {
+				t.Errorf("%d unread body bytes remain after the %s disposition; want 0 (drained for keep-alive reuse)",
+					body.Len(), tc.name)
 			}
 		})
 	}

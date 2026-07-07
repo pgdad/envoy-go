@@ -5,7 +5,9 @@ package wasm
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
@@ -170,6 +172,143 @@ func TestRegistry_FactoryErrorNotCached(t *testing.T) {
 	}
 	if !r.has(key) {
 		t.Fatal("entry must be present after successful acquire")
+	}
+}
+
+// TestRegistry_FactoryRunsOutsideLock proves the pending-sentry discipline:
+// an in-flight factory for one key MUST NOT hold the process-global registry
+// mutex (the factory performs a full VM boot including guest code execution),
+// so an acquire for a DIFFERENT key completes while the first factory is
+// still running.
+func TestRegistry_FactoryRunsOutsideLock(t *testing.T) {
+	r := NewRegistry()
+	keyA := makeVMKey("vmlockA", nil, []byte("a"))
+	keyB := makeVMKey("vmlockB", nil, []byte("b"))
+
+	factoryEntered := make(chan struct{})
+	releaseFactory := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.AcquireRootVM(keyA, func() (*RootVM, error) {
+			close(factoryEntered)
+			<-releaseFactory
+			return &RootVM{}, nil
+		})
+		done <- err
+	}()
+	<-factoryEntered
+
+	// While keyA's factory is in flight, an unrelated key must not block.
+	acquired := make(chan struct{})
+	go func() {
+		if _, err := r.AcquireRootVM(keyB, func() (*RootVM, error) { return &RootVM{}, nil }); err != nil {
+			t.Errorf("AcquireRootVM(keyB): %v", err)
+		}
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("AcquireRootVM(keyB) blocked behind keyA's in-flight factory (registry mutex held across factory)")
+	}
+
+	close(releaseFactory)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := r.refcountFor(keyA); got != 1 {
+		t.Fatalf("refcount(keyA) = %d, want 1", got)
+	}
+}
+
+// TestRegistry_ConcurrentSameKeyAcquire_SingleFactory proves concurrent
+// same-key acquirers wait on the construction sentry: the factory runs
+// exactly once and every acquirer receives the same *RootVM with the full
+// refcount.
+func TestRegistry_ConcurrentSameKeyAcquire_SingleFactory(t *testing.T) {
+	r := NewRegistry()
+	key := makeVMKey("vmonce", nil, []byte("code"))
+	var calls atomic.Int32
+	const N = 16
+	vms := make([]*RootVM, N)
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			vm, err := r.AcquireRootVM(key, func() (*RootVM, error) {
+				calls.Add(1)
+				time.Sleep(5 * time.Millisecond) // widen the construction window
+				return &RootVM{}, nil
+			})
+			if err != nil {
+				t.Error(err)
+			}
+			vms[i] = vm
+		}(i)
+	}
+	wg.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("factory calls = %d, want 1 (same-key acquirers must wait on the sentry)", got)
+	}
+	for i := 1; i < N; i++ {
+		if vms[i] != vms[0] {
+			t.Fatal("all same-key acquirers must share one *RootVM")
+		}
+	}
+	if got := r.refcountFor(key); got != N {
+		t.Fatalf("refcount = %d, want %d", got, N)
+	}
+}
+
+// TestRegistry_FactoryErrorWakesWaiters proves a same-key waiter blocked on
+// a construction sentry retries with its OWN factory after the first
+// factory fails (the failed sentry is removed, not cached).
+func TestRegistry_FactoryErrorWakesWaiters(t *testing.T) {
+	r := NewRegistry()
+	key := makeVMKey("vmerrwake", nil, []byte("code"))
+
+	factoryEntered := make(chan struct{})
+	releaseFactory := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := r.AcquireRootVM(key, func() (*RootVM, error) {
+			close(factoryEntered)
+			<-releaseFactory
+			return nil, errors.New("boot failure")
+		})
+		firstDone <- err
+	}()
+	<-factoryEntered
+
+	// Second same-key acquirer parks on the sentry.
+	secondDone := make(chan error, 1)
+	var secondCalls atomic.Int32
+	go func() {
+		_, err := r.AcquireRootVM(key, func() (*RootVM, error) {
+			secondCalls.Add(1)
+			return &RootVM{}, nil
+		})
+		secondDone <- err
+	}()
+
+	close(releaseFactory)
+	if err := <-firstDone; err == nil {
+		t.Fatal("expected first acquire to surface the factory error")
+	}
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second acquire after failed sentry: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second acquirer never woke from the failed construction sentry")
+	}
+	if got := secondCalls.Load(); got != 1 {
+		t.Fatalf("second factory calls = %d, want 1 (fresh miss after failure)", got)
+	}
+	if got := r.refcountFor(key); got != 1 {
+		t.Fatalf("refcount = %d, want 1", got)
 	}
 }
 

@@ -253,7 +253,9 @@ func (s *GrpcAccessLogSink) run() {
 			}
 			entry := buildHTTPAccessLogEntry(rec, s.additionalRequestHeaders, s.additionalResponseHeaders)
 			buf = append(buf, entry)
-			bufBytes += proto.Size(entry)
+			if s.bufferSizeBytes > 0 { // skip the proto.Size walk when the accumulated size is never consulted
+				bufBytes += proto.Size(entry)
+			}
 			if bufBytes >= s.bufferSizeBytes { // SIZE trigger (AMEND-BUF-1); 0 ⇒ every entry flushes
 				flush()
 			}

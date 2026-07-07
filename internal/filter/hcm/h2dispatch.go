@@ -123,7 +123,6 @@ func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 			action:                   notFound.asRouterActionH2(),
 			req:                      req,
 			routeIdx:                 -1,
-			status:                   404,
 			tlsPrincipals:            d.tlsPrincipals,
 			tlsConnectionState:       d.tlsConnectionState,
 			downstreamRemoteAddr:     d.downstreamRemoteAddr,
@@ -205,9 +204,6 @@ type chainDispatchAction struct {
 	action   router.H2Action
 	req      *http.Request
 	routeIdx int
-	// status pinned at construction time; for no-match path only (404). Unused
-	// for the matched-route case (status comes from rf.Status() post-RunAction).
-	status int
 	// tlsPrincipals is the priority-ordered TLS principal-name candidate slice
 	// from the parent h2Dispatcher (extracted once at connection build time by
 	// runH2). nil for plaintext / non-mTLS / no-client-cert connections.

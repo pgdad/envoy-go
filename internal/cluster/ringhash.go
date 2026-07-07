@@ -141,10 +141,7 @@ func (rh *ringHashLB) Pick(hashKey uint64, hasHash bool, _ SubsetMatch, _ bool) 
 	if m == len(rh.ring) {
 		m = 0 // wrap
 	}
-	if rh.health == nil || rh.health.inPanic(rh.endpoints) {
-		if rh.health != nil {
-			rh.health.panicInc()
-		}
+	if rh.health.panicGate(rh.endpoints) {
 		return rh.endpoints[rh.ring[m].ep], noopRelease, nil
 	}
 	// Walk the ring forward from m to the next healthy host (ADR-0243).

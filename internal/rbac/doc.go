@@ -7,7 +7,8 @@
 //
 // The package evaluates access-control rules against the abstract [EvalContext]
 // interface. The Permission Large 11 and Principal Large 11 evaluator trees,
-// the adapter helpers (matchString / matchHeader / matchPath / matchCidr), and
+// the build-time-compiled adapter helpers (compiledStringMatcher /
+// compiledHeaderMatcher / compilePathMatcher / compiledCidr), and
 // the builder entry-points (buildOnePermission / buildOnePrincipal) are
 // package-internal; both consumers reach them through the compiler/Evaluate
 // surface (BuildRulesEngine / BuildMatcherEngine / Evaluate).

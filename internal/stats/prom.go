@@ -44,7 +44,7 @@ func WriteProm(w io.Writer, r *Registry) error {
 			g = &promGroup{
 				name:  base,
 				mtype: m.Type(),
-				help:  helpText[base], // empty string if absent; emitted as "" then
+				help:  helpText[base], // empty string if absent; the emit loop falls back to the Prometheus name
 			}
 			groups[base] = g
 			keys = append(keys, base)

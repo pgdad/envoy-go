@@ -581,3 +581,57 @@ func TestController_FAKE_TIME_ConcurrencyUpdateTick_EmitsGaugesAfterWindowClose(
 		t.Errorf("burstQueueSize gauge = %d; want 1 (sqrt(3*0.5) ≈ 1.22 → int64 1)", got)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// 11. TestController_RACE_SampleResetTimerReArm — sampleResetTimer write-write
+// race guard (maintenance-pass fix: the concurrencyUpdateTick re-arm used to
+// write c.sampleResetTimer AFTER releasing mu, racing updateMinRTTLocked's
+// under-mu write of the same field from the sample-driven window-close path —
+// and, functionally, risking a permanently doubled tick cadence when a minRTT
+// window was entered + closed inside that unlock/re-arm gap).
+// -----------------------------------------------------------------------------
+
+// TestController_RACE_SampleResetTimerReArm drives the two sampleResetTimer
+// writers concurrently under `go test -race`: goroutine 1 fires the periodic
+// concurrencyUpdateTick path (both its empty-sample re-arm and its
+// aggregate+re-arm arms), goroutine 2 loops the minRTT window enter
+// (updateMinRTTTick) + sample-driven close (recordLatencySample ×
+// minRTTRequestCount → updateMinRTTLocked re-arm). Before the fix the race
+// detector flags the tick path's unlocked field write; after it, all writes
+// happen under c.mu.
+func TestController_RACE_SampleResetTimerReArm(t *testing.T) {
+	cfg := testCompiledConfig()
+	cfg.minRTTRequestCount = 2 // tiny window so goroutine 2 closes it fast
+	clk := clock.NewFakeClock(time.Unix(0, 0))
+	c := newGradientController(cfg, testFilterStats(), clk)
+
+	// Close the construction-time minRTT window (AMEND-2 C4 enters it
+	// immediately) so both goroutines start from the out-of-window state.
+	c.recordLatencySample(time.Millisecond)
+	c.recordLatencySample(time.Millisecond)
+
+	const iters = 200
+	var wg sync.WaitGroup
+	wg.Add(2)
+	// Goroutine 1 — the periodic tick path. Direct concurrencyUpdateTick
+	// calls stand in for timer fires (the FakeClock invokes the callback
+	// the same way from Advance); each call re-arms sampleResetTimer.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			c.recordLatencySample(time.Millisecond)
+			c.concurrencyUpdateTick()
+		}
+	}()
+	// Goroutine 2 — the sample-driven window enter/close path. The close
+	// (updateMinRTTLocked) re-arms sampleResetTimer under mu.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			c.updateMinRTTTick()
+			c.recordLatencySample(time.Millisecond)
+			c.recordLatencySample(time.Millisecond)
+		}
+	}()
+	wg.Wait()
+}

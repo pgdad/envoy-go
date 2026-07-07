@@ -104,12 +104,10 @@ type SandboxConfig struct {
 // distinct field (e.g., a `DenyCoroutine` flag), which is deliberately
 // NOT introduced at 22.1 (YAGNI).
 func applyZeroValueDefaults(sb SandboxConfig) SandboxConfig {
-	if !sb.AllowCoroutine {
-		sb.AllowCoroutine = true
-	}
-	if !sb.AllowOSTimeHelpers {
-		sb.AllowOSTimeHelpers = true
-	}
+	// Unconditional: opt-out is impossible per the CAVEAT above — the
+	// zero value and an explicit true both resolve to true.
+	sb.AllowCoroutine = true
+	sb.AllowOSTimeHelpers = true
 	return sb
 }
 
@@ -172,11 +170,11 @@ func applySandbox(state *lua.LState, sb SandboxConfig) {
 	}
 	if sb.AllowOS || sb.AllowOSTimeHelpers {
 		lua.OpenOs(state)
-		// When AllowOS is false BUT AllowOSTimeHelpers is true, the
-		// os table is open for the 4 read-only time helpers; the 7
-		// dangerous entries get nilled. When AllowOS is true the os
+		// When AllowOS is false (so we got here via AllowOSTimeHelpers),
+		// the os table is open for the 4 read-only time helpers only; the
+		// 7 dangerous entries get nilled. When AllowOS is true the os
 		// table is left as-opened with no post-walk strip.
-		if !sb.AllowOS && sb.AllowOSTimeHelpers {
+		if !sb.AllowOS {
 			nilOutOsNonTimeHelpers(state)
 		}
 	}

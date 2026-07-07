@@ -756,3 +756,51 @@ func TestDecoder_MessageToStringPerOpcode(t *testing.T) {
 		}
 	}
 }
+
+// A declared messageLength beyond the maxMessageLen cap routes to the
+// decoderError path exactly like a msgLen < 16 (finding: mongo was the only
+// protocol proxy with no upper bound — a downstream declaring msgLen≈2GiB made
+// readBuf accumulate without limit). Both directions share nextMessage, so both
+// are pinned; the boundary case (exactly maxMessageLen) stays a partial frame.
+func TestNextMessage_OversizedDeclaredLengthIsDecodeError(t *testing.T) {
+	oversized := append(leI32(0x7FFFFFFF), leI32(1)...) // messageLength ≈ 2GiB
+	oversized = append(oversized, leI32(0)...)          // responseTo
+	oversized = append(oversized, leI32(opQuery)...)    // opCode — never reached
+
+	t.Run("read-side", func(t *testing.T) {
+		d, ms := newTestDecoder(t)
+		d.decodeOnData(oversized, int64(len(oversized)))
+		if got := ms.counters["decoding_error"].Load(); got != 1 {
+			t.Fatalf("decoding_error = %d, want 1", got)
+		}
+		if d.sniffing.Load() {
+			t.Error("sniffing must be off after an oversized declared length")
+		}
+		if d.readBuf != nil {
+			t.Errorf("readBuf must be released after the decode error; still holds %d bytes", len(d.readBuf))
+		}
+	})
+	t.Run("write-side", func(t *testing.T) {
+		d, ms := newTestDecoder(t)
+		d.decodeOnWrite(oversized)
+		if got := ms.counters["decoding_error"].Load(); got != 1 {
+			t.Fatalf("decoding_error = %d, want 1", got)
+		}
+		if d.writeBuf != nil {
+			t.Errorf("writeBuf must be released after the decode error; still holds %d bytes", len(d.writeBuf))
+		}
+	})
+	t.Run("at-the-cap-is-a-partial-frame", func(t *testing.T) {
+		d, ms := newTestDecoder(t)
+		atCap := append(leI32(maxMessageLen), leI32(1)...)
+		atCap = append(atCap, leI32(0)...)
+		atCap = append(atCap, leI32(opQuery)...)
+		d.decodeOnData(atCap, int64(len(atCap)))
+		if got := ms.counters["decoding_error"].Load(); got != 0 {
+			t.Fatalf("decoding_error = %d, want 0 (a length AT the cap waits for bytes)", got)
+		}
+		if !d.sniffing.Load() {
+			t.Error("sniffing must stay on for a length at the cap")
+		}
+	})
+}

@@ -1682,3 +1682,56 @@ func TestServerConn_WindowUpdate_OverflowBoundsCheck(t *testing.T) {
 		}
 	})
 }
+
+// TestServerConn_RequestWithTrailersIsDispatched pins the trailing-HEADERS
+// dispatch path: a request whose END_STREAM arrives on a trailing HEADERS
+// frame (HEADERS without END_STREAM → DATA without END_STREAM → trailing
+// HEADERS with END_STREAM) MUST still be dispatched and served. The trailer
+// fields themselves are observed-and-discarded per SPEC §2.1; only the
+// END_STREAM transition matters. Before the fix the isExisting branch of
+// onHeaders returned without queueing a dispatch, so the request hung with
+// no response and the stream leaked its MAX_CONCURRENT_STREAMS slot forever.
+func TestServerConn_RequestWithTrailersIsDispatched(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	disp := &fixedDispatcher{action: &fixedAction{status: 200, body: "trailered\n"}}
+	clientConn, _ := startServerConn(t, ctx, disp, DefaultServerSettings)
+
+	tr := newH2Transport(clientConn)
+	defer tr.CloseIdleConnections()
+
+	// x/net's http2.Transport emits the trailing-HEADERS frame when
+	// req.Trailer is populated: HEADERS (no END_STREAM), DATA (no END_STREAM),
+	// then HEADERS carrying the trailers with END_STREAM set.
+	req, err := http.NewRequest("POST", "http://test.local/upload", bytes.NewBufferString("hello"))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Trailer = http.Header{"X-Checksum": []string{"abc123"}}
+
+	type rtResult struct {
+		resp *http.Response
+		err  error
+	}
+	resCh := make(chan rtResult, 1)
+	go func() {
+		resp, err := tr.RoundTrip(req)
+		resCh <- rtResult{resp, err}
+	}()
+
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			t.Fatalf("RoundTrip: %v", res.err)
+		}
+		if res.resp.StatusCode != 200 {
+			t.Errorf("status = %d, want 200", res.resp.StatusCode)
+		}
+		if body := readBody(t, res.resp); body != "trailered\n" {
+			t.Errorf("body = %q, want %q", body, "trailered\n")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("request with trailing HEADERS was never served (dispatch not queued on the trailer END_STREAM)")
+	}
+}

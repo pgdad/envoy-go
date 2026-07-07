@@ -650,7 +650,7 @@ func TestHandleTerminalWrapComposition(t *testing.T) {
 	wf := &fakeWriteFilter{name: "w", status: Continue}
 	rt := newChainRuntime(nil, &fakeConn{}, connFacts{})
 	rt.terminal = rec
-	rt.writeFilters = []WriteFilter{wf}
+	rt.setWriteFilters([]WriteFilter{wf})
 	rt.buf.Append([]byte("prefix")) // simulate undrained buffered prefix
 	rt.handleTerminal(context.Background())
 	wrap, ok := rec.gotConn.(*writeChainConn)
@@ -718,7 +718,7 @@ func TestHandleTerminalFullCompositionOrder(t *testing.T) {
 	wf := &fakeWriteFilter{name: "w", status: Continue}
 	rt := newChainRuntime(nil, raw, connFacts{})
 	rt.terminal = rec
-	rt.writeFilters = []WriteFilter{wf}
+	rt.setWriteFilters([]WriteFilter{wf})
 	rt.buf.Append([]byte("prefix"))
 	rt.handleTerminal(context.Background())
 
@@ -746,7 +746,7 @@ func TestHandleTerminalCompositionNoPrefix(t *testing.T) {
 	wf := &fakeWriteFilter{name: "w", status: Continue}
 	rt := newChainRuntime(nil, raw, connFacts{})
 	rt.terminal = rec
-	rt.writeFilters = []WriteFilter{wf}
+	rt.setWriteFilters([]WriteFilter{wf})
 	rt.handleTerminal(context.Background())
 
 	wc, ok := rec.gotConn.(*writeChainConn)
@@ -772,7 +772,7 @@ func TestHandleTerminalPrefixNotReFedThroughReplay(t *testing.T) {
 	rt := newChainRuntime([]ReadFilter{f}, raw, connFacts{})
 	rec := &recordingTerminal{}
 	rt.terminal = rec
-	rt.writeFilters = []WriteFilter{wf}
+	rt.setWriteFilters([]WriteFilter{wf})
 
 	// Pre-handoff: the filter sees "pre" via the normal onData path; the bytes
 	// stay undrained (passthrough filter) → become the handoff prefix.
@@ -814,7 +814,7 @@ func TestChainSoundnessInvariantEveryByteSeenExactlyOnce(t *testing.T) {
 	rt := newChainRuntime([]ReadFilter{f}, raw, connFacts{})
 	rec := &recordingTerminal{}
 	rt.terminal = rec
-	rt.writeFilters = []WriteFilter{wf}
+	rt.setWriteFilters([]WriteFilter{wf})
 
 	// Pre-handoff: one socket read via the normal onData path. (The runtime
 	// hands off the moment every read filter has Continued — serveNetworkChain's
@@ -851,7 +851,7 @@ func TestHandleTerminalReverseWriteDispatch(t *testing.T) {
 	rec := &recordingTerminal{}
 	rt := newChainRuntime(nil, &fakeConn{}, connFacts{})
 	rt.terminal = rec
-	rt.writeFilters = []WriteFilter{a, b} // CHAIN order
+	rt.setWriteFilters([]WriteFilter{a, b}) // CHAIN order
 	rt.handleTerminal(context.Background())
 	_, _ = rec.gotConn.Write([]byte("x"))
 	if len(order) != 2 || order[0] != "B" || order[1] != "A" {
@@ -867,7 +867,7 @@ func TestHandleTerminalDoesNotMutateChainOrder(t *testing.T) {
 	rec := &recordingTerminal{}
 	rt := newChainRuntime(nil, &fakeConn{}, connFacts{})
 	rt.terminal = rec
-	rt.writeFilters = []WriteFilter{a, b}
+	rt.setWriteFilters([]WriteFilter{a, b})
 	rt.handleTerminal(context.Background())
 	if rt.writeFilters[0].(*fakeWriteFilter).name != "A" {
 		t.Fatal("handleTerminal mutated chainRuntime.writeFilters (must reverse a COPY)")
@@ -1242,8 +1242,12 @@ func TestChainHaltablePreHandoffHoldThenResume(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("onData did not return after resume — the hold never released")
 	}
-	if rt.resumeIdx != 1 {
-		t.Errorf("resumeIdx = %d, want 1 (advanced PAST the halting filter)", rt.resumeIdx)
+	// The resume advanced PAST the halting filter (sawData stays 1 — no
+	// re-delivery within the pass), completing the pass; a completed pass over a
+	// PURE-READ chain (no terminal) then resets resumeIdx to 0 so the next
+	// socket read re-delivers to every filter (upstream onRead re-iteration).
+	if rt.resumeIdx != 0 {
+		t.Errorf("resumeIdx = %d, want 0 (completed pure-read pass resets the resume index)", rt.resumeIdx)
 	}
 	if hf.sawData != 1 {
 		t.Errorf("sawData = %d, want 1 (the halting filter is entered exactly once; resume advances PAST it, not re-delivering)", hf.sawData)
@@ -1483,5 +1487,25 @@ func TestCloseDirectionThroughWrapStackNoPrefix(t *testing.T) {
 	sd.SetCloseDirection(CloseDirectionLocal)
 	if got := rt.cb.CloseDirection(); got != CloseDirectionLocal {
 		t.Errorf("CloseDirection through no-prefix wrap stack = %v, want Local", got)
+	}
+}
+
+// A PURE-READ all-Continue chain re-delivers on EVERY socket read (upstream
+// FilterManagerImpl::onRead parity — the onData doc contract): the completed
+// pass resets resumeIdx, so a second socket read reaches the filters again
+// instead of being appended to the buffer and never delivered (the sticky
+// resumeIdx == len(filters) latent bug). Terminal chains are unaffected —
+// terminalReady keys on resumeIdx staying at len(filters).
+func TestPureReadAllContinueChainDeliversEverySocketRead(t *testing.T) {
+	f := &recordingReadFilter{name: "A", status: Continue}
+	rt := newChainRuntime([]ReadFilter{f}, &fakeConn{}, connFacts{})
+	rt.onNewConnection()
+	rt.onData([]byte("abc"), false)
+	rt.onData([]byte("def"), false)
+	if got := len(f.ends); got != 2 {
+		t.Fatalf("OnData deliveries = %d, want 2 (one per socket read)", got)
+	}
+	if string(f.seen) != "abcdef" {
+		t.Fatalf("filter saw %q, want abcdef (the second read's bytes must be delivered, not silently buffered)", f.seen)
 	}
 }

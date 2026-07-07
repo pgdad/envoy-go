@@ -103,28 +103,6 @@ func TestTracerCounters_Registration(t *testing.T) {
 	}
 }
 
-func TestTracerCounters_IncSentAndDropped(t *testing.T) {
-	reg := stats.NewRegistry()
-	c := RegisterTracerCounters(reg)
-
-	c.IncSent(3)
-	if v := c.spansSent.Load(); v != 3 {
-		t.Errorf("spans_sent = %d, want 3", v)
-	}
-
-	c.IncDropped()
-	if v := c.spansDropped.Load(); v != 1 {
-		t.Errorf("spans_dropped = %d, want 1", v)
-	}
-}
-
-func TestTracerCounters_NilSafe(t *testing.T) {
-	var c *TracerCounters
-	// Must not panic.
-	c.IncSent(1)
-	c.IncDropped()
-}
-
 func TestZipkinCounters_Registration(t *testing.T) {
 	reg := stats.NewRegistry()
 	before := countMetrics(reg)
@@ -149,28 +127,6 @@ func TestZipkinCounters_Registration(t *testing.T) {
 			t.Errorf("missing registered metric %q", w)
 		}
 	}
-}
-
-func TestZipkinCounters_IncSentAndDropped(t *testing.T) {
-	reg := stats.NewRegistry()
-	c := RegisterZipkinCounters(reg)
-
-	c.IncSent(3)
-	if v := c.spansSent.Load(); v != 3 {
-		t.Errorf("spans_sent = %d, want 3", v)
-	}
-
-	c.IncDropped()
-	if v := c.spansDropped.Load(); v != 1 {
-		t.Errorf("spans_dropped = %d, want 1", v)
-	}
-}
-
-func TestZipkinCounters_NilSafe(t *testing.T) {
-	var c *ZipkinCounters
-	// Must not panic.
-	c.IncSent(1)
-	c.IncDropped()
 }
 
 func TestHCMCounters_Record(t *testing.T) {

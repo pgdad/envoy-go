@@ -1,8 +1,6 @@
 package hcm
 
 import (
-	"bufio"
-	"context"
 	"net/http"
 	"strings"
 
@@ -39,29 +37,19 @@ type matchPrefix string
 func (m matchPrefix) matches(p string) bool { return strings.HasPrefix(p, string(m)) }
 
 // routeAction is the action half of a routeEntry. Implementations live in
-// actions.go: directResponseAction (synthesizes a local reply) and
-// clusterRouteAction (the H1 cluster-dial bridge to internal/filter/http/router).
-// Returning errCloseAfterAction from do signals the connection loop to close
-// after this iteration; other non-nil errors propagate and trigger
-// downstream close.
+// actions.go: directResponseAction (synthesizes a local reply),
+// clusterRouteAction (the cluster-dial bridge to internal/filter/http/router)
+// and weightedClusterRouteAction (the weighted-selection sibling).
 //
-// Phase 06.1 Task 11 widened do's return to (status int, err error) so
-// runConnection can Inc the HCM downstream_rq_<Nxx> bucket per SPEC §5.5
-// without snooping bw. status is the HTTP status code finalized by the
-// action (e.g. 200 for a happy direct_response, 502/503 for a router
-// local-reply on dial/upstream failure, the upstream response code for
-// a successful proxy round-trip). status is meaningful even when err is
-// non-nil (the action populates it before the writer error).
-//
-// Phase 07.1 Task 15: in addition to do(), routeAction now exposes
-// asRouterAction() which returns a router.Action closure for the
-// chain-mediated dispatch path; HCM dispatch (connection.go) injects
+// Phase 07.1 Task 15: asRouterAction() returns a router.Action closure for
+// the chain-mediated dispatch path; HCM dispatch (connection.go) injects
 // this closure into the terminal router filter via *Filter.SetAction
-// before iteration begins. The do() method is preserved for the legacy
-// direct-call shape (kept for the H2-side residue + tests; H1 dispatch
-// post-Task-15 goes through asRouterAction()).
+// before iteration begins. The legacy direct-call do() shape (which wrote
+// wire bytes straight into a *bufio.Writer) was production-unreachable
+// after Tasks 15+16 moved both codecs onto the chain-mediated path and has
+// been deleted; the byte-preservation coverage now drives the Action
+// closures directly.
 type routeAction interface {
-	do(ctx context.Context, req *http.Request, bw *bufio.Writer) (int, error)
 	asRouterAction() router.Action
 	// asRouterActionH2 returns the H2-flavored router.H2Action closure for the
 	// chain-mediated H2 dispatch path (Task 16). HCM h2dispatch.go injects this

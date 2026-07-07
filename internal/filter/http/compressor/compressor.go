@@ -5,9 +5,9 @@ import (
 	"compress/gzip"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	gzipv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/compression/gzip/compressor/v3"
@@ -19,24 +19,27 @@ import (
 	"github.com/pgdad/envoy-go/internal/stats"
 )
 
-// strongEtagPattern matches RFC 7232 §2.3 "strong validator" ETag values:
-// a double-quote, zero or more non-quote chars, a double-quote. Per
-// §11.7 + §1.1 amendment 6 mode-a: strong-ETag is STRIPPED on compress path
-// because the strong-validator semantic ("entity bytes have not changed")
-// cannot hold for a gzip-encoded entity whose bytes differ from the
-// uncompressed entity.
-//
-// weakEtagPattern matches RFC 7232 §2.3 "weak validator" ETag values: the
-// literal W/ prefix followed by a quoted string. Per §11.7 mode-a: weak-ETag
-// is PRESERVED on compress path — the weak-validator semantic ("entity is
-// semantically equivalent") DOES survive gzip re-encoding.
-//
-// Both patterns compile once at init per ADR-0129 §Decision (iv) helper-
-// regex discipline.
-var (
-	strongEtagPattern = regexp.MustCompile(`^"[^"]*"$`)
-	weakEtagPattern   = regexp.MustCompile(`^W/"[^"]*"$`)
-)
+// isStrongEtag matches RFC 7232 §2.3 "strong validator" ETag values:
+// a double-quote, zero or more non-quote chars, a double-quote (formerly the
+// regex `^"[^"]*"$`; replaced by direct string checks since the anchored
+// pattern reduces to a prefix/suffix/contains test on the hot compress path).
+// Per §11.7 + §1.1 amendment 6 mode-a: strong-ETag is STRIPPED on compress
+// path because the strong-validator semantic ("entity bytes have not
+// changed") cannot hold for a gzip-encoded entity whose bytes differ from
+// the uncompressed entity.
+func isStrongEtag(v string) bool {
+	return len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' &&
+		!strings.Contains(v[1:len(v)-1], `"`)
+}
+
+// isWeakEtag matches RFC 7232 §2.3 "weak validator" ETag values: the literal
+// W/ prefix followed by a quoted string (formerly the regex `^W/"[^"]*"$`).
+// Per §11.7 mode-a: weak-ETag is PRESERVED on compress path — the
+// weak-validator semantic ("entity is semantically equivalent") DOES survive
+// gzip re-encoding.
+func isWeakEtag(v string) bool {
+	return strings.HasPrefix(v, "W/") && isStrongEtag(v[2:])
+}
 
 // TypeURL is the canonical envoy.filters.http.compressor typed_config type URL.
 // Boot wiring in cmd/envoy-go/main.go (Task 10) registers New under this key
@@ -108,9 +111,41 @@ type compiledConfig struct {
 //
 // Silent-ignored Gzip fields (memory_level, window_bits, chunk_size) are NOT
 // stored — Go compress/gzip does not expose libz-equivalent knobs.
+//
+// writerPool amortizes the per-response *gzip.Writer allocation (the deflate
+// state is hundreds of KB): the level is fixed per compiledConfig, so every
+// pooled writer was constructed at the same level, and gzip.Writer.Reset is
+// documented to make the writer equivalent to a fresh NewWriterLevel result —
+// pooling cannot change the compressed output bytes. The pool is
+// concurrency-safe; compiledGzipConfig is held by pointer everywhere
+// (effectiveConfig's shallow clone copies the *compiledGzipConfig pointer,
+// not the struct), so the pool is never copied.
 type compiledGzipConfig struct {
 	level       int
 	huffmanOnly bool
+
+	writerPool sync.Pool // of *gzip.Writer constructed at .level
+}
+
+// acquireWriter returns a *gzip.Writer at g.level writing to buf: a pooled
+// writer Reset onto buf when one is available, else a fresh
+// gzip.NewWriterLevel. The error return preserves EncodeData's defensive
+// out-of-range-level branch (unreachable per ADR-0130 §Decision (iv), which
+// clamps level to [-1, 9] at config-parse time).
+func (g *compiledGzipConfig) acquireWriter(buf *bytes.Buffer) (*gzip.Writer, error) {
+	if w, ok := g.writerPool.Get().(*gzip.Writer); ok {
+		w.Reset(buf)
+		return w, nil
+	}
+	return gzip.NewWriterLevel(buf, g.level)
+}
+
+// releaseWriter returns a writer to the pool for reuse. Callers only release
+// writers whose Write+Close both succeeded — error-state writers are dropped
+// (Reset would recover them, but dropping keeps the invariant trivially
+// auditable).
+func (g *compiledGzipConfig) releaseWriter(w *gzip.Writer) {
+	g.writerPool.Put(w)
 }
 
 // compiledPerRoute captures the per-route CompressorPerRoute proto's parsed
@@ -142,7 +177,10 @@ type compiledPerRoute struct {
 // Lands-in-task field — see newFilterStats below. Production paths through
 // New supply a non-nil *stats.Registry from FactoryCtx so all 17 fields are
 // populated with non-nil *stats.Counter values; nil-tolerant test paths per
-// ADR-0085 receive a nil *filterStats from newFilterStats(nil, ...).
+// ADR-0085 receive an all-nil-fields *filterStats from
+// newFilterStats(nil, ...) (matching fault's registerFaultStats shape), so
+// field selections like f.stats.NoAcceptHeader stay panic-free and
+// incCounter's per-counter nil-guard absorbs the Inc.
 type filterStats struct {
 	// 6 Accept-Encoding-cluster counters (NOT split per direction; shared
 	// across both per SPEC §11.5 empirical scrape verbatim).
@@ -467,17 +505,22 @@ func parsePerRoute(perRoute proto.Message) (*compiledPerRoute, error) {
 // per ADR-0132 §Decision (v). This function MUST NOT collapse the empty
 // segment — phase-14 mirrors reference Envoy's namespace shape verbatim.
 //
-// Nil-tolerant: returns nil if reg == nil (per ADR-0085 nil-tolerance pattern;
-// non-stat-bearing test code paths). Production paths through New supply a
-// non-nil *stats.Registry from FactoryCtx; the returned *filterStats has all
-// 17 fields populated with non-nil *stats.Counter values.
+// Nil-tolerant: returns an all-nil-fields *filterStats if reg == nil (per
+// ADR-0085 nil-tolerance pattern; non-stat-bearing test code paths). The
+// non-nil-struct/nil-fields shape mirrors fault's registerFaultStats: the
+// EncodeHeaders/EncodeData counter blocks select fields off f.stats
+// unconditionally, so a nil *filterStats would panic on field selection
+// before incCounter's per-counter nil-guard could help. Production paths
+// through New supply a non-nil *stats.Registry from FactoryCtx; the returned
+// *filterStats has all 17 fields populated with non-nil *stats.Counter
+// values.
 //
 // Called exactly once per HCM-build-time per stat_prefix per HCM. Mirrors the
 // phase-11 localratelimit newFilterStats + phase-12 csrf newFilterStats
 // precedents at a wider counter surface (17 vs 4 vs 3).
 func newFilterStats(reg *stats.Registry, hcmStatPrefix string, libraryName string) *filterStats {
 	if reg == nil {
-		return nil
+		return &filterStats{} // all-nil fields; incCounter guards each Inc
 	}
 	// Build the per-instance namespace prefix once. The fmt.Sprintf surfaces
 	// the consecutive-dots D5 shape when libraryName == "" — DO NOT collapse.
@@ -823,10 +866,12 @@ func computeSkipReason(
 	// Bucket 11: content-length too small (known). Per §11.9: when
 	// Content-Length is present (parseable uint) and below minContentLength,
 	// skip. Unset/unparseable Content-Length defers the gate to EncodeData
-	// (Task 7 late-gate per §6.7).
+	// (Task 7 late-gate per §6.7). Parsed at bitSize 64 so a CL ≥ 2^32 is
+	// classified "large" (never below the uint32 minContentLength) rather
+	// than "unparseable".
 	if cl := headers.Get("Content-Length"); cl != "" {
-		if n, err := strconv.ParseUint(cl, 10, 32); err == nil {
-			if uint32(n) < effective.minContentLength {
+		if n, err := strconv.ParseUint(cl, 10, 64); err == nil {
+			if n < uint64(effective.minContentLength) {
 				return "content_length_too_small_known"
 			}
 		}
@@ -895,11 +940,11 @@ func maybeStripStrongEtag(headers http.Header) {
 	if val == "" {
 		return
 	}
-	if strongEtagPattern.MatchString(val) {
+	if isStrongEtag(val) {
 		headers.Del("Etag")
 		return
 	}
-	if weakEtagPattern.MatchString(val) {
+	if isWeakEtag(val) {
 		// Weak validator preserved verbatim per SPEC §6.6 line 918 + §11.7.
 		return
 	}
@@ -916,10 +961,11 @@ func maybeStripStrongEtag(headers http.Header) {
 //     §Decision (iv) + ADR-0125 amendment §(viii)) could in principle widen
 //     to lazy-registration paths analogous to phase-11 localratelimit's
 //     NewCounterIfAbsent; the nil-guard keeps the call sites uniform.
-//  2. Test ergonomics: callers may construct *filter directly (without going
-//     through New) with stats: nil; the wrapper avoids a nil-deref panic
-//     before the structural-guard `f.stats != nil` check at the EncodeData
-//     byte-counter .Add call sites.
+//  2. Test ergonomics: newFilterStats(nil, ...) returns an all-nil-fields
+//     *filterStats (nil-registry test paths per ADR-0085); the wrapper
+//     absorbs the Inc on those nil counters, complementing the structural
+//     `f.stats != nil` guard at the EncodeData byte-counter .Add call sites
+//     for callers that construct *filter directly with stats: nil.
 //
 // Per-call cost is one predictable nil-check; negligible vs the
 // atomic.Uint64.Add in Inc.
@@ -927,6 +973,15 @@ func incCounter(c *stats.Counter) {
 	if c != nil {
 		c.Inc()
 	}
+}
+
+// belowMinContentLength reports whether a body of bodyLen bytes falls below
+// the configured min_content_length. The comparison is widened to uint64 so
+// bodies ≥ 4 GiB do not wrap to a small uint32 value and spuriously skip
+// compression after EncodeHeaders has already committed
+// Content-Encoding: gzip to the response headers.
+func belowMinContentLength(bodyLen int, minContentLength uint32) bool {
+	return uint64(bodyLen) < uint64(minContentLength)
 }
 
 // EncodeData runs the Path B body algorithm per SPEC §6.7 + §11.9 + §11.14 +
@@ -983,16 +1038,20 @@ func (f *filter) EncodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 	// Step 3: Late min_content_length gate per D4 settlement — BOTH counters
 	// increment on below-threshold late-revert anomaly.
 	effective := f.effectiveConfig()
-	if uint32(len(data)) < effective.minContentLength {
+	if belowMinContentLength(len(data), effective.minContentLength) {
 		incCounter(f.stats.ResponseContentLengthTooSmall)
 		incCounter(f.stats.ResponseNotCompressed)
 		return envoyhttp.DataContinue
 	}
-	// Step 4: Compress body in one shot. Defensive error branches mirror SPEC
-	// §6.7 verbatim — gzip.NewWriterLevel can only fail on out-of-range level,
-	// which ADR-0130 §Decision (iv) prevents at config-parse time.
+	// Step 4: Compress body in one shot. Writers are pooled per
+	// compiledGzipConfig (Reset produces output byte-identical to a fresh
+	// writer at the same level). Defensive error branches mirror SPEC §6.7
+	// verbatim — gzip.NewWriterLevel can only fail on out-of-range level,
+	// which ADR-0130 §Decision (iv) prevents at config-parse time; error-state
+	// writers are dropped rather than released back to the pool.
 	var buf bytes.Buffer
-	gzWriter, err := gzip.NewWriterLevel(&buf, f.config.gzip.level)
+	buf.Grow(len(data)/2 + 64) // heuristic pre-size to cut regrowth copies
+	gzWriter, err := f.config.gzip.acquireWriter(&buf)
 	if err != nil {
 		incCounter(f.stats.ResponseNotCompressed)
 		return envoyhttp.DataContinue
@@ -1006,6 +1065,7 @@ func (f *filter) EncodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 		incCounter(f.stats.ResponseNotCompressed)
 		return envoyhttp.DataContinue
 	}
+	f.config.gzip.releaseWriter(gzWriter)
 	compressed := buf.Bytes()
 	// Step 5: Emit via framework primitive (ADR-0131 §Decision (vi)).
 	f.ecb.OverwriteBody(compressed)

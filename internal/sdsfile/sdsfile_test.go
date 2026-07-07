@@ -371,6 +371,41 @@ func TestWatcher_Close_DuringInFlightReload_NoPanic(t *testing.T) {
 	}
 }
 
+// TestWatcher_Close_RacesStart_RaceClean verifies that Start() and Close()
+// invoked from different goroutines with no external synchronization are
+// race-clean: the started flag is an atomic.Bool (a plain bool here was
+// flagged by -race — the documented filter-lifecycle ownership permits
+// construction/Start and teardown to happen on different goroutines). If
+// Close wins the race, Start's run() goroutine observes the closed done
+// channel (or the closed fsnotify Events channel) and exits promptly.
+func TestWatcher_Close_RacesStart_RaceClean(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.bin")
+	if err := os.WriteFile(path, []byte("v0"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	w, err := New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_ = w.Start()
+	}()
+	go func() {
+		defer wg.Done()
+		_ = w.Close()
+	}()
+	wg.Wait()
+	// Idempotent teardown regardless of which goroutine won.
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
 // 5. Race-group `TestWatcher_DebounceRace_*` per planner-time D4
 
 // TestWatcher_DebounceRace_ConcurrentCurrent verifies that N goroutines

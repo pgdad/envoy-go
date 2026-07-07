@@ -13,12 +13,13 @@ package admission_control
 //     ZERO-new-primitive constraint at phase-23. Documented in PROGRESS Task 5
 //     entry with forward-pointer to the Task 11 BEHAVIOR_CONTRACT note.
 //
-//  2. RPS suppression: averageRps() < rpsThreshold ⇒ return Continue WITHOUT
-//     consulting shouldReject. f.record stays true (the request is admitted
-//     to encode-side classification). NOT a reject. Mirrors upstream
-//     admission_control.cc:87-91.
+//  2. RPS suppression: windowed rps < rpsThreshold ⇒ return Continue WITHOUT
+//     consulting the reject formula. f.record stays true (the request is
+//     admitted to encode-side classification). NOT a reject. Mirrors upstream
+//     admission_control.cc:87-91. Gates 2 + 3 read ONE controller
+//     windowSnapshot (single lock + purge) — see controller.windowSnapshot.
 //
-//  3. Probabilistic reject: shouldReject() ⇒
+//  3. Probabilistic reject: rejectDecision(n, s) ⇒
 //     f.record=false; f.stats.rqRejected.Inc();
 //     f.cb.SendLocalReply(503, "", nil); return StopIteration.
 //     Wire shape per AMEND-7 + PD-2.503: status 503, EMPTY body "", nil
@@ -66,20 +67,27 @@ func (f *filter) DecodeHeaders(_ http.Header, _ bool) envoyhttp.FilterHeadersSta
 		return envoyhttp.Continue
 	}
 
-	// Gate 2: RPS suppression — admit WITHOUT consulting shouldReject.
-	// averageRps() < rpsThreshold ⇒ traffic volume below the RPS floor; the
-	// filter would produce noisy decisions on a near-empty window. Pass through
+	// Gates 2 + 3 share ONE window snapshot (single clock read + lock +
+	// stale-bucket purge) instead of the previous averageRps() +
+	// shouldReject()→requestCounts() double lock/purge. Same formula, same
+	// RPS math — only the sub-microsecond now-skew between the two reads
+	// disappears.
+	n, s, rps := f.controller.windowSnapshot()
+
+	// Gate 2: RPS suppression — admit WITHOUT consulting the reject formula.
+	// rps < rpsThreshold ⇒ traffic volume below the RPS floor; the filter
+	// would produce noisy decisions on a near-empty window. Pass through
 	// with f.record=true so the encode side classifies the request normally.
 	// NOT a reject; do NOT clear record. Mirrors admission_control.cc:87-91.
-	if f.controller.averageRps() < f.cc.rpsThreshold {
+	if rps < f.cc.rpsThreshold {
 		return envoyhttp.Continue
 	}
 
 	// Gate 3: probabilistic reject.
-	// shouldReject() consults the window via requestCounts() + the formula.
+	// rejectDecision consults the snapshot counts + the formula.
 	// On reject: clear record per AMEND-11; increment rqRejected (filter owns
 	// this counter per the controller comment above); emit the AMEND-7 wire shape.
-	if f.controller.shouldReject() {
+	if f.controller.rejectDecision(n, s) {
 		f.record = false
 		f.stats.rqRejected.Inc()
 		// AMEND-7 + PD-2.503 reject wire shape: status 503, EMPTY body "",

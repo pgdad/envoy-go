@@ -48,10 +48,7 @@ func (mg *maglevLB) Pick(hashKey uint64, hasHash bool, _ SubsetMatch, _ bool) (E
 		hashKey = mg.rng()
 	}
 	slot := hashKey % mg.tableSize
-	if mg.health == nil || mg.health.inPanic(mg.endpoints) {
-		if mg.health != nil {
-			mg.health.panicInc()
-		}
+	if mg.health.panicGate(mg.endpoints) {
 		return mg.endpoints[mg.table[slot]], noopRelease, nil
 	}
 	// Walk the table slots forward from slot to the next healthy host (ADR-0243).

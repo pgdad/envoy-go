@@ -18,6 +18,7 @@ import (
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	tls_inspectorv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/tls_inspector/v3"
 	drv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/direct_response/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	networkrbacv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/rbac/v3"
@@ -3338,5 +3339,146 @@ func TestServeNetworkChainNilDrainNoPanic(t *testing.T) {
 	}
 	if probe.draining {
 		t.Error("Draining() must be false when dm is nil (no drain state wired)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance pass (2026-07): peek-buffer plumbing, Listeners locking,
+// accept-loop backoff
+// ---------------------------------------------------------------------------
+
+// TestListenerFilterPeekBufferSizeHintPlumbed verifies the build-time
+// InitialReadBufferSizer probe: a tls_inspector configured with
+// initial_read_buffer_size 16384 lands on listenerRuntime.lfPeekBufSize, so
+// serveConnection sizes the per-connection peekerConn via NewPeekerConnSize
+// and a ClientHello larger than the 4096 default is peekable in full
+// (previously the fixed-size NewPeekerConn made the setting silently
+// ineffective).
+func TestListenerFilterPeekBufferSizeHintPlumbed(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	pb := &tls_inspectorv3.TlsInspector{InitialReadBufferSize: wrapperspb.UInt32(16384)}
+	tc, err := anypb.New(pb)
+	if err != nil {
+		t.Fatalf("anypb.New: %v", err)
+	}
+	l := &listenerv3.Listener{
+		Name: "l_lf_buf",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains: []*listenerv3.FilterChain{{Filters: []*listenerv3.Filter{mkTcpProxyFilter(t, "c_echo")}}},
+		ListenerFilters: []*listenerv3.ListenerFilter{{
+			Name:       "envoy.filters.listener.tls_inspector",
+			ConfigType: &listenerv3.ListenerFilter_TypedConfig{TypedConfig: tc},
+		}},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if got := mgr.runtimes[0].lfPeekBufSize; got != 16384 {
+		t.Errorf("lfPeekBufSize = %d, want 16384", got)
+	}
+}
+
+// TestListenerFilterPeekBufferSizeHintDefaults pins the two non-override
+// shapes: a default-config tls_inspector hints its 4096 default, and a
+// listener with zero listener_filters[] records 0 (serveConnection then
+// skips the peekerConn wrap entirely — no filter consumes the Peeker).
+func TestListenerFilterPeekBufferSizeHintDefaults(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+
+	withInspector := &listenerv3.Listener{
+		Name: "l_lf_default",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		FilterChains:    []*listenerv3.FilterChain{{Filters: []*listenerv3.Filter{mkTcpProxyFilter(t, "c_echo")}}},
+		ListenerFilters: []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)},
+	}
+	noFilters := mkListener("l_no_lf", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo"))
+	boot := mkBoot(0, []*listenerv3.Listener{withInspector, noFilters}, nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if got := mgr.runtimes[0].lfPeekBufSize; got != 4096 {
+		t.Errorf("default tls_inspector lfPeekBufSize = %d, want 4096", got)
+	}
+	if got := mgr.runtimes[1].lfPeekBufSize; got != 0 {
+		t.Errorf("no-listener-filters lfPeekBufSize = %d, want 0", got)
+	}
+}
+
+// TestListenersConcurrentWithStopIsRaceClean verifies Listeners() holds
+// startedMu: it is called from the admin handlers concurrently with Stop()'s
+// nil-write of rt.netLn, and the previously-unlocked nil-check-then-Addr()
+// walk both raced under -race and could nil-panic.
+func TestListenersConcurrentWithStopIsRaceClean(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	boot := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_race", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
+	}, nil)
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			_ = m.Listeners()
+		}
+	}()
+	m.Stop()
+	<-done
+	if got := len(m.Listeners()); got != 0 {
+		t.Errorf("Listeners() after Stop: got %d entries, want 0", got)
+	}
+}
+
+// flakyListener is a net.Listener stub whose Accept fails `fails` times with
+// a transient (non-ErrClosed) error and then returns net.ErrClosed so the
+// accept loop exits. Only acceptLoop's single goroutine calls Accept, so no
+// synchronization is needed.
+type flakyListener struct {
+	fails int
+}
+
+func (f *flakyListener) Accept() (net.Conn, error) {
+	if f.fails > 0 {
+		f.fails--
+		return nil, fmt.Errorf("accept tcp: too many open files")
+	}
+	return nil, net.ErrClosed
+}
+
+func (f *flakyListener) Close() error   { return nil }
+func (f *flakyListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+
+// TestAcceptLoopBacksOffOnPersistentAcceptError verifies the accept loop
+// paces retries on persistent non-fatal Accept errors instead of
+// hot-spinning: five consecutive failures must accumulate at least the
+// 5+10+20+40+80 = 155ms doubling backoff before the loop observes ErrClosed
+// and exits.
+func TestAcceptLoopBacksOffOnPersistentAcceptError(t *testing.T) {
+	rt := &listenerRuntime{name: "l_backoff"}
+	ln := &flakyListener{fails: 5}
+	start := time.Now()
+	rt.acceptLoop(context.Background(), ln)
+	if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
+		t.Errorf("acceptLoop returned after %v; want >= ~155ms of accumulated backoff (hot-spin regression)", elapsed)
 	}
 }

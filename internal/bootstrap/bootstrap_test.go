@@ -2377,3 +2377,163 @@ func TestDogStatsdSink_AcceptMaxBytesPerDatagramZero(t *testing.T) {
 		t.Errorf("DogStatsdSinkConfigs[0].MaxBytesPerDatagram: got %d, want %d", got, want)
 	}
 }
+
+// ----------------------------------------------------------------------------
+// Maintenance pass (2026-07): default_filter_chain access-log walk,
+// descriptor-derived TypeURLs, IPv6 statsd/dog_statsd addresses
+// ----------------------------------------------------------------------------
+
+// hcmDefaultFilterChainWithAccessLog mirrors hcmWithAccessLog but places the
+// HCM inside the listener's default_filter_chain (filter_chains[] left empty),
+// which the listener manager fully supports (ADR-0080). Used to verify the
+// access-log walk covers the default chain too.
+func hcmDefaultFilterChainWithAccessLog(accessLogBlock string) string {
+	accessLogField := ""
+	if accessLogBlock != "" {
+		accessLogField = "\n                access_log:\n" + accessLogBlock
+	}
+	return `
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  listeners:
+    - name: l_http_dfc
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      default_filter_chain:
+        filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: ingress_http` + accessLogField + `
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: vh_default
+                      domains: ["*"]
+                      routes:
+                        - match: { path: "/health" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "OK\n" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+`
+}
+
+// TestBootstrap_AccessLog_DefaultFilterChain_Collected verifies that a
+// file-type access_log entry on an HCM inside default_filter_chain is parsed
+// into AccessLogConfigs — previously the walk covered only filter_chains[]
+// and the default chain's access logs were silently dropped.
+func TestBootstrap_AccessLog_DefaultFilterChain_Collected(t *testing.T) {
+	yamlSrc := hcmDefaultFilterChainWithAccessLog(`
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/envoy-dfc-access.log`)
+	bs, err := Load(strings.NewReader(yamlSrc))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.AccessLogConfigs); got != 1 {
+		t.Fatalf("AccessLogConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.AccessLogConfigs[0].Path, "/tmp/envoy-dfc-access.log"; got != want {
+		t.Errorf("AccessLogConfigs[0].Path: got %q, want %q", got, want)
+	}
+}
+
+// TestBootstrap_AccessLog_DefaultFilterChain_RejectJSONFormat verifies the
+// default_filter_chain walk enforces the SAME validation as filter_chains[]:
+// json_format on a file-type entry is a boot error, byte-identical wording.
+func TestBootstrap_AccessLog_DefaultFilterChain_RejectJSONFormat(t *testing.T) {
+	yamlSrc := hcmDefaultFilterChainWithAccessLog(`
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/envoy-dfc-access.log
+                      json_format:
+                        timestamp: "%START_TIME%"`)
+	_, err := Load(strings.NewReader(yamlSrc))
+	if err == nil {
+		t.Fatal("Load: want error for json_format in default_filter_chain, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported config: access_log[].json_format") {
+		t.Errorf("error should contain 'unsupported config: access_log[].json_format': %q", err.Error())
+	}
+}
+
+// TestAccessLogWalk_TypeURLsDerivedMatchLiterals guards the descriptor
+// derivation of the five access-log-walk TypeURLs: each derived value must
+// equal the previously-hard-coded literal (verify-typeurl-via-descriptor —
+// the metricsServiceTypeURL precedent).
+func TestAccessLogWalk_TypeURLsDerivedMatchLiterals(t *testing.T) {
+	cases := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"hcm", hcmTypeURL, "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager"},
+		{"file", fileAccessLogTypeURL, "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog"},
+		{"http_grpc", httpGrpcAccessLogTypeURL, "type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.HttpGrpcAccessLogConfig"},
+		{"tcp_grpc", tcpGrpcAccessLogTypeURL, "type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.TcpGrpcAccessLogConfig"},
+		{"otlp", otlpAccessLogTypeURL, "type.googleapis.com/envoy.extensions.access_loggers.open_telemetry.v3.OpenTelemetryAccessLogConfig"},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("%s TypeURL: got %q, want %q", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// TestStatsdSink_IPv6AddressBracketed verifies the statsd UDP address is
+// built with net.JoinHostPort: an IPv6 literal renders bracketed so
+// net.ResolveUDPAddr can parse it (the previous Sprintf form produced the
+// unparseable "::1:8125" and the sink failed at boot). IPv4 output is
+// byte-identical (pinned by TestStatsdSink_AcceptUDPWithPrefix).
+func TestStatsdSink_IPv6AddressBracketed(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      address:
+        socket_address: {address: "::1", port_value: 8125}
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.StatsdSinkConfigs); got != 1 {
+		t.Fatalf("StatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.StatsdSinkConfigs[0].UDPAddress, "[::1]:8125"; got != want {
+		t.Errorf("UDPAddress: got %q, want %q", got, want)
+	}
+}
+
+// TestDogStatsdSink_IPv6AddressBracketed is the dog_statsd sibling of
+// TestStatsdSink_IPv6AddressBracketed (both parsers share the
+// parseUDPSinkAddressAndPrefix tail).
+func TestDogStatsdSink_IPv6AddressBracketed(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.dog_statsd
+    typed_config:
+      "@type": ` + dogStatsdSinkType + `
+      address:
+        socket_address: {address: "::1", port_value: 8125}
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.DogStatsdSinkConfigs); got != 1 {
+		t.Fatalf("DogStatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.DogStatsdSinkConfigs[0].UDPAddress, "[::1]:8125"; got != want {
+		t.Errorf("UDPAddress: got %q, want %q", got, want)
+	}
+}

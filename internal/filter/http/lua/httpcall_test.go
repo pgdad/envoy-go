@@ -591,3 +591,45 @@ end
 		t.Fatalf("coroutine_yields_total delta = %d; want 1 (ONCE per yield)", afterYields-beforeYields)
 	}
 }
+
+// -----------------------------------------------------------------------
+// Test 9: a script runtime error raised AFTER the sync-httpCall resume
+// increments stats.errors. The outer dispatch site's Resume already
+// returned ResumeYield when the script suspended, so the error is only
+// observable at the dispatch goroutine's inner Resume — the capture
+// lives at noteInnerResumeError (body.go), shared with the body bridge.
+// -----------------------------------------------------------------------
+
+func Test_HTTPCall_error_after_sync_resume_increments_errors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	host, port := httpCallSplitHostPort(t, srv.Listener.Addr().String())
+	cm := httpCallMkClusterMgr(t, "c_resume_err", host, port)
+	c := httpclient.New(httpclient.Options{Timeout: 5 * time.Second})
+	f := newHTTPCallBridgeFilter(t, c, cm)
+
+	src := `
+function consume()
+    local hdrs, body = rh:httpCall("c_resume_err", {[":method"]="GET",[":path"]="/"}, "", 5000)
+    error("boom after httpCall resume")
+end
+`
+	chunk, err := luaprim.CompileScript([]byte(src), nil)
+	if err != nil {
+		t.Fatalf("CompileScript: %v", err)
+	}
+	if err := f.vm.Run(chunk); err != nil {
+		t.Fatalf("vm.Run: %v", err)
+	}
+
+	errorsBefore := f.cc.stats.errors.Load()
+	driveSyncHTTPCall(t, f, "consume")
+	// driveSyncHTTPCall waits on f.httpCallDone, which the dispatch
+	// goroutine closes AFTER its Resume + noteInnerResumeError have run —
+	// the counter increment is happens-before-ordered with this load.
+	if delta := f.cc.stats.errors.Load() - errorsBefore; delta != 1 {
+		t.Fatalf("errors delta = %d; want 1 (inner-Resume error capture at dispatch goroutine)", delta)
+	}
+}

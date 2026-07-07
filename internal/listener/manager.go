@@ -75,16 +75,31 @@ func extractListenerPrincipal(cfg *stdtls.Config) string {
 		}
 		leaf = parsed
 	}
-	if len(leaf.URIs) > 0 && leaf.URIs[0] != nil {
-		return leaf.URIs[0].String()
-	}
-	if len(leaf.DNSNames) > 0 {
-		return leaf.DNSNames[0]
-	}
-	if cn := leaf.Subject.CommonName; cn != "" {
-		return cn
+	if ps := certPrincipals(leaf); len(ps) > 0 {
+		return ps[0]
 	}
 	return ""
+}
+
+// certPrincipals returns the priority-ordered principals (URI SANs → DNS
+// SANs → Subject CN) extracted from one *x509.Certificate. Shared by
+// extractListenerPrincipal (which consumes only the first element — the
+// listener SERVER-cert identity) and downstreamPrincipals (which consumes
+// the full ordered list — the mTLS CLIENT-cert identities); both walks were
+// previously duplicated inline with byte-identical output.
+func certPrincipals(cert *x509.Certificate) []string {
+	var principals []string
+	for _, u := range cert.URIs {
+		if u == nil {
+			continue
+		}
+		principals = append(principals, u.String())
+	}
+	principals = append(principals, cert.DNSNames...)
+	if cn := cert.Subject.CommonName; cn != "" {
+		principals = append(principals, cn)
+	}
+	return principals
 }
 
 // chainInfo holds the per-chain state built at NewManager time.
@@ -133,6 +148,14 @@ type listenerRuntime struct {
 	listenerFilterFactories []listenerfilter.FilterInstanceFactory
 	lfTimeoutMs             uint32
 	continueOnLfTimeout     bool
+	// lfPeekBufSize is the LARGEST listenerfilter.InitialReadBufferSizer hint
+	// across the listener's listener_filters[] (tls_inspector's parsed
+	// initial_read_buffer_size), probed once at build time. 0 = no filter
+	// hinted; serveConnection then uses the default-size peek buffer. This is
+	// what plumbs a configured initial_read_buffer_size > 4096 into the
+	// per-connection peekerConn (previously the fixed-4096 NewPeekerConn made
+	// larger configured sizes silently ineffective).
+	lfPeekBufSize int
 	// 06.1 metric fields (per SPEC §6 — listener-scope only, 2 metrics per
 	// listener). Allocated by registerListenerMetrics at Start time (post-bind,
 	// pre-Freeze) and Inc/Dec'd from the accept-loop hot path.
@@ -481,6 +504,22 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		}
 	}
 
+	// Probe each per-connection filter ONCE at build time for the optional
+	// InitialReadBufferSizer hint and keep the largest value; serveConnection
+	// sizes the per-connection peek buffer accordingly so a ClientHello larger
+	// than the 4096 default is peekable in full. The sample instances are
+	// discarded immediately (OnDestroy honors the per-connection lifecycle).
+	lfPeekBufSize := 0
+	for _, fac := range lfFactories {
+		sample := fac()
+		if h, ok := sample.(listenerfilter.InitialReadBufferSizer); ok {
+			if v := h.InitialReadBufferSize(); v > lfPeekBufSize {
+				lfPeekBufSize = v
+			}
+		}
+		sample.OnDestroy()
+	}
+
 	// ADR-0082: parse listener_filters_timeout (default 15000ms; envelope
 	// [1000, 60000]).
 	lfTimeoutMs, err := parseListenerFiltersTimeout(name, l.GetListenerFiltersTimeout())
@@ -492,9 +531,9 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 	// chainSpecs / defaultSpec / chainByName directly via
 	// listenerfilter.SelectChain — there is no listener-level *stdtls.Config
 	// (each chainInfo carries its own per-chain config) and no legacy chain
-	// ordering. The unused `cis` local accumulator is silently discarded;
-	// chainByName is the canonical post-build chainInfo lookup.
-	_ = cis
+	// ordering. The `cis` accumulator is consumed only by the build-time
+	// mixed-TLS check above; chainByName is the canonical post-build
+	// chainInfo lookup.
 
 	rt := &listenerRuntime{
 		name:                    name,
@@ -507,6 +546,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		listenerFilterFactories: lfFactories,
 		lfTimeoutMs:             lfTimeoutMs,
 		continueOnLfTimeout:     l.GetContinueOnListenerFiltersTimeout(),
+		lfPeekBufSize:           lfPeekBufSize,
 	}
 	return rt, nil
 }
@@ -875,6 +915,12 @@ func (m *Manager) Start(ctx context.Context) error {
 // the rt.netLn field that Stop nil-writes (the race detector flags the in-loop
 // read otherwise — surfaced by Task 10).
 func (rt *listenerRuntime) acceptLoop(ctx context.Context, ln net.Listener) {
+	// backoff paces retries on persistent non-fatal Accept errors (e.g.
+	// EMFILE fd exhaustion): 5ms doubling to a 100ms cap, reset on the next
+	// successful Accept — the standard net/http.Server pattern. Without it
+	// the loop hot-spins, flooding the log and pegging a CPU exactly when
+	// the process is resource-starved.
+	var backoff time.Duration
 	for {
 		raw, err := ln.Accept()
 		if err != nil {
@@ -885,8 +931,22 @@ func (rt *listenerRuntime) acceptLoop(ctx context.Context, ln net.Listener) {
 				return
 			}
 			log.Printf("listener %q: accept: %v", rt.name, err)
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else {
+				backoff *= 2
+				if backoff > 100*time.Millisecond {
+					backoff = 100 * time.Millisecond
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
 			continue
 		}
+		backoff = 0
 		// 08.2 (Task 5) drain fast-path per ADR-0094 + SPEC §11.5: on drain,
 		// the accepted conn is immediately closed without filter-chain
 		// dispatch (TCP handshake completes; the client observes accept-then-
@@ -909,7 +969,9 @@ func (rt *listenerRuntime) acceptLoop(ctx context.Context, ln net.Listener) {
 // helper introduced by phase 07.2 Task 10 (SPEC §5.2 lifecycle). The 8 steps:
 //
 //  1. Build ChainMatchInputs from the connection's local/remote addresses.
-//  2. Wrap raw in a peekerConn so listener filters can Peek without consuming.
+//  2. Wrap raw in a peekerConn so listener filters can Peek without consuming
+//     (skipped when the listener has zero listener_filters[]; sized to the
+//     largest build-time InitialReadBufferSizer hint when filters exist).
 //  3. Construct per-connection ListenerFilter instances from the per-listener
 //     factory slice (one allocation per filter per connection).
 //  4. Run the listener-filter pipeline; on error, honor
@@ -943,7 +1005,21 @@ func (rt *listenerRuntime) serveConnection(ctx context.Context, raw net.Conn) {
 	}
 
 	// (2) Wrap in peekerConn so listener filters can read without consuming.
-	pkConn := listenerfilter.NewPeekerConn(raw)
+	// The wrap is UNCONDITIONAL even with zero listener_filters[]: the wrapper
+	// deliberately does NOT implement SetLinger, so the serveNetworkChain
+	// NoFlush close path's SO_LINGER-0 (RST) branch stays dormant and a
+	// NoFlush close surfaces to the client as a plain FIN — socket-level
+	// behavior pinned by the 0043-network-rbac differential (deny verdict
+	// closed_no_bytes, not a reset). When filters exist, the buffer is sized
+	// to the largest build-time InitialReadBufferSizer hint (tls_inspector's
+	// initial_read_buffer_size), defaulting to 4096 when no filter hinted.
+	var pkConn net.Conn
+	if rt.lfPeekBufSize > 0 {
+		pkConn = listenerfilter.NewPeekerConnSize(raw, rt.lfPeekBufSize)
+	} else {
+		pkConn = listenerfilter.NewPeekerConn(raw)
+	}
+	peeker := listenerfilter.AsPeeker(pkConn)
 
 	// (3) Construct per-connection ListenerFilter instances from factories.
 	filters := make([]listenerfilter.ListenerFilter, len(rt.listenerFilterFactories))
@@ -953,7 +1029,7 @@ func (rt *listenerRuntime) serveConnection(ctx context.Context, raw net.Conn) {
 
 	// (4) Run listener-filter pipeline.
 	var p listenerfilter.Pipeline
-	if err := p.Run(ctx, filters, listenerfilter.AsPeeker(pkConn), &inputs, rt.lfTimeoutMs); err != nil {
+	if err := p.Run(ctx, filters, peeker, &inputs, rt.lfTimeoutMs); err != nil {
 		if !rt.continueOnLfTimeout {
 			log.Printf("listener %q: listener-filter pipeline aborted: %v", rt.name, err)
 			_ = pkConn.Close()
@@ -1128,19 +1204,7 @@ func downstreamPrincipals(conn net.Conn) []string {
 	if !state.HandshakeComplete || len(state.PeerCertificates) == 0 {
 		return nil
 	}
-	cert := state.PeerCertificates[0]
-	var principals []string
-	for _, u := range cert.URIs {
-		if u == nil {
-			continue
-		}
-		principals = append(principals, u.String())
-	}
-	principals = append(principals, cert.DNSNames...)
-	if cn := cert.Subject.CommonName; cn != "" {
-		principals = append(principals, cn)
-	}
-	return principals
+	return certPrincipals(state.PeerCertificates[0])
 }
 
 // localIP / localPort / remoteIP / remotePort extract the IP+port pieces from
@@ -1182,7 +1246,15 @@ func remotePort(c net.Conn) uint32 {
 // Order is bootstrap-declaration order; callers needing alphabetical ordering
 // must sort. (Per 08.1 REVIEW N-1 carry-forward, landed inline in 08.2 Task 5
 // per SPEC §10.2.)
+//
+// startedMu is held for the walk: rt.netLn is nil-written by Stop() and
+// assigned by Start() under the same mutex, and Listeners() is called from
+// the admin HTTP handlers concurrently with shutdown — the unlocked
+// nil-check-then-Addr() sequence both raced and could nil-panic if Stop ran
+// between the two reads.
 func (m *Manager) Listeners() []Info {
+	m.startedMu.Lock()
+	defer m.startedMu.Unlock()
 	out := make([]Info, 0, len(m.runtimes))
 	for _, rt := range m.runtimes {
 		if rt.netLn == nil {

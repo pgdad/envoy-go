@@ -110,6 +110,16 @@ func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 		return envoyhttp.DataContinue
 	}
 
+	// Use the SAME effective config resolved at DecodeHeaders (per-route
+	// override > listener default) per phase-25.3 Task 9 — the body cap +
+	// the per-plugin stat scope belong to the per-route plugin when an
+	// override is active. Fall back to f.cfg when DecodeHeaders never
+	// resolved (test-double paths). Mirrors encode_headers.go.
+	eff := f.eff
+	if eff == nil {
+		eff = f.cfg
+	}
+
 	// Sticky cap-exceeded short-circuit per Q2. Once the cap is exceeded on
 	// the decode side, subsequent chunks pass through StopAllIteration
 	// without re-invoking SendLocalReply or re-bumping the counters. The
@@ -131,19 +141,19 @@ func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 	// length; if the accumulator grew past the cap on this chunk, fire the
 	// sticky flag + counters + 413 SendLocalReply (decode-side only — encode
 	// side does not have a SendLocalReply surface).
-	if uint32(len(f.decodeBody)) > f.cfg.bodyBufferCapBytes {
+	if uint32(len(f.decodeBody)) > eff.bodyBufferCapBytes {
 		f.decodeBodyCapExceeded = true
 
-		if f.cfg.stats != nil {
-			if f.cfg.stats.bodyBufferCapExceeded != nil {
-				f.cfg.stats.bodyBufferCapExceeded.Inc()
+		if eff.stats != nil {
+			if eff.stats.bodyBufferCapExceeded != nil {
+				eff.stats.bodyBufferCapExceeded.Inc()
 			}
 			// 25.2 §2.25 co-increment: every envoy-go-strict surface that
 			// fails a stream MUST also count against the generic failures
 			// counter so operators see one number reflecting all wasm-driven
 			// stream failures.
-			if f.cfg.stats.envoyGoFailures != nil {
-				f.cfg.stats.envoyGoFailures.Inc()
+			if eff.stats.envoyGoFailures != nil {
+				eff.stats.envoyGoFailures.Inc()
 			}
 		}
 
@@ -157,7 +167,7 @@ func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 			f.decoderCb.SendLocalReply(localReply413Status, localReply413Body, nil)
 		} else {
 			logf("WARN wasm: body cap exceeded (cap=%d, accumulated=%d) but decoderCb is nil — cannot emit 413; stopping iteration",
-				f.cfg.bodyBufferCapBytes, len(f.decodeBody))
+				eff.bodyBufferCapBytes, len(f.decodeBody))
 		}
 		return envoyhttp.DataStopIterationNoBuffer
 	}
@@ -176,14 +186,14 @@ func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 	// chunk delta. The guest reads via proxy_get_buffer_bytes(HttpRequestBody,
 	// start, max_size) against the accumulator.
 	//
-	//nolint:gosec // f.cfg.bodyBufferCapBytes is uint32 + we already enforced
+	//nolint:gosec // eff.bodyBufferCapBytes is uint32 + we already enforced
 	//             // len(f.decodeBody) <= cap above; uint32 conversion is safe.
 	action, err := f.streamCtx.CallProxyOnRequestBody(ctx, uint32(len(f.decodeBody)), endStream)
 	if err != nil {
 		// Fail-OPEN per ADR-0072 per-stream runtime posture — the request
 		// still serves, just without wasm body processing on this chunk.
-		if f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
-			f.cfg.stats.envoyGoFailures.Inc()
+		if eff.stats != nil && eff.stats.envoyGoFailures != nil {
+			eff.stats.envoyGoFailures.Inc()
 		}
 		logf("ERROR wasm: CallProxyOnRequestBody(stream=%d, bodySize=%d, endStream=%v): %v",
 			f.streamContextID, len(f.decodeBody), endStream, err)
@@ -239,21 +249,28 @@ func (f *filter) EncodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 		return envoyhttp.DataContinue
 	}
 
+	// Per-route effective config (override > listener default) — see the
+	// DecodeData mirror above.
+	eff := f.eff
+	if eff == nil {
+		eff = f.cfg
+	}
+
 	if f.encodeBodyCapExceeded {
 		return envoyhttp.DataStopIterationNoBuffer
 	}
 
 	f.encodeBody = append(f.encodeBody, data...)
 
-	if uint32(len(f.encodeBody)) > f.cfg.bodyBufferCapBytes {
+	if uint32(len(f.encodeBody)) > eff.bodyBufferCapBytes {
 		f.encodeBodyCapExceeded = true
 
-		if f.cfg.stats != nil {
-			if f.cfg.stats.bodyBufferCapExceeded != nil {
-				f.cfg.stats.bodyBufferCapExceeded.Inc()
+		if eff.stats != nil {
+			if eff.stats.bodyBufferCapExceeded != nil {
+				eff.stats.bodyBufferCapExceeded.Inc()
 			}
-			if f.cfg.stats.envoyGoFailures != nil {
-				f.cfg.stats.envoyGoFailures.Inc()
+			if eff.stats.envoyGoFailures != nil {
+				eff.stats.envoyGoFailures.Inc()
 			}
 		}
 
@@ -261,7 +278,7 @@ func (f *filter) EncodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 		// the cap-exceeded event so the operator sees a per-stream trace +
 		// return StopAllIteration so the chain terminates the response early.
 		logf("WARN wasm: encode-side body cap exceeded (cap=%d, accumulated=%d) — EncoderFilterCallbacks does not expose SendLocalReply; stopping iteration",
-			f.cfg.bodyBufferCapBytes, len(f.encodeBody))
+			eff.bodyBufferCapBytes, len(f.encodeBody))
 		return envoyhttp.DataStopIterationNoBuffer
 	}
 
@@ -270,11 +287,11 @@ func (f *filter) EncodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 	}
 
 	ctx := context.Background()
-	//nolint:gosec // len(f.encodeBody) bounded by f.cfg.bodyBufferCapBytes uint32 ceiling above.
+	//nolint:gosec // len(f.encodeBody) bounded by eff.bodyBufferCapBytes uint32 ceiling above.
 	action, err := f.streamCtx.CallProxyOnResponseBody(ctx, uint32(len(f.encodeBody)), endStream)
 	if err != nil {
-		if f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
-			f.cfg.stats.envoyGoFailures.Inc()
+		if eff.stats != nil && eff.stats.envoyGoFailures != nil {
+			eff.stats.envoyGoFailures.Inc()
 		}
 		logf("ERROR wasm: CallProxyOnResponseBody(stream=%d, bodySize=%d, endStream=%v): %v",
 			f.streamContextID, len(f.encodeBody), endStream, err)

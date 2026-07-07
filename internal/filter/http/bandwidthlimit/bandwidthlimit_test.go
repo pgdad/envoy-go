@@ -752,17 +752,17 @@ func TestDecodeData_PassthroughWhenInactive_DataContinue(t *testing.T) {
 	if status != envoyhttp.DataContinue {
 		t.Errorf("status: got %v, want DataContinue (inactive)", status)
 	}
-	if len(fl.requestBody) != 0 {
-		t.Errorf("requestBody: got len=%d, want 0 (inactive must not buffer)", len(fl.requestBody))
+	if fl.requestBodyLen != 0 {
+		t.Errorf("requestBodyLen: got %d, want 0 (inactive must not accumulate)", fl.requestBodyLen)
 	}
 }
 
 func TestDecodeData_BufferedAccumulation_PreEndStream(t *testing.T) {
 	// Multi-chunk body; pre-endStream chunks return DataContinue (envoy-go HCM
 	// dispatch is synchronous in the same goroutine as the chain — parking on
-	// non-endStream would deadlock) but still accumulate locally on
-	// f.requestBody so the throttle decision on the terminal chunk uses the
-	// full body length.
+	// non-endStream would deadlock) but still accumulate the chunk lengths on
+	// f.requestBodyLen so the throttle decision on the terminal chunk uses the
+	// full body length (the framework's bodyBuf holds the actual bytes).
 	fl, _ := makeFilterWithMode(t, bandwidthlimitv3.BandwidthLimit_REQUEST, 10, 0)
 	fl.DecodeHeaders(http.Header{}, false)
 	chunk1 := []byte("chunk1-")
@@ -774,18 +774,18 @@ func TestDecodeData_BufferedAccumulation_PreEndStream(t *testing.T) {
 	if status := fl.DecodeData(chunk2, false); status != envoyhttp.DataContinue {
 		t.Errorf("chunk2: got %v, want DataContinue", status)
 	}
-	// Pre-endStream the local accumulator must reflect both chunks.
-	want := "chunk1-chunk2-"
-	if string(fl.requestBody) != want {
-		t.Errorf("requestBody after 2 chunks: got %q, want %q", string(fl.requestBody), want)
+	// Pre-endStream the local length accumulator must reflect both chunks.
+	want := len("chunk1-chunk2-")
+	if fl.requestBodyLen != want {
+		t.Errorf("requestBodyLen after 2 chunks: got %d, want %d", fl.requestBodyLen, want)
 	}
 	// Final non-endStream chunk also passes through.
 	if status := fl.DecodeData(chunk3, false); status != envoyhttp.DataContinue {
 		t.Errorf("chunk3: got %v, want DataContinue", status)
 	}
-	want = "chunk1-chunk2-chunk3"
-	if string(fl.requestBody) != want {
-		t.Errorf("requestBody after 3 chunks: got %q, want %q", string(fl.requestBody), want)
+	want = len("chunk1-chunk2-chunk3")
+	if fl.requestBodyLen != want {
+		t.Errorf("requestBodyLen after 3 chunks: got %d, want %d", fl.requestBodyLen, want)
 	}
 }
 
@@ -1034,17 +1034,17 @@ func TestEncodeData_PassthroughWhenInactive_DataContinue(t *testing.T) {
 	if status != envoyhttp.DataContinue {
 		t.Errorf("status: got %v, want DataContinue (inactive)", status)
 	}
-	if len(fl.responseBody) != 0 {
-		t.Errorf("responseBody: got len=%d, want 0 (inactive must not buffer)", len(fl.responseBody))
+	if fl.responseBodyLen != 0 {
+		t.Errorf("responseBodyLen: got %d, want 0 (inactive must not accumulate)", fl.responseBodyLen)
 	}
 }
 
 func TestEncodeData_BufferedAccumulation_PreEndStream(t *testing.T) {
 	// Multi-chunk body; pre-endStream chunks return DataContinue (envoy-go HCM
 	// encode-side dispatch is synchronous in the same goroutine as the chain —
-	// parking on non-endStream would deadlock) but still accumulate locally on
-	// f.responseBody so the throttle decision on the terminal chunk uses the
-	// full body length. Mirror of decode-side.
+	// parking on non-endStream would deadlock) but still accumulate the chunk
+	// lengths on f.responseBodyLen so the throttle decision on the terminal
+	// chunk uses the full body length. Mirror of decode-side.
 	fl, _, _ := makeFilterWithModeBothCB(t, bandwidthlimitv3.BandwidthLimit_RESPONSE, 10, 0)
 	fl.DecodeHeaders(http.Header{}, false)
 	chunk1 := []byte("chunk1-")
@@ -1056,16 +1056,16 @@ func TestEncodeData_BufferedAccumulation_PreEndStream(t *testing.T) {
 	if status := fl.EncodeData(chunk2, false); status != envoyhttp.DataContinue {
 		t.Errorf("chunk2: got %v, want DataContinue", status)
 	}
-	want := "chunk1-chunk2-"
-	if string(fl.responseBody) != want {
-		t.Errorf("responseBody after 2 chunks: got %q, want %q", string(fl.responseBody), want)
+	want := len("chunk1-chunk2-")
+	if fl.responseBodyLen != want {
+		t.Errorf("responseBodyLen after 2 chunks: got %d, want %d", fl.responseBodyLen, want)
 	}
 	if status := fl.EncodeData(chunk3, false); status != envoyhttp.DataContinue {
 		t.Errorf("chunk3: got %v, want DataContinue", status)
 	}
-	want = "chunk1-chunk2-chunk3"
-	if string(fl.responseBody) != want {
-		t.Errorf("responseBody after 3 chunks: got %q, want %q", string(fl.responseBody), want)
+	want = len("chunk1-chunk2-chunk3")
+	if fl.responseBodyLen != want {
+		t.Errorf("responseBodyLen after 3 chunks: got %d, want %d", fl.responseBodyLen, want)
 	}
 }
 

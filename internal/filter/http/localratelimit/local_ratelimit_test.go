@@ -292,6 +292,36 @@ func TestDecodeHeaders_AllowPath_CountersIncremented(t *testing.T) {
 	}
 }
 
+// TestDecodeHeaders_NilStats_NoPanic verifies the request-path nil-tolerance
+// contract: a filter built with a nil ctx.Stats (test path per the
+// runtimeConfig doc + ADR-0085) must not panic in DecodeHeaders on either the
+// allow arm or the rate-limited arm — every stat touch is nil-guarded
+// (matching the bandwidthlimit sibling discipline).
+func TestDecodeHeaders_NilStats_NoPanic(t *testing.T) {
+	cfg := happyConfig()
+	cfg.TokenBucket.MaxTokens = 1
+	factory, err := New(mustAny(t, cfg), envoyhttp.FactoryCtx{}) // nil Stats
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	inst := factory()
+	f := inst.Decoder.(*filter)
+	dcb := &fakeDecoderCB{}
+	f.SetDecoderCallbacks(dcb)
+
+	// Allow arm (first token) must not panic.
+	if status := f.DecodeHeaders(nil, true); status != envoyhttp.Continue {
+		t.Errorf("DecodeHeaders allow: got %v, want Continue", status)
+	}
+	// Rate-limited arm (bucket exhausted) must not panic either.
+	if status := f.DecodeHeaders(nil, true); status != envoyhttp.StopIteration {
+		t.Errorf("DecodeHeaders limited: got %v, want StopIteration", status)
+	}
+	if !dcb.sendCalled {
+		t.Errorf("DecodeHeaders limited: SendLocalReply must be called")
+	}
+}
+
 // TestDecodeHeaders_RateLimitedPath_CountersIncremented_Lockstep verifies that on
 // the rate-limited path DecodeHeaders returns StopIteration, calls SendLocalReply
 // with the canonical status/body/header, increments all 4 counters correctly,

@@ -104,12 +104,20 @@ func (f *filter) DecodeTrailers(trailers gohttp.Header) envoyhttp.FilterTrailers
 		return envoyhttp.TrailersContinue
 	}
 
+	// Per-route effective config (override > listener default) — the
+	// failure counter belongs to the per-route plugin's stat scope when an
+	// override is active. Mirrors encode_headers.go.
+	eff := f.eff
+	if eff == nil {
+		eff = f.cfg
+	}
+
 	ctx := context.Background()
 	numTrailers := numHeaderValues(trailers)
 	action, err := f.streamCtx.CallProxyOnRequestTrailers(ctx, numTrailers)
 	if err != nil {
-		if f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
-			f.cfg.stats.envoyGoFailures.Inc()
+		if eff.stats != nil && eff.stats.envoyGoFailures != nil {
+			eff.stats.envoyGoFailures.Inc()
 		}
 		logf("ERROR wasm: CallProxyOnRequestTrailers(stream=%d, numTrailers=%d): %v",
 			f.streamContextID, numTrailers, err)
@@ -160,12 +168,19 @@ func (f *filter) EncodeTrailers(trailers gohttp.Header) envoyhttp.FilterTrailers
 		return envoyhttp.TrailersContinue
 	}
 
+	// Per-route effective config (override > listener default) — see the
+	// DecodeTrailers mirror above.
+	eff := f.eff
+	if eff == nil {
+		eff = f.cfg
+	}
+
 	ctx := context.Background()
 	numTrailers := numHeaderValues(trailers)
 	action, err := f.streamCtx.CallProxyOnResponseTrailers(ctx, numTrailers)
 	if err != nil {
-		if f.cfg.stats != nil && f.cfg.stats.envoyGoFailures != nil {
-			f.cfg.stats.envoyGoFailures.Inc()
+		if eff.stats != nil && eff.stats.envoyGoFailures != nil {
+			eff.stats.envoyGoFailures.Inc()
 		}
 		logf("ERROR wasm: CallProxyOnResponseTrailers(stream=%d, numTrailers=%d): %v",
 			f.streamContextID, numTrailers, err)

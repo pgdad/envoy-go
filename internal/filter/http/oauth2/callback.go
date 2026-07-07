@@ -242,17 +242,17 @@ func (f *filter) applyTokenEndpointResponse(resp *http.Response, err error) {
 	switch {
 	case err != nil:
 		// Transport-level error → category (a) 302 challenge per AMEND-3.
-		f.emitCategoryA_AuthChallengeLocked()
+		f.emitCategoryA_AuthChallengeWire()
 	case resp == nil:
 		// Defensive: nil response without err is anomalous; route to (a).
-		f.emitCategoryA_AuthChallengeLocked()
+		f.emitCategoryA_AuthChallengeWire()
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		// 2xx — parse JSON body + emit (b) post-callback-success.
 		var tr tokenEndpointResponse
 		if jerr := json.Unmarshal(bodyBytes, &tr); jerr != nil || tr.AccessToken == "" {
 			// Malformed body OR missing access_token → treat as transient
 			// failure (category (a) 302 challenge).
-			f.emitCategoryA_AuthChallengeLocked()
+			f.emitCategoryA_AuthChallengeWire()
 			break
 		}
 		f.emitCategoryB_PostCallbackLocked(tr)
@@ -261,7 +261,7 @@ func (f *filter) applyTokenEndpointResponse(resp *http.Response, err error) {
 		}
 	case resp.StatusCode >= 500 && resp.StatusCode < 600:
 		// 5xx retry-eligible → category (a) 302 challenge per AMEND-3.
-		f.emitCategoryA_AuthChallengeLocked()
+		f.emitCategoryA_AuthChallengeWire()
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
 		// 4xx terminal → category (d) 401 + oauth_failure++.
 		if cc.stats != nil && cc.stats.oauthFailure != nil {
@@ -271,7 +271,7 @@ func (f *filter) applyTokenEndpointResponse(resp *http.Response, err error) {
 	default:
 		// Any other non-2xx (e.g. 3xx) → treat as retry-eligible per
 		// AMEND-3 deny-path simplification.
-		f.emitCategoryA_AuthChallengeLocked()
+		f.emitCategoryA_AuthChallengeWire()
 	}
 
 	// Resume the parked decode goroutine per the extauthz SendLocalReply +
@@ -279,36 +279,6 @@ func (f *filter) applyTokenEndpointResponse(resp *http.Response, err error) {
 	// but does NOT unblock the park.
 	if f.dcb != nil {
 		f.dcb.ContinueDecoding()
-	}
-}
-
-// emitCategoryA_AuthChallengeLocked emits the category (a) 302 wire shape
-// inline. Caller MUST hold f.mu. Mirrors handleUnauthenticated's wire
-// emission shape (decode_headers.go) — the only difference is the call-site
-// (this one fires from the resume goroutine, NOT the dispatcher entry).
-func (f *filter) emitCategoryA_AuthChallengeLocked() {
-	cc := f.cc
-
-	stateValue := f.composeStateCookieValueSkeleton()
-	authorizationURL := cc.authorizationEndpoint
-
-	hdrs := envoyhttp.OrderedHeaders{
-		{Name: "Location", Value: authorizationURL},
-	}
-	cookieHeaders := make(http.Header)
-	emitCategoryA_AuthChallenge(
-		cookieHeaders,
-		cc.cookieNames,
-		cc.cookieAttrs,
-		cc.stateCookieName,
-		stateValue,
-	)
-	for _, v := range cookieHeaders["Set-Cookie"] {
-		hdrs = append(hdrs, envoyhttp.HeaderField{Name: "Set-Cookie", Value: v})
-	}
-
-	if f.dcb != nil {
-		f.dcb.SendLocalReply(302, "", hdrs)
 	}
 }
 
@@ -633,31 +603,11 @@ func (f *filter) handleRefreshFailureLocked() envoyhttp.FilterHeadersStatus {
 		cc.stats.oauthRefreshtokenFailure.Inc()
 	}
 
-	// Emit the category (a) 302 challenge wire shape inline (the
-	// handleUnauthenticated body acquires no locks of its own; the only
-	// state it touches is cc.* (read-only) + f.dcb (write-only via
-	// SendLocalReply). Safe to call with f.mu held.
-	stateValue := f.composeStateCookieValueSkeleton()
-	authorizationURL := cc.authorizationEndpoint
-
-	hdrs := envoyhttp.OrderedHeaders{
-		{Name: "Location", Value: authorizationURL},
-	}
-	cookieHeaders := make(http.Header)
-	emitCategoryA_AuthChallenge(
-		cookieHeaders,
-		cc.cookieNames,
-		cc.cookieAttrs,
-		cc.stateCookieName,
-		stateValue,
-	)
-	for _, v := range cookieHeaders["Set-Cookie"] {
-		hdrs = append(hdrs, envoyhttp.HeaderField{Name: "Set-Cookie", Value: v})
-	}
-
-	if f.dcb != nil {
-		f.dcb.SendLocalReply(302, "", hdrs)
-	}
+	// Emit the category (a) 302 challenge via the shared wire helper
+	// (decode_headers.go) — lock-free by design, so safe to call with f.mu
+	// held. The counter increment above is the only difference from
+	// handleUnauthenticated.
+	f.emitCategoryA_AuthChallengeWire()
 	return envoyhttp.StopIteration
 }
 

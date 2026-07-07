@@ -3,7 +3,6 @@ package tls_inspector
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 
 	"google.golang.org/protobuf/types/known/anypb"
 
@@ -53,11 +52,11 @@ type filter struct {
 // listener-filter pipeline began running on real network connections.
 func (f *filter) Inspect(ctx context.Context, peeker listenerfilter.Peeker, inputs *listenerfilter.ChainMatchInputs) (listenerfilter.ListenerFilterStatus, error) {
 	// Step 1: peek the 5-byte TLS record header to learn the record length.
+	// Peek yields only net/io errors (io.EOF, net.ErrClosed,
+	// os.ErrDeadlineExceeded) — ctx is not plumbed into the socket read —
+	// so every zero-byte error is a non-TLS classification, not an abort.
 	hdr, err := peeker.Peek(5)
 	if err != nil && len(hdr) == 0 {
-		if errors.Is(err, context.Canceled) {
-			return listenerfilter.Continue, ctx.Err()
-		}
 		inputs.TransportProtocol = "raw_buffer"
 		return listenerfilter.Continue, nil
 	}
@@ -76,9 +75,6 @@ func (f *filter) Inspect(ctx context.Context, peeker listenerfilter.Peeker, inpu
 	}
 	buf, err := peeker.Peek(want)
 	if err != nil && len(buf) == 0 {
-		if errors.Is(err, context.Canceled) {
-			return listenerfilter.Continue, ctx.Err()
-		}
 		inputs.TransportProtocol = "raw_buffer"
 		return listenerfilter.Continue, nil
 	}
@@ -99,3 +95,11 @@ func (f *filter) Inspect(ctx context.Context, peeker listenerfilter.Peeker, inpu
 
 // OnDestroy releases per-connection resources. tls_inspector holds none.
 func (f *filter) OnDestroy() {}
+
+// InitialReadBufferSize implements listenerfilter.InitialReadBufferSizer: it
+// reports the parsed initial_read_buffer_size ([256, 65536]; 4096 default) so
+// the listener manager sizes the per-connection peek buffer to match. Without
+// this hint a configured size > 4096 was silently ineffective — the fixed
+// 4096-byte peeker returned bufio.ErrBufferFull and an oversized ClientHello
+// was misclassified as raw_buffer.
+func (f *filter) InitialReadBufferSize() int { return f.cfg.bufferSize }

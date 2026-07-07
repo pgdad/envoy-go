@@ -2,7 +2,7 @@ package lua
 
 // body.go — Task 7 (phase 22.2 IMPL) body bridge per SPEC §3.4 + §4.1 +
 // §11.3 D3 closure (option (a) defensive copy at endStream) + ADR-0192
-// §Decision body anticipation + ADR-0191 BodyBuffer interface consumer.
+// §Decision body anticipation.
 //
 // # Surface
 //
@@ -51,18 +51,6 @@ package lua
 // embedded in ADR-0192.** Recorded in the Task 7 PROGRESS.md entry per
 // the R9 signal protocol per PLAN Task 7 Step 6.
 //
-// # Concrete BodyBuffer implementation (ADR-0191 consumer)
-//
-// The decodedBodyBuffer + encodedBodyBuffer types below satisfy the
-// internal/lua.BodyBuffer interface declared at Task 3. The interface
-// decouples internal/lua/ from the per-filter accumulation surface;
-// concrete consumers live here per ADR-0191 §Context lineage separation.
-// At Task 7 the interface is satisfied for symmetric introspection (the
-// :body() / :bodyChunks() LGFunctions consume the *filter directly for
-// performance — one indirection vs the interface seam — but the
-// interface-satisfying wrappers are retained for cross-package consumers
-// + the BodyBuffer test compliance assertion at Task 3).
-//
 // # Defensive-copy discipline at endStream (§11.3 D3)
 //
 // Every :body() / :bodyChunks() chunk-emit defensive-copies via
@@ -84,111 +72,97 @@ import (
 )
 
 // -----------------------------------------------------------------------
-// Concrete BodyBuffer implementations (ADR-0191 interface consumers)
+// Per-side field selection (decode vs encode)
 // -----------------------------------------------------------------------
 
-// decodedBodyBuffer wraps the per-filter decode-side accumulation +
-// satisfies internal/lua.BodyBuffer. Returned for cross-package
-// consumers + as a documentation surface for the per-filter discipline.
-// Internal :body() / :bodyChunks() LGFunctions consume the *filter
-// directly to avoid the interface-call overhead on the body-bridge hot
-// path.
-type decodedBodyBuffer struct {
-	f *filter
+// bodySide selects the per-filter fields for ONE body direction. The
+// decode and encode body paths are structurally identical — they differ
+// only in which per-filter fields they touch (decodedBodyBytes /
+// bodyReady / pendingBodyResume vs the encoded* / resp* mirrors) and in
+// which hook name the error log cites. Parameterizing accumulate /
+// :body() / :bodyChunks() by side keeps each implemented ONCE so any
+// fix lands on both directions.
+type bodySide struct {
+	// hook is the dispatcher hook name ("envoy_on_request" /
+	// "envoy_on_response") cited by the inner-Resume error log —
+	// matches the decode_headers.go / encode_headers.go dispatcher
+	// wording.
+	hook string
+
+	bytes         *[]byte
+	chunks        *[][]byte
+	ready         *bool
+	pendingResume **lua.LState
 }
 
-// Bytes returns the full accumulated decode-side body. Consumers SHOULD
-// defensive-copy via lua.LString(string(b.Bytes())) per §11.3 D3.
-func (b *decodedBodyBuffer) Bytes() []byte {
-	if b == nil || b.f == nil {
-		return nil
+// decodeBodySide selects the request-side (DecodeData) accumulation
+// fields.
+func (f *filter) decodeBodySide() bodySide {
+	return bodySide{
+		hook:          "envoy_on_request",
+		bytes:         &f.decodedBodyBytes,
+		chunks:        &f.decodedBodyChunks,
+		ready:         &f.bodyReady,
+		pendingResume: &f.pendingBodyResume,
 	}
-	return b.f.decodedBodyBytes
 }
 
-// Chunks returns the per-DecodeData decode-side chunks.
-func (b *decodedBodyBuffer) Chunks() [][]byte {
-	if b == nil || b.f == nil {
-		return nil
+// encodeBodySide selects the response-side (EncodeData) accumulation
+// fields.
+func (f *filter) encodeBodySide() bodySide {
+	return bodySide{
+		hook:          "envoy_on_response",
+		bytes:         &f.encodedBodyBytes,
+		chunks:        &f.encodedBodyChunks,
+		ready:         &f.respBodyReady,
+		pendingResume: &f.pendingRespBodyResume,
 	}
-	return b.f.decodedBodyChunks
 }
 
-// EndStream reports whether the terminal decode-side endStream signal
-// has fired.
-func (b *decodedBodyBuffer) EndStream() bool {
-	if b == nil || b.f == nil {
-		return false
+// noteInnerResumeError increments stats.errors + logs when an inner
+// (bridge-driven) vm.Resume returns a script runtime error. The outer
+// dispatch site (decode_headers.go / encode_headers.go) never sees this
+// error — its own Resume already returned ResumeYield when the script
+// suspended — so the capture MUST happen at the inner Resume site to
+// preserve the upstream-parity contract that the `errors` counter
+// increments on ANY hook runtime error. Wording matches the dispatcher
+// ("ERROR lua: <hook> failed: <err>"). Shared by the body accumulator
+// below + the httpCall dispatch goroutine (httpcall.go).
+func noteInnerResumeError(f *filter, hook string, rerr error) {
+	if rerr == nil {
+		return
 	}
-	return b.f.bodyReady
-}
-
-// encodedBodyBuffer wraps the per-filter encode-side accumulation; same
-// shape + discipline as decodedBodyBuffer.
-type encodedBodyBuffer struct {
-	f *filter
-}
-
-// Bytes returns the full accumulated encode-side body.
-func (b *encodedBodyBuffer) Bytes() []byte {
-	if b == nil || b.f == nil {
-		return nil
+	if f != nil && f.cc != nil && f.cc.stats != nil && f.cc.stats.errors != nil {
+		f.cc.stats.errors.Inc()
 	}
-	return b.f.encodedBodyBytes
+	logf("ERROR lua: %s failed: %v", hook, rerr)
 }
-
-// Chunks returns the per-EncodeData encode-side chunks.
-func (b *encodedBodyBuffer) Chunks() [][]byte {
-	if b == nil || b.f == nil {
-		return nil
-	}
-	return b.f.encodedBodyChunks
-}
-
-// EndStream reports whether the terminal encode-side endStream signal
-// has fired.
-func (b *encodedBodyBuffer) EndStream() bool {
-	if b == nil || b.f == nil {
-		return false
-	}
-	return b.f.respBodyReady
-}
-
-// Compile-time interface conformance assertions per ADR-0191 + Task 3
-// BodyBuffer seam. The interface-satisfying wrappers can be consumed by
-// future cross-package callers (e.g., a separate body-buffer observer
-// at fuzz harnesses); the per-filter LGFunctions below short-circuit
-// the interface and read *filter directly.
-var (
-	_ luaprim.BodyBuffer = (*decodedBodyBuffer)(nil)
-	_ luaprim.BodyBuffer = (*encodedBodyBuffer)(nil)
-)
 
 // -----------------------------------------------------------------------
 // Body-accumulation helpers (called from DecodeData / EncodeData)
 // -----------------------------------------------------------------------
 
-// accumulateRequestBody is the DecodeData hot-path body accumulator. Per
-// SPEC §4.1 + §11.3.2: each DecodeData call appends to f.decodedBodyBytes
-// + f.decodedBodyChunks (mirrors ext_authz / ext_proc per-filter
-// accumulation patterns). On terminal endStream the f.bodyReady flag
-// fires + any suspended request-side coroutine (pending :body() awaiting
-// endStream) is resumed with the accumulated bytes via vm.Resume.
+// accumulateBody is the shared DecodeData / EncodeData hot-path body
+// accumulator, parameterized by side. Per SPEC §4.1 + §11.3.2: each
+// data call appends to the side's bytes + chunks accumulators (mirrors
+// ext_authz / ext_proc per-filter accumulation patterns). On terminal
+// endStream the side's ready flag fires + any suspended coroutine
+// (pending :body() awaiting endStream) is resumed with the accumulated
+// bytes via vm.Resume. Returns true when a suspended coroutine was
+// resumed at this call — the caller (DecodeData in lua.go) uses this to
+// run the post-resume respond-state check.
 //
 // Counter discipline:
 //   - bodyBufferedBytesTotal increments by len(data) per call (cumulative
 //     byte volume per SPEC §7.1).
 //
-// Defensive copy: f.decodedBodyChunks captures a per-call slice of len
+// Defensive copy: the chunks accumulator captures a per-call slice of
 // len(data) — copies the bytes (the framework-supplied data slice's
-// backing array lifetime is NOT guaranteed beyond DecodeData return, so
-// chunks MUST defensive-copy at append time to be safely re-readable
-// later by :bodyChunks()).
-func accumulateRequestBody(f *filter, data []byte, endStream bool) {
-	if f == nil {
-		return
-	}
-	// Lazy-initialize the per-stream cap on first DecodeData. Tests may
+// backing array lifetime is NOT guaranteed beyond DecodeData/EncodeData
+// return, so chunks MUST defensive-copy at append time to be safely
+// re-readable later by :bodyChunks()).
+func accumulateBody(f *filter, side bodySide, data []byte, endStream bool) bool {
+	// Lazy-initialize the per-stream cap on first data call. Tests may
 	// pre-populate to a smaller value to exercise arm-21; production
 	// reaches here with zero value + sets the default.
 	if f.maxBodyBufferedBytes == 0 {
@@ -197,93 +171,151 @@ func accumulateRequestBody(f *filter, data []byte, endStream bool) {
 
 	if len(data) > 0 {
 		// Defensive copy of the data slice — the framework-supplied
-		// []byte's backing array may be reused after DecodeData returns,
+		// []byte's backing array may be reused after the callback returns,
 		// so chunks MUST own a fresh allocation for safe later iteration.
 		chunk := make([]byte, len(data))
 		copy(chunk, data)
-		f.decodedBodyBytes = append(f.decodedBodyBytes, chunk...)
-		f.decodedBodyChunks = append(f.decodedBodyChunks, chunk)
+		*side.bytes = append(*side.bytes, chunk...)
+		*side.chunks = append(*side.chunks, chunk)
 		if f.cc != nil && f.cc.stats != nil && f.cc.stats.bodyBufferedBytesTotal != nil {
 			f.cc.stats.bodyBufferedBytesTotal.Add(uint64(len(data)))
 		}
 	}
 
-	if endStream {
-		f.bodyReady = true
-		// Resume any suspended :body() coroutine with the accumulated
-		// bytes. Defensive-copy into a Lua-owned LString per §11.3 D3
-		// (gopher-lua's LString IS an immutable Go string — detaches Lua
-		// ownership from the decodedBodyBytes slice lifetime).
-		//
-		// Resume's error return is intentionally discarded here: any
-		// script-side runtime error post-resume is captured via
-		// stats.errors at the dispatch site (decode_headers.go) when
-		// the parent's encompassing Resume returns ResumeError. The
-		// inner Resume here is part of the bridge plumbing, not the
-		// outermost dispatch site — its return is not actionable at
-		// this level. Future Task 14 / Task 16 may surface the error
-		// through a per-stream-debug log channel.
-		if f.pendingBodyResume != nil && f.vm != nil {
-			child := f.pendingBodyResume
-			f.pendingBodyResume = nil // clear before Resume to prevent double-dispatch
-			_, _, _ = f.vm.Resume(child, nil, lua.LString(string(f.decodedBodyBytes)))
-		}
+	if !endStream {
+		return false
 	}
+	*side.ready = true
+	if *side.pendingResume == nil || f.vm == nil {
+		return false
+	}
+	// Resume the suspended :body() coroutine with the accumulated
+	// bytes. Defensive-copy into a Lua-owned LString per §11.3 D3
+	// (gopher-lua's LString IS an immutable Go string — detaches Lua
+	// ownership from the accumulated slice lifetime).
+	child := *side.pendingResume
+	*side.pendingResume = nil // clear before Resume to prevent double-dispatch
+	_, rerr, _ := f.vm.Resume(child, nil, lua.LString(string(*side.bytes)))
+	// Any script runtime error raised AFTER this resume is invisible to
+	// the outer dispatch site (its Resume already returned ResumeYield);
+	// capture it here per the upstream-parity errors-counter contract.
+	noteInnerResumeError(f, side.hook, rerr)
+	return true
 }
 
-// accumulateResponseBody is the EncodeData hot-path body accumulator.
-// Symmetric to accumulateRequestBody for the response side.
+// accumulateRequestBody is the DecodeData entry to the shared
+// accumulator (request side). Returns true when a suspended :body()
+// coroutine was resumed at this call — DecodeData (lua.go) re-runs the
+// respond-state check in that case, since the resumed continuation may
+// have called request_handle:respond().
+func accumulateRequestBody(f *filter, data []byte, endStream bool) bool {
+	if f == nil {
+		return false
+	}
+	return accumulateBody(f, f.decodeBodySide(), data, endStream)
+}
+
+// accumulateResponseBody is the EncodeData entry to the shared
+// accumulator (response side). The resumed return is not consumed on
+// the encode side: encode-side :respond() raises the AMEND-8 runtime
+// error (captured via noteInnerResumeError inside accumulateBody), so
+// there is no respond state to re-check.
 func accumulateResponseBody(f *filter, data []byte, endStream bool) {
 	if f == nil {
 		return
 	}
-	if f.maxBodyBufferedBytes == 0 {
-		f.maxBodyBufferedBytes = defaultMaxBodyBufferedBytes
-	}
-
-	if len(data) > 0 {
-		chunk := make([]byte, len(data))
-		copy(chunk, data)
-		f.encodedBodyBytes = append(f.encodedBodyBytes, chunk...)
-		f.encodedBodyChunks = append(f.encodedBodyChunks, chunk)
-		if f.cc != nil && f.cc.stats != nil && f.cc.stats.bodyBufferedBytesTotal != nil {
-			f.cc.stats.bodyBufferedBytesTotal.Add(uint64(len(data)))
-		}
-	}
-
-	if endStream {
-		f.respBodyReady = true
-		// Resume return values discarded per the symmetric discipline
-		// documented at accumulateRequestBody (see comments there).
-		if f.pendingRespBodyResume != nil && f.vm != nil {
-			child := f.pendingRespBodyResume
-			f.pendingRespBodyResume = nil
-			_, _, _ = f.vm.Resume(child, nil, lua.LString(string(f.encodedBodyBytes)))
-		}
-	}
+	accumulateBody(f, f.encodeBodySide(), data, endStream)
 }
 
 // -----------------------------------------------------------------------
 // Bridge methods — request_handle:body / :bodyChunks
 // -----------------------------------------------------------------------
 
-// requestHandleBody implements request_handle:body() per SPEC §3.4 +
-// §4.1 + §11.3 D3 closure (defensive copy at endStream).
+// handleBody is the shared :body() bridge body, parameterized by side
+// per SPEC §3.4 + §4.1 + §11.3 D3 closure (defensive copy at
+// endStream). The caller (requestHandleBody / responseHandleBody) has
+// already resolved the owning non-nil *filter via the userdata's
+// filterRef back-pointer.
 //
 // Logic:
 //
-//  1. Resolve the owning *filter via the userdata's filterRef back-
-//     pointer.
-//  2. If !f.bodyReady (endStream NOT yet fired), stash L on
-//     f.pendingBodyResume + increment coroutineYieldsTotal + return
-//     YieldFromBridge(L, lua.LNil) per §11.1 D2 closure. The DecodeData
-//     callback at endStream resumes the suspended coroutine with the
-//     accumulated bytes; the script's local-binding receives the
-//     resumed bytes via the bridge function's Lua-side call expression.
-//  3. If len(f.decodedBodyBytes) > f.maxBodyBufferedBytes, raise the
-//     arm-21 runtime-reject with byte-stable wording per W2.
-//  4. Otherwise: push lua.LString(string(f.decodedBodyBytes)) per the
-//     §11.3 D3 defensive-copy discipline + return 1.
+//  1. If !*side.ready (endStream NOT yet fired), stash L on
+//     *side.pendingResume + increment coroutineYieldsTotal + return
+//     YieldFromBridge(L, lua.LNil) per §11.1 D2 closure. The
+//     DecodeData / EncodeData callback at endStream resumes the
+//     suspended coroutine with the accumulated bytes; the script's
+//     local-binding receives the resumed bytes via the bridge
+//     function's Lua-side call expression.
+//  2. If len(*side.bytes) > f.maxBodyBufferedBytes, raise the arm-21
+//     runtime-reject with byte-stable wording per W2.
+//  3. Otherwise: push lua.LString(string(*side.bytes)) per the §11.3
+//     D3 defensive-copy discipline + return 1.
+func handleBody(L *lua.LState, f *filter, side bodySide) int {
+	if !*side.ready {
+		// Yield: stash the bridge LState on the per-filter pending slot,
+		// bump the yield-event counter ONCE per yield (not per Resume),
+		// and return the YieldFromBridge sentinel to gopher-lua's
+		// callGFunction.
+		*side.pendingResume = L
+		if f.cc != nil && f.cc.stats != nil && f.cc.stats.coroutineYieldsTotal != nil {
+			f.cc.stats.coroutineYieldsTotal.Inc()
+		}
+		return luaprim.YieldFromBridge(L, lua.LNil)
+	}
+
+	if len(*side.bytes) > f.maxBodyBufferedBytes {
+		L.RaiseError("%s", fmt.Sprintf(
+			"lua: body: accumulated body exceeds maximum buffered size of %d bytes",
+			f.maxBodyBufferedBytes,
+		))
+		return 0
+	}
+
+	// Defensive copy at endStream per §11.3 D3: gopher-lua's LString is
+	// an immutable Go string; converting via string(b) creates a fresh
+	// backing array — Lua owns it across coroutine yield/resume + HCM
+	// dispatch goroutine lifetimes.
+	L.Push(lua.LString(string(*side.bytes)))
+	return 1
+}
+
+// pushBodyChunksIter is the shared :bodyChunks() bridge body. Pushes a
+// stateful Lua iterator function that yields each per-DecodeData /
+// per-EncodeData chunk on successive invocations (defensive-copied via
+// lua.LString); returns nil when chunks are exhausted.
+//
+// Pre-endStream semantics: the iterator emits available chunks then nil
+// (matching the upstream Lua filter's bodyChunks() iterator-completion
+// contract — the script author drives multiple iterations across
+// DecodeData firings; for simplicity at 22.2 the iterator captures the
+// chunk-slice at call-time and emits those chunks). At 22.2 the typical
+// caller invokes :bodyChunks() inside envoy_on_request_body or after
+// :body() — at endStream the chunk slice is fully populated.
+//
+// The chunk slice is captured by closure at iterator-construction time;
+// subsequent DecodeData / EncodeData firings AFTER :bodyChunks()
+// invocation will extend the per-filter chunk slice but the iterator's
+// captured len(chunks) does NOT see those extensions (snapshot-at-call-
+// time semantics — matches the upstream behavior).
+func pushBodyChunksIter(L *lua.LState, chunks [][]byte) int {
+	i := 0
+	iter := L.NewFunction(func(L2 *lua.LState) int {
+		if i >= len(chunks) {
+			L2.Push(lua.LNil)
+			return 1
+		}
+		c := chunks[i]
+		i++
+		L2.Push(lua.LString(string(c)))
+		return 1
+	})
+	L.Push(iter)
+	return 1
+}
+
+// requestHandleBody implements request_handle:body(). Resolves the
+// owning *filter via the userdata's filterRef back-pointer, then
+// delegates to the shared handleBody with the decode side selected.
 func requestHandleBody(L *lua.LState) int {
 	ud := L.CheckUserData(1)
 	ctx, ok := ud.Value.(*requestHandleContext)
@@ -298,53 +330,11 @@ func requestHandleBody(L *lua.LState) int {
 		L.Push(lua.LString(""))
 		return 1
 	}
-
-	if !f.bodyReady {
-		// Yield: stash the bridge LState on the per-filter pending slot,
-		// bump the yield-event counter ONCE per yield (not per Resume),
-		// and return the YieldFromBridge sentinel to gopher-lua's
-		// callGFunction.
-		f.pendingBodyResume = L
-		if f.cc != nil && f.cc.stats != nil && f.cc.stats.coroutineYieldsTotal != nil {
-			f.cc.stats.coroutineYieldsTotal.Inc()
-		}
-		return luaprim.YieldFromBridge(L, lua.LNil)
-	}
-
-	if len(f.decodedBodyBytes) > f.maxBodyBufferedBytes {
-		L.RaiseError("%s", fmt.Sprintf(
-			"lua: body: accumulated body exceeds maximum buffered size of %d bytes",
-			f.maxBodyBufferedBytes,
-		))
-		return 0
-	}
-
-	// Defensive copy at endStream per §11.3 D3: gopher-lua's LString is
-	// an immutable Go string; converting via string(b) creates a fresh
-	// backing array — Lua owns it across coroutine yield/resume + HCM
-	// dispatch goroutine lifetimes.
-	L.Push(lua.LString(string(f.decodedBodyBytes)))
-	return 1
+	return handleBody(L, f, f.decodeBodySide())
 }
 
 // requestHandleBodyChunks implements request_handle:bodyChunks() per
-// SPEC §3.4. Returns a stateful Lua iterator function that yields each
-// per-DecodeData chunk on successive invocations (defensive-copied via
-// lua.LString); returns nil when chunks are exhausted.
-//
-// Pre-endStream semantics: the iterator emits available chunks then nil
-// (matching the upstream Lua filter's bodyChunks() iterator-completion
-// contract — the script author drives multiple iterations across
-// DecodeData firings; for simplicity at 22.2 the iterator captures the
-// chunk-slice at call-time and emits those chunks). At 22.2 the typical
-// caller invokes :bodyChunks() inside envoy_on_request_body or after
-// :body() — at endStream the chunk slice is fully populated.
-//
-// The chunk slice is captured by closure at iterator-construction time;
-// subsequent DecodeData firings AFTER :bodyChunks() invocation will
-// extend f.decodedBodyChunks but the iterator's captured len(snap) does
-// NOT see those extensions (snapshot-at-call-time semantics — matches
-// the upstream behavior).
+// SPEC §3.4 — see pushBodyChunksIter for the iterator semantics.
 func requestHandleBodyChunks(L *lua.LState) int {
 	ud := L.CheckUserData(1)
 	ctx, ok := ud.Value.(*requestHandleContext)
@@ -357,20 +347,7 @@ func requestHandleBodyChunks(L *lua.LState) int {
 	if f != nil {
 		chunks = f.decodedBodyChunks
 	}
-
-	i := 0
-	iter := L.NewFunction(func(L2 *lua.LState) int {
-		if i >= len(chunks) {
-			L2.Push(lua.LNil)
-			return 1
-		}
-		c := chunks[i]
-		i++
-		L2.Push(lua.LString(string(c)))
-		return 1
-	})
-	L.Push(iter)
-	return 1
+	return pushBodyChunksIter(L, chunks)
 }
 
 // -----------------------------------------------------------------------
@@ -393,25 +370,7 @@ func responseHandleBody(L *lua.LState) int {
 		L.Push(lua.LString(""))
 		return 1
 	}
-
-	if !f.respBodyReady {
-		f.pendingRespBodyResume = L
-		if f.cc != nil && f.cc.stats != nil && f.cc.stats.coroutineYieldsTotal != nil {
-			f.cc.stats.coroutineYieldsTotal.Inc()
-		}
-		return luaprim.YieldFromBridge(L, lua.LNil)
-	}
-
-	if len(f.encodedBodyBytes) > f.maxBodyBufferedBytes {
-		L.RaiseError("%s", fmt.Sprintf(
-			"lua: body: accumulated body exceeds maximum buffered size of %d bytes",
-			f.maxBodyBufferedBytes,
-		))
-		return 0
-	}
-
-	L.Push(lua.LString(string(f.encodedBodyBytes)))
-	return 1
+	return handleBody(L, f, f.encodeBodySide())
 }
 
 // responseHandleBodyChunks implements response_handle:bodyChunks()
@@ -428,18 +387,5 @@ func responseHandleBodyChunks(L *lua.LState) int {
 	if f != nil {
 		chunks = f.encodedBodyChunks
 	}
-
-	i := 0
-	iter := L.NewFunction(func(L2 *lua.LState) int {
-		if i >= len(chunks) {
-			L2.Push(lua.LNil)
-			return 1
-		}
-		c := chunks[i]
-		i++
-		L2.Push(lua.LString(string(c)))
-		return 1
-	})
-	L.Push(iter)
-	return 1
+	return pushBodyChunksIter(L, chunks)
 }

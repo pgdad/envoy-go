@@ -59,6 +59,23 @@ import (
 // upstream CircllHist by ≤ 1 bin-width at the percentile boundary (envoy-go-
 // strict departure per BRAINSTORM §8 item 4).
 func Quantile(samples []time.Duration, p float64) time.Duration {
+	if len(samples) <= 1 {
+		return quantileInPlace(samples, p) // 0- and 1-element paths never sort
+	}
+	sorted := make([]time.Duration, len(samples))
+	copy(sorted, samples)
+	return quantileInPlace(sorted, p)
+}
+
+// quantileInPlace is Quantile without the defensive copy: it sorts samples
+// IN PLACE and returns the p-quantile. Used by the gradientController's two
+// production call sites (concurrencyUpdateTick + updateMinRTTLocked), which
+// reset the source slice to [:0] immediately after the call — the copy
+// Quantile makes to preserve the caller's ordering is pure waste there (one
+// alloc + O(n) copy per tick / per window close). Same numeric result as
+// Quantile; Quantile remains the exported test-vector contract (D10 row 8's
+// caller-slice-not-mutated invariant applies to Quantile only).
+func quantileInPlace(samples []time.Duration, p float64) time.Duration {
 	if len(samples) == 0 {
 		return 0
 	}
@@ -71,9 +88,7 @@ func Quantile(samples []time.Duration, p float64) time.Duration {
 	if p > 1 {
 		p = 1
 	}
-	sorted := make([]time.Duration, len(samples))
-	copy(sorted, samples)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-	idx := int(p * float64(len(sorted)-1))
-	return sorted[idx]
+	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+	idx := int(p * float64(len(samples)-1))
+	return samples[idx]
 }

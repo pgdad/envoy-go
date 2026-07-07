@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-	"strings"
 	"testing"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -16,22 +15,33 @@ import (
 	filter_http "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
-func TestDirectResponseAction_Do(t *testing.T) {
+// TestDirectResponseAction_AsRouterAction drives the live chain-mediated shape
+// (the Action closure HCM dispatch injects via *Filter.SetAction) and asserts
+// the logical ActionResponse: configured status, the 4 default headers, and
+// the configured inline body. Ported from the deleted legacy direct-write
+// do() test — the wire-byte shape is pinned separately by
+// TestDirectResponseWriteH1_GoldenCompat (via writeStatusReply) and the
+// dispatch-level TestDispatchRequest_* coverage in connection_test.go.
+func TestDirectResponseAction_AsRouterAction(t *testing.T) {
 	a := &directResponseAction{status: 200, bodyText: "OK\n"}
-	var buf bytes.Buffer
-	bw := bufio.NewWriter(&buf)
-	if _, err := a.do(context.Background(), &http.Request{}, bw); err != nil {
-		t.Fatalf("do: %v", err)
+	resp, picked, err := a.asRouterAction()(context.Background(), &http.Request{})
+	if err != nil {
+		t.Fatalf("action: %v", err)
 	}
-	if err := bw.Flush(); err != nil {
-		t.Fatal(err)
+	if resp.Status != 200 {
+		t.Errorf("Status = %d, want 200", resp.Status)
 	}
-	out := buf.String()
-	if !strings.HasPrefix(out, "HTTP/1.1 200 OK\r\n") {
-		t.Errorf("expected 200 OK status line, got: %q", out)
+	if string(resp.Body) != "OK\n" {
+		t.Errorf("Body = %q, want %q", resp.Body, "OK\n")
 	}
-	if !strings.HasSuffix(out, "OK\n") {
-		t.Errorf("expected body 'OK\\n' suffix, got: %q", out)
+	if got := resp.Headers.Get("Content-Type"); got != "text/plain" {
+		t.Errorf("Content-Type = %q, want text/plain", got)
+	}
+	if got := resp.Headers.Get("Content-Length"); got != "3" {
+		t.Errorf("Content-Length = %q, want 3", got)
+	}
+	if picked.Host != "" {
+		t.Errorf("picked = %+v, want zero Endpoint for direct_response", picked)
 	}
 }
 

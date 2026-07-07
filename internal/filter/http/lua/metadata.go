@@ -415,16 +415,15 @@ func luaToStructpb(L *lua.LState, lv lua.LValue) *structpb.Value {
 	}
 }
 
-// luaTableToStructpb detects whether the table is a list (contiguous
-// 1..N integer keys; at least one entry) OR a struct (string-keyed; OR
-// empty), then dispatches to the appropriate structpb constructor.
-func luaTableToStructpb(L *lua.LState, t *lua.LTable) *structpb.Value {
-	// Detect list-shape: at least one numeric 1-indexed key AND every
-	// key is a contiguous integer in [1, N]. Empty tables fall through
-	// to struct-shape (Lua has no intrinsic empty-list-vs-empty-struct
-	// distinction; we prefer struct as the default since :set with an
-	// empty table is most-likely a struct-shaped argument).
-	maxIdx := 0
+// luaTableListShape is the shared two-pass list-vs-map shape detector
+// consumed by both marshaling walkers (luaTableToStructpb below +
+// luaTableToAny at filterstate.go). Reports isList=true (with the
+// 1-based maxIdx) when the table has at least one key AND every key is
+// an integer-valued lua.LNumber >= 1 AND the numeric keys are
+// contiguous 1..maxIdx (count preserved — no holes). Empty tables
+// report isList=false: Lua has no intrinsic empty-list-vs-empty-map
+// distinction, and both callers prefer the map/struct default.
+func luaTableListShape(t *lua.LTable) (isList bool, maxIdx int) {
 	allIntKeys := true
 	hasAnyKey := false
 	t.ForEach(func(k, _ lua.LValue) {
@@ -440,23 +439,35 @@ func luaTableToStructpb(L *lua.LState, t *lua.LTable) *structpb.Value {
 		}
 		allIntKeys = false
 	})
-	if hasAnyKey && allIntKeys && maxIdx > 0 {
-		// Verify contiguity 1..maxIdx — count is preserved if no holes.
-		count := 0
-		t.ForEach(func(k, _ lua.LValue) {
-			if _, ok := k.(lua.LNumber); ok {
-				count++
-			}
-		})
-		if count == maxIdx {
-			// List-shape.
-			values := make([]*structpb.Value, 0, maxIdx)
-			for i := 1; i <= maxIdx; i++ {
-				lv := t.RawGetInt(i)
-				values = append(values, luaToStructpb(L, lv))
-			}
-			return structpb.NewListValue(&structpb.ListValue{Values: values})
+	if !hasAnyKey || !allIntKeys || maxIdx == 0 {
+		return false, 0
+	}
+	// Verify contiguity 1..maxIdx — count is preserved if no holes.
+	count := 0
+	t.ForEach(func(k, _ lua.LValue) {
+		if _, ok := k.(lua.LNumber); ok {
+			count++
 		}
+	})
+	return count == maxIdx, maxIdx
+}
+
+// luaTableToStructpb detects whether the table is a list (contiguous
+// 1..N integer keys; at least one entry) OR a struct (string-keyed; OR
+// empty), then dispatches to the appropriate structpb constructor.
+// Shape detection is shared with luaTableToAny (filterstate.go) via
+// luaTableListShape; empty tables fall through to struct-shape (we
+// prefer struct as the default since :set with an empty table is
+// most-likely a struct-shaped argument).
+func luaTableToStructpb(L *lua.LState, t *lua.LTable) *structpb.Value {
+	if isList, maxIdx := luaTableListShape(t); isList {
+		// List-shape.
+		values := make([]*structpb.Value, 0, maxIdx)
+		for i := 1; i <= maxIdx; i++ {
+			lv := t.RawGetInt(i)
+			values = append(values, luaToStructpb(L, lv))
+		}
+		return structpb.NewListValue(&structpb.ListValue{Values: values})
 	}
 	// Struct-shape (covers empty + hash + mixed-skipping-non-string).
 	fields := map[string]*structpb.Value{}

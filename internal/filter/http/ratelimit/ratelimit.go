@@ -86,11 +86,11 @@ const TypeURL = "type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.
 //     SetEncoderCallbacks). The decode-side accessors
 //     (RouteRateLimits, VirtualHostRateLimits, DownstreamRemoteAddr)
 //     flow through dcb.
-//   - callCtx /
-//     callCancel    — per-stream cancellable context for the async
-//     ShouldRateLimit call. OnDestroy fires callCancel so the in-flight
-//     goroutine observes ctx.Err() and returns. The ext_authz precedent
-//     at extauthz.go:1037.
+//   - callCancel    — cancel handle for the per-stream cancellable context
+//     of the async ShouldRateLimit call (the context itself is captured by
+//     the goroutine as a local; no field copy is needed). OnDestroy fires
+//     callCancel so the in-flight goroutine observes ctx.Err() and returns.
+//     The ext_authz precedent at extauthz.go:1037.
 //   - mu / done     — the resume-after-OnDestroy race guard. OnDestroy
 //     sets done=true under mu + fires callCancel; the resume goroutine
 //     acquires mu + checks done before touching dcb (the ext_authz
@@ -101,7 +101,8 @@ type filter struct {
 	dcb envoyhttp.DecoderFilterCallbacks
 
 	// Async-dispatch state per planner-time decision + the ext_authz precedent.
-	callCtx    context.Context //nolint:containedctx // stored for OnDestroy cancellation per the ext_authz callCancel precedent (extauthz.go:1037-1039)
+	// Only the CancelFunc is stored: OnDestroy needs the cancel handle, while
+	// the context itself is closure-captured by the async goroutine.
 	callCancel context.CancelFunc
 
 	// mu + done guard the resume-after-OnDestroy race per the ext_authz

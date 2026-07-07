@@ -1487,6 +1487,44 @@ func TestExtractEndpoints_NoMetadataIsNilMap(t *testing.T) {
 	}
 }
 
+// TestEndpoint_Addr_Forms pins Addr()'s output: byte-identical to the historic
+// fmt.Sprintf("%s:%d") form for IPv4 and hostname hosts (pool/health/hash keys
+// depend on this), and the bracketed dialable form for IPv6 (previously the
+// undialable "::1:80").
+func TestEndpoint_Addr_Forms(t *testing.T) {
+	tests := []struct {
+		ep   Endpoint
+		want string
+	}{
+		{Endpoint{Host: "127.0.0.1", Port: 80}, "127.0.0.1:80"},
+		{Endpoint{Host: "10.0.0.1", Port: 9001}, "10.0.0.1:9001"},
+		{Endpoint{Host: "example.com", Port: 8080}, "example.com:8080"},
+		{Endpoint{Host: "::1", Port: 80}, "[::1]:80"},
+		{Endpoint{Host: "2001:db8::2", Port: 443}, "[2001:db8::2]:443"},
+	}
+	for _, tt := range tests {
+		if got := tt.ep.Addr(); got != tt.want {
+			t.Errorf("Endpoint{%q, %d}.Addr() = %q, want %q", tt.ep.Host, tt.ep.Port, got, tt.want)
+		}
+	}
+}
+
+// TestExtractEndpoints_CachesAddr proves the build-time addr precompute matches
+// the on-demand Addr() computation (the hot-path cache is observation-free).
+func TestExtractEndpoints_CachesAddr(t *testing.T) {
+	c := mkStaticCluster("c_addr", mkLbEndpoint("127.0.0.1", 9001))
+	eps, err := extractEndpoints(c.GetLoadAssignment(), "c_addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eps[0].addr == "" {
+		t.Fatal("extractEndpoints must precompute the addr cache")
+	}
+	if eps[0].addr != "127.0.0.1:9001" || eps[0].Addr() != "127.0.0.1:9001" {
+		t.Fatalf("cached addr %q / Addr() %q, want 127.0.0.1:9001", eps[0].addr, eps[0].Addr())
+	}
+}
+
 func TestEndpoint_AddrIgnoresMetadata(t *testing.T) {
 	a := Endpoint{Host: "127.0.0.1", Port: 9001}
 	b := Endpoint{Host: "127.0.0.1", Port: 9001, Metadata: map[string]SubsetValue{"version": {Kind: subsetString, Str: "v1"}}}

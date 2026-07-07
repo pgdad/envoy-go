@@ -131,6 +131,14 @@ func (r *bsonReader) readString() (string, error) {
 	return string(b[:n-1]), nil // strip the trailing NUL
 }
 
+// maxBSONDepth caps document/array nesting. Each level recurses once through
+// parseDocumentAt/parseElementValue (5 wire bytes per level), so an unbounded
+// depth would let crafted input exhaust the goroutine stack — an unrecoverable
+// runtime panic. 256 comfortably exceeds any real driver's nesting (MongoDB
+// itself enforces 100); deeper input takes the normal errBSON → decoding_error
+// path.
+const maxBSONDepth = 256
+
 // parseBSON parses a single top-level BSON document from buf (the test entry
 // point; production decode calls parseDocument directly so the codec can size a
 // trailing returnFieldsSelector via remaining()). Trailing bytes after the
@@ -148,9 +156,17 @@ func parseBSON(buf []byte) (bsonDoc, error) {
 	return d, nil
 }
 
-// parseDocument walks one document: int32 docLength (INCLUDES itself + the
-// trailing 0x00) + elements + 0x00. Nested documents recurse (Task 5).
-func parseDocument(r *bsonReader) (bsonDoc, error) {
+// parseDocument parses one top-level document (depth 0); nesting recurses
+// through parseDocumentAt with an explicit depth counter.
+func parseDocument(r *bsonReader) (bsonDoc, error) { return parseDocumentAt(r, 0) }
+
+// parseDocumentAt walks one document: int32 docLength (INCLUDES itself + the
+// trailing 0x00) + elements + 0x00. Nested documents recurse (Task 5) with
+// depth+1; beyond maxBSONDepth → errBSON (stack-exhaustion guard).
+func parseDocumentAt(r *bsonReader, depth int) (bsonDoc, error) {
+	if depth >= maxBSONDepth {
+		return bsonDoc{}, errBSON("document nesting too deep")
+	}
 	start := r.pos
 	docLen, err := r.readInt32()
 	if err != nil {
@@ -182,7 +198,7 @@ func parseDocument(r *bsonReader) (bsonDoc, error) {
 		if err != nil {
 			return bsonDoc{}, err
 		}
-		val, err := parseElementValue(r, t)
+		val, err := parseElementValue(r, t, depth)
 		if err != nil {
 			return bsonDoc{}, err
 		}
@@ -194,7 +210,9 @@ func parseDocument(r *bsonReader) (bsonDoc, error) {
 // fixed-width scalar types; Part 2 (Task 5) adds the variable-length + nested
 // cases (String 0x02, Document 0x03, Array 0x04, Binary 0x05, ObjectId 0x07,
 // Regex 0x0B, Symbol 0x0E). ANY other type byte → throw (upstream parity).
-func parseElementValue(r *bsonReader, t byte) (any, error) {
+// depth is the ENCLOSING document's nesting level; the Document/Array cases
+// recurse at depth+1 (bounded by maxBSONDepth).
+func parseElementValue(r *bsonReader, t byte, depth int) (any, error) {
 	switch t {
 	case 0x01: // Double
 		b, err := r.readBytes(8)
@@ -223,9 +241,9 @@ func parseElementValue(r *bsonReader, t byte) (any, error) {
 	case 0x0E: // Symbol (same wire shape as String)
 		return r.readString()
 	case 0x03: // Document (recurse)
-		return parseDocument(r)
+		return parseDocumentAt(r, depth+1)
 	case 0x04: // Array (recurse — same wire shape as Document)
-		return parseDocument(r)
+		return parseDocumentAt(r, depth+1)
 	case 0x05: // Binary: int32 len + subtype byte + bytes
 		n, err := r.readInt32()
 		if err != nil {

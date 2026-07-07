@@ -1,6 +1,9 @@
 package redisproxy
 
-import "github.com/pgdad/envoy-go/internal/stats"
+import (
+	"github.com/pgdad/envoy-go/internal/filter/network/statroster"
+	"github.com/pgdad/envoy-go/internal/stats"
+)
 
 // counterSuffixes is the fixed counter roster under redis.<stat_prefix>.: the 6
 // downstream counters (32.1) + the 2 splitter.* + 3 REDIS_CLUSTER_STATS (32.2).
@@ -51,13 +54,10 @@ type redisStats struct {
 // cx/rq counters increment in the Handle pump (filter.go).
 func newRedisStats(reg *stats.Registry, statPrefix string) *redisStats {
 	rs := &redisStats{
-		prefix:   "redis." + statPrefix + ".",
-		counters: make(map[string]*stats.Counter, len(counterSuffixes)),
-		gauges:   make(map[string]*stats.Gauge, len(gaugeSuffixes)),
+		prefix: "redis." + statPrefix + ".",
+		gauges: make(map[string]*stats.Gauge, len(gaugeSuffixes)),
 	}
-	for _, suf := range counterSuffixes {
-		rs.counters[suf] = reg.NewCounterIfAbsent(rs.prefix + suf)
-	}
+	rs.counters = statroster.New(reg, rs.prefix, counterSuffixes)
 	for _, suf := range gaugeSuffixes {
 		rs.gauges[suf] = reg.NewGaugeIfAbsent(rs.prefix + suf)
 	}
@@ -79,25 +79,6 @@ func (rs *redisStats) incCxTotal()      { rs.counters["downstream_cx_total"].Inc
 func (rs *redisStats) incRqTotal()      { rs.counters["downstream_rq_total"].Inc() }
 func (rs *redisStats) addRxBytes(n int) { rs.counters["downstream_cx_rx_bytes_total"].Add(uint64(n)) }
 func (rs *redisStats) addTxBytes(n int) { rs.counters["downstream_cx_tx_bytes_total"].Add(uint64(n)) }
-
-// command returns the per-command counter for (lower-cased name, slot∈{total,
-// success,error}), or nil if the name is not a supported command (a classify
-// invariant — the pump only calls these for actProxy verdicts with a table member).
-func (rs *redisStats) command(name, slot string) *stats.Counter {
-	cs, ok := rs.commands[name]
-	if !ok {
-		return nil
-	}
-	switch slot {
-	case "total":
-		return cs.total
-	case "success":
-		return cs.success
-	case "error":
-		return cs.errc
-	}
-	return nil
-}
 
 func (rs *redisStats) incCommandTotal(name string)   { rs.commands[name].total.Inc() }
 func (rs *redisStats) incCommandSuccess(name string) { rs.commands[name].success.Inc() }

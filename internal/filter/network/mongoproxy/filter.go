@@ -79,7 +79,6 @@ type filter struct {
 	cfg        *compiledConfig // shared, boot-parsed (incl. the roster)
 	dec        *decoder        // per-connection (private readBuf + sniffing + chainConsumed + active-query list)
 	cb         network.ReadFilterCallbacks
-	wcb        network.WriteFilterCallbacks
 	delayTimer *time.Timer              // 29.3 fault-delay async-resume timer (SPEC §3.2); OnDestroy cancels.
 	alSink     *accesslog.AsyncFileSink // 29.3 access log; nil when access_log is unset (no-op emit). Shared across connections.
 }
@@ -194,10 +193,13 @@ func (f *filter) OnWrite(buf *network.Buffer, _ bool) network.Status {
 	return network.Continue
 }
 
-// SetReadFilterCallbacks / SetWriteFilterCallbacks store both (the both-directions
-// dual injection — chain.go injects each exactly once).
-func (f *filter) SetReadFilterCallbacks(cb network.ReadFilterCallbacks)   { f.cb = cb }
-func (f *filter) SetWriteFilterCallbacks(cb network.WriteFilterCallbacks) { f.wcb = cb }
+// SetReadFilterCallbacks stores the read callbacks (used by the delay resume,
+// dynamic metadata, and the drain-close). SetWriteFilterCallbacks satisfies the
+// WriteFilter interface (the both-directions dual injection — chain.go injects
+// each exactly once); the write callbacks are never used, so they are
+// deliberately not retained (dead state otherwise; the zookeeperproxy shape).
+func (f *filter) SetReadFilterCallbacks(cb network.ReadFilterCallbacks) { f.cb = cb }
+func (f *filter) SetWriteFilterCallbacks(network.WriteFilterCallbacks)  {}
 
 // OnDestroy drains any residual active-query entries (Dec the gauge per entry so
 // it returns to 0 at connection end — §3.4) then drops the per-connection

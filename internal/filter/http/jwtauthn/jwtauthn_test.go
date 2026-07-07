@@ -1323,11 +1323,8 @@ func TestExtractTokens_DefaultAuthorizationBearer_Success(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("extractTokens: want 1 token, got %d (%v)", len(out), out)
 	}
-	if out[0].raw != "eyJfake" {
-		t.Errorf("raw: got %q; want %q", out[0].raw, "eyJfake")
-	}
-	if out[0].src != sourceHeader {
-		t.Errorf("src: got %v; want sourceHeader", out[0].src)
+	if out[0] != "eyJfake" {
+		t.Errorf("token: got %q; want %q", out[0], "eyJfake")
 	}
 }
 
@@ -1346,8 +1343,8 @@ func TestExtractTokens_DefaultAuthorizationBearer_StripsTrailingGarbage(t *testi
 	if len(tokens) != 1 {
 		t.Fatalf("expected 1 token, got %d", len(tokens))
 	}
-	if tokens[0].raw != "eyJfake" {
-		t.Fatalf("expected raw=%q (stripped), got %q", "eyJfake", tokens[0].raw)
+	if tokens[0] != "eyJfake" {
+		t.Fatalf("expected token=%q (stripped), got %q", "eyJfake", tokens[0])
 	}
 }
 
@@ -1359,14 +1356,8 @@ func TestExtractTokens_DefaultAccessTokenQuery_Success(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("extractTokens: want 1 token, got %d (%v)", len(out), out)
 	}
-	if out[0].raw != "eyJqfake" {
-		t.Errorf("raw: got %q; want %q", out[0].raw, "eyJqfake")
-	}
-	if out[0].src != sourceParam {
-		t.Errorf("src: got %v; want sourceParam", out[0].src)
-	}
-	if out[0].name != "access_token" {
-		t.Errorf("name: got %q; want access_token", out[0].name)
+	if out[0] != "eyJqfake" {
+		t.Errorf("token: got %q; want %q", out[0], "eyJqfake")
 	}
 }
 
@@ -1382,11 +1373,11 @@ func TestExtractTokens_DefaultBoth_TwoTokens(t *testing.T) {
 	if len(out) != 2 {
 		t.Fatalf("extractTokens: want 2 tokens, got %d (%v)", len(out), out)
 	}
-	if out[0].src != sourceHeader || out[0].raw != "eyJhdr" {
-		t.Errorf("token[0]: got %+v; want {raw:eyJhdr src:sourceHeader}", out[0])
+	if out[0] != "eyJhdr" {
+		t.Errorf("token[0]: got %q; want %q (header iterates first)", out[0], "eyJhdr")
 	}
-	if out[1].src != sourceParam || out[1].raw != "eyJqry" {
-		t.Errorf("token[1]: got %+v; want {raw:eyJqry src:sourceParam}", out[1])
+	if out[1] != "eyJqry" {
+		t.Errorf("token[1]: got %q; want %q (query param second)", out[1], "eyJqry")
 	}
 }
 
@@ -1413,11 +1404,8 @@ func TestExtractTokens_FromHeaders_ValuePrefix_Substring(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("extractTokens: want 1 token, got %d (%v)", len(out), out)
 	}
-	if out[0].raw != "eyJxjwt" {
-		t.Errorf("raw: got %q; want %q", out[0].raw, "eyJxjwt")
-	}
-	if out[0].name != "X-JWT" {
-		t.Errorf("name: got %q; want X-JWT", out[0].name)
+	if out[0] != "eyJxjwt" {
+		t.Errorf("token: got %q; want %q", out[0], "eyJxjwt")
 	}
 }
 
@@ -1431,8 +1419,8 @@ func TestExtractTokens_FromHeaders_NoPrefix_Verbatim(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("extractTokens: want 1 token, got %d (%v)", len(out), out)
 	}
-	if out[0].raw != "eyJvjwt" {
-		t.Errorf("raw: got %q; want %q", out[0].raw, "eyJvjwt")
+	if out[0] != "eyJvjwt" {
+		t.Errorf("token: got %q; want %q", out[0], "eyJvjwt")
 	}
 }
 
@@ -1449,8 +1437,8 @@ func TestExtractTokens_FromHeaders_PrefixMidString_Substring(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("extractTokens: want 1 token, got %d (%v)", len(out), out)
 	}
-	if out[0].raw != "eyJxabc" {
-		t.Errorf("raw: got %q; want %q (trailing non-base64url chars must be stripped)", out[0].raw, "eyJxabc")
+	if out[0] != "eyJxabc" {
+		t.Errorf("token: got %q; want %q (trailing non-base64url chars must be stripped)", out[0], "eyJxabc")
 	}
 }
 
@@ -1463,8 +1451,8 @@ func TestExtractTokens_FromParams_FirstValueOnly(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("extractTokens: want 1 token (first-value-only), got %d (%v)", len(out), out)
 	}
-	if out[0].raw != "A" {
-		t.Errorf("raw: got %q; want %q", out[0].raw, "A")
+	if out[0] != "A" {
+		t.Errorf("token: got %q; want %q", out[0], "A")
 	}
 }
 
@@ -1488,11 +1476,8 @@ func TestExtractTokens_FromCookies_Verbatim_CaseSensitive(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("extractTokens: want 1 token, got %d (%v)", len(out), out)
 	}
-	if out[0].raw != "eyJxcookie" {
-		t.Errorf("raw: got %q; want %q", out[0].raw, "eyJxcookie")
-	}
-	if out[0].src != sourceCookie {
-		t.Errorf("src: got %v; want sourceCookie", out[0].src)
+	if out[0] != "eyJxcookie" {
+		t.Errorf("token: got %q; want %q", out[0], "eyJxcookie")
 	}
 }
 
@@ -1506,8 +1491,8 @@ func TestExtractTokens_FromCookies_NoUrlDecode_Per11P15(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("extractTokens: want 1 token, got %d (%v)", len(out), out)
 	}
-	if out[0].raw != "ey%2BJ" {
-		t.Errorf("raw: got %q; want %q (verbatim — no URL-decode per §11.P15)", out[0].raw, "ey%2BJ")
+	if out[0] != "ey%2BJ" {
+		t.Errorf("token: got %q; want %q (verbatim — no URL-decode per §11.P15)", out[0], "ey%2BJ")
 	}
 }
 
@@ -1528,8 +1513,8 @@ func TestExtractTokens_ExplicitSources_DefaultsSuppressed(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("extractTokens: want 1 token (defaults suppressed), got %d (%v)", len(out), out)
 	}
-	if out[0].raw != "eyJxexplicit" || out[0].name != "X-JWT" {
-		t.Errorf("token: got %+v; want raw=eyJxexplicit name=X-JWT", out[0])
+	if out[0] != "eyJxexplicit" {
+		t.Errorf("token: got %q; want %q (from the explicit X-JWT source)", out[0], "eyJxexplicit")
 	}
 }
 
@@ -1551,14 +1536,14 @@ func TestExtractTokens_IterationOrder_HeadersThenParamsThenCookies(t *testing.T)
 	if len(out) != 3 {
 		t.Fatalf("extractTokens: want 3 tokens, got %d (%v)", len(out), out)
 	}
-	if out[0].src != sourceHeader || out[0].raw != "eyJhdr" {
-		t.Errorf("token[0]: got %+v; want header eyJhdr", out[0])
+	if out[0] != "eyJhdr" {
+		t.Errorf("token[0]: got %q; want header-sourced eyJhdr", out[0])
 	}
-	if out[1].src != sourceParam || out[1].raw != "eyJqry" {
-		t.Errorf("token[1]: got %+v; want param eyJqry", out[1])
+	if out[1] != "eyJqry" {
+		t.Errorf("token[1]: got %q; want param-sourced eyJqry", out[1])
 	}
-	if out[2].src != sourceCookie || out[2].raw != "eyJcok" {
-		t.Errorf("token[2]: got %+v; want cookie eyJcok", out[2])
+	if out[2] != "eyJcok" {
+		t.Errorf("token[2]: got %q; want cookie-sourced eyJcok", out[2])
 	}
 }
 

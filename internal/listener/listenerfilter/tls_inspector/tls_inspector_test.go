@@ -181,6 +181,34 @@ func TestInspectConcurrentIndependentConnections(t *testing.T) {
 	wg.Wait()
 }
 
+// TestFilterImplementsInitialReadBufferSizer verifies the per-connection
+// filter exposes its parsed initial_read_buffer_size through the OPTIONAL
+// listenerfilter.InitialReadBufferSizer interface — the hint the listener
+// manager probes at build time to size the per-connection peek buffer, which
+// is what makes a configured size > 4096 actually effective.
+func TestFilterImplementsInitialReadBufferSizer(t *testing.T) {
+	pb := &tls_inspectorv3.TlsInspector{
+		InitialReadBufferSize: wrapperspb.UInt32(16384),
+	}
+	tc, err := anypb.New(pb)
+	if err != nil {
+		t.Fatalf("anypb.New: %v", err)
+	}
+	instFactory, err := New(tc, listenerfilter.FactoryCtx{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	inst := instFactory()
+	defer inst.OnDestroy()
+	h, ok := inst.(listenerfilter.InitialReadBufferSizer)
+	if !ok {
+		t.Fatalf("filter does not implement listenerfilter.InitialReadBufferSizer")
+	}
+	if got := h.InitialReadBufferSize(); got != 16384 {
+		t.Errorf("InitialReadBufferSize: got %d, want 16384", got)
+	}
+}
+
 func TestOnDestroyIsNoOp(t *testing.T) {
 	f := &filter{cfg: &config{bufferSize: 4096}}
 	defer func() {

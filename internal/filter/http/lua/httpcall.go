@@ -138,7 +138,7 @@ func requestHandleHttpCall(L *lua.LState) int {
 		L.ArgError(1, "expected request_handle")
 		return 0
 	}
-	return runHTTPCall(L, ctx.filterRef, 2)
+	return runHTTPCall(L, ctx.filterRef, 2, "envoy_on_request")
 }
 
 // responseHandleHttpCall implements response_handle:httpCall(...) per
@@ -150,13 +150,15 @@ func responseHandleHttpCall(L *lua.LState) int {
 		L.ArgError(1, "expected response_handle")
 		return 0
 	}
-	return runHTTPCall(L, ctx.filterRef, 2)
+	return runHTTPCall(L, ctx.filterRef, 2, "envoy_on_response")
 }
 
 // runHTTPCall is the shared sync/async dispatch core consumed by both
 // request_handle:httpCall and response_handle:httpCall. argStart is the
 // stack index of the first positional argument AFTER the receiver
-// userdata (always 2 — Lua method-call convention).
+// userdata (always 2 — Lua method-call convention). hook is the
+// dispatcher hook name ("envoy_on_request" / "envoy_on_response") cited
+// by the inner-Resume error log (see noteInnerResumeError at body.go).
 //
 // Argument shape per SPEC §11.7.1:
 //
@@ -166,7 +168,7 @@ func responseHandleHttpCall(L *lua.LState) int {
 //  3. body — string (may be empty; nil treated as empty)
 //  4. timeout_ms — number (zero or negative uses defaultHTTPCallTimeout)
 //  5. asynchronous — boolean (optional; default = false = sync)
-func runHTTPCall(L *lua.LState, f *filter, argStart int) int {
+func runHTTPCall(L *lua.LState, f *filter, argStart int, hook string) int {
 	// Arg 1: cluster (required).
 	cluster := L.CheckString(argStart)
 	if cluster == "" {
@@ -332,16 +334,24 @@ func runHTTPCall(L *lua.LState, f *filter, argStart int) int {
 		// Per §11.1 D2 goroutine-safety: this goroutine MUST NOT race with
 		// the outer parent.Resume call site; coordination at 22.2 is via
 		// the readyCh gate above + doneCh signal below.
+		//
+		// Any script runtime error raised AFTER these resumes is invisible
+		// to the outer dispatch site (its Resume already returned
+		// ResumeYield when the script suspended on this httpCall) —
+		// capture it here via noteInnerResumeError per the upstream-parity
+		// errors-counter contract.
 		f.pendingHTTPCallResume = nil // clear before Resume to prevent double-dispatch
 		if err != nil {
 			if f.vm != nil {
-				_, _, _ = f.vm.Resume(child, nil, lua.LNil, lua.LString(err.Error()))
+				_, rerr, _ := f.vm.Resume(child, nil, lua.LNil, lua.LString(err.Error()))
+				noteInnerResumeError(f, hook, rerr)
 			}
 			return
 		}
 		hdrsTbl, bodyStr := marshalHTTPCallResponse(child, resp)
 		if f.vm != nil {
-			_, _, _ = f.vm.Resume(child, nil, hdrsTbl, lua.LString(bodyStr))
+			_, rerr, _ := f.vm.Resume(child, nil, hdrsTbl, lua.LString(bodyStr))
+			noteInnerResumeError(f, hook, rerr)
 		}
 	}(L, f.httpCallReady, f.httpCallDone, cancel)
 

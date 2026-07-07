@@ -96,11 +96,15 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 	activeFaults := new(atomic.Int64)
 	fs := registerFaultStats(ctx.Stats, ctx.StatPrefix)
 	return func() envoyhttp.HTTPFilter {
+		// f.rng is left nil here and allocated lazily by rollPercent on the
+		// first non-boundary roll: the common differential-fixture
+		// percentages (0% / 100%) short-circuit without ever consulting the
+		// RNG, so the eager ~5 KB rngSource allocation + seed loop per
+		// request was pure waste on those paths.
 		f := &filter{
 			cfg:    rc,
 			active: activeFaults,
 			stats:  fs,
-			rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
 		}
 		return envoyhttp.HTTPFilter{
 			Name:    "envoy.filters.http.fault",
@@ -253,10 +257,14 @@ type filter struct {
 	cfg    *runtimeConfig
 	active *atomic.Int64
 	stats  *faultStats
-	rng    *rand.Rand
+
+	// rng is allocated lazily by rollPercent on the first non-boundary roll
+	// (0% and 100% short-circuit without consulting the RNG). Accessed only
+	// from the dispatch goroutine per ADR-0102's decode-goroutine-only
+	// RNG-access invariant, so the lazy init needs no synchronization.
+	rng *rand.Rand
 
 	dcb envoyhttp.DecoderFilterCallbacks
-	ecb envoyhttp.EncoderFilterCallbacks
 
 	delayTimer   *time.Timer // ADR-0102 async-resume timer; Task 5 wires; Task 6 cancels in OnDestroy.
 	markedActive atomic.Bool // ADR-0105 sync.Once-equivalent guard; markActive Store(true), decrementActive CAS(true,false).
@@ -269,7 +277,11 @@ var (
 )
 
 func (f *filter) SetDecoderCallbacks(cb envoyhttp.DecoderFilterCallbacks) { f.dcb = cb }
-func (f *filter) SetEncoderCallbacks(cb envoyhttp.EncoderFilterCallbacks) { f.ecb = cb }
+
+// SetEncoderCallbacks is a no-op retained to satisfy StreamEncoderFilter —
+// fault's encode side is pure pass-through and never consults the encoder
+// callbacks (the abort/delay paths dial the DECODER callbacks only).
+func (f *filter) SetEncoderCallbacks(envoyhttp.EncoderFilterCallbacks) {}
 
 // DecodeHeaders implements the fault filter's decode-side discipline per SPEC §6.4.
 // Task 4 lands the abort-only path + headers gate + percentage roll. Tasks 5/6/7
@@ -364,19 +376,40 @@ func (f *filter) matchesHeaders(headers http.Header, cfg *runtimeConfig) bool {
 	return true
 }
 
+// rngSeedCounter is a process-global counter mixed into each lazily-allocated
+// per-filter RNG seed so two filter instances allocated within the same
+// wall-clock nanosecond still receive distinct seeds (and therefore distinct
+// roll sequences) — a pure time.Now().UnixNano() seed handed identical
+// sequences to same-nanosecond requests.
+var rngSeedCounter atomic.Int64
+
+// nextRNGSeed derives a fresh per-filter RNG seed: wall-clock nanoseconds
+// XOR-mixed with the process-global counter shifted into the high word. Two
+// same-nanosecond calls differ in the counter word; two different-nanosecond
+// calls differ in the time word.
+func nextRNGSeed() int64 {
+	return time.Now().UnixNano() ^ (rngSeedCounter.Add(1) << 32)
+}
+
 // rollPercent returns true iff a fresh random sample falls under p (in [0, 100]).
 // Per planner-time decision 12: 0 short-circuits to false; 100 short-circuits
-// to true; intermediate values consult the per-instance *rand.Rand seeded by
-// time.Now().UnixNano() at filter-instance allocation time. The short-circuits
-// preserve determinism at the boundary percentages (0% never fires; 100%
-// always fires) without consulting the RNG — important for the
-// decode-goroutine-only RNG-access invariant per ADR-0102.
+// to true; intermediate values consult the per-instance *rand.Rand, allocated
+// lazily on the first non-boundary roll (the boundary short-circuits are the
+// common differential-fixture percentages, so most requests never pay the
+// ~5 KB rngSource allocation). The short-circuits preserve determinism at the
+// boundary percentages (0% never fires; 100% always fires) without consulting
+// the RNG — important for the decode-goroutine-only RNG-access invariant per
+// ADR-0102; the lazy init runs on that same goroutine, so it needs no
+// synchronization.
 func (f *filter) rollPercent(p float64) bool {
 	if p <= 0 {
 		return false
 	}
 	if p >= 100 {
 		return true
+	}
+	if f.rng == nil {
+		f.rng = rand.New(rand.NewSource(nextRNGSeed()))
 	}
 	return f.rng.Float64()*100 < p
 }

@@ -10,7 +10,7 @@
 //	for {
 //	    select {
 //	    case <-rv.clk.After(period):
-//	        rv.lockAndDispatchTick(ctx)
+//	        rv.lockAndDispatchTick(ctx, stop)
 //	    case <-stop:
 //	        return
 //	    }
@@ -25,9 +25,17 @@
 // RootVM dispatchMu-held frame of the dispatcher running proxy_on_X); (b)
 // directly from the per-plugin configure path (a future Task 14 connection;
 // at Task 5 only (a) is wired). Re-schedule semantics: SetTickPeriod
-// STOPS the current goroutine (close(rv.tickStop) + WaitGroup wait) BEFORE
-// spawning a fresh goroutine with the new period. period <= 0 cancels the
-// tick (stops the current goroutine + leaves rv.tickStop nil).
+// SIGNALS the current goroutine to exit (close(rv.tickStop)) then spawns a
+// fresh goroutine with the new period WITHOUT waiting for the old one to
+// exit — the superseded goroutine is fenced off by the stale-generation
+// check in lockAndDispatchTick (its snapshotted stop channel no longer
+// matches rv.tickStop) so it can never fire a stale tick. period <= 0
+// cancels the tick (signals the current goroutine + leaves rv.tickStop
+// nil). Waiting here would deadlock: caller site (a) holds dispatchMu, and
+// the old goroutine may itself be the caller's frame (a guest re-arming the
+// tick from inside proxy_on_tick) or blocked on the caller-held dispatchMu
+// inside lockAndDispatchTick. Only stopTickGoroutine (the Close path, never
+// under dispatchMu) joins via tickWG.Wait().
 //
 // # The clock-seam dependency
 //
@@ -96,23 +104,26 @@ const TickPeriodFloor = 10 * time.Millisecond
 //   - period >= TickPeriodFloor ⇒ USE AS-IS. Stop the current goroutine +
 //     spawn a fresh one running the requested period.
 //
-// Re-schedule discipline (stop-then-spawn) is deliberately simple: it avoids
-// a re-schedule channel + works correctly when the goroutine is currently
-// blocked in <-rv.clk.After(...). The cost is at most one extra
-// FakeClock.After registration per re-schedule (the old goroutine's pending
-// After-channel is dropped + becomes eligible for GC after the next
-// FakeClock.Advance that covers its deadline, or after the channel
-// reference is dropped in the production RealClock case via the runtime
-// time-heap's natural eviction).
+// Re-schedule discipline (signal-then-spawn, NO join) is deliberately
+// simple: it avoids a re-schedule channel + works correctly when the
+// goroutine is currently blocked in <-rv.clk.After(...). The cost is at
+// most one extra FakeClock.After registration per re-schedule (the old
+// goroutine's pending After-channel is dropped + becomes eligible for GC
+// after the next FakeClock.Advance that covers its deadline, or after the
+// channel reference is dropped in the production RealClock case via the
+// runtime time-heap's natural eviction).
 //
 // Caller MUST NOT hold tickMu when invoking SetTickPeriod (we acquire it).
-// Caller MAY hold dispatchMu (the abi-shim caller path is inside dispatchMu;
-// the WaitGroup-wait on the old tick goroutine does NOT re-acquire
-// dispatchMu — it only waits for the goroutine's own exit, which races with
-// the goroutine's own dispatchMu-acquire — but the goroutine acquires
-// dispatchMu only INSIDE lockAndDispatchTick which short-circuits via the
-// closed-or-stopped check; the stop signal pre-empts the next After loop
-// iteration BEFORE re-acquiring dispatchMu).
+// Caller MAY hold dispatchMu (the abi-shim caller path is inside dispatchMu)
+// — and the OLD tick goroutine may even BE the caller's own dispatch frame
+// (a guest re-arming the tick from inside proxy_on_tick, the standard
+// one-shot-timer pattern). That is exactly why SetTickPeriod MUST NOT
+// tickWG.Wait(): joining the old goroutine from inside its own dispatch
+// frame (or while it is blocked on the caller-held dispatchMu inside
+// lockAndDispatchTick) is a guaranteed deadlock. The superseded goroutine
+// instead exits on its own (its snapshotted stop channel is closed) and the
+// stale-generation check in lockAndDispatchTick keeps it from ever firing a
+// stale tick in the interim.
 //
 // NOTE: SetTickPeriod is safe to call BEFORE NewStreamContext + AFTER
 // Configure + AFTER any number of NewStreamContext calls. The tick
@@ -121,16 +132,26 @@ func (rv *RootVM) SetTickPeriod(period time.Duration) {
 	rv.tickMu.Lock()
 	defer rv.tickMu.Unlock()
 
-	// Stop the current goroutine (if any). Close the stop channel, wait
-	// for the WaitGroup to drain, then clear the field.
+	// Signal the current goroutine to exit (if any). Close the stop channel
+	// + clear the field; deliberately NO tickWG.Wait() here (see the
+	// re-schedule discipline doc above — waiting would self-deadlock when
+	// the guest re-arms the tick from inside proxy_on_tick, or cross-
+	// deadlock when a fired tick is blocked on the caller-held dispatchMu).
 	if rv.tickStop != nil {
 		close(rv.tickStop)
 		rv.tickStop = nil
-		rv.tickWG.Wait()
 	}
 
 	// period <= 0 ⇒ cancel (no replacement goroutine).
 	if period <= 0 {
+		rv.tickPeriod = 0
+		return
+	}
+
+	// Refuse to spawn on a closed RootVM: a hostcall frame racing Close
+	// could otherwise leak a fresh tick goroutine after stopTickGoroutine's
+	// sweep + race its tickWG.Add against the Close-side tickWG.Wait.
+	if rv.closed.Load() {
 		rv.tickPeriod = 0
 		return
 	}
@@ -156,7 +177,7 @@ func (rv *RootVM) SetTickPeriod(period time.Duration) {
 //	for {
 //	    select {
 //	    case <-rv.clk.After(period):
-//	        rv.lockAndDispatchTick(ctx)
+//	        rv.lockAndDispatchTick(ctx, stop)
 //	    case <-stop:
 //	        return
 //	    }
@@ -164,7 +185,12 @@ func (rv *RootVM) SetTickPeriod(period time.Duration) {
 //
 // The `stop` arg is the goroutine's OWN stop channel (snapshotted under
 // tickMu at spawn time) so a concurrent SetTickPeriod re-schedule does NOT
-// confuse this goroutine into watching a fresh chan.
+// confuse this goroutine into watching a fresh chan. The same snapshot
+// doubles as the goroutine's GENERATION token: lockAndDispatchTick compares
+// it against the current rv.tickStop and refuses to dispatch when they
+// differ (this goroutine has been superseded by a re-schedule and merely
+// hasn't observed its closed stop channel yet — select picks randomly when
+// both the After fire and the stop close are ready).
 func (rv *RootVM) tickRun(ctx context.Context, period time.Duration, stop <-chan struct{}) {
 	defer rv.tickWG.Done()
 	for {
@@ -175,7 +201,7 @@ func (rv *RootVM) tickRun(ctx context.Context, period time.Duration, stop <-chan
 		// is GC'd when this goroutine drops the reference at return.
 		select {
 		case <-rv.clk.After(period):
-			rv.lockAndDispatchTick(ctx)
+			rv.lockAndDispatchTick(ctx, stop)
 		case <-stop:
 			return
 		}
@@ -193,6 +219,14 @@ func (rv *RootVM) tickRun(ctx context.Context, period time.Duration, stop <-chan
 //     dispatchMu; do NOT touch rv.instance).
 //   - re-check closed flag AFTER acquiring dispatchMu (Close races with the
 //     tick fire — the lock-acquire may complete after Close.Lock release).
+//   - stale-generation check: the caller's snapshotted stop channel must
+//     still be the current rv.tickStop (compared under tickMu). A
+//     SetTickPeriod re-schedule/cancel supersedes the calling goroutine
+//     WITHOUT joining it (see SetTickPeriod doc); a superseded goroutine
+//     that already consumed an After fire lands here and MUST NOT dispatch
+//     a stale tick. Lock order: dispatchMu → tickMu (same order as the
+//     hostcall SetTickPeriod path, which runs inside a dispatchMu-held
+//     frame; stopTickGoroutine never holds tickMu across the tickWG join).
 //   - proxy_on_tick guest export missing OR capProxyOnTick capability denied
 //     ⇒ skip the guest invocation (HasGlobalFunc handles both via the
 //     gate-at-getFunction discipline per AMEND-B5).
@@ -201,7 +235,7 @@ func (rv *RootVM) tickRun(ctx context.Context, period time.Duration, stop <-chan
 // panic; the panic does NOT propagate to the caller (tickRun) so the tick
 // goroutine survives. PanicHandlerFn (if configured) fires from inside the
 // wrapper.
-func (rv *RootVM) lockAndDispatchTick(ctx context.Context) {
+func (rv *RootVM) lockAndDispatchTick(ctx context.Context, stop <-chan struct{}) {
 	if rv.closed.Load() {
 		return
 	}
@@ -211,6 +245,15 @@ func (rv *RootVM) lockAndDispatchTick(ctx context.Context) {
 	// Close may have acquired + released dispatchMu (e.g., during a final
 	// drain) between our outer-closed-check and our Lock call.
 	if rv.closed.Load() || rv.instance == nil {
+		return
+	}
+	// Stale-generation check (see the guard list above): a superseded
+	// goroutine's stop snapshot no longer matches rv.tickStop — skip the
+	// dispatch entirely (including the test/observability tickHandler).
+	rv.tickMu.Lock()
+	current := rv.tickStop
+	rv.tickMu.Unlock()
+	if current != stop {
 		return
 	}
 
@@ -265,14 +308,14 @@ func (rv *RootVM) lockAndDispatchTick(ctx context.Context) {
 // the closed flag.
 func (rv *RootVM) stopTickGoroutine() {
 	rv.tickMu.Lock()
-	defer rv.tickMu.Unlock()
 	if rv.tickStop != nil {
 		close(rv.tickStop)
 		rv.tickStop = nil
 	}
 	rv.tickPeriod = 0
-	// Release tickMu before Wait — the tick goroutine does NOT touch
-	// tickMu, so this is purely defensive against a future change that
-	// might.
+	rv.tickMu.Unlock()
+	// Wait OUTSIDE tickMu — the tick goroutine's lockAndDispatchTick
+	// acquires tickMu for the stale-generation check; holding tickMu across
+	// the join would deadlock against a goroutine blocked on that acquire.
 	rv.tickWG.Wait()
 }

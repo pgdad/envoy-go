@@ -89,14 +89,12 @@ func DecideWithContext(h http.Header, ic TraceContext, continued bool, cfg *Trac
 			d.Sample = true
 			d.Reason = Client
 			d.Class = ClientEnabled
-		case h.Get("X-Client-Trace-Id") != "":
-			// client_sampling suppressed the force => fall through to random (§11)
-			d.Sample = rng.Float64()*100 < cfg.RandomSampling
-			if d.Sample {
-				d.Reason = Sampled
-			}
-			d.Class = RandomSampling
 		default:
+			// A client_sampling-suppressed force (x-client-trace-id present but the
+			// Float64 draw in the case above failed) falls through HERE to random
+			// sampling (§11) — the same decision, reason, and class as the no-header
+			// path, with the identical rng stream (the client-sampling draw was
+			// already consumed inside the case condition iff the header was present).
 			d.Sample = rng.Float64()*100 < cfg.RandomSampling
 			if d.Sample {
 				d.Reason = Sampled

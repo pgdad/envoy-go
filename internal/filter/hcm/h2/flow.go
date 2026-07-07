@@ -61,6 +61,18 @@ func (w *window) reserveBlocking(ctx context.Context, max int32) (int32, error) 
 		taken = w.n
 	}
 	w.n -= taken
+	leftover := w.n > 0
 	w.mu.Unlock()
+	// Chain the wakeup: the signal channel has capacity 1, so one replenish
+	// wakes exactly one waiter. If window capacity remains after this take,
+	// re-signal so a second goroutine blocked on the same window (e.g. two
+	// streams stalled on the conn-level send window) is woken too instead of
+	// stalling until an unrelated future replenish arrives.
+	if leftover {
+		select {
+		case w.ch <- struct{}{}:
+		default:
+		}
+	}
 	return taken, nil
 }

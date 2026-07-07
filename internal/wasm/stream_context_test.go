@@ -16,6 +16,7 @@ package wasm
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/pgdad/envoy-go/internal/wasm/abi"
@@ -295,4 +296,121 @@ func TestStreamContext_TrapPoison_SkipsTeardown(t *testing.T) {
 	if stillPresent {
 		t.Error("streamCtx entry still present after Close; want removed (Close must still perform map cleanup)")
 	}
+}
+
+// --- TestStreamContext_DispatchAfterRootVMClose_ErrorNotPanic --------------
+
+// TestStreamContext_DispatchAfterRootVMClose_ErrorNotPanic: RootVM.Close
+// flips every live child StreamContext's closed flag + nils rv.instance
+// under dispatchMu. A caller still holding the *StreamContext must observe
+// the graceful closed-StreamContext error from every CallProxyOn* method —
+// NOT a nil-interface panic dereferencing the cleared rv.instance — and
+// NewStreamContext must reject with the closed-RootVM error. Exercises the
+// dispatchGuest re-check discipline (the instance read lives under
+// dispatchMu with a post-Lock closed re-check).
+func TestStreamContext_DispatchAfterRootVMClose_ErrorNotPanic(t *testing.T) {
+	ctx := context.Background()
+	mod := mustCompileWithCacheForRootVM(t, ctx, exportsAll25_2CallbacksModule)
+	rv, err := NewRootVM(ctx, mod, 1, WithRootSandboxConfig(allowAllSandbox()))
+	if err != nil {
+		t.Fatalf("NewRootVM: %v", err)
+	}
+	rv.RegisterABICallbacks(&fakeABICallbacks{})
+	sc, err := rv.NewStreamContext(ctx)
+	if err != nil {
+		t.Fatalf("NewStreamContext: %v", err)
+	}
+
+	if err := rv.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Every per-callback dispatch must early-return with the exact
+	// pre-consolidation closed-StreamContext error string (pinned — the
+	// dispatchGuest helper builds it from the method name).
+	if _, err := sc.CallProxyOnRequestHeaders(ctx, 1, false); err == nil ||
+		err.Error() != "wasm: CallProxyOnRequestHeaders on closed StreamContext" {
+		t.Errorf("CallProxyOnRequestHeaders after Close: err=%v; want the closed-StreamContext error", err)
+	}
+	if _, err := sc.CallProxyOnRequestBody(ctx, 1, false); err == nil ||
+		err.Error() != "wasm: CallProxyOnRequestBody on closed StreamContext" {
+		t.Errorf("CallProxyOnRequestBody after Close: err=%v; want the closed-StreamContext error", err)
+	}
+	if done, err := sc.CallProxyOnDone(ctx); err == nil || !done ||
+		err.Error() != "wasm: CallProxyOnDone on closed StreamContext" {
+		t.Errorf("CallProxyOnDone after Close: done=%v err=%v; want (true, closed-StreamContext error)", done, err)
+	}
+	if err := sc.CallProxyOnLog(ctx); err == nil ||
+		err.Error() != "wasm: CallProxyOnLog on closed StreamContext" {
+		t.Errorf("CallProxyOnLog after Close: err=%v; want the closed-StreamContext error", err)
+	}
+
+	if _, err := rv.NewStreamContext(ctx); err == nil {
+		t.Error("NewStreamContext after Close: err=nil; want closed-RootVM error")
+	}
+}
+
+// --- TestStreamContext_ConcurrentDispatchAndClose_NoPanic ------------------
+
+// TestStreamContext_ConcurrentDispatchAndClose_NoPanic: hammers per-stream
+// dispatch + NewStreamContext concurrently with RootVM.Close under -race.
+// Before the dispatchGuest consolidation the CallProxyOn* template read
+// rv.instance BEFORE acquiring dispatchMu and never re-checked closed after
+// Lock, so a dispatch racing Close could dereference the nil'd instance —
+// a panic this test would surface (plus a -race report on the unsynchronized
+// instance read). Errors are expected + ignored; the assertion is the
+// absence of panics/races.
+func TestStreamContext_ConcurrentDispatchAndClose_NoPanic(t *testing.T) {
+	ctx := context.Background()
+	mod := mustCompileWithCacheForRootVM(t, ctx, exportsAll25_2CallbacksModule)
+	rv, err := NewRootVM(ctx, mod, 1, WithRootSandboxConfig(allowAllSandbox()))
+	if err != nil {
+		t.Fatalf("NewRootVM: %v", err)
+	}
+	rv.RegisterABICallbacks(&fakeABICallbacks{})
+
+	const streams = 8
+	scs := make([]*StreamContext, streams)
+	for i := range scs {
+		sc, err := rv.NewStreamContext(ctx)
+		if err != nil {
+			t.Fatalf("NewStreamContext(%d): %v", i, err)
+		}
+		scs[i] = sc
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, sc := range scs {
+		wg.Add(1)
+		go func(sc *StreamContext) {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 100; j++ {
+				// Real guest dispatch (exported) + no-export path — both
+				// must survive a concurrent Close gracefully.
+				_, _ = sc.CallProxyOnRequestBody(ctx, 1, false)
+				_, _ = sc.CallProxyOnRequestHeaders(ctx, 1, false)
+			}
+		}(sc)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for j := 0; j < 100; j++ {
+			if sc, err := rv.NewStreamContext(ctx); err == nil {
+				_ = sc.Close(ctx)
+			}
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		_ = rv.Close()
+	}()
+
+	close(start)
+	wg.Wait()
 }

@@ -81,13 +81,17 @@ import (
 //   - recordLatencySample acquires mu for sample-slice mutation + minRTT
 //     state-machine transitions.
 //   - Timer callbacks (concurrencyUpdateTick, updateMinRTTTick) acquire mu
-//     for state mutation; re-arm AfterFunc calls in the concurrencyUpdateTick
-//     path happen with mu released, while re-arm calls in the
-//     updateMinRTTLocked path happen while controller.mu is held — safe
-//     because FakeClock.mu is a SEPARATE mutex (no deadlock risk). The
-//     FakeClock re-entrancy/drain-loop contract is documented at
-//     internal/clock (Advance doc-comment + internal/clock/clock_test.go's
-//     reentrant-AfterFunc test).
+//     for state mutation; ALL sampleResetTimer/minRTTCalcTimer re-arm
+//     AfterFunc calls (and their handle-field writes) happen while
+//     controller.mu is held. Arming under mu is safe because FakeClock.mu is
+//     a SEPARATE mutex (no deadlock risk), and it is REQUIRED: the
+//     sampleResetTimer field is also written by updateMinRTTLocked from the
+//     sample-driven window-close path, so an unlocked write from the tick
+//     path would be a write-write race AND could leave two armed timers
+//     chained (each fired tick re-arms itself — permanently doubling the
+//     concurrency-update cadence). The FakeClock re-entrancy/drain-loop
+//     contract is documented at internal/clock (Advance doc-comment +
+//     internal/clock/clock_test.go's reentrant-AfterFunc test).
 type gradientController struct {
 	cfg   *compiledConfig
 	stats *filterStats
@@ -218,15 +222,21 @@ func (c *gradientController) concurrencyUpdateTick() {
 	}
 	if len(c.latencySamples) == 0 {
 		// No samples accumulated this tick. Re-arm + return per cc:66-80.
-		c.mu.Unlock()
+		// The re-arm MUST happen under mu (see the concurrency contract in
+		// the type doc): updateMinRTTLocked also writes sampleResetTimer
+		// from the sample-driven window-close path, and an unlocked write
+		// here would race it — and could double-arm the tick chain if a
+		// window was entered + closed between the unlock and the re-arm.
 		c.sampleResetTimer = c.clock.AfterFunc(c.cfg.concurrencyUpdateInterval, c.concurrencyUpdateTick)
+		c.mu.Unlock()
 		return
 	}
 	// Aggregate sample-RTT via sample_aggregate_percentile-quantile per
 	// cc:176-182 + AMEND-2 C1 (sorted-slice percentile per §3.3 +
 	// BRAINSTORM §8 item 4 carve-out — ≤ 1 bin-width divergence acceptable
-	// per ADR-0186 §Decision).
-	sampleRTT := Quantile(c.latencySamples, c.cfg.sampleAggregatePercentile)
+	// per ADR-0186 §Decision). In-place variant: the slice is reset to [:0]
+	// on the next line, so Quantile's defensive copy would be pure waste.
+	sampleRTT := quantileInPlace(c.latencySamples, c.cfg.sampleAggregatePercentile)
 	c.latencySamples = c.latencySamples[:0] // clear, preserving capacity
 	c.stats.sampleRTTMsecs.Set(sampleRTT.Nanoseconds())
 	// Compute gradient + new-limit per §4.3 + §4.4.
@@ -234,9 +244,9 @@ func (c *gradientController) concurrencyUpdateTick() {
 	c.stats.gradient.Set(int64(gradient * 1000)) // ×1000 per ADR-0059 AMENDMENT
 	newLimit := c.calculateNewLimitLocked(gradient)
 	c.updateConcurrencyLimitLocked(newLimit)
-	c.mu.Unlock()
-	// Re-arm for the next tick.
+	// Re-arm for the next tick — under mu, same discipline as above.
 	c.sampleResetTimer = c.clock.AfterFunc(c.cfg.concurrencyUpdateInterval, c.concurrencyUpdateTick)
+	c.mu.Unlock()
 }
 
 // updateMinRTTTick is the min_rtt_calc_timer callback per SPEC §4.5 trigger
@@ -306,7 +316,9 @@ func (c *gradientController) updateMinRTTLocked() {
 		return
 	}
 	// Step (f) — percentile aggregation NOT MIN per AMEND-2 C1 + cc:176-182.
-	minRTT := Quantile(c.minRTTSamples, c.cfg.sampleAggregatePercentile)
+	// In-place variant: the slice is reset to [:0] two lines down, so
+	// Quantile's defensive copy would be pure waste.
+	minRTT := quantileInPlace(c.minRTTSamples, c.cfg.sampleAggregatePercentile)
 	c.minRTT = minRTT
 	c.stats.minRTTMsecs.Set(minRTT.Nanoseconds()) // ns per AMEND-3 C3
 	c.minRTTSamples = c.minRTTSamples[:0]

@@ -25,7 +25,7 @@ package lua
 //   3. Parse + compile via gopher-lua (expensive; performed OUTSIDE
 //      the lock — long-held write lock would serialize all compile
 //      misses across the filter).
-//   4. Build *Chunk{proto, hash}.
+//   4. Build *Chunk{proto}.
 //   5. If cache != nil: Lock; DOUBLE-CHECK store[hash] (another
 //      goroutine may have raced ahead during step 3 + already
 //      stored the same content); if present, return that one (drop
@@ -63,13 +63,12 @@ import (
 // map key (deferred).
 const chunkSourceName = "lua_filter_chunk"
 
-// Chunk wraps a compiled *FunctionProto safe for cross-VM reuse. The
-// hash field carries the SHA-256(src) for cache identity at the
-// CompileCache; the proto is loaded onto each per-stream *lua.LState
+// Chunk wraps a compiled *FunctionProto safe for cross-VM reuse. Cache
+// identity at the CompileCache is the SHA-256(src) map key computed at
+// CompileScript; the proto is loaded onto each per-stream *lua.LState
 // via state.NewFunctionFromProto without recompilation.
 type Chunk struct {
 	proto *lua.FunctionProto
-	hash  [32]byte
 }
 
 // CompileCache is a content-addressed compile cache, keyed by
@@ -122,7 +121,7 @@ func CompileScript(src []byte, cache *CompileCache) (*Chunk, error) {
 		return nil, fmt.Errorf("lua compile: %w", err)
 	}
 
-	chunk := &Chunk{proto: proto, hash: hash}
+	chunk := &Chunk{proto: proto}
 
 	// Cache write-path: Lock + DOUBLE-CHECK store[hash]. If another
 	// goroutine populated the slot during our parse/compile window,

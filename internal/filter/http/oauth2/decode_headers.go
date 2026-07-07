@@ -153,6 +153,30 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 // + redirect_uri + state + scope + resource) + the byte-exact state-cookie
 // payload per SPEC §12 item A3 RATIFIED-PENDING-IMPL-TIME.
 func (f *filter) handleUnauthenticated() envoyhttp.FilterHeadersStatus {
+	f.emitCategoryA_AuthChallengeWire()
+	return envoyhttp.StopIteration
+}
+
+// emitCategoryA_AuthChallengeWire is the SINGLE home of the category (a) 302
+// auth-challenge wire emission per SPEC §4.1 + §4.4 + §4.5 — shared by
+// handleUnauthenticated (dispatcher entry), applyTokenEndpointResponse's
+// failure legs (resume goroutine), and handleRefreshFailureLocked (resume
+// goroutine). Counter increments stay at the call sites per §4.6.
+//
+// Lock-free BY DESIGN so it is safe to call both with and without f.mu held:
+// the only state touched is cc.* (read-only post-boot per ADR-0072),
+// f.composeStateCookieValueSkeleton (reads the wall clock only), and f.dcb
+// (write-only via SendLocalReply).
+//
+// Wire shape:
+//
+//   - Status: 302
+//   - Body:   empty
+//   - Headers:
+//   - Location: <authorization_endpoint URL>     — SPEC §4.4
+//   - Set-Cookie: <state cookie SET>             — SPEC §4.5
+//   - Set-Cookie: <4 envelope cookies cleared (Max-Age=0)>
+func (f *filter) emitCategoryA_AuthChallengeWire() {
 	cc := f.cc
 
 	// Compose a placeholder state-cookie value. Task 8/10 finalize per
@@ -187,7 +211,6 @@ func (f *filter) handleUnauthenticated() envoyhttp.FilterHeadersStatus {
 	if f.dcb != nil {
 		f.dcb.SendLocalReply(302, "", hdrs)
 	}
-	return envoyhttp.StopIteration
 }
 
 // handlePassThrough bypasses the OAuth2 dispatch + increments the

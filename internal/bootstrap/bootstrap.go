@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -169,31 +171,38 @@ import (
 	"github.com/pgdad/envoy-go/internal/stats"
 )
 
-const (
+// The five access-log-walk TypeURLs below are DERIVED from their proto
+// descriptors rather than hard-coded so a proto-package rename is caught at
+// build time, not silently (the verify-typeurl-via-descriptor discipline —
+// reference_network_filter_typeurl_extensions, the metricsServiceTypeURL
+// precedent). A test asserts each equals its previously-hard-coded literal.
+var (
 	// hcmTypeURL is the TypeURL for HttpConnectionManager, used when walking
 	// listener filter chains to find HCM filters during access_log[] parsing.
-	hcmTypeURL = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager"
+	hcmTypeURL = "type.googleapis.com/" + string((&hcmv3.HttpConnectionManager{}).ProtoReflect().Descriptor().FullName())
 
 	// fileAccessLogTypeURL is the TypeURL for the file access logger
 	// (envoy.access_loggers.file). Used in access_log[] typed_config
 	// type-switching per ADR-0067.
-	fileAccessLogTypeURL = "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog"
+	fileAccessLogTypeURL = "type.googleapis.com/" + string((&fileaccesslogv3.FileAccessLog{}).ProtoReflect().Descriptor().FullName())
 
 	// httpGrpcAccessLogTypeURL is the TypeURL for the gRPC HTTP access logger
 	// (envoy.access_loggers.http_grpc). Lifted from the ADR-0041 silent-ignore
 	// set at phase 44.1 (ADR-0255).
-	httpGrpcAccessLogTypeURL = "type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.HttpGrpcAccessLogConfig"
+	httpGrpcAccessLogTypeURL = "type.googleapis.com/" + string((&grpcalv3.HttpGrpcAccessLogConfig{}).ProtoReflect().Descriptor().FullName())
 
 	// tcpGrpcAccessLogTypeURL is the TypeURL for the TCP gRPC access logger
 	// (envoy.access_loggers.tcp_grpc). STRICT-REJECTED at boot (ADR-0080): TCP ALS
 	// is unsupported; silently ignoring it would drop a configured user's access
 	// logs with no signal (the ADR-0080 anti-silent-divergence rule).
-	tcpGrpcAccessLogTypeURL = "type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.TcpGrpcAccessLogConfig"
+	tcpGrpcAccessLogTypeURL = "type.googleapis.com/" + string((&grpcalv3.TcpGrpcAccessLogConfig{}).ProtoReflect().Descriptor().FullName())
 
 	// otlpAccessLogTypeURL is the TypeURL for the OpenTelemetry (OTLP) access logger.
 	// Lifted from the ADR-0041 silent-ignore set at phase 45.1 (ADR-0258).
-	otlpAccessLogTypeURL = "type.googleapis.com/envoy.extensions.access_loggers.open_telemetry.v3.OpenTelemetryAccessLogConfig"
+	otlpAccessLogTypeURL = "type.googleapis.com/" + string((&otlpalv3.OpenTelemetryAccessLogConfig{}).ProtoReflect().Descriptor().FullName())
+)
 
+const (
 	// alsDefaultBufferSizeBytes is the buffer_size_bytes default applied when the
 	// CommonGrpcAccessLogConfig wrapper is absent — the empirically-pinned
 	// reference default (AMEND-BUF-2). An explicit present-but-0 value is honored
@@ -558,19 +567,36 @@ func parseStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
 	if sd.GetTcpClusterName() != "" {
 		return fmt.Errorf("bootstrap: stats_sinks[%d]: statsd tcp_cluster_name is not supported (envoy-go is UDP-only; configure address.socket_address)", idx)
 	}
-	sa := sd.GetAddress().GetSocketAddress()
-	if sa == nil {
-		return fmt.Errorf("bootstrap: stats_sinks[%d]: statsd requires address.socket_address (statsd_specifier is required)", idx)
-	}
-	prefix := sd.GetPrefix()
-	if prefix == "" {
-		prefix = "envoy"
+	addr, prefix, err := parseUDPSinkAddressAndPrefix(sd.GetAddress().GetSocketAddress(), sd.GetPrefix(), "statsd", "statsd_specifier", idx)
+	if err != nil {
+		return err
 	}
 	result.StatsdSinkConfigs = append(result.StatsdSinkConfigs, StatsdSinkConfig{
-		UDPAddress: fmt.Sprintf("%s:%d", sa.GetAddress(), sa.GetPortValue()),
+		UDPAddress: addr,
 		Prefix:     prefix,
 	})
 	return nil
+}
+
+// parseUDPSinkAddressAndPrefix is the socket_address + prefix tail shared by
+// the statsd and dog_statsd sink parsers (the parseCommonGrpcAccessLogConfig
+// precedent): it rejects a nil socket_address (interpolating the sink +
+// specifier labels so each caller's error string stays byte-identical to the
+// pre-extraction wording), applies the `prefix == "" → "envoy"` default, and
+// builds the "host:port" dial string. net.JoinHostPort (not fmt.Sprintf) so
+// an IPv6 literal renders bracketed ("[::1]:8125") and stays parseable by
+// net.ResolveUDPAddr; IPv4/hostname output is byte-identical to the previous
+// Sprintf form. The sink-specific arms (statsd's tcp_cluster_name reject,
+// dog_statsd's max_bytes_per_datagram read) stay in each caller.
+func parseUDPSinkAddressAndPrefix(sa *corev3.SocketAddress, prefix, sinkLabel, specifierLabel string, idx int) (string, string, error) {
+	if sa == nil {
+		return "", "", fmt.Errorf("bootstrap: stats_sinks[%d]: %s requires address.socket_address (%s is required)", idx, sinkLabel, specifierLabel)
+	}
+	if prefix == "" {
+		prefix = "envoy"
+	}
+	addr := net.JoinHostPort(sa.GetAddress(), strconv.FormatUint(uint64(sa.GetPortValue()), 10))
+	return addr, prefix, nil
 }
 
 // parseDogStatsdSinkConfig parses one dog_statsd UDP stats sink typed_config and
@@ -588,24 +614,21 @@ func parseDogStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
 	if err := tc.UnmarshalTo(&dsd); err != nil {
 		return fmt.Errorf("bootstrap: stats_sinks[%d]: dog_statsd typed_config: %w", idx, err)
 	}
-	sa := dsd.GetAddress().GetSocketAddress()
-	if sa == nil {
-		return fmt.Errorf("bootstrap: stats_sinks[%d]: dog_statsd requires address.socket_address (dog_statsd_specifier is required)", idx)
-	}
-	prefix := dsd.GetPrefix()
-	if prefix == "" {
-		prefix = "envoy"
+	addr, prefix, err := parseUDPSinkAddressAndPrefix(dsd.GetAddress().GetSocketAddress(), dsd.GetPrefix(), "dog_statsd", "dog_statsd_specifier", idx)
+	if err != nil {
+		return err
 	}
 	result.DogStatsdSinkConfigs = append(result.DogStatsdSinkConfigs, DogStatsdSinkConfig{
-		UDPAddress:          fmt.Sprintf("%s:%d", sa.GetAddress(), sa.GetPortValue()),
+		UDPAddress:          addr,
 		Prefix:              prefix,
 		MaxBytesPerDatagram: dsd.GetMaxBytesPerDatagram().GetValue(),
 	})
 	return nil
 }
 
-// parseAccessLogConfigs walks the static_resources listeners looking for HCM
-// filters, then parses each HCM's access_log[] entries per ADR-0067. File-type
+// parseAccessLogConfigs walks the static_resources listeners (every
+// filter_chains[] entry plus default_filter_chain) looking for HCM filters,
+// then parses each HCM's access_log[] entries per ADR-0067. File-type
 // entries are collected into result.AccessLogConfigs; other typed_config types
 // are silently ignored. log_format/format_string/json_format on file-type
 // entries produce a fatal error.
@@ -615,7 +638,18 @@ func parseAccessLogConfigs(bs *bootstrapv3.Bootstrap, result *Bootstrap) error {
 		return nil
 	}
 	for _, listener := range sr.GetListeners() {
-		for _, fc := range listener.GetFilterChains() {
+		// The walk covers filter_chains[] PLUS default_filter_chain (when
+		// present): the listener manager fully supports HCM inside
+		// default_filter_chain, so its access_log[] entries get the same
+		// validation + sink collection as the indexed chains (the ADR-0080
+		// anti-silent-divergence rule). The three-index slice expression
+		// forces append to copy rather than scribble on the proto's backing
+		// array.
+		chains := listener.GetFilterChains()
+		if dfc := listener.GetDefaultFilterChain(); dfc != nil {
+			chains = append(chains[:len(chains):len(chains)], dfc)
+		}
+		for _, fc := range chains {
 			for _, f := range fc.GetFilters() {
 				tc := f.GetTypedConfig()
 				if tc == nil || tc.GetTypeUrl() != hcmTypeURL {

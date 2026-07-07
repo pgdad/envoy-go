@@ -50,6 +50,7 @@ import (
 
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"github.com/pgdad/envoy-go/internal/clock"
 	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 )
 
@@ -131,7 +132,7 @@ var (
 //  2. buildCompiledConfig(tc) — Task 2 PARSE-REJECT + default-application.
 //  3. ctx.Stats != nil — required for the 3-counter stat-surface registration.
 //  4. newFilterStats(ctx.Stats, "http."+ctx.StatPrefix) — Task 3 3-name registration.
-//  5. newController(cc, stats, defaultClock{}, defaultRand{}) — Task 4 controller.
+//  5. newController(cc, stats, clock.RealClock{}, defaultRand{}) — Task 4 controller.
 //  6. Return the per-stream FilterInstanceFactory closure.
 //
 // The returned HTTPFilter has Decoder=f AND Encoder=f — admission_control
@@ -156,7 +157,7 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 	// adaptive_concurrency factory boundary convention (Task 10 fix) and the
 	// phase-20 oauth2 baseStatPrefix precedent.
 	st := newFilterStats(ctx.Stats, "http."+ctx.StatPrefix)
-	ctrl := newController(cc, st, defaultClock{}, defaultRand{})
+	ctrl := newController(cc, st, clock.RealClock{}, defaultRand{})
 	return func() envoyhttp.HTTPFilter {
 		f := &filter{
 			cc:         cc,

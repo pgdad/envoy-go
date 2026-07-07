@@ -228,7 +228,6 @@ func (f *filter) DecodeHeaders(headers http.Header, _ bool) envoyhttp.FilterHead
 	// the cancellation chains via context.WithTimeout's AND-of-cancellation.
 	callCtx, callCancel := context.WithCancel(context.Background())
 	f.mu.Lock()
-	f.callCtx = callCtx
 	f.callCancel = callCancel
 	f.mu.Unlock()
 
