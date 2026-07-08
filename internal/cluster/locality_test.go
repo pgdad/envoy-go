@@ -1,8 +1,13 @@
 package cluster
 
-import "testing"
+import (
+	"strconv"
+	"testing"
 
-// trackingFactory returns a leafFactory that builds ONE stubLB per distinct
+	"github.com/pgdad/envoy-go/internal/stats"
+)
+
+// trackingFactory returns a healthLeafFactory that builds ONE stubLB per distinct
 // call, recording each call's endpoint sub-slice (by pointer-stable Port sum,
 // a cheap fingerprint) so tests can assert what newLocalityWeightedLB built.
 type factoryCall struct {
@@ -10,9 +15,9 @@ type factoryCall struct {
 	sum uint32 // sum of Port across the sub-slice — a cheap "which slice" fingerprint
 }
 
-func trackingFactory() (leafFactory, *[]factoryCall) {
+func trackingFactory() (healthLeafFactory, *[]factoryCall) {
 	var calls []factoryCall
-	f := func(sub []Endpoint) (loadBalancer, error) {
+	f := func(sub []Endpoint, _ *clusterHealth) (loadBalancer, error) {
 		var sum uint32
 		for _, ep := range sub {
 			sum += ep.Port
@@ -92,7 +97,7 @@ func TestNewLocalityWeightedLB_DuplicateLocality_LastWriteWins(t *testing.T) {
 func TestNewLocalityWeightedLB_FactoryErrorPropagates(t *testing.T) {
 	eps := []Endpoint{{Host: "a0", Port: 1, Locality: LocalityID{Region: "a"}}}
 	wantErr := errNoEndpoints
-	factory := func(sub []Endpoint) (loadBalancer, error) { return nil, wantErr }
+	factory := func(sub []Endpoint, _ *clusterHealth) (loadBalancer, error) { return nil, wantErr }
 	if _, err := newLocalityWeightedLBWithRNG(eps, nil, 140, true, factory, func() uint64 { return 0 }); err != wantErr {
 		t.Errorf("err = %v, want %v", err, wantErr)
 	}
@@ -126,7 +131,7 @@ func TestPick_HealthyLocality_DelegatesToItsOwnChild(t *testing.T) {
 	epsB := []Endpoint{{Host: "b0", Port: 2, Locality: LocalityID{Region: "b"}, LocalityWeight: 0}} // zero weight → never drawn
 	all := append(append([]Endpoint{}, epsA...), epsB...)
 	stubs := map[string]*stubLB{}
-	factory := func(sub []Endpoint) (loadBalancer, error) {
+	factory := func(sub []Endpoint, _ *clusterHealth) (loadBalancer, error) {
 		key := "flat"
 		if len(sub) != len(all) {
 			key = sub[0].Locality.Region
@@ -157,11 +162,11 @@ func TestPick_PanicBypassesLocalityWeighting(t *testing.T) {
 	epsA := []Endpoint{{Host: "a0", Port: 1, Locality: LocalityID{Region: "a"}, LocalityWeight: 2}}
 	epsB := []Endpoint{{Host: "b0", Port: 2, Locality: LocalityID{Region: "b"}, LocalityWeight: 1}}
 	all := append(append([]Endpoint{}, epsA...), epsB...)
-	health := newClusterHealth(all, 0.5)
+	health := newClusterHealth(all, 50)
 	health.states["a0:1"].healthy.Store(false) // 1/2 = 50%, NOT strictly < 0.5 yet...
 	health.states["b0:2"].healthy.Store(false) // ...now 0/2 = 0% < 0.5 → cluster-wide panic
 	stubs := map[string]*stubLB{}
-	factory := func(sub []Endpoint) (loadBalancer, error) {
+	factory := func(sub []Endpoint, _ *clusterHealth) (loadBalancer, error) {
 		key := "flat"
 		if len(sub) != len(all) {
 			key = sub[0].Locality.Region
@@ -194,7 +199,7 @@ func TestPick_ZeroTotalEffectiveWeight_FallsBackToFlat(t *testing.T) {
 	epsB := []Endpoint{{Host: "b0", Port: 2, Locality: LocalityID{Region: "b"}, LocalityWeight: 0}}
 	all := append(append([]Endpoint{}, epsA...), epsB...)
 	stubs := map[string]*stubLB{}
-	factory := func(sub []Endpoint) (loadBalancer, error) {
+	factory := func(sub []Endpoint, _ *clusterHealth) (loadBalancer, error) {
 		key := "flat"
 		if len(sub) != len(all) {
 			key = sub[0].Locality.Region
@@ -224,7 +229,7 @@ func TestPick_ForwardsHashKeyAndMatchUnchanged(t *testing.T) {
 	var gotHasHash bool
 	var gotMatch SubsetMatch
 	var gotHasMatch bool
-	factory := func(sub []Endpoint) (loadBalancer, error) {
+	factory := func(sub []Endpoint, _ *clusterHealth) (loadBalancer, error) {
 		return &argRecordingLB{onPick: func(hk uint64, hh bool, m SubsetMatch, hm bool) {
 			gotHashKey, gotHasHash, gotMatch, gotHasMatch = hk, hh, m, hm
 		}}, nil
@@ -335,7 +340,7 @@ func TestPick_ExplicitZeroOPF_AlwaysFallsBackToFlat(t *testing.T) {
 	// fully healthy (TestPick_HealthyLocality_DelegatesToItsOwnChild, Task 4).
 	eps := []Endpoint{{Host: "a0", Port: 1, Locality: LocalityID{Region: "a"}, LocalityWeight: 5}}
 	stubs := map[string]*stubLB{}
-	factory := func(sub []Endpoint) (loadBalancer, error) {
+	factory := func(sub []Endpoint, _ *clusterHealth) (loadBalancer, error) {
 		// Deviation from the PLAN's sketch: with a SINGLE locality, the
 		// per-group sub-slice and the flat fallback's full-endpoint slice
 		// are both length 1 (== len(eps)), so a length-based key never
@@ -369,68 +374,89 @@ func TestPick_ExplicitZeroOPF_AlwaysFallsBackToFlat(t *testing.T) {
 	}
 }
 
-func TestPick_ChildLocalityCanLocallyPanicIndependently(t *testing.T) {
-	// DOCUMENTATION test (not a phase-52 requirement to fix): a locality's
-	// child is built by the UNCHANGED buildLeafLB/roundRobin, which
-	// evaluates its OWN clusterHealth.inPanic over ITS OWN endpoint
-	// sub-slice (health.go's roundRobin.Pick, loadbalancer.go:44-66) — a
-	// DIFFERENT scope than the wrapper's cluster-wide inPanic check
-	// (Pick, Task 4). A locality's local healthy fraction can dip below the
-	// SHARED panicThreshold (0.5 default) while the CLUSTER-WIDE fraction
-	// stays above it, so the wrapper itself never enters panic, yet the
-	// CHOSEN locality's own child independently sprays across its own
-	// full sub-slice (including unhealthy hosts) once delegated to. This is
-	// a structural consequence of reusing buildLeafLB's children UNCHANGED
-	// (the identical posture subsetLB's children already have) and is
-	// UNTESTED by the 0095 differential (its synthetic backends respond 200
-	// on data paths regardless of health-check status, so this local-panic
-	// behavior never perturbs the REGION-level share assertions). Recorded
-	// here as a coverage boundary, found reading the real roundRobin.Pick
-	// code at this PLAN's Task 6 review — not a bug to fix in phase 52
-	// (fixing it would require passing a per-locality "panic disabled" view
-	// into buildLeafLB's children, contradicting the ZERO-new-Pick-parameter,
-	// buildLeafLB-reused-unchanged design, D-LW7).
-	region := []Endpoint{
-		{Host: "a0", Port: 1, Locality: LocalityID{Region: "a"}, LocalityWeight: 1},
-		{Host: "a1", Port: 2, Locality: LocalityID{Region: "a"}, LocalityWeight: 1},
-		{Host: "a2", Port: 3, Locality: LocalityID{Region: "a"}, LocalityWeight: 1},
-	}
-	other := []Endpoint{{Host: "b0", Port: 4, Locality: LocalityID{Region: "b"}, LocalityWeight: 1}}
-	all := append(append([]Endpoint{}, region...), other...)
-	health := newClusterHealth(all, 0.5)
-	health.states["a1:2"].healthy.Store(false)
-	health.states["a2:3"].healthy.Store(false) // region a: 1/3 ≈ 33% < 50% (locally panics); cluster-wide: 2/4 = 50%, NOT < 50% (no cluster-wide panic)
-	if health.inPanic(all) {
-		t.Fatal("test setup invariant broken: cluster-wide must NOT be in panic (2/4 == 50%, strict <)")
-	}
-	regionAChild := &roundRobin{endpoints: region, health: health}
-	factory := func(sub []Endpoint) (loadBalancer, error) {
-		if len(sub) == len(region) {
-			return regionAChild, nil
+func TestPick_DegradedLocality_NoLocalPanic(t *testing.T) {
+	// AMEND-PT3 / D-PT4: a single degraded locality (40% healthy) within a
+	// cluster that is NOT in cluster-wide panic (70% overall) must NOT locally
+	// flatten — its unhealthy hosts receive ZERO traffic. The per-locality
+	// child is built against a panic-DISABLED tierHealth view.
+	mkLoc := func(region string, n int) []Endpoint {
+		eps := make([]Endpoint, n)
+		for i := range eps {
+			eps[i] = Endpoint{Host: region + strconv.Itoa(i), Port: 1, Locality: LocalityID{Region: region}, LocalityWeight: 1}
 		}
-		return &roundRobin{endpoints: sub, health: health}, nil
+		return eps
 	}
-	lw, err := newLocalityWeightedLBWithRNG(all, health, 140, true, factory, func() uint64 { return 0 }) // rng()==0 → r==0 → the wrapper always picks the FIRST bucket (region a, the only nonzero-remaining-weight locality drawn first in encounter order)
+	epsA := mkLoc("a", 5)
+	epsB := mkLoc("b", 5)
+	all := append(append([]Endpoint{}, epsA...), epsB...)
+	health := newClusterHealth(all, 50)
+	// Degrade locality A to 2/5 = 40% (below 50%), cluster-wide 7/10 = 70% >= 50%.
+	for _, dead := range []string{"a2:1", "a3:1", "a4:1"} {
+		health.states[dead].healthy.Store(false)
+	}
+	// Real roundRobin children so per-host availability filtering is LIVE.
+	factory := func(sub []Endpoint, h *clusterHealth) (loadBalancer, error) {
+		return &roundRobin{endpoints: sub, health: h}, nil
+	}
+	// rng()==0 -> r==0 -> the FIRST bucket (locality A, encounter order) is
+	// always drawn; every pick routes to A's child.
+	lw, err := newLocalityWeightedLBWithRNG(all, health, 140, true, factory, func() uint64 { return 0 })
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Fully deterministic, not a statistical draw: the wrapper always delegates
-	// to regionAChild (rng pinned to 0), and regionAChild's OWN panic branch
-	// round-robins via a persistent counter (loadbalancer.go:44-66) that cycles
-	// a0,a1,a2,a0,... on every call regardless of health — so an unhealthy host
-	// (a1 or a2) is guaranteed within the first 3 draws.
-	sawUnhealthyAHost := false
-	for i := 0; i < 3; i++ {
-		ep, release, err := lw.Pick(0, false, SubsetMatch{}, false)
+	seen := map[string]int{}
+	for i := 0; i < 100; i++ {
+		ep, _, err := lw.Pick(0, false, SubsetMatch{}, false)
 		if err != nil {
 			t.Fatal(err)
 		}
-		release()
-		if ep.Host == "a1" || ep.Host == "a2" {
-			sawUnhealthyAHost = true
+		seen[ep.Addr()]++
+	}
+	for _, dead := range []string{"a2:1", "a3:1", "a4:1"} {
+		if seen[dead] != 0 {
+			t.Errorf("degraded locality A must NOT flatten (per-locality panic-disabled): unhealthy host %s got %d picks, want 0", dead, seen[dead])
 		}
 	}
-	if !sawUnhealthyAHost {
-		t.Error("region a's local panic branch must surface an unhealthy host within 3 draws (deterministic round-robin cycling) — the documented child-local-panic coverage boundary did not reproduce")
+	if seen["a0:1"]+seen["a1:1"] == 0 {
+		t.Error("locality A's healthy hosts must still receive traffic")
+	}
+}
+
+func TestPick_LocalityPanic_IncrementsOncePerPick(t *testing.T) {
+	// AMEND-PT2 / D-PT1(iii): under cluster-wide panic the locality-weighted LB
+	// must increment lb_healthy_panic EXACTLY ONCE per pick (not twice). The
+	// flat child (shared, panic-enabled health) does the single increment via
+	// its own panicGate; the outer panicInc() is redundant and removed.
+	mkLoc := func(region string, n int) []Endpoint {
+		eps := make([]Endpoint, n)
+		for i := range eps {
+			eps[i] = Endpoint{Host: region + strconv.Itoa(i), Port: 1, Locality: LocalityID{Region: region}, LocalityWeight: 1}
+		}
+		return eps
+	}
+	all := append(append([]Endpoint{}, mkLoc("a", 2)...), mkLoc("b", 2)...)
+	health := newClusterHealth(all, 50)
+	reg := stats.NewRegistry()
+	health.panicCounter = reg.NewCounter("lb_healthy_panic")
+	for _, ep := range all { // 0/4 healthy -> cluster-wide panic
+		health.states[ep.Addr()].healthy.Store(false)
+	}
+	// Real roundRobin children bound to the shared health (the flat child's
+	// panicGate is what increments; healthLeafFactory signature from Task 5).
+	factory := func(sub []Endpoint, h *clusterHealth) (loadBalancer, error) {
+		return &roundRobin{endpoints: sub, health: h}, nil
+	}
+	lw, err := newLocalityWeightedLBWithRNG(all, health, 140, true, factory, func() uint64 { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 50
+	for i := 0; i < n; i++ {
+		if _, _, err := lw.Pick(0, false, SubsetMatch{}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := health.panicCounter.Load(); got != n {
+		t.Errorf("lb_healthy_panic = %d over %d picks, want %d (once per pick, not 2N) — AMEND-PT2", got, n, n)
 	}
 }

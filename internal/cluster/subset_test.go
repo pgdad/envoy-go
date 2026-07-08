@@ -379,3 +379,41 @@ func TestSubsetLB_PickNilCountersNoPanic(t *testing.T) {
 		t.Fatalf("nil-counter Pick must not panic/err: %v", err)
 	}
 }
+
+func TestSubsetLB_DegradedSubset_StillFlattens(t *testing.T) {
+	// AMEND-PT3 sub-question / D-PT4 (the crux asymmetry): a subset is its OWN
+	// LB host-set, so a degraded subset DOES panic per-subset (unhealthy hosts
+	// served). subsetLB is UNCHANGED by phase 54 — its children keep the SHARED
+	// (panic-enabled) health, unlike locality's new tierHealth children.
+	eps := []Endpoint{
+		epMD("h0", 1, map[string]SubsetValue{"v": {Kind: subsetString, Str: "x"}}),
+		epMD("h1", 1, map[string]SubsetValue{"v": {Kind: subsetString, Str: "x"}}),
+		epMD("h2", 1, map[string]SubsetValue{"v": {Kind: subsetString, Str: "x"}}),
+		epMD("h3", 1, map[string]SubsetValue{"v": {Kind: subsetString, Str: "x"}}),
+		epMD("h4", 1, map[string]SubsetValue{"v": {Kind: subsetString, Str: "x"}}),
+	}
+	health := newClusterHealth(eps, 50)
+	for _, dead := range []string{"h2:1", "h3:1", "h4:1"} {
+		health.states[dead].healthy.Store(false) // 2/5 = 40% < 50%
+	}
+	// The subset children CLOSE over the shared health (the manager.go:478-479
+	// wiring — UNCHANGED this phase; leafFactory, no health parameter).
+	factory := func(sub []Endpoint) (loadBalancer, error) {
+		return &roundRobin{endpoints: sub, health: health}, nil
+	}
+	s := newSubsetLB(eps, lbSubsetCfg{fallback: fallbackNoFallback, selectors: [][]string{{"v"}}}, factory)
+	match := NewSubsetMatch(map[string]SubsetValue{"v": {Kind: subsetString, Str: "x"}})
+	served := 0
+	for i := 0; i < 100; i++ {
+		ep, _, err := s.Pick(0, false, match, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ep.Addr() == "h2:1" || ep.Addr() == "h3:1" || ep.Addr() == "h4:1" {
+			served++
+		}
+	}
+	if served == 0 {
+		t.Error("a degraded subset must FLATTEN (per-subset panic, D-PT4): its unhealthy hosts must receive traffic, got 0")
+	}
+}

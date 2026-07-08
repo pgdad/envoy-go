@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -68,22 +69,22 @@ func (h *hostHealth) recordResult(ok bool, unhealthyThreshold, healthyThreshold 
 // the build-time-injected stat handles. Consulted at Pick by the LB constructs
 // (ADR-0243). nil on a Cluster with no health_checks -> the LBs use their fast path.
 type clusterHealth struct {
-	states            map[string]*hostHealth // keyed by Endpoint.Addr()
-	panicThreshold    float64                // healthy fraction below which panic fires (default 0.5; strict <)
-	membershipHealthy *stats.Gauge           // membership_healthy (injected at registerClusterMetrics; nil-guarded)
-	panicCounter      *stats.Counter         // lb_healthy_panic (injected; nil-guarded)
-	ejectionsActive   *stats.Gauge           // outlier_detection.ejections_active (injected at Task 8; nil-guarded)
+	states                map[string]*hostHealth // keyed by Endpoint.Addr()
+	panicThresholdPercent int                    // floored integer percent below which panic fires (default 50; strict <, integer cross-multiply — AMEND-PT1)
+	membershipHealthy     *stats.Gauge           // membership_healthy (injected at registerClusterMetrics; nil-guarded)
+	panicCounter          *stats.Counter         // lb_healthy_panic (injected; nil-guarded)
+	ejectionsActive       *stats.Gauge           // outlier_detection.ejections_active (injected at Task 8; nil-guarded)
 
 	// nowNanos is the injectable clock backing the lazy un-eject deadline check
 	// (overridden in unit tests for deterministic time). Defaults to wall time.
 	nowNanos func() int64
 }
 
-func newClusterHealth(endpoints []Endpoint, panicThreshold float64) *clusterHealth {
+func newClusterHealth(endpoints []Endpoint, panicThresholdPercent int) *clusterHealth {
 	ch := &clusterHealth{
-		states:         make(map[string]*hostHealth, len(endpoints)),
-		panicThreshold: panicThreshold,
-		nowNanos:       func() int64 { return time.Now().UnixNano() },
+		states:                make(map[string]*hostHealth, len(endpoints)),
+		panicThresholdPercent: panicThresholdPercent,
+		nowNanos:              func() int64 { return time.Now().UnixNano() },
 	}
 	for _, ep := range endpoints {
 		ch.states[ep.Addr()] = newHostHealth()
@@ -177,14 +178,18 @@ func (ch *clusterHealth) ejectedCount(eps []Endpoint) int {
 	return n
 }
 
-// inPanic reports whether the healthy fraction is strictly below the panic
-// threshold (exactly 50% does NOT panic).
+// inPanic reports whether the cluster is in panic mode: the healthy PERCENTAGE
+// is strictly below the FLOORED integer threshold percent. Mirrors the
+// reference EXACTLY via an integer cross-multiply (AMEND-PT1,
+// reference_percent_threshold_integer_truncation): panic iff
+// 100*availableCount < panicThresholdPercent*total (strict <, ULP-safe — no
+// float division). Exactly-at-threshold does NOT panic; total==0 -> not panic.
 func (ch *clusterHealth) inPanic(eps []Endpoint) bool {
 	total := len(eps)
 	if total == 0 {
 		return false
 	}
-	return float64(ch.availableCount(eps))/float64(total) < ch.panicThreshold
+	return 100*ch.availableCount(eps) < ch.panicThresholdPercent*total
 }
 
 // recomputeMembership Sets the membership_healthy gauge to the current healthy count.
@@ -480,14 +485,55 @@ func parseHealthChecks(c *clusterv3.Cluster, name string) ([]checkerSpec, bool, 
 	return out, hasGrpc, nil
 }
 
-// parsePanicThreshold reads common_lb_config.healthy_panic_threshold (Percent;
-// default 50%). Returns a fraction in [0,1].
-func parsePanicThreshold(c *clusterv3.Cluster) float64 {
+// validatePanicThresholdRange rejects an out-of-range healthy_panic_threshold
+// at boot, mirroring the reference's PGV [0,100] constraint (AMEND-PT4,
+// ADR-0080). STANDALONE + UNCONDITIONAL: it must fire for ANY cluster carrying
+// the field, including a plain cluster that never builds a health registry
+// (whose parsePanicThreshold call sites are all health-guarded). Exactly 0 and
+// 100 are accepted (inclusive). NaN is config-unreachable (protojson rejects a
+// NaN double at unmarshal).
+func validatePanicThresholdRange(c *clusterv3.Cluster, name string) error {
 	p := c.GetCommonLbConfig().GetHealthyPanicThreshold()
 	if p == nil {
-		return 0.5
+		return nil
 	}
-	return p.GetValue() / 100.0
+	if v := p.GetValue(); v < 0 || v > 100 {
+		return fmt.Errorf("cluster: %q: common_lb_config.healthy_panic_threshold: value must be inside range [0, 100]", name)
+	}
+	return nil
+}
+
+// parsePanicThreshold reads common_lb_config.healthy_panic_threshold (Percent;
+// default 50%) and FLOORS it to an integer percent (AMEND-PT1: the reference
+// integer-truncates the threshold toward zero before comparing). The value is
+// guaranteed in [0,100] by validatePanicThresholdRange (called earlier in
+// buildCluster, Task 4), so no clamp is needed. Returns an integer percent.
+func parsePanicThreshold(c *clusterv3.Cluster) int {
+	p := c.GetCommonLbConfig().GetHealthyPanicThreshold()
+	if p == nil {
+		return 50
+	}
+	return int(math.Floor(p.GetValue()))
+}
+
+// tierHealth returns a clusterHealth VIEW over the SAME per-host state as
+// shared (per-host available()/isHealthy() honor live health-check results
+// identically, since states is a Go map — a reference type — shared, not
+// copied) but with panic PERMANENTLY DISABLED (panicThresholdPercent: 0, so
+// inPanic can never fire — 100*avail < 0*total is never true). AMEND-P1
+// confirmed the reference applies NO per-tier panic concept: a tier at 20%
+// healthy correctly restricts its share to its healthy hosts, never
+// internally flattening across its own unhealthy ones (AMEND-P1-COROLLARY).
+// membershipHealthy/panicCounter/ejectionsActive stay nil (this view never
+// emits stats — priorityLB.Pick itself is the SOLE caller of
+// health.panicInc(), on its OWN capacity-sum bypass, below). nowNanos is
+// shared (not reset) so any outlier-ejection lazy-uneject check evaluated
+// through this view uses the identical injectable clock as the real
+// registry — outlier-detection composition with priority tiers is out of
+// scope this phase (SPEC's non-purposes list), so this is a defensive
+// consistency choice, not a tested feature.
+func tierHealth(shared *clusterHealth) *clusterHealth {
+	return &clusterHealth{states: shared.states, panicThresholdPercent: 0, nowNanos: shared.nowNanos}
 }
 
 // run is the background loop: probe immediately, then every interval until ctx done.

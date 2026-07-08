@@ -64,7 +64,7 @@ var _ loadBalancer = (*localityWeightedLB)(nil)
 // PCG (newPCGRNG, leastrequest.go:61-81 — the random.go/leastrequest.go
 // crypto-constructor/injectable-constructor split) then delegates to
 // newLocalityWeightedLBWithRNG.
-func newLocalityWeightedLB(endpoints []Endpoint, health *clusterHealth, opf uint32, hasOPF bool, factory leafFactory) (*localityWeightedLB, error) {
+func newLocalityWeightedLB(endpoints []Endpoint, health *clusterHealth, opf uint32, hasOPF bool, factory healthLeafFactory) (*localityWeightedLB, error) {
 	rng, err := newPCGRNG()
 	if err != nil {
 		return nil, err
@@ -82,7 +82,7 @@ func newLocalityWeightedLB(endpoints []Endpoint, health *clusterHealth, opf uint
 // source LocalityLbEndpoints groups resolves last-write-wins on weight, and
 // MERGES the duplicate's endpoints into the SAME group (D-LW-DUP — grouping
 // is by identity, not source-group index).
-func newLocalityWeightedLBWithRNG(endpoints []Endpoint, health *clusterHealth, opf uint32, hasOPF bool, factory leafFactory, rng func() uint64) (*localityWeightedLB, error) {
+func newLocalityWeightedLBWithRNG(endpoints []Endpoint, health *clusterHealth, opf uint32, hasOPF bool, factory healthLeafFactory, rng func() uint64) (*localityWeightedLB, error) {
 	overprovisioningFactor := opf
 	if !hasOPF {
 		overprovisioningFactor = defaultOverprovisioningFactor
@@ -98,15 +98,19 @@ func newLocalityWeightedLBWithRNG(endpoints []Endpoint, health *clusterHealth, o
 		weights[ep.Locality] = ep.LocalityWeight // last-write-wins (D-LW-DUP)
 	}
 	lw := &localityWeightedLB{allEndpoints: endpoints, health: health, overprovisioningFactor: overprovisioningFactor, rng: rng}
+	tierView := health
+	if health != nil {
+		tierView = tierHealth(health) // AMEND-PT3: per-locality children never locally panic
+	}
 	for _, id := range order {
 		members := byLocality[id]
-		child, err := factory(members)
+		child, err := factory(members, tierView) // panic-DISABLED view
 		if err != nil {
 			return nil, err
 		}
 		lw.groups = append(lw.groups, localityGroup{id: id, endpoints: members, weight: weights[id], child: child})
 	}
-	flat, err := factory(endpoints)
+	flat, err := factory(endpoints, health) // KEEPS the shared, panic-ENABLED health (§3.2/§3.3)
 	if err != nil {
 		return nil, err
 	}
@@ -139,9 +143,14 @@ func effectiveWeight(weight uint32, healthyFraction float64, overprovisioningFac
 // hashKey/hasHash/match/hasMatch pass straight through to whichever child is
 // chosen, UNCHANGED (D-LW7) — the identical forwarding shape subsetLB.Pick
 // already uses (subset.go:213-230).
+//
+// AMEND-PT2: the flat child was built with the SAME shared, panic-enabled
+// clusterHealth (newLocalityWeightedLBWithRNG above), so lw.flat.Pick's own
+// leaf-level panicGate already increments lb_healthy_panic exactly once for
+// this pick. Do NOT also call lw.health.panicInc() here — that double-counted
+// (2N over N picks) until AMEND-PT2 removed it.
 func (lw *localityWeightedLB) Pick(hashKey uint64, hasHash bool, match SubsetMatch, hasMatch bool) (Endpoint, func(), error) {
 	if lw.health != nil && lw.health.inPanic(lw.allEndpoints) {
-		lw.health.panicInc()
 		return lw.flat.Pick(hashKey, hasHash, match, hasMatch)
 	}
 	type bucket struct {

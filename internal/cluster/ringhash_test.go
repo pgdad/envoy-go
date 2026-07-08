@@ -31,7 +31,7 @@ func TestRingHash_HealthAware_WalkToNextHealthy(t *testing.T) {
 
 	// Attach a health registry and mark the primary unhealthy. 2/3 healthy = 66%
 	// > 50% -> NOT in panic; the ring walk skips the unhealthy primary.
-	ch := newClusterHealth(e, 0.5)
+	ch := newClusterHealth(e, 50)
 	rh.health = ch
 	ch.states[primary.Addr()].healthy.Store(false)
 

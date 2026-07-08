@@ -493,7 +493,7 @@ type detectorFixture struct {
 
 func newDetectorFixture(cfg outlierConfig, eps []Endpoint, enforceRoll func() uint32) detectorFixture {
 	var now int64
-	ch := newClusterHealth(eps, 0.5)
+	ch := newClusterHealth(eps, 50)
 	ch.nowNanos = func() int64 { return now }
 	reg := stats.NewRegistry()
 	ch.ejectionsActive = reg.NewGauge("outlier_detection.ejections_active")

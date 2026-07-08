@@ -85,7 +85,7 @@ func TestRandom_DoesNotAvoidHeldEndpoint(t *testing.T) {
 // available host ("b" unhealthy: draw 1 walks to "c").
 func TestRandom_HealthAware_PickSequenceUnchanged(t *testing.T) {
 	e := eps(3)
-	ch := newClusterHealth(e, 0.5)
+	ch := newClusterHealth(e, 50)
 	ch.states[e[1].Addr()].healthy.Store(false) // "b" out; 2/3 = 66% > 50% -> no panic
 	r := newRandomWithRNG(e, seqRNG(0, 1, 2, 4))
 	r.health = ch
@@ -106,7 +106,7 @@ func TestRandom_HealthAware_PickSequenceUnchanged(t *testing.T) {
 // increments once per pick.
 func TestRandom_PanicMode_BlindDraw(t *testing.T) {
 	e := eps(3)
-	ch := newClusterHealth(e, 0.5)
+	ch := newClusterHealth(e, 50)
 	reg := stats.NewRegistry()
 	ch.panicCounter = reg.NewCounter("lb_healthy_panic")
 	ch.states[e[0].Addr()].healthy.Store(false)

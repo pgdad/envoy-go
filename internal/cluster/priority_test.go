@@ -123,10 +123,10 @@ func TestCascadeLoads_EmptyCapacities(t *testing.T) {
 
 func TestTierHealth_SharesStatesButDisablesPanic(t *testing.T) {
 	ep := Endpoint{Host: "a", Port: 1}
-	shared := newClusterHealth([]Endpoint{ep}, 0.5)
+	shared := newClusterHealth([]Endpoint{ep}, 50)
 	view := tierHealth(shared)
-	if view.panicThreshold != 0 {
-		t.Errorf("view.panicThreshold = %v, want 0 (panic permanently disabled)", view.panicThreshold)
+	if view.panicThresholdPercent != 0 {
+		t.Errorf("view.panicThresholdPercent = %v, want 0 (panic permanently disabled)", view.panicThresholdPercent)
 	}
 	// The states map is the SAME map (a reference type) — mutating the shared
 	// registry's host state must be visible through the view.
@@ -134,8 +134,8 @@ func TestTierHealth_SharesStatesButDisablesPanic(t *testing.T) {
 	if view.isHealthy(ep) {
 		t.Error("view must observe LIVE health-check results via the shared states map")
 	}
-	// panicThreshold=0 means inPanic can never fire: a fraction is never
-	// strictly < 0, even at 0% available (AMEND-P1-COROLLARY's structural
+	// panicThresholdPercent=0 means inPanic can never fire: 100*avail < 0 is
+	// never true, even at 0% available (AMEND-P1-COROLLARY's structural
 	// guarantee — this is what makes a tier's own child incapable of
 	// internally flattening, Task 7's Pick-level proof).
 	if view.inPanic([]Endpoint{ep}) {
@@ -155,7 +155,7 @@ func TestTierHealth_NowNanosShared(t *testing.T) {
 	// real registry — a unit-test determinism requirement, not a priority-53
 	// feature (outlier detection composition with priority tiers is out of
 	// scope this phase, matching SPEC's non-purposes list).
-	shared := newClusterHealth(nil, 0.5)
+	shared := newClusterHealth(nil, 50)
 	var fixedNow int64 = 42
 	shared.nowNanos = func() int64 { return fixedNow }
 	view := tierHealth(shared)
@@ -164,7 +164,7 @@ func TestTierHealth_NowNanosShared(t *testing.T) {
 	}
 }
 
-// trackingPriorityFactory returns a priorityLeafFactory that builds ONE
+// trackingPriorityFactory returns a healthLeafFactory that builds ONE
 // stubLB per distinct call, recording each call's endpoint sub-slice (by
 // port-sum fingerprint) AND the health VIEW it was given (by pointer), so
 // tests can assert what newPriorityLB built and which health view each tier
@@ -175,7 +175,7 @@ type priorityFactoryCall struct {
 	health *clusterHealth
 }
 
-func trackingPriorityFactory() (priorityLeafFactory, *[]priorityFactoryCall) {
+func trackingPriorityFactory() (healthLeafFactory, *[]priorityFactoryCall) {
 	var calls []priorityFactoryCall
 	f := func(sub []Endpoint, h *clusterHealth) (loadBalancer, error) {
 		var sum uint32
@@ -196,7 +196,7 @@ func TestNewPriorityLB_GroupsByPriority(t *testing.T) {
 	tier1 := []Endpoint{{Host: "p1a", Port: 3, Priority: 1}}
 	all := append(append([]Endpoint{}, tier0...), tier1...)
 	factory, calls := trackingPriorityFactory()
-	shared := newClusterHealth(all, 0.5)
+	shared := newClusterHealth(all, 50)
 	pr, err := newPriorityLBWithRNG(all, shared, 140, true, factory, func() uint64 { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -235,8 +235,8 @@ func TestNewPriorityLB_GroupsByPriority(t *testing.T) {
 	if tierHealthViews[0] == shared {
 		t.Error("tier children must NOT receive the raw shared *clusterHealth directly — they must receive tierHealth(shared)'s panic-disabled VIEW")
 	}
-	if tierHealthViews[0].panicThreshold != 0 {
-		t.Errorf("tier children's health view panicThreshold = %v, want 0", tierHealthViews[0].panicThreshold)
+	if tierHealthViews[0].panicThresholdPercent != 0 {
+		t.Errorf("tier children's health view panicThresholdPercent = %v, want 0", tierHealthViews[0].panicThresholdPercent)
 	}
 }
 
@@ -381,7 +381,7 @@ func TestPick_ExactBoundary100_NoBypass_AllToP1(t *testing.T) {
 	tier0 := []Endpoint{{Host: "p0", Port: 1, Priority: 0}}
 	tier1 := []Endpoint{{Host: "p1", Port: 2, Priority: 1}}
 	all := append(append([]Endpoint{}, tier0...), tier1...)
-	health := newClusterHealth(all, 0.5)
+	health := newClusterHealth(all, 50)
 	health.states["p0:1"].healthy.Store(false)
 	stubs := map[uint32]*stubLB{}
 	var flat *stubLB
@@ -425,7 +425,7 @@ func TestPick_CapacityShortfall_BypassesToFlat(t *testing.T) {
 	tier0 := mkTier("t0h", 0, 1)
 	tier1 := mkTier("t1h", 1, 1)
 	all := append(append([]Endpoint{}, tier0...), tier1...)
-	health := newClusterHealth(all, 0.5)
+	health := newClusterHealth(all, 50)
 	for _, ep := range tier0[1:] {
 		health.states[ep.Addr()].healthy.Store(false)
 	}
@@ -468,7 +468,7 @@ func TestPick_CapacityShortfall_IncrementsPanicCounter(t *testing.T) {
 	tier0 := []Endpoint{{Host: "p0", Port: 1, Priority: 0}}
 	tier1 := []Endpoint{{Host: "p1", Port: 2, Priority: 1}}
 	all := append(append([]Endpoint{}, tier0...), tier1...)
-	health := newClusterHealth(all, 0.5)
+	health := newClusterHealth(all, 50)
 	panicCounter := reg.NewCounter("test.lb_healthy_panic")
 	health.panicCounter = panicCounter
 	health.states["p0:1"].healthy.Store(false)
@@ -501,7 +501,7 @@ func TestPick_PerTierChild_NeverSpraysUnhealthyHosts(t *testing.T) {
 	}
 	tier1 := []Endpoint{{Host: "t1h0", Port: 100, Priority: 1}}
 	all := append(append([]Endpoint{}, tier0...), tier1...)
-	health := newClusterHealth(all, 0.5)
+	health := newClusterHealth(all, 50)
 	for _, ep := range tier0[1:] {
 		health.states[ep.Addr()].healthy.Store(false) // 4 of 5 unhealthy → 20% healthy
 	}

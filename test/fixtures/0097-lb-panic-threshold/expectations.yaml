@@ -1,0 +1,59 @@
+# Phase-54 fixture 0097-lb-panic-threshold: differential expectations.
+#
+# Cross-side [http_connection_manager + router] fixture over ONE HTTP
+# listener l_http path-routing to THREE STATIC clusters (c_pt_a / c_pt_b /
+# c_pt_c), 5 hosts each, active HTTP health checking (path /healthz, fast
+# convergence). All 15 hosts are driver-owned toggleable HTTP responders.
+#
+# The ONLY per-cluster config difference is
+# common_lb_config.healthy_panic_threshold; every cluster is degraded to the
+# SAME fixed 2-of-5 hosts (indices 3 and 4), giving 3/5 = 60% healthy in
+# every cluster:
+#
+#   c_pt_a: { value: 80 }   -> PANICS   (60 < 80)
+#   c_pt_b: absent           -> NO panic (60 >= the 50% reference default)
+#   c_pt_c: { value: 60.9 } -> NO panic (floor(60.9)=60; 60 < 60 is FALSE --
+#                               the AMEND-PT1 integer-truncation
+#                               discriminator)
+#
+# AssertStats sequence (both sides, all three arms in-band):
+#   1. degrade hosts 3 and 4 in EACH cluster.
+#   2. poll cluster.<name>.membership_healthy == 3 for each cluster.
+#   3. warmupUntilStable per cluster path (c_pt_b/c_pt_c exclude the
+#      degraded hosts' bodies; c_pt_a uses no exclusion -- panic serves ALL
+#      hosts by design).
+#   4. drive 200 requests to each of /a, /b, /c; tally per (cluster, host).
+#   5. scrapeStats both admin endpoints.
+#
+# Assertions (both sides, exact via assertEq):
+#   c_pt_a: every one of the 5 hosts (incl the 2 degraded) has tally > 0
+#     (offset-invariant -- reference_round_robin_offset_randomized, never
+#     host identity/sequence); cluster.c_pt_a.lb_healthy_panic == 200.
+#   c_pt_b: the 2 degraded hosts have tally == 0;
+#     cluster.c_pt_b.lb_healthy_panic == 0.
+#   c_pt_c: the 2 degraded hosts have tally == 0;
+#     cluster.c_pt_c.lb_healthy_panic == 0.
+#   cluster.c_pt_{a,b,c}.membership_healthy == 3 on both sides.
+# Plus the "decode ran" guard: cluster.c_pt_a.upstream_rq_total > 0 on the
+# reference before trusting the readout.
+#
+# response-body: byte-exact required ONLY over the fixed "READY\n" Drive
+# stream (address-independent). The load-phase GET /a|/b|/c bodies are
+# tallied for the per-side per-host assertions inside AssertStats, NOT
+# byte-compared (a randomized RR selection -- cross-side per-request
+# identity is infeasible, the 0060/0065/0095/0096 lineage).
+#
+# NOT exercised by this fixture (deliberately, per SPEC §10's own scope
+# discipline): the locality/subset double-increment + retrofit interactions
+# with panic mode (UNIT-tested, SPEC §8.2); the out-of-range
+# healthy_panic_threshold boot-reject (validatePanicThresholdRange,
+# [0,100]) -- a manager_test.go UNIT test, not a separate cross-side
+# boot-reject fixture directory.
+#
+# Non-additions: NO new BackendKind (all 15 real hosts are driver-owned; the
+# one runner-spawned backend is an unreferenced HTTPEcho throwaway --
+# BackendCount()==1 satisfies the runner's >=1 contract, runner_test.go:221);
+# NO separate boot-reject cross-side dir (see above).
+response-body:
+  applicable: true
+  scope: byte-exact

@@ -139,7 +139,7 @@ func TestLeastRequest_SkewAvoidsLoadedEndpoint(t *testing.T) {
 // next available host; strict < keeps the FIRST-drawn candidate on active ties.
 func TestLeastRequest_HealthAware_PickSequenceUnchanged(t *testing.T) {
 	e := eps(3)
-	ch := newClusterHealth(e, 0.5)
+	ch := newClusterHealth(e, 50)
 	ch.states[e[1].Addr()].healthy.Store(false) // "b" out; 2/3 = 66% > 50% -> no panic
 	// choiceCount 2, draws {1, 0}: candidate 1 = draw 1 → "b" unhealthy → walks
 	// to "c" (idx 2); candidate 2 = draw 0 → "a" (idx 0). Both actives are 0, so

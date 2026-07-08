@@ -12,6 +12,7 @@ import (
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -2181,5 +2182,47 @@ func TestManager_Priority_ReadsOverprovisioningFactor(t *testing.T) {
 	cl2, _ := mgr2.Get("c_pri_opf")
 	if got := cl2.lb.(*priorityLB).overprovisioningFactor; got != 100 {
 		t.Errorf("explicit overprovisioning_factor=100: got %d, want 100", got)
+	}
+}
+
+func TestBuildCluster_RejectsPanicThresholdAbove100(t *testing.T) {
+	c := mkStaticCluster("c_pt_hi", mkLbEndpoint("127.0.0.1", 9001))
+	c.CommonLbConfig = &clusterv3.Cluster_CommonLbConfig{HealthyPanicThreshold: &typev3.Percent{Value: 150}}
+	_, err := buildCluster(c, 0, "")
+	if err == nil || !strings.Contains(err.Error(), "healthy_panic_threshold") {
+		t.Fatalf("value 150 must be rejected with a healthy_panic_threshold message; got err = %v", err)
+	}
+}
+
+func TestBuildCluster_RejectsPanicThresholdNegative(t *testing.T) {
+	c := mkStaticCluster("c_pt_lo", mkLbEndpoint("127.0.0.1", 9001))
+	c.CommonLbConfig = &clusterv3.Cluster_CommonLbConfig{HealthyPanicThreshold: &typev3.Percent{Value: -10}}
+	_, err := buildCluster(c, 0, "")
+	if err == nil || !strings.Contains(err.Error(), "healthy_panic_threshold") {
+		t.Fatalf("value -10 must be rejected; got err = %v", err)
+	}
+}
+
+func TestBuildCluster_AcceptsPanicThresholdBoundaries(t *testing.T) {
+	// Exactly 0 and 100 are ACCEPTED (inclusive) — on a PLAIN cluster (no
+	// health_checks), proving the check is unconditional yet non-over-eager.
+	for _, v := range []float64{0, 100} {
+		c := mkStaticCluster("c_pt_ok", mkLbEndpoint("127.0.0.1", 9001))
+		c.CommonLbConfig = &clusterv3.Cluster_CommonLbConfig{HealthyPanicThreshold: &typev3.Percent{Value: v}}
+		if _, err := buildCluster(c, 0, ""); err != nil {
+			t.Errorf("boundary value %v must be accepted; got err = %v", v, err)
+		}
+	}
+}
+
+func TestBuildCluster_RejectsOutOfRangeOnPlainCluster(t *testing.T) {
+	// D-PT-REJECT-PLACEMENT: a PLAIN cluster (no health_checks, no
+	// outlier_detection, no wrapper) never reaches parsePanicThreshold, yet the
+	// reference rejects an out-of-range value at boot — the STANDALONE check
+	// must still fire here (this is why folding into parsePanicThreshold fails).
+	c := mkStaticCluster("c_plain_hi", mkLbEndpoint("127.0.0.1", 9001))
+	c.CommonLbConfig = &clusterv3.Cluster_CommonLbConfig{HealthyPanicThreshold: &typev3.Percent{Value: 200}}
+	if _, err := buildCluster(c, 0, ""); err == nil {
+		t.Fatal("out-of-range panic threshold on a plain (no-HC) cluster must still be rejected")
 	}
 }

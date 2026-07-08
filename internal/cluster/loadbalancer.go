@@ -22,6 +22,15 @@ type loadBalancer interface {
 	Pick(hashKey uint64, hasHash bool, match SubsetMatch, hasMatch bool) (Endpoint, func(), error)
 }
 
+// healthLeafFactory builds a child loadBalancer over an endpoint sub-slice,
+// against an EXPLICIT health view h (rather than a value baked into the closure
+// at the manager.go call site) — required so a wrapper can hand different
+// children different health views: localityWeightedLB/priorityLB give per-group
+// children a panic-DISABLED tierHealth(health) view while keeping the flat
+// fallback on a different registry. subset.go's leafFactory (no health param)
+// is a DISTINCT type — subset children close over the shared health directly.
+type healthLeafFactory func(sub []Endpoint, h *clusterHealth) (loadBalancer, error)
+
 // noopRelease is the shared release for LB policies that hold no per-pick state
 // (roundRobin). It is a no-op; the ADR-0024 per-cluster counter is untouched.
 var noopRelease = func() {}

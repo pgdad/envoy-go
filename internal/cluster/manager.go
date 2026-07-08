@@ -434,6 +434,9 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	if err != nil {
 		return nil, err
 	}
+	if err := validatePanicThresholdRange(c, name); err != nil {
+		return nil, err
+	}
 	timeout := defaultConnectTimeout
 	if c.GetConnectTimeout() != nil {
 		timeout = c.GetConnectTimeout().AsDuration()
@@ -510,8 +513,8 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 		if hasOPF {
 			opf = opfWrapper.GetValue()
 		}
-		lw, err := newLocalityWeightedLB(endpoints, health, opf, hasOPF, func(sub []Endpoint) (loadBalancer, error) {
-			return buildLeafLB(c, name, sub, health)
+		lw, err := newLocalityWeightedLB(endpoints, health, opf, hasOPF, func(sub []Endpoint, h *clusterHealth) (loadBalancer, error) {
+			return buildLeafLB(c, name, sub, h)
 		})
 		if err != nil {
 			return nil, err

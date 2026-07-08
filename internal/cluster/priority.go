@@ -27,26 +27,6 @@ import (
 	"sort"
 )
 
-// tierHealth returns a clusterHealth VIEW over the SAME per-host state as
-// shared (per-host available()/isHealthy() honor live health-check results
-// identically, since states is a Go map — a reference type — shared, not
-// copied) but with panic PERMANENTLY DISABLED (panicThreshold: 0, so
-// inPanic can never fire — a fraction is never strictly < 0). AMEND-P1
-// confirmed the reference applies NO per-tier panic concept: a tier at 20%
-// healthy correctly restricts its share to its healthy hosts, never
-// internally flattening across its own unhealthy ones (AMEND-P1-COROLLARY).
-// membershipHealthy/panicCounter/ejectionsActive stay nil (this view never
-// emits stats — priorityLB.Pick itself is the SOLE caller of
-// health.panicInc(), on its OWN capacity-sum bypass, below). nowNanos is
-// shared (not reset) so any outlier-ejection lazy-uneject check evaluated
-// through this view uses the identical injectable clock as the real
-// registry — outlier-detection composition with priority tiers is out of
-// scope this phase (SPEC's non-purposes list), so this is a defensive
-// consistency choice, not a tested feature.
-func tierHealth(shared *clusterHealth) *clusterHealth {
-	return &clusterHealth{states: shared.states, panicThreshold: 0, nowNanos: shared.nowNanos}
-}
-
 // tierCapacity computes one tier's effective capacity AS A PERCENT (0-100):
 // min(100, overprovisioningFactor × healthyFraction) — the SAME primitive as
 // locality.go's effectiveWeight (locality.go:117-125), expressed as an
@@ -84,23 +64,6 @@ type priorityGroup struct {
 	child     loadBalancer
 }
 
-// priorityLeafFactory is a LOCAL variation on subset.go's leafFactory
-// (subset.go:131 — type leafFactory func(sub []Endpoint) (loadBalancer,
-// error), reused as-is by locality.go): it accepts the health VIEW to build
-// the leaf against as an explicit parameter, rather than a value baked into
-// the closure at the manager.go call site — required so newPriorityLB can
-// supply the SAME tierHealth(health) view to every tier child and nil to the
-// flat child from the SAME factory (D-P-FACTORY; manager.go's
-// wrap-after-switch site defines the closure as func(sub []Endpoint, h
-// *clusterHealth) (loadBalancer, error) { return buildLeafLB(c, name, sub, h) }
-// — h is now a parameter, not captured — confirmed to compile verbatim
-// against buildLeafLB's actual 4-parameter signature, Task 6).
-//
-// This is a PHASE-53-LOCAL type, distinct from subset.go's leafFactory —
-// subset.go/locality.go's call sites and the shared leafFactory type stay
-// completely untouched (D-P-FACTORY).
-type priorityLeafFactory func(sub []Endpoint, h *clusterHealth) (loadBalancer, error)
-
 // priorityLB is a per-cluster WRAPPER load balancer (ADR-0270). Built ONCE at
 // cluster construction when the cluster's endpoints span more than one
 // distinct Priority value (tier membership never changes post-boot — no
@@ -128,7 +91,7 @@ var _ loadBalancer = (*priorityLB)(nil)
 // newPriorityLBWithRNG.
 //
 //nolint:unused // called from manager.go's wrap-after-switch site (Task 6)
-func newPriorityLB(endpoints []Endpoint, health *clusterHealth, opf uint32, hasOPF bool, factory priorityLeafFactory) (*priorityLB, error) {
+func newPriorityLB(endpoints []Endpoint, health *clusterHealth, opf uint32, hasOPF bool, factory healthLeafFactory) (*priorityLB, error) {
 	rng, err := newPCGRNG()
 	if err != nil {
 		return nil, err
@@ -151,7 +114,7 @@ func newPriorityLB(endpoints []Endpoint, health *clusterHealth, opf uint32, hasO
 // divergence-risk rationale versus locality.go's flat child), and resolves
 // the overprovisioning_factor absent/explicit-zero distinction (D-LW-OPF0's
 // exact pattern, reused verbatim for the SAME proto field).
-func newPriorityLBWithRNG(endpoints []Endpoint, health *clusterHealth, opf uint32, hasOPF bool, factory priorityLeafFactory, rng func() uint64) (*priorityLB, error) {
+func newPriorityLBWithRNG(endpoints []Endpoint, health *clusterHealth, opf uint32, hasOPF bool, factory healthLeafFactory, rng func() uint64) (*priorityLB, error) {
 	overprovisioningFactor := opf
 	if !hasOPF {
 		overprovisioningFactor = defaultOverprovisioningFactor // locality.go:39 — the SAME package-level constant, reused verbatim (not redefined)

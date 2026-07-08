@@ -50,7 +50,7 @@ func TestHostHealth_Transitions(t *testing.T) {
 
 func TestClusterHealth_View(t *testing.T) {
 	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}, {Host: "10.0.0.2", Port: 80}, {Host: "10.0.0.3", Port: 80}}
-	ch := newClusterHealth(eps, 0.5)
+	ch := newClusterHealth(eps, 50)
 	if ch.healthyCount(eps) != 3 || ch.inPanic(eps) {
 		t.Fatal("all healthy: count 3, no panic")
 	}
@@ -69,7 +69,7 @@ func TestClusterHealth_View(t *testing.T) {
 
 func TestClusterHealth_StatHandles(t *testing.T) {
 	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}, {Host: "10.0.0.2", Port: 80}}
-	ch := newClusterHealth(eps, 0.5)
+	ch := newClusterHealth(eps, 50)
 
 	// nil-guarded: no panic before the stat handles are injected.
 	ch.recomputeMembership(eps)
@@ -151,7 +151,7 @@ func TestHealthChecker_ProbeOnce(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
 	defer srv.Close()
 	eps := []Endpoint{addrEndpoint(srv.Listener.Addr().String()), {Host: "127.0.0.1", Port: 1}}
-	ch := newClusterHealth(eps, 0.5)
+	ch := newClusterHealth(eps, 50)
 	reg := stats.NewRegistry()
 	hc := newHealthChecker(eps, ch, checkerSpec{
 		interval:  time.Second,
@@ -474,23 +474,83 @@ func TestParseHealthChecks_Grpc(t *testing.T) {
 	}
 }
 
-func TestParsePanicThreshold(t *testing.T) {
-	if got := parsePanicThreshold(&clusterv3.Cluster{}); got != 0.5 {
-		t.Fatalf("nil common_lb_config: got %v, want 0.5", got)
+// mkPanicEps builds n plain endpoints (strconv is already imported).
+func mkPanicEps(n int) []Endpoint {
+	eps := make([]Endpoint, n)
+	for i := range eps {
+		eps[i] = Endpoint{Host: "h" + strconv.Itoa(i), Port: 1}
 	}
-	c := &clusterv3.Cluster{
-		CommonLbConfig: &clusterv3.Cluster_CommonLbConfig{
-			HealthyPanicThreshold: &typev3.Percent{Value: 70},
-		},
+	return eps
+}
+
+func TestParsePanicThreshold_FloorsToIntegerPercent(t *testing.T) {
+	// AMEND-PT1: the reference integer-TRUNCATES (floors) the configured
+	// threshold to a whole percent before comparing. parsePanicThreshold now
+	// returns an integer percent (D-PT-STORE); floor, NOT round.
+	cases := []struct {
+		value float64
+		want  int
+	}{
+		{0, 0},     // explicit 0 disables (D-PT2)
+		{50, 50},   // integer — unchanged
+		{60.9, 60}, // floor(60.9) == 60 (the AMEND-PT1 divergence value)
+		{66.7, 66}, // floor, not round-half-up (66.7 -> 66)
+		{66.5, 66}, // floor, refuting round (66.5 -> 66)
+		{100, 100}, // boundary accepted
 	}
-	if got := parsePanicThreshold(c); got != 0.7 {
-		t.Fatalf("Percent{70}: got %v, want 0.7", got)
+	for _, c := range cases {
+		cl := &clusterv3.Cluster{
+			CommonLbConfig: &clusterv3.Cluster_CommonLbConfig{
+				HealthyPanicThreshold: &typev3.Percent{Value: c.value},
+			},
+		}
+		if got := parsePanicThreshold(cl); got != c.want {
+			t.Errorf("parsePanicThreshold(%.1f) = %d, want %d", c.value, got, c.want)
+		}
+	}
+}
+
+func TestParsePanicThreshold_AbsentDefaults50(t *testing.T) {
+	if got := parsePanicThreshold(&clusterv3.Cluster{}); got != 50 {
+		t.Errorf("absent common_lb_config: got %d, want 50", got)
+	}
+}
+
+func TestInPanic_IntegerCrossMultiply(t *testing.T) {
+	// AMEND-PT1: panic iff 100*available < panicThresholdPercent*total (strict <).
+	mk := func(healthy, total, thresholdPercent int) bool {
+		eps := mkPanicEps(total)
+		ch := newClusterHealth(eps, thresholdPercent)
+		for i := healthy; i < total; i++ {
+			ch.states[eps[i].Addr()].healthy.Store(false)
+		}
+		return ch.inPanic(eps)
+	}
+	cases := []struct {
+		healthy, total, threshold int
+		wantPanic                 bool
+		note                      string
+	}{
+		{3, 5, 60, false, "60% at floor(60.9)=60: 300 < 300 false -> NO panic (the AMEND-PT1 divergence; pre-fix 0.60<0.609 wrongly panicked)"},
+		{3, 5, 80, true, "60% at 80: 300 < 400 -> panic"},
+		{3, 5, 50, false, "60% at 50: 300 < 250 false -> no panic"},
+		{2, 3, 67, true, "66.67% at 67: 200 < 201 -> panic"},
+		{2, 3, 66, false, "66.67% at floor(66.7)=66: 200 < 198 false -> no panic"},
+		{2, 5, 50, true, "40% at 50: 200 < 250 -> panic (absent-default arm, D-PT1)"},
+		{1, 5, 0, false, "threshold 0 disables: 100 < 0 never true -> no panic even at 20%"},
+		{0, 0, 50, false, "empty set never panics"},
+	}
+	for _, c := range cases {
+		if got := mk(c.healthy, c.total, c.threshold); got != c.wantPanic {
+			t.Errorf("inPanic(healthy=%d,total=%d,threshold=%d) = %v, want %v — %s",
+				c.healthy, c.total, c.threshold, got, c.wantPanic, c.note)
+		}
 	}
 }
 
 func TestIsEjected_UnknownAddr(t *testing.T) {
 	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}}
-	ch := newClusterHealth(eps, 0.5)
+	ch := newClusterHealth(eps, 50)
 	unknown := Endpoint{Host: "10.0.0.9", Port: 80}
 	if ch.isEjected(unknown) {
 		t.Fatal("unknown addr must not be ejected")
@@ -499,7 +559,7 @@ func TestIsEjected_UnknownAddr(t *testing.T) {
 
 func TestEject_ThenAvailableFalse(t *testing.T) {
 	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}, {Host: "10.0.0.2", Port: 80}}
-	ch := newClusterHealth(eps, 0.5)
+	ch := newClusterHealth(eps, 50)
 	now := int64(1_000_000_000)
 	ch.nowNanos = func() int64 { return now }
 	h := ch.states["10.0.0.2:80"]
@@ -518,7 +578,7 @@ func TestEject_ThenAvailableFalse(t *testing.T) {
 
 func TestLazyUneject(t *testing.T) {
 	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}}
-	ch := newClusterHealth(eps, 0.5)
+	ch := newClusterHealth(eps, 50)
 	reg := stats.NewRegistry()
 	ch.ejectionsActive = reg.NewGauge("ejections_active")
 	base := int64(2_000_000_000)
@@ -564,7 +624,7 @@ func TestLazyUneject(t *testing.T) {
 // decrements ejections_active exactly once.
 func TestAvailable_LazyUnejects(t *testing.T) {
 	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}}
-	ch := newClusterHealth(eps, 0.5)
+	ch := newClusterHealth(eps, 50)
 	reg := stats.NewRegistry()
 	ch.ejectionsActive = reg.NewGauge("ejections_active")
 	base := int64(2_000_000_000)
@@ -597,7 +657,7 @@ func TestAvailable_LazyUnejects(t *testing.T) {
 // pre-fusion isHealthy && !isEjected short-circuit).
 func TestAvailable_UnhealthyShortCircuitsEjectionCheck(t *testing.T) {
 	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}}
-	ch := newClusterHealth(eps, 0.5)
+	ch := newClusterHealth(eps, 50)
 	now := int64(3_000_000_000)
 	ch.nowNanos = func() int64 { return now }
 	h := ch.states["10.0.0.1:80"]
@@ -615,7 +675,7 @@ func TestAvailable_UnhealthyShortCircuitsEjectionCheck(t *testing.T) {
 
 func TestAvailable_NoOutlier(t *testing.T) {
 	eps := []Endpoint{{Host: "10.0.0.1", Port: 80}, {Host: "10.0.0.2", Port: 80}, {Host: "10.0.0.3", Port: 80}}
-	ch := newClusterHealth(eps, 0.5)
+	ch := newClusterHealth(eps, 50)
 	ch.states["10.0.0.2:80"].healthy.Store(false) // one unhealthy, none ejected
 	for _, ep := range eps {
 		if ch.available(ep) != ch.isHealthy(ep) {
@@ -624,5 +684,42 @@ func TestAvailable_NoOutlier(t *testing.T) {
 	}
 	if ch.availableCount(eps) != ch.healthyCount(eps) {
 		t.Fatalf("availableCount=%d != healthyCount=%d with no ejection", ch.availableCount(eps), ch.healthyCount(eps))
+	}
+}
+
+func TestPanicGate_DisableAtZero(t *testing.T) {
+	// D-PT2: explicit {value:0} (parsePanicThreshold -> 0) disables panic
+	// entirely — even at 20% healthy, panicGate does NOT bypass.
+	eps := mkPanicEps(5)
+	ch := newClusterHealth(eps, 0)
+	for i := 1; i < 5; i++ {
+		ch.states[eps[i].Addr()].healthy.Store(false) // 1/5 = 20% healthy
+	}
+	if ch.panicGate(eps) {
+		t.Error("threshold 0 must NEVER panic (disable-at-0, D-PT2), even at 20% healthy")
+	}
+}
+
+func TestPanicGate_ExactlyAtThreshold_NoPanic(t *testing.T) {
+	// D-PT1(i): strict < — exactly at the threshold does NOT panic.
+	eps := mkPanicEps(5)
+	ch := newClusterHealth(eps, 60)
+	for i := 3; i < 5; i++ {
+		ch.states[eps[i].Addr()].healthy.Store(false) // 3/5 = exactly 60%
+	}
+	if ch.panicGate(eps) {
+		t.Error("60% healthy at a 60% threshold must NOT panic (strict <, D-PT1 i)")
+	}
+}
+
+func TestPanicGate_AbsentDefault50_PanicsBelow(t *testing.T) {
+	// D-PT2: absent threshold defaults to 50%; 2/5 = 40% < 50% -> panic.
+	eps := mkPanicEps(5)
+	ch := newClusterHealth(eps, parsePanicThreshold(&clusterv3.Cluster{})) // == 50
+	for i := 2; i < 5; i++ {
+		ch.states[eps[i].Addr()].healthy.Store(false) // 2/5 = 40%
+	}
+	if !ch.panicGate(eps) {
+		t.Error("40% healthy at the absent-default 50% threshold must panic")
 	}
 }

@@ -125,7 +125,7 @@ func TestRoundRobin_ReleaseIsNonNilNoop(t *testing.T) {
 // (incl. unhealthy) and increments lb_healthy_panic.
 func TestRoundRobin_HealthAware(t *testing.T) {
 	e := eps(3) // addrs "a:1000", "b:1001", "c:1002"
-	ch := newClusterHealth(e, 0.5)
+	ch := newClusterHealth(e, 50)
 	rr := &roundRobin{endpoints: e, health: ch}
 
 	// Mark one unhealthy: 2/3 = 66% > 50% -> NOT in panic; that host is skipped.
