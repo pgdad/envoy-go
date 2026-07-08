@@ -181,6 +181,36 @@ func TestDifferential(t *testing.T) {
 	}
 }
 
+// startSubjectWithRetry allocates a probed port block (freeTCPPortBlock) for
+// the subject's base listener port plus a fresh admin port, renders the
+// config via render, and starts the subject — retrying the whole
+// allocate→render→start sequence on any start error (bounded at 3, with a
+// short growing backoff so a burst of ephemeral-socket churn can drain).
+//
+// Multi-listener fixtures derive listener ports as subjPort+1..+N without
+// reserving them, so even a probed block can race a bind in the window
+// between the probe's close and envoy-go's bind (seen on CI and under
+// full-suite load as "address already in use" followed by "subject ready:
+// EOF"). We retry on ANY start error because the collision is not
+// classifiable from the returned error — the subject dies before the ready
+// sentinel, so all that surfaces is "subject ready: EOF".
+func startSubjectWithRetry(ctx context.Context, t *testing.T, root string, render func(subjPort, subjAdminPort int) string) *SubjectProxy {
+	t.Helper()
+	for attempt := 1; ; attempt++ {
+		subjPort := freeTCPPortBlock(t)
+		subjAdminPort := freeTCPPort(t)
+		subj, err := StartSubjectProxy(ctx, root, render(subjPort, subjAdminPort), fmt.Sprintf("127.0.0.1:%d", subjAdminPort))
+		if err == nil {
+			return subj
+		}
+		if attempt >= 3 {
+			t.Fatalf("subj start (attempt %d): %v", attempt, err)
+		}
+		t.Logf("subj start attempt %d failed (%v); retrying with fresh ports", attempt, err)
+		time.Sleep(time.Duration(attempt) * 300 * time.Millisecond)
+	}
+}
+
 func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDriver) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -1133,32 +1163,11 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	defer func() { _ = ref.Stop(context.Background()) }()
 	refAddr := ref.ListenerAddr(d.ReferenceListenerPort())
 
-	// 3. Subject proxy.
-	//
-	// Multi-listener fixtures derive ports as subjPort+1..+N without reserving
-	// them, so a freshly-allocated base port can collide with a port grabbed in
-	// the window between freeTCPPort's close and envoy-go's bind. Retry the whole
-	// allocate→render→start sequence on bind collisions (seen on CI as
-	// "address already in use" followed by "subject ready: EOF").
-	//
-	// We retry on any start error (bounded at 3) because the collision is not
-	// classifiable from the returned error — the subject dies before the ready
-	// sentinel, so all that surfaces is "subject ready: EOF".
-	var subj *SubjectProxy
-	for attempt := 1; ; attempt++ {
-		subjPort := freeTCPPort(t)
-		subjAdminPort := freeTCPPort(t)
-		subjCfg := d.SubjectConfig(d.ReferenceListenerPort(), subjPort, backendPorts, subjAdminPort)
-		var serr error
-		subj, serr = StartSubjectProxy(ctx, root, subjCfg, fmt.Sprintf("127.0.0.1:%d", subjAdminPort))
-		if serr == nil {
-			break
-		}
-		if attempt >= 3 {
-			t.Fatalf("subj start (attempt %d): %v", attempt, serr)
-		}
-		t.Logf("subj start attempt %d failed (%v); retrying with fresh ports", attempt, serr)
-	}
+	// 3. Subject proxy (allocate→render→start with retry; see
+	// startSubjectWithRetry for the bind-collision rationale).
+	subj := startSubjectWithRetry(ctx, t, root, func(subjPort, subjAdminPort int) string {
+		return d.SubjectConfig(d.ReferenceListenerPort(), subjPort, backendPorts, subjAdminPort)
+	})
 	defer func() { _ = subj.Stop() }()
 
 	// 4. Snapshot baseline accept counts before driving ref (the reference
@@ -1319,13 +1328,9 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			t.Fatalf("alt ref start: %v", err)
 		}
 		defer func() { _ = altRef.Stop(context.Background()) }()
-		altSubjPort := freeTCPPort(t)
-		altSubjAdminPort := freeTCPPort(t)
-		altSubjCfg := acd.AlternateSubjectConfig(altRefPort, altSubjPort, backendPorts, altSubjAdminPort)
-		altSubj, err := StartSubjectProxy(ctx, root, altSubjCfg, fmt.Sprintf("127.0.0.1:%d", altSubjAdminPort))
-		if err != nil {
-			t.Fatalf("alt subj start: %v", err)
-		}
+		altSubj := startSubjectWithRetry(ctx, t, root, func(subjPort, subjAdminPort int) string {
+			return acd.AlternateSubjectConfig(altRefPort, subjPort, backendPorts, subjAdminPort)
+		})
 		defer func() { _ = altSubj.Stop() }()
 		altRefAddr := altRef.ListenerAddr(altRefPort)
 		altSubjAddr := altSubj.ListenerAddr(acd.AlternateSubjectListenerName())
@@ -2009,17 +2014,12 @@ func startEchoBackend(ctx context.Context, repoRoot string, port int) (*exec.Cmd
 // the refListenerPort argument.
 func runReferenceLessFixture(ctx context.Context, t *testing.T, root string, d FixtureDriver, backendPorts []int) {
 	t.Helper()
-	// Subject proxy.
-	// NOTE: no bind-collision retry here (see runFixture's subject-start retry
-	// loop); extend it to this site if the 0036/0034-style flake shape ever
-	// appears in this runner.
-	subjPort := freeTCPPort(t)
-	subjAdminPort := freeTCPPort(t)
-	subjCfg := d.SubjectConfig(0, subjPort, backendPorts, subjAdminPort)
-	subj, err := StartSubjectProxy(ctx, root, subjCfg, fmt.Sprintf("127.0.0.1:%d", subjAdminPort))
-	if err != nil {
-		t.Fatalf("subj start: %v", err)
-	}
+	// Subject proxy (allocate→render→start with retry — the flake shape the
+	// prior NOTE here anticipated appeared as 0024's single-attempt fast-fail;
+	// see startSubjectWithRetry).
+	subj := startSubjectWithRetry(ctx, t, root, func(subjPort, subjAdminPort int) string {
+		return d.SubjectConfig(0, subjPort, backendPorts, subjAdminPort)
+	})
 	defer func() { _ = subj.Stop() }()
 
 	// Drive subj. The driver's DriveSubject returns whatever bytes it captures

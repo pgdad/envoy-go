@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -166,6 +167,54 @@ func freeTCPPort(t *testing.T) int {
 	}
 	defer func() { _ = ln.Close() }()
 	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// subjectPortBlockSpan is the number of consecutive ports probed by
+// freeTCPPortBlock. Multi-listener fixtures derive listener ports as
+// subjPort+1..+N without reserving them (0036 derives 12); 16 covers every
+// current fixture with headroom.
+const subjectPortBlockSpan = 16
+
+// subjectPortBlockCursor strides freeTCPPortBlock's candidate bases so
+// concurrent subtests never probe the same block within a wrap
+// (11008/16 = 688 blocks per wrap).
+var subjectPortBlockCursor atomic.Uint32
+
+// freeTCPPortBlock returns a base port whose full derived block
+// [base, base+subjectPortBlockSpan) was observed bindable (on the wildcard
+// address, matching the subject's own 0.0.0.0 listener binds) at allocation
+// time. Bases come from 20000..31007 — BELOW the kernel ephemeral range
+// (net.ipv4.ip_local_port_range, 32768+ by default) that freeTCPPort draws
+// from — so the subject's derived, never-reserved listener ports don't race
+// the ephemeral source ports of concurrent suite traffic (the documented
+// bind-collision flake at the subject-start retry loop; ~8% of the ephemeral
+// range was observed busy under Docker Desktop + full-suite load). Ports are
+// probed then closed, so a small race window remains — the subject-start
+// retry loop is the second line of defense.
+func freeTCPPortBlock(t *testing.T) int {
+	t.Helper()
+	for tries := 0; tries < 256; tries++ {
+		slot := subjectPortBlockCursor.Add(1)
+		base := 20000 + int(slot*subjectPortBlockSpan%11008)
+		ok := true
+		var lns []net.Listener
+		for p := base; p < base+subjectPortBlockSpan; p++ {
+			ln, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
+			if err != nil {
+				ok = false
+				break
+			}
+			lns = append(lns, ln)
+		}
+		for _, ln := range lns {
+			_ = ln.Close()
+		}
+		if ok {
+			return base
+		}
+	}
+	t.Logf("freeTCPPortBlock: no fully-free %d-port block after 256 tries; falling back to an ephemeral base", subjectPortBlockSpan)
+	return freeTCPPort(t)
 }
 
 // TestHostGatewayIP verifies that HostGatewayIP returns a non-empty literal IP
