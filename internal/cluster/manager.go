@@ -387,6 +387,18 @@ func buildLeafLB(c *clusterv3.Cluster, name string, endpoints []Endpoint, health
 	}
 }
 
+// distinctPriorities returns the set of distinct Endpoint.Priority values
+// present in endpoints. Used only for its cardinality — len(...) > 1 gates
+// the priorityLB wrap (SPEC §3.3); order is immaterial here (newPriorityLB
+// does its own ascending sort at construction, priority.go Task 4).
+func distinctPriorities(endpoints []Endpoint) map[uint32]struct{} {
+	set := make(map[uint32]struct{}, len(endpoints))
+	for _, ep := range endpoints {
+		set[ep.Priority] = struct{}{}
+	}
+	return set
+}
+
 func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, error) {
 	name := c.GetName()
 	if name == "" {
@@ -505,6 +517,40 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 			return nil, err
 		}
 		lb = lw
+	}
+	// Phase 53 (ADR-0270): the THIRD wrap-after-switch site. sc/lwc are
+	// ALREADY in scope from the two switches above (both declared via := at
+	// function scope, never reassigned) — reused directly, not re-derived.
+	priorityTiers := distinctPriorities(endpoints)
+	switch {
+	case len(priorityTiers) > 1 && lwc != nil:
+		return nil, fmt.Errorf("cluster: %q: common_lb_config.locality_weighted_lb_config cannot be combined with multi-tier LocalityLbEndpoints.priority", name)
+	case len(priorityTiers) > 1 && sc != nil:
+		return nil, fmt.Errorf("cluster: %q: lb_subset_config cannot be combined with multi-tier LocalityLbEndpoints.priority", name)
+	case len(priorityTiers) > 1:
+		// D-P-HEALTHALLOC (the D-LW-HEALTHALLOC precedent reapplied): a
+		// priority-tiered cluster ALWAYS needs clusterHealth.availableCount
+		// to be CALLABLE, even with zero health_checks configured (a
+		// well-defined 100%-healthy-everywhere fast path).
+		if health == nil {
+			health = newClusterHealth(endpoints, parsePanicThreshold(c))
+		}
+		// D-LW-OPF0's exact pattern, reused verbatim (NOT re-derived): the
+		// wrapper's PRESENCE is checked BEFORE .GetValue() so an explicit
+		// {value: 0} is honored literally.
+		opfWrapper := la.GetPolicy().GetOverprovisioningFactor()
+		var opf uint32
+		hasOPF := opfWrapper != nil
+		if hasOPF {
+			opf = opfWrapper.GetValue()
+		}
+		pr, err := newPriorityLB(endpoints, health, opf, hasOPF, func(sub []Endpoint, h *clusterHealth) (loadBalancer, error) {
+			return buildLeafLB(c, name, sub, h)
+		})
+		if err != nil {
+			return nil, err
+		}
+		lb = pr
 	}
 	cl.lb = lb
 	cl.health = health
@@ -817,6 +863,7 @@ func extractEndpoints(la *endpointv3.ClusterLoadAssignment, clusterName string) 
 		l := group.GetLocality() // nil-safe: (*corev3.Locality)(nil).GetRegion() == ""
 		loc := LocalityID{Region: l.GetRegion(), Zone: l.GetZone(), SubZone: l.GetSubZone()}
 		weight := group.GetLoadBalancingWeight().GetValue() // 0 when unset — AMEND-LW2, no default
+		priority := group.GetPriority()                     // plain uint32; 0 == omitted == explicit-zero (AMEND-P3)
 		for ei, lbe := range group.GetLbEndpoints() {
 			ep := lbe.GetEndpoint()
 			if ep == nil {
@@ -831,7 +878,7 @@ func extractEndpoints(la *endpointv3.ClusterLoadAssignment, clusterName string) 
 				return nil, fmt.Errorf("cluster: %q: endpoints[%d].lb_endpoints[%d]: only socket_address endpoints supported", clusterName, gi, ei)
 			}
 			scalars, _ := ScalarsFromStruct(lbe.GetMetadata().GetFilterMetadata()["envoy.lb"]) // drop non-scalar keys
-			e := Endpoint{Host: sa.GetAddress(), Port: sa.GetPortValue(), Metadata: scalars, Locality: loc, LocalityWeight: weight}
+			e := Endpoint{Host: sa.GetAddress(), Port: sa.GetPortValue(), Metadata: scalars, Locality: loc, LocalityWeight: weight, Priority: priority}
 			e.addr = e.Addr() // precompute the hot-path Addr() string once at build time
 			out = append(out, e)
 		}

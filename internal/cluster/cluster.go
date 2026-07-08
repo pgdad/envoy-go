@@ -58,6 +58,14 @@ type Endpoint struct {
 	// locality ZERO load whenever a sibling locality has an explicit weight).
 	// Only consulted by localityWeightedLB.
 	LocalityWeight uint32
+	// Priority is the tier number captured from the owning LocalityLbEndpoints
+	// group's priority field (phase 53; the THIRD per-endpoint dimension after
+	// Metadata and Locality/LocalityWeight). Unlike LocalityWeight/
+	// overprovisioning_factor, priority is a PLAIN uint32 proto field (no
+	// wrapper type) — 0 is both the explicit-zero AND the omitted value,
+	// meaning "highest-priority tier" (AMEND-P3). Only consulted by
+	// priorityLB. NOT part of the dial identity.
+	Priority uint32
 
 	// addr is the Addr() string precomputed at extractEndpoints time (the pick
 	// hot path — health scans, pool/hash keys — calls Addr() per host; caching
