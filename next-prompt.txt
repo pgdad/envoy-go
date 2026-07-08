@@ -1,45 +1,53 @@
 === AUTONOMOUS LOOP CONTROL (read FIRST) ===
 This file is a SELF-ADVANCING router for driving the project forward one stage at a time. Each session performs EXACTLY ONE lifecycle stage of the active phase (BRAINSTORM → SPEC → PLAN → IMPL — one stage per session, the project discipline), lands it (commit + push per `feedback_push_to_origin`), then ROLLS THIS FILE FORWARD to point at the next stage.
 
-TERMINATION SENTINEL: if — and ONLY if — ALL work is complete (every chartered ROADMAP row/phase is `done`, EVERY family's deferred-candidate list is ALSO empty, and STATE.md's NEXT shows there is NO next stage left to perform), create an empty file named `stop` at the git root with `: > /home/esa/git/envoy-go/stop` and EXIT without further action. (The sentinel does NOT apply right now — phase 54 IS `done` and the Load-balancing family HAS closed, BUT the Observability family and the Operational-tooling family both still carry non-empty deferred-candidate lists, so future work remains. Do NOT create `stop`.)
+TERMINATION SENTINEL: if — and ONLY if — ALL work is complete (every chartered ROADMAP row/phase is `done`, EVERY family's deferred-candidate list is ALSO empty, and STATE.md's NEXT shows there is NO next stage left to perform), create an empty file named `stop` at the git root with `: > /home/esa/git/envoy-go/stop` and EXIT without further action.
 
-**STATUS AS OF 2026-07-08: phase 54 (`load-balancer-panic-threshold`) IMPL is DONE and LANDED (squash `e06e88ec`, row 54 `in-progress → done`, lifecycle-state 3 → done). The Load-balancing family has CLOSED (the FOURTH family to close, after HTTP-filters @ 25.3 / Network-filters @ 33 / Upstream-robustness @ 43). There is NO chartered phase currently in-progress.**
+**SENTINEL RE-CHECKED 2026-07-08 against `docs/envoy-go/ROADMAP.md` §"Feature Families (09+)" — it does NOT fire. Do NOT create `stop`.** Evidence: (a) the **Observability family** STAYS OPEN with deferred candidates — `graphite` + OTLP-metrics sinks, the plain-statsd `tcp_cluster_name` transport, tracing `custom_tags`/`spawn_upstream_span`/`http_service`/force-trace, and the tap filter; (b) the **Operational-tooling family** STAYS OPEN with deferred candidates — xDS-sourced (not just static-file) dry-validation, an admin-API live-reload-and-validate endpoint, an RTDS/SDS validate companion; (c) FIVE families have never been opened at all — **HTTP/3 + QUIC**, **gRPC**, **xDS / dynamic config**, **Runtime + hot restart**, **WASM host**. Substantial work remains.
 
-- **What just landed (phase 54, the EIGHTH and FINAL Load-balancing-family row):** `healthy_panic_threshold` turned from a consumed-but-never-proven field into a proven, hardened construct. Four evidence-driven corrections (AMEND-PT1 integer-truncation floor + integer cross-multiply / AMEND-PT2 `lb_healthy_panic` double-increment removal / AMEND-PT3 locality child-local-panic retrofit / AMEND-PT4 out-of-range `[0,100]` reject) + the first-ever differential proof (`0097-lb-panic-threshold`, three arms). Counts now: fixtures **99**, fuzzers **52**, stat surface **1200**, BackendKind **38**, DECISIONS tail **ADR-0271**.
+**STATUS AS OF 2026-07-08: phase 54 (`load-balancer-panic-threshold`) IMPL is DONE and LANDED (squash `e06e88ec`, row 54 `done`). The Load-balancing family CLOSED (the FOURTH family to close, after HTTP-filters @ 25.3 / Network-filters @ 33 / Upstream-robustness @ 43). ZERO ROADMAP rows are `in-progress`. The loop is RE-OPENED and the next phase is CHARTERED below.**
 
-==============================================
-
-## THE NEXT ACTION: a human charters the next phase (the loop PAUSES here)
-
-The autonomous loop self-advances through the STAGES of a chartered phase, but choosing the NEXT PHASE from the deferred-candidate pool is a HUMAN decision (the ROADMAP §9 convention: "Do not pre-populate rows for unbrainstormed phases"; phase 54 itself was "Picked by a human as the family's LAST remaining candidate"). With the Load-balancing family closed and NO phase in-progress, the project has reached a natural human-selection checkpoint.
-
-**This session should:**
-1. Re-verify the cold-start baselines (below) against master tip `e06e88ec`.
-2. Surface to the human the OPEN families and their deferred-candidate lists so they can pick the next phase to charter. The two families with non-empty deferred candidates are:
-   - **Observability** (tracing / access-log / stats-sink extensions — read the ROADMAP §9 Observability family heading + the phase-44..49 rows' "Deferred surface" notes for the live candidate list).
-   - **Operational tooling** (the family opened at phase 51 `bootstrap-validate-mode`, ADR-0268 — read its "Deferred surface" note for candidates).
-   Enumerate the actual candidates from `docs/envoy-go/ROADMAP.md` (do NOT trust this summary — read the source) and present them.
-3. Once the human picks a candidate, register a new ROADMAP row `in-progress`, invoke `superpowers:brainstorming`, and perform that phase's BRAINSTORM (the lifecycle-stage-0 → 1 step). Then land it (commit + push) and ROLL THIS FILE FORWARD to point at that phase's SPEC.
-
-If the human is not present to pick, do NOT guess a phase or invent a row — report that the Load-balancing family is closed, that no phase is chartered, and present the deferred-candidate menu, then stop and await selection. (The `stop` sentinel is NOT the right action — work remains; `stop` is only for total project completion.)
+**THE NEXT ACTION: the phase-55 (`stats-sink-statsd-tcp`) BRAINSTORM.**
 
 ==============================================
+
+## The chartered phase: 55 — `stats-sink-statsd-tcp` (the plain-statsd `tcp_cluster_name` transport)
+
+- **Why this candidate.** It is the CHEAPEST remaining follow-on and has an exact, recent precedent: **phase 50 (`stats-sink-dogstatsd-batching`) lifted the phase-49 `max_bytes_per_datagram` strict-reject**; phase 55 lifts the *phase-48* `tcp_cluster_name` strict-reject the same way. The as-built reject is live and byte-stable at `internal/bootstrap/bootstrap.go:567-568`:
+  ```go
+  if sd.GetTcpClusterName() != "" {
+      return fmt.Errorf("bootstrap: stats_sinks[%d]: statsd tcp_cluster_name is not supported (envoy-go is UDP-only; configure address.socket_address)", idx)
+  }
+  ```
+  Phase 48 (ADR-0265) deliberately scoped to the UDP `address` variant and DEFERRED + strict-rejected `tcp_cluster_name` (Q1 of its BRAINSTORM dialogue). This row consumes that deferral: the EIGHTH Observability-family row.
+- **What it reuses (maximal landed substrate — this is the point).** The phase-47 `Flusher`/`Sink` seam (`internal/statssink/flusher.go`, `sink.go`) UNCHANGED; the phase-48 statsd line-protocol emitter + the sink-private always-on `deltaState` (`internal/statssink/statsd.go`, `delta.go`) UNCHANGED in its *formatting*; the `stats_sinks[]` dispatch arm + `parseStatsdSinkConfig` (`internal/bootstrap/bootstrap.go`); the `cmd/envoy-go/main.go` sink build loop.
+- **What is genuinely NEW (and therefore the BRAINSTORM's real work).** A **TCP transport** for a stats sink. envoy-go's statsd sink today owns a `*net.UDPConn` (`internal/statssink/udp.go`). `tcp_cluster_name` names a *cluster*, so the write path must go through the cluster manager rather than a directly-dialed socket — the SAME shape the tracing Zipkin exporter uses (`httpclient.ClusterDispatch`, ADR-0261) and the gRPC ALS/metrics_service sinks use (`grpcclient.Dialer`, ADR-0158). Expect the BRAINSTORM to settle: connection lifecycle + reconnect on a long-lived TCP stats stream; whether delta-vs-absolute semantics change on TCP (they should NOT — same line protocol); framing (statsd over TCP is newline-delimited); and back-pressure/drop policy when the cluster is unavailable (contrast UDP's never-blocks property, which phase 48 explicitly relied on to justify a SYNCHRONOUS `Submit` with NO background goroutine — a TCP sink may reintroduce a background mutator, which has `-race` consequences per `reference_full_suite_race_after_background_mutator`).
+- **This is a CHARTER, not a commitment to scope.** Nothing is registered yet: per the ROADMAP §Schema invariant, **row 55 is registered `in-progress` AT the BRAINSTORM commit**, not before. If the human prefers a different deferred candidate (see the SENTINEL list above), swap it at the top of the BRAINSTORM — the rest of this router's discipline is candidate-independent.
+
+## What THIS session does (the BRAINSTORM, lifecycle-state 0 → 1)
+
+1. Re-verify the cold-start baselines (below) against master tip `60509b78`. Do NOT trust any count in this file without re-running the commands.
+2. Invoke `superpowers:brainstorming` (REQUIRED before any creative/design work — it is the process skill that owns this stage).
+3. Read the inputs (below), then run the user dialogue. Mirror the recent BRAINSTORM shape (phase 48/49/50/54 are the templates — a numbered Q1..Qn user dialogue whose answers are recorded verbatim, then a 12-section document). The questions this phase must settle are at minimum: transport/connection lifecycle, framing, drop/back-pressure policy, whether a background goroutine is introduced, the differential proof shape (a driver-owned TCP statsd receiver — the phase-48 `test/helpers/statsdrecv` UDP receiver is the template to extend, NOT to replace), phasing (single flat row vs ADR-0045 split), and the anticipated counts.
+4. Write `docs/envoy-go/phases/55-stats-sink-statsd-tcp/BRAINSTORM.md`, register ROADMAP **row 55 `in-progress`** at the same commit, advance `docs/envoy-go/STATE.md`'s active-phase, land it (commit + push per `feedback_push_to_origin`), then **ROLL THIS FILE FORWARD to point at the phase-55 SPEC**.
+5. BRAINSTORM/SPEC/PLAN stages are docs-only. Recent docs-only stages ran direct-on-master or in a docs worktree; either is acceptable — the fresh-worktree + subagent discipline is MANDATORY for the IMPL.
 
 ## Honor throughout (the discipline, unchanged)
-- **Lifecycle = one stage per session** (BRAINSTORM → SPEC → PLAN → IMPL). Once a phase is chartered: build the stage end-to-end, land it (commit + push per `feedback_push_to_origin`), then roll this file forward.
-- **Subagent-driven execution** (`feedback_execution_style`) in a **fresh worktree** (`feedback_git_worktrees`); subagents commit LOCALLY only (`feedback_subagents_no_push`); the CONTROLLER verifies each commit, re-runs gates on the frozen HEAD, does deliberate-break/liveness verification ITSELF, and SQUASHES + PUSHES at stage-close (`feedback_subagent_autocommit_claudemd` · `feedback_push_to_origin`). Per-task gates: `gofmt -l` + `golangci-lint` + `go vet` + `go build ./...` (`feedback_pertask_gofmt_lint`).
-- **Process anchors:** ADR-0106 (per-leg rows) · ADR-0044 (ADR §Decision+§Consequences land at IMPL) · ADR-0045 (split soft gate) · ADR-0080 (byte-stable rejects) · ADR-0052 (atomic six-gate completion bundle) · next-free **ADR-0272**.
-- Re-verify baselines fresh at cold-start — do NOT trust any count in this file without re-running the baseline commands against current HEAD:
-  - `ls -d test/fixtures/[0-9][0-9][0-9][0-9]* | wc -l` → expect **99**
+- **Lifecycle = one stage per session** (BRAINSTORM → SPEC → PLAN → IMPL). This session: the phase-55 BRAINSTORM ONLY.
+- **Subagent-driven execution** (`feedback_execution_style`) in a **fresh worktree** (`feedback_git_worktrees`) — mandatory at IMPL; subagents commit LOCALLY only (`feedback_subagents_no_push`); the CONTROLLER verifies each commit, re-runs gates on the frozen HEAD, does deliberate-break/liveness verification ITSELF, and SQUASHES + PUSHES at stage-close (`feedback_subagent_autocommit_claudemd` · `feedback_push_to_origin`). Per-task gates: `gofmt -l` + `golangci-lint` + `go vet` + `go build ./...` (`feedback_pertask_gofmt_lint`).
+- **Process anchors:** ADR-0106 (per-leg rows, no parent rollup) · ADR-0044 (ADR §Decision+§Consequences land at IMPL; §Context drafted at SPEC) · ADR-0045 (split soft gate) · ADR-0080 (byte-stable rejects — LIFTING one needs an explicit replacement arm, see `reference_strict_reject_sibling_typeurl_gap`) · ADR-0052 (atomic six-gate completion bundle) · ADR-0227 (reference `envoyproxy/envoy:contrib-v1.37.2`) · next-free **ADR-0272**.
+- Re-verify baselines fresh at cold-start against current HEAD:
+  - `ls -d test/fixtures/[0-9][0-9][0-9][0-9]* | wc -l` → expect **99** (next fixture dir: `0098-*`)
   - `grep -rh '^func Fuzz' --include='*.go' --exclude-dir=.worktrees . | wc -l` → expect **52**
-  - DECISIONS tail: `grep -nE '^## ADR-0[0-9]+' docs/envoy-go/DECISIONS.md | tail -1` → expect **ADR-0271** (next-free ADR-0272)
-  - BackendKind tail: `grep -n "BackendKind = " test/differential/fixture/fixture.go | tail -1` → expect **38**
+  - `grep -nE '^## ADR-0[0-9]+' docs/envoy-go/DECISIONS.md | tail -1` → expect **ADR-0271** (next-free **ADR-0272**)
+  - `grep -n "BackendKind = " test/differential/fixture/fixture.go | tail -1` → expect **38**
   - stat surface → **1200**
 
 ## Read first (in order)
-1. THIS FILE — the cold-start router (no chartered phase; human picks the next candidate).
-2. `docs/envoy-go/STATE.md` — the active-phase header (`phase 54 IMPL done`) + full history + the "Next → NO chartered phase remains" note.
-3. `docs/envoy-go/ROADMAP.md` — row 54 `done`; the Load-balancing family CLOSED; the OPEN families (Observability, Operational-tooling) and their deferred-candidate lists (the source of the next-phase menu).
-4. `docs/envoy-go/DECISIONS.md` — ADR-0271 (the phase-54 record) is the tail; ADR-0272 is next-free.
-5. `docs/envoy-go/BOOTSTRAP_PROMPT.md` — the family-expansion + lifecycle discipline if any ambiguity about how to charter a new phase.
-6. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — the `feedback_*` execution discipline + the `reference_*` differential/probe lessons relevant to whichever candidate the human picks.
+1. THIS FILE — the cold-start router (phase-55 BRAINSTORM is next).
+2. `docs/envoy-go/STATE.md` — the active-phase header (`phase 54 IMPL done`) + full history.
+3. `docs/envoy-go/ROADMAP.md` §"Observability family" — the family's full row history (44 → 50) and the live deferred-candidate list; the phase-48 row is where `tcp_cluster_name` was deferred.
+4. `docs/envoy-go/phases/48-stats-sink-statsd/` (BRAINSTORM + SPEC + PLAN) — the DIRECT ancestor: it defines the statsd line protocol, the UDP-only Q1 decision, and the `tcp_cluster_name` deferral this phase consumes. `docs/envoy-go/phases/50-stats-sink-dogstatsd-batching/BRAINSTORM.md` — the SHAPE template for a "lift a prior row's strict-reject" phase.
+5. The as-built source: `internal/bootstrap/bootstrap.go` (the `:567` `tcp_cluster_name` reject + `parseStatsdSinkConfig` + the `stats_sinks[]` dispatch), `internal/statssink/{statsd.go,udp.go,delta.go,flusher.go,sink.go}`, `cmd/envoy-go/main.go` (the sink build loop), `test/helpers/statsdrecv/` (the driver-owned UDP receiver to extend for TCP), `test/fixtures/0092-stats-sink-statsd/` (the differential template).
+6. For the cluster-dispatch write path: `internal/httpclient` (`ClusterDispatch`, ADR-0261, the Zipkin exporter's transport) and `internal/grpcclient` (`Dialer`, ADR-0158) — the two landed precedents for a sink/exporter writing through a named cluster rather than a raw socket.
+7. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — especially `reference_delta_sink_differential_stability_barrier`, `reference_periodic_sink_differential_two_receivers`, `reference_host_gateway_ip_docker_desktop`, `reference_stats_sink_metrics_service_probe`, `reference_dogstatsd_tag_order_unsorted`, `reference_line_parser_extension_delimiter_reuse`, `reference_full_suite_race_after_background_mutator`, `reference_strict_reject_sibling_typeurl_gap`, `reference_wire_format_both_sides_see_same_bytes`, and the `feedback_*` execution discipline.
