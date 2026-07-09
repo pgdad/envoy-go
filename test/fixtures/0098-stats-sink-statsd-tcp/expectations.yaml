@@ -1,0 +1,129 @@
+# Phase 55 fixture 0098-stats-sink-statsd-tcp expectations (ADR-0019 — prose; the
+# driver is the enforcer via AssertStats; this file is documentation).
+#
+# This fixture proves the statsd TCP line-protocol stats sink (ADR-0272)
+# end-to-end: cross-side (subject envoy-go vs reference Envoy contrib-v1.37.2 in
+# Docker) on the SAME deterministic COUNTER NAME SUBSET delta-SUM model + absolute
+# GAUGE subset as the phase 48 UDP fixture (0092), PLUS three SUBJECT-EXACT
+# transport assertions the TCP receiver makes possible.
+#
+# Topology (single-listener plaintext H1; HTTPFixedBody backend; driver-owned
+# in-process statsdrecv TCP receivers):
+#   l_test (hcm_local)  — one downstream HTTP/1.1 listener; route prefix "/" →
+#                         cluster c_backend (HTTPFixedBody, 17-byte body).
+#   c_backend           — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
+#   c_statsd            — STATIC cluster the statsd TCP sink dials via DialSink;
+#                         its single endpoint is the driver-owned statsdrecv TCP
+#                         receiver, bound 0.0.0.0:<port> so the Docker reference
+#                         container reaches the host at the host-gateway literal IP.
+#
+# A bootstrap-level stats_sinks[] statsd entry uses the TCP arm
+# (tcp_cluster_name: c_statsd) on BOTH sides + stats_flush_interval: 0.5s. The
+# proxy opens a LONG-LIVED TCP connection to c_statsd and writes '\n'-TERMINATED
+# statsd lines (<prefix>.<name>:<delta>|c for counters; <prefix>.<name>:<abs>|g
+# for gauges).
+#
+# ## node.id + node.cluster REQUIRED on BOTH sides (AMEND-TCP-NODE)
+#
+# Unlike 0092's UDP sink (which boots with no node at all), the reference REFUSES
+# TO BOOT a tcp_cluster_name statsd sink unless BOTH node.id and node.cluster are
+# set (either alone fails identically). Both bootstraps carry a node:{id,cluster}
+# block (SPEC-55 §3.7, §11.6).
+#
+# ## Two private per-side receivers + hard Close() (as-built)
+#
+# The statsd sink flushes PERIODICALLY and holds its TCP connection open for the
+# process lifetime — the reference keeps sending during the subject's drive window
+# (reference_periodic_sink_differential_two_receivers). A single shared receiver
+# would let the reference's concurrent flushes contaminate the subject snapshot.
+# So the driver starts TWO private TCP receivers — one per side — on two
+# separately-allocated host ports, both bound 0.0.0.0 BEFORE either proxy starts.
+# Each side owns an uncontaminated accumulator (no Reset() needed). After the
+# subject snapshot BOTH are hard-stopped via Close() — for a TCP receiver this
+# hard-closes the listener and every accepted connection. NEVER a graceful stop
+# (the sink never closes its side).
+#
+# ## Reachability: LITERAL host-gateway IP for the reference (not 127.0.0.1)
+#
+# The reference bootstrap's c_statsd endpoint is the host-gateway literal IP
+# (reference_host_gateway_ip_docker_desktop) — e.g. 192.168.65.2 on Docker
+# Desktop, resolved by a throwaway getent-hosts container (inlined hostGatewayIP
+# to avoid an import cycle). The subject uses 127.0.0.1.
+#
+# ## Workload + release barrier + stability barrier
+#
+# Each side fires K = 7 deterministic GET /probe requests (Host: statsd.example,
+# UA: statsd-probe/1; all 2xx), then POLLS that side's private receiver until the
+# COUNTER subset's per-flush deltas SUM to == 7 (DeltaSum — a release barrier,
+# never a sleep; reference_concurrency_differential_release_barrier), then awaits
+# >= 2 further flushes (awaitFurtherFlushes, riding on SeenCount(marker) — the
+# stability barrier that distinguishes per-flush DELTA from broken ABSOLUTE:
+# under correct deltas the idle counters emit 0 each flush so the SUM stays K;
+# an absolute sink re-adds the cumulative and overshoots K;
+# reference_delta_sink_differential_stability_barrier).
+#
+# ## Asserted CROSS-SIDE (both snapshots, after convergence + the >= 2-flush barrier)
+#
+# A name-SUBSET, NOT the whole line set (AMEND-TCP-USEDONLY — the reference emits
+# only USED stats, so the sets differ structurally; assert NAMED SUBSETS only,
+# reference_stats_sink_emits_used_only). Names are PREFIX-JOINED.
+#
+#   For each name in the counter subset:
+#     sdpfx.cluster.c_backend.upstream_rq_total
+#     sdpfx.http.hcm_local.downstream_rq_total
+#     sdpfx.http.hcm_local.downstream_rq_2xx
+#   on BOTH sides:
+#     present     (decode ran — a zero-line pass is structurally impossible)
+#     delta-SUM == 7  (== K; still 7 after >= 2 further flushes)
+#   Absolute gauge:
+#     sdpfx.cluster.c_backend.membership_total  == 1  (one backend endpoint;
+#       membership_total not membership_healthy — reference_membership_total_vs_healthy_gauge)
+#
+# ## Asserted SUBJECT-EXACT (the reference's values are RECORDED via log.Printf,
+#                            NEVER asserted)
+#
+#   subject ConnCount == 1
+#     One long-lived connection; no per-flush redial. Cross-side equality is
+#     infeasible BY THE HISTOGRAM BOUNDARY (AMEND-TCP-CONNCOUNT): the reference
+#     opens a SECOND, |ms-only worker-timer connection that envoy-go (no
+#     histograms, ADR-0060) can never open, so the reference ConnCount is 2. A
+#     structural gap, not uncertainty — hence subject-only + reference recorded.
+#
+#   subject UnparsedCount == 0
+#     envoy-go emits only |c and |g, every line '\n'-TERMINATED. A non-zero count
+#     is the signature of '\n'-SEPARATED (not terminated) framing concatenating
+#     two lines across a flush boundary. This is the LIVENESS signal for the
+#     controller's later deliberate framing break
+#     (reference_framing_break_needs_unparsed_counter). The reference legitimately
+#     emits ~35 |ms lines, so its unparsed count is recorded, not asserted.
+#
+#   subject sdpfx.cluster.c_statsd.upstream_cx_total == 0
+#     DialSink took the UNACCOUNTED dial path (AMEND-TCP-CXSTATS): no
+#     max_connections permit, no upstream_cx_* accounting
+#     (reference_cluster_sink_dial_unaccounted). Subject-only: the reference never
+#     emits this line at all (AMEND-TCP-USEDONLY — omits never-incremented
+#     counters), while envoy-go registers upstream_cx_total unconditionally for
+#     every cluster including c_statsd, so the line MUST be present with value 0.
+#     Its ABSENCE is a real failure (the cxTotalOK guard distinguishes
+#     absent-from-zero: statsdrecv creates the map entry even for a |c line of 0,
+#     so DeltaSum returns (0, true) when the line was emitted).
+#
+# ## UNasserted (vary side-to-side / impl-specific / non-deterministic)
+#
+#   The WHOLE line set (AMEND-TCP-USEDONLY — the reference emits only USED stats,
+#       including |ms timer histograms envoy-go lacks; the sets differ structurally).
+#   |ms timer lines (histogram side-channel; envoy-go has no histograms).
+#   Non-deterministic gauges (server.uptime, *_active, connection churn).
+#   Flush cadence.
+#   Per-flush write granularity (not observable to a line-parsing stream receiver;
+#       the assertion is on aggregated line content, framing-agnostic).
+#
+# Cross-refs: phase 55 SPEC + ADR-0272 + AMEND-TCP-NODE/CONNCOUNT/CXSTATS/USEDONLY +
+#             reference_delta_sink_differential_stability_barrier +
+#             reference_periodic_sink_differential_two_receivers +
+#             reference_host_gateway_ip_docker_desktop +
+#             reference_cluster_sink_dial_unaccounted +
+#             reference_stats_sink_emits_used_only +
+#             reference_framing_break_needs_unparsed_counter +
+#             reference_membership_total_vs_healthy_gauge +
+#             reference_concurrency_differential_release_barrier.

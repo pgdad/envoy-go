@@ -122,6 +122,7 @@ import (
 	_ "github.com/pgdad/envoy-go/test/fixtures/0095-lb-locality-weighted/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0096-lb-priority/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0097-lb-panic-threshold/driver"
+	_ "github.com/pgdad/envoy-go/test/fixtures/0098-stats-sink-statsd-tcp/driver"
 	"github.com/pgdad/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

@@ -4,6 +4,7 @@ import (
 	"context"
 	stdtls "crypto/tls"
 	"crypto/x509"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -147,7 +148,13 @@ func TestCluster_Dial_Plaintext(t *testing.T) {
 // Dial — TLS
 // ---------------------------------------------------------------------------
 
-func TestCluster_Dial_TLS(t *testing.T) {
+// tlsPairForTest builds a server/client *stdtls.Config pair against the
+// 0002-tls-tcp fixture's PKI (upstream-alpha cert/key + its CA), for tests
+// that need a TLS echo server and a matching upstream client config without
+// duplicating cert-loading. Shared by TestCluster_Dial_TLS and
+// TestDialSink_TLS.
+func tlsPairForTest(t *testing.T) (srv, cli *stdtls.Config) {
+	t.Helper()
 	caPEM, err := os.ReadFile("../../test/fixtures/0002-tls-tcp/pki/ca.pem")
 	if err != nil {
 		t.Fatalf("read ca.pem: %v", err)
@@ -165,21 +172,27 @@ func TestCluster_Dial_TLS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln := listenTLS(t, &stdtls.Config{
+	srv = &stdtls.Config{
 		Certificates: []stdtls.Certificate{pair},
 		MinVersion:   stdtls.VersionTLS12,
-	})
-	defer func() { _ = ln.Close() }()
+	}
 
 	// Build upstream *stdtls.Config against this server.
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(caPEM)
-	upCfg := &stdtls.Config{
+	cli = &stdtls.Config{
 		ServerName: "alpha.envoy-go.test",
 		RootCAs:    pool,
 		MinVersion: stdtls.VersionTLS12,
 		MaxVersion: stdtls.VersionTLS13,
 	}
+	return srv, cli
+}
+
+func TestCluster_Dial_TLS(t *testing.T) {
+	srvCfg, upCfg := tlsPairForTest(t)
+	ln := listenTLS(t, srvCfg)
+	defer func() { _ = ln.Close() }()
 
 	ep := endpointFromAddr(ln.Addr())
 	c := mkTestCluster("test-tls", upCfg, ep)
@@ -761,5 +774,119 @@ func TestEnsureRetryStats_NilGuardIncIsNoop(t *testing.T) {
 		if names[n] {
 			t.Errorf("counter %q present on non-retry cluster, want absent", n)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DialSink (phase 55 Task 1) — the unaccounted stats-sink dial
+// ---------------------------------------------------------------------------
+
+// TestDialSink_NoCxAccounting pins AMEND-TCP-CXSTATS: the reference's statsd TCP
+// connection reports upstream_cx_total: 0 / upstream_cx_active: 0. DialSink must
+// leave BOTH counters untouched, before and after the conn's Close.
+func TestDialSink_NoCxAccounting(t *testing.T) {
+	ln := listenTCP(t)
+	c := mkTestCluster("c_statsd", nil, endpointFromAddr(ln.Addr()))
+
+	conn, err := c.DialSink(context.Background())
+	if err != nil {
+		t.Fatalf("DialSink: %v", err)
+	}
+	if got := c.upstreamCxTotal.Load(); got != 0 {
+		t.Errorf("upstream_cx_total after DialSink = %d, want 0", got)
+	}
+	if got := c.upstreamCxActive.Load(); got != 0 {
+		t.Errorf("upstream_cx_active after DialSink = %d, want 0", got)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := c.upstreamCxActive.Load(); got != 0 {
+		t.Errorf("upstream_cx_active after Close = %d, want 0 (never Inc'd, must not go negative)", got)
+	}
+	if got := c.upstreamCxTotal.Load(); got != 0 {
+		t.Errorf("upstream_cx_total after Close = %d, want 0", got)
+	}
+}
+
+// TestDialSink_TakesNoConnPermit is the decisive AMEND-TCP-CXSTATS test. The probe
+// showed the reference STILL connects and flushes with max_connections: 0 on the
+// stats cluster. envoy-go's connPool returns errConnPoolOverflow on the FIRST
+// acquire at maxConnections=0/maxPending=0 (connpool_test.go:295 "(f)"), so Dial
+// FAILS on such a cluster while DialSink MUST succeed. This test would pass
+// vacuously if DialSink merely skipped the Inc but still took the permit.
+func TestDialSink_TakesNoConnPermit(t *testing.T) {
+	ln := listenTCP(t)
+	c := mkTestCluster("c_statsd", nil, endpointFromAddr(ln.Addr()))
+	attachConnPool(c, 0, 0) // max_connections: 0, max_pending_requests: 0
+
+	// Control: Dial must be refused by the permit.
+	if _, _, err := c.Dial(context.Background()); !errors.Is(err, errConnPoolOverflow) {
+		t.Fatalf("Dial with max_connections=0: got %v, want errConnPoolOverflow", err)
+	}
+	// DialSink bypasses the permit entirely.
+	conn, err := c.DialSink(context.Background())
+	if err != nil {
+		t.Fatalf("DialSink with max_connections=0: %v (must bypass the permit)", err)
+	}
+	_ = conn.Close()
+}
+
+// TestDialSink_ReturnsBareConn: no connWithGauge wrapper — there is no gauge to
+// Dec and no permit to release, so wrapping would be a lie (and connDec would
+// underflow the pool).
+func TestDialSink_ReturnsBareConn(t *testing.T) {
+	ln := listenTCP(t)
+	c := mkTestCluster("c_statsd", nil, endpointFromAddr(ln.Addr()))
+	conn, err := c.DialSink(context.Background())
+	if err != nil {
+		t.Fatalf("DialSink: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, wrapped := conn.(*connWithGauge); wrapped {
+		t.Fatal("DialSink returned a *connWithGauge; want the bare net.Conn")
+	}
+}
+
+// TestDialSink_TLS: DialSink honors upstream TLS, like Dial.
+func TestDialSink_TLS(t *testing.T) {
+	srvCfg, cliCfg := tlsPairForTest(t)
+	ln := listenTLS(t, srvCfg)
+	c := mkTestCluster("c_statsd", cliCfg, endpointFromAddr(ln.Addr()))
+	conn, err := c.DialSink(context.Background())
+	if err != nil {
+		t.Fatalf("DialSink over TLS: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, ok := conn.(*stdtls.Conn); !ok {
+		t.Fatalf("DialSink over TLS returned %T, want *tls.Conn", conn)
+	}
+}
+
+// TestDialSink_CtxCanceled: a canceled ctx short-circuits before the pick.
+func TestDialSink_CtxCanceled(t *testing.T) {
+	ln := listenTCP(t)
+	c := mkTestCluster("c_statsd", nil, endpointFromAddr(ln.Addr()))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.DialSink(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("DialSink with canceled ctx: got %v, want context.Canceled", err)
+	}
+}
+
+// TestDialSink_DialFailure surfaces the same wrapped error string as Dial.
+func TestDialSink_DialFailure(t *testing.T) {
+	ln := listenTCP(t)
+	// endpointFromAddr takes a net.Addr (cluster_test.go:110), NOT a string.
+	// The net.Addr VALUE stays usable after the listener closes.
+	addr := ln.Addr()
+	_ = ln.Close() // nothing is listening now
+	c := mkTestCluster("c_statsd", nil, endpointFromAddr(addr))
+	_, err := c.DialSink(context.Background())
+	if err == nil {
+		t.Fatal("DialSink to a closed port: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "cluster: dial: ") {
+		t.Errorf("error %q should carry the byte-stable prefix %q", err, "cluster: dial: ")
 	}
 }

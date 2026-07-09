@@ -44,12 +44,51 @@ static_resources:
       "@type": ` + statsdType + `
       address: { socket_address: { address: 127.0.0.1, port_value: 8125, protocol: TCP } }
 `))
-	// tcp_cluster_name (reject)
+	// tcp_cluster_name (ACCEPT since phase 55 / ADR-0272 — the node in `head`
+	// satisfies the node-required arm; the cluster is unknown, so this seed
+	// exercises the unknown-cluster reject added in Task 4)
 	f.Add([]byte(head + `stats_sinks:
   - name: envoy.stat_sinks.statsd
     typed_config:
       "@type": ` + statsdType + `
       tcp_cluster_name: statsd
+`))
+	// tcp_cluster_name with a KNOWN cluster (accept)
+	f.Add([]byte(`node: { id: sd-node, cluster: sd-cluster }
+admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 9901}
+static_resources:
+  listeners: []
+  clusters:
+    - name: c_statsd
+      connect_timeout: 1s
+      type: STATIC
+      load_assignment:
+        cluster_name: c_statsd
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: 127.0.0.1, port_value: 8125}
+stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdType + `
+      tcp_cluster_name: c_statsd
+`))
+	// tcp_cluster_name with NO node (reject — AMEND-TCP-NODE)
+	f.Add([]byte(`admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 9901}
+static_resources:
+  listeners: []
+  clusters: []
+stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdType + `
+      tcp_cluster_name: c_statsd
 `))
 	// missing statsd_specifier (reject)
 	f.Add([]byte(head + `stats_sinks:

@@ -558,6 +558,33 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 	return c.dialPicked(ctx, ep, release, true /*ownPermit*/)
 }
 
+// DialSink dials one endpoint of c for a STATS SINK and returns the bare conn.
+//
+// Unlike Dial it takes NO max_connections permit (ADR-0252) and increments NO
+// upstream_cx_* counter — mirroring the reference, whose statsd TCP connection
+// bypasses conn-pool accounting entirely: with max_connections: 0 on the stats
+// cluster it still connects and still flushes, and reports upstream_cx_total: 0
+// / upstream_cx_active: 0 (SPEC-55 §11.4, AMEND-TCP-CXSTATS). It DOES honor the
+// LB pick, connect_timeout, and upstream TLS.
+//
+// The pick is released IMMEDIATELY (PickEndpoint's contract), so the sink's
+// long-lived connection is invisible to least_request — the accepted, already-
+// documented cost of every PickEndpoint caller.
+//
+// STATS SINKS ONLY. Any data-plane caller wanting a connection MUST use Dial:
+// bypassing the permit and the gauges anywhere else silently breaks circuit
+// breaking and upstream_cx_active.
+func (c *Cluster) DialSink(ctx context.Context) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ep, err := c.PickEndpoint()
+	if err != nil {
+		return nil, err
+	}
+	return c.dialAndTLS(ctx, ep)
+}
+
 // dialPicked is the SHARED post-pick dial body for Dial and the H2 multiplex
 // pool's dialPooledH2To (extracted so the compiler enforces parity —
 // D-H2-DIALSHARE). Given an already
@@ -565,37 +592,18 @@ func (c *Cluster) Dial(ctx context.Context) (net.Conn, Endpoint, error) {
 // TCP-dials (connect_timeout-bounded) → TLS-handshakes (when configured) →
 // Inc's upstream_cx_{total,active} → wraps in connWithGauge{dec: connDec(release)}.
 //
-// ownPermit governs the failure-path give-back: when true, each failure path
-// calls releaseConnSlot() (the caller holds a permit that has no connWithGauge
-// wrapper yet to free it). On SUCCESS the permit ALWAYS transfers to the
-// connWithGauge dec closure (connDec → releaseConn on conn Close; the sync.Once
-// guards gauge-Dec + LB-release + permit-release together so double-Close cannot
-// double-release). Both Dial and dialPooledH2To currently pass ownPermit=true;
-// the flag documents the single axis of variation and leaves room for a future
-// permit-less caller without forking the body.
+// ownPermit remains the single axis of variation for the ACCOUNTED callers
+// (Dial, dialPooledH2To — both pass true). The unaccounted stats-sink caller
+// (DialSink) does NOT route through here: it needs no counter Inc and no
+// connWithGauge wrap, so it shares only the dialAndTLS core.
 func (c *Cluster) dialPicked(ctx context.Context, ep Endpoint, release func(), ownPermit bool) (net.Conn, Endpoint, error) {
-	releasePermit := func() {
+	final, err := c.dialAndTLS(ctx, ep)
+	if err != nil {
 		if ownPermit {
 			c.releaseConnSlot()
 		}
-	}
-	d := &net.Dialer{Timeout: c.connectTimeout}
-	raw, err := d.DialContext(ctx, "tcp", ep.Addr())
-	if err != nil {
-		releasePermit()
 		release()
-		return nil, ep, fmt.Errorf("cluster: dial: %w", err)
-	}
-	var final net.Conn = raw
-	if c.upstreamCfg != nil {
-		conn := stdtls.Client(raw, c.upstreamCfg)
-		if err := conn.HandshakeContext(ctx); err != nil {
-			_ = raw.Close()
-			releasePermit()
-			release()
-			return nil, ep, fmt.Errorf("cluster: tls: handshake: %w", err)
-		}
-		final = conn
+		return nil, ep, err
 	}
 	c.upstreamCxTotal.Inc()
 	c.upstreamCxActive.Inc()
@@ -604,6 +612,29 @@ func (c *Cluster) dialPicked(ctx context.Context, ep Endpoint, release func(), o
 	// gauge Dec, the LB release AND the pool release, so double-Close cannot
 	// double-release. The struct is unchanged.
 	return &connWithGauge{Conn: final, dec: c.connDec(release)}, ep, nil
+}
+
+// dialAndTLS is the accounting-FREE dial core shared by dialPicked and DialSink:
+// TCP-dial to ep bounded by connect_timeout, then the upstream TLS handshake
+// bounded by ctx. It touches NO counter, takes NO permit, and holds NO LB
+// release — every one of those is the caller's business. Extracted at phase 55
+// so DialSink (the unaccounted stats-sink dial, AMEND-TCP-CXSTATS) cannot drift
+// from Dial's dial/TLS semantics.
+func (c *Cluster) dialAndTLS(ctx context.Context, ep Endpoint) (net.Conn, error) {
+	d := &net.Dialer{Timeout: c.connectTimeout}
+	raw, err := d.DialContext(ctx, "tcp", ep.Addr())
+	if err != nil {
+		return nil, fmt.Errorf("cluster: dial: %w", err)
+	}
+	if c.upstreamCfg == nil {
+		return raw, nil
+	}
+	conn := stdtls.Client(raw, c.upstreamCfg)
+	if err := conn.HandshakeContext(ctx); err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("cluster: tls: handshake: %w", err)
+	}
+	return conn, nil
 }
 
 // AcquireH1 returns an HTTP/1.1 upstream connection ready to write a request

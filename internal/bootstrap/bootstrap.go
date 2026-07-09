@@ -286,17 +286,21 @@ type OTLPConfig struct {
 	ResourceAttributes []*commonpb.KeyValue
 }
 
-// StatsdSinkConfig is the parsed statsd UDP stats-sink config from one top-level
-// stats_sinks[] StatsdSink entry (ADR-0265). The sink (the StatsdSink + Flusher)
-// is constructed in cmd/envoy-go/main.go after Load returns; this struct carries
-// only the parse-time data. tcp_cluster_name is STRICT-REJECTED (UDP-only — the
-// reference boots statsd-over-TCP; ADR-0080); a missing statsd_specifier / nil
-// socket_address is a REFERENCE-PARITY reject; socket_address.protocol is
-// accepted-and-IGNORED (dial UDP regardless — rejecting the proto-default TCP(0)
-// would reject the omit case).
+// StatsdSinkConfig is the parsed statsd stats-sink config from one top-level
+// stats_sinks[] StatsdSink entry (ADR-0265; the TCP transport ADR-0272). The sink
+// (the StatsdSink / TCPStatsdSink + Flusher) is constructed in cmd/envoy-go/main.go
+// after Load returns; this struct carries only the parse-time data.
+//
+// It is a TAGGED UNION over the StatsdSink.statsd_specifier oneof, whose two arms
+// are the ONLY two the proto has (stats.pb.go:571-577): EXACTLY ONE of UDPAddress
+// and TCPClusterName is non-empty. A missing oneof (both empty) is a
+// REFERENCE-PARITY reject, never a parsed value. socket_address.protocol is
+// accepted-and-IGNORED on the UDP arm (dial UDP regardless — rejecting the
+// proto-default TCP(0) would reject the omit case).
 type StatsdSinkConfig struct {
-	UDPAddress string // socket_address host:port (an IP literal:port; net.ResolveUDPAddr-resolvable)
-	Prefix     string // StatsdSink.prefix, default "envoy" when empty
+	UDPAddress     string // address.socket_address host:port (an IP literal:port; net.ResolveUDPAddr-resolvable). Empty ⇔ the TCP arm.
+	TCPClusterName string // tcp_cluster_name: a named cluster the sink dials via Cluster.DialSink (ADR-0272). Empty ⇔ the UDP arm.
+	Prefix         string // StatsdSink.prefix, default "envoy" when empty
 }
 
 // DogStatsdSinkConfig is the parsed dog_statsd UDP stats-sink config from one
@@ -397,14 +401,16 @@ type Bootstrap struct {
 	// cmd/envoy-go/main.go after Load returns (and ONLY when this slice is
 	// non-empty — byte-stability, D-MS-FLUSH-INERT).
 	StatsSinkConfigs []StatsSinkConfig
-	// StatsdSinkConfigs is the parsed top-level stats_sinks[] statsd UDP sink
+	// StatsdSinkConfigs is the parsed top-level stats_sinks[] statsd sink
 	// entries (ADR-0265), in declaration order. Empty when no StatsdSink
-	// stats_sinks[] entry is configured. Per ADR-0265/ADR-0080: tcp_cluster_name
-	// and a missing statsd_specifier/socket_address are rejected at parse time.
-	// socket_address.protocol is accepted-and-ignored (dial UDP regardless).
-	// prefix defaults to "envoy" when empty. The StatsdSink is built in
-	// cmd/envoy-go/main.go after Load returns (and ONLY when this slice is
-	// non-empty).
+	// stats_sinks[] entry is configured. Per ADR-0272 each element is a TAGGED
+	// UNION over statsd_specifier: exactly one of UDPAddress (the UDP arm) /
+	// TCPClusterName (the TCP arm) is set. Both arms share this single slice so
+	// declaration order is preserved. A missing statsd_specifier is rejected at
+	// parse time; socket_address.protocol is accepted-and-ignored on the UDP arm
+	// (dial UDP regardless). prefix defaults to "envoy" when empty. The
+	// StatsdSink/TCPStatsdSink is built in cmd/envoy-go/main.go after Load
+	// returns (and ONLY when this slice is non-empty).
 	StatsdSinkConfigs []StatsdSinkConfig
 	// DogStatsdSinkConfigs is the parsed top-level stats_sinks[] dog_statsd UDP
 	// sink entries (ADR-0266), in declaration order. Empty when no DogStatsdSink
@@ -551,29 +557,77 @@ func parseMetricsServiceConfig(tc *anypb.Any, idx int, result *Bootstrap) error 
 	return nil
 }
 
-// parseStatsdSinkConfig parses one statsd UDP stats sink typed_config and appends
-// a StatsdSinkConfig to result.StatsdSinkConfigs (ADR-0265). It STRICT-REJECTS
-// (ADR-0080): tcp_cluster_name (UDP-only this row — the reference boots statsd-
-// over-TCP). A missing statsd_specifier / nil socket_address is a REFERENCE-PARITY
-// reject (the reference PGV-rejects it). GetAddress() returns nil for BOTH a
-// missing oneof AND a tcp_cluster_name arm, so the tcp_cluster_name check runs
-// FIRST (distinct message). socket_address.protocol is accepted-and-IGNORED
-// (envoy-go dials UDP regardless). prefix defaults to "envoy" when empty.
+// parseStatsdSinkConfig parses one statsd stats sink typed_config and appends a
+// StatsdSinkConfig to result.StatsdSinkConfigs (ADR-0265, ADR-0272).
+//
+// ORDERING (load-bearing, and INVERTED from phase 48): GetAddress() returns nil
+// for BOTH a missing statsd_specifier AND a tcp_cluster_name arm. At phase 48,
+// tcp_cluster_name was a REJECT, so it had to be checked FIRST to produce a
+// distinct message. It is now an ACCEPT, so it must be DISPATCHED first for the
+// same reason — otherwise the shared nil-address tail would reject a valid TCP
+// config as "statsd_specifier is required". TestStatsdSink_TCPArmDispatchedBefore
+// NilAddressReject pins this.
+//
+// The TCP arm carries two additional REFERENCE-PARITY rejects (node required;
+// unknown cluster) — see parseStatsdTCPArm.
 func parseStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
 	var sd metricsconfigv3.StatsdSink
 	if err := tc.UnmarshalTo(&sd); err != nil {
 		return fmt.Errorf("bootstrap: stats_sinks[%d]: statsd typed_config: %w", idx, err)
 	}
-	if sd.GetTcpClusterName() != "" {
-		return fmt.Errorf("bootstrap: stats_sinks[%d]: statsd tcp_cluster_name is not supported (envoy-go is UDP-only; configure address.socket_address)", idx)
+	prefix := sd.GetPrefix()
+	if cn := sd.GetTcpClusterName(); cn != "" {
+		return parseStatsdTCPArm(cn, prefix, idx, result)
 	}
-	addr, prefix, err := parseUDPSinkAddressAndPrefix(sd.GetAddress().GetSocketAddress(), sd.GetPrefix(), "statsd", "statsd_specifier", idx)
+	addr, prefix, err := parseUDPSinkAddressAndPrefix(sd.GetAddress().GetSocketAddress(), prefix, "statsd", "statsd_specifier", idx)
 	if err != nil {
 		return err
 	}
 	result.StatsdSinkConfigs = append(result.StatsdSinkConfigs, StatsdSinkConfig{
 		UDPAddress: addr,
 		Prefix:     prefix,
+	})
+	return nil
+}
+
+// parseStatsdTCPArm handles the tcp_cluster_name arm of statsd_specifier
+// (ADR-0272) and applies its two REFERENCE-PARITY rejects (ADR-0080), both
+// probed against envoyproxy/envoy:contrib-v1.37.2 (SPEC-55 §11.6):
+//
+//  1. node.id AND node.cluster must BOTH be set. The reference refuses to boot
+//     otherwise ("tcp statsd: node 'id' and 'cluster' are required."); either
+//     field alone fails with the identical message. The UDP address arm boots
+//     with no node at all — the requirement is TCP-SPECIFIC (control probe).
+//     Neither value appears in any emitted line: this is a validation, not a
+//     naming input.
+//  2. tcp_cluster_name must name a declared cluster ("tcp statsd: unknown
+//     cluster 'c_nonexistent'"). static_resources.clusters is the COMPLETE
+//     cluster set today; when CDS lands this check must move to the cluster
+//     manager. main.go keeps a defensive cm.Get fatal for the can't-happen case.
+//
+// Precedence when BOTH are invalid was not probed; envoy-go checks node first.
+// No test depends on the order.
+func parseStatsdTCPArm(clusterName, prefix string, idx int, result *Bootstrap) error {
+	node := result.Proto.GetNode()
+	if node.GetId() == "" || node.GetCluster() == "" {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: statsd tcp_cluster_name requires node.id and node.cluster to be set", idx)
+	}
+	known := false
+	for _, c := range result.Proto.GetStaticResources().GetClusters() {
+		if c.GetName() == clusterName {
+			known = true
+			break
+		}
+	}
+	if !known {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: statsd tcp_cluster_name %q names an unknown cluster", idx, clusterName)
+	}
+	if prefix == "" {
+		prefix = "envoy"
+	}
+	result.StatsdSinkConfigs = append(result.StatsdSinkConfigs, StatsdSinkConfig{
+		TCPClusterName: clusterName,
+		Prefix:         prefix,
 	})
 	return nil
 }
@@ -586,7 +640,7 @@ func parseStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
 // builds the "host:port" dial string. net.JoinHostPort (not fmt.Sprintf) so
 // an IPv6 literal renders bracketed ("[::1]:8125") and stays parseable by
 // net.ResolveUDPAddr; IPv4/hostname output is byte-identical to the previous
-// Sprintf form. The sink-specific arms (statsd's tcp_cluster_name reject,
+// Sprintf form. The sink-specific arms (statsd's tcp_cluster_name dispatch,
 // dog_statsd's max_bytes_per_datagram read) stay in each caller.
 func parseUDPSinkAddressAndPrefix(sa *corev3.SocketAddress, prefix, sinkLabel, specifierLabel string, idx int) (string, string, error) {
 	if sa == nil {

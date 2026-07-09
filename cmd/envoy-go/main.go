@@ -204,11 +204,33 @@ func main() {
 				statsSinks = append(statsSinks, statssink.NewMetricsServiceSink(client, minNode, cfg.ReportCountersAsDeltas, cfg.EmitTagsAsLabels))
 			}
 		}
-		// Phase 48 (ADR-0265): the statsd UDP stats sink. NewStatsdSink dials a
-		// connected UDP socket; a resolve/dial error is a fatal boot failure (the
-		// metrics_service-client precedent). Synchronous (no goroutine), so it adds
-		// no background mutator to the shutdown drain.
+		// Phase 48 (ADR-0265): the statsd UDP stats sink — synchronous, no
+		// goroutine. Phase 55 (ADR-0272): the statsd TCP transport — a bounded-
+		// channel + writer-goroutine sink, the statsd sinks' FIRST background
+		// mutator. StatsdSinkConfig is a TAGGED UNION over statsd_specifier:
+		// exactly one of TCPClusterName / UDPAddress is set (bootstrap.go).
 		for _, cfg := range bs.StatsdSinkConfigs {
+			if cfg.TCPClusterName != "" {
+				name := cfg.TCPClusterName
+				// Defensive: bootstrap already rejected an unknown cluster at parse
+				// time against static_resources.clusters (the complete set today —
+				// no CDS). When CDS lands, THIS becomes the real check.
+				if _, ok := cm.Get(name); !ok {
+					log.Fatalf("statssink: statsd tcp sink: unknown cluster %q", name)
+				}
+				// Re-look-up the cluster per dial so the latest cluster-manager
+				// state is observed (the grpcclient.go:128-141 idiom). DialSink is
+				// the UNACCOUNTED dial: no max_connections permit, no upstream_cx_*
+				// (AMEND-TCP-CXSTATS).
+				statsSinks = append(statsSinks, statssink.NewTCPStatsdSink(func(ctx context.Context) (net.Conn, error) {
+					cl, ok := cm.Get(name)
+					if !ok {
+						return nil, fmt.Errorf("statssink: statsd tcp: cluster %q vanished", name)
+					}
+					return cl.DialSink(ctx)
+				}, cfg.Prefix))
+				continue
+			}
 			sink, err := statssink.NewStatsdSink(cfg.UDPAddress, cfg.Prefix)
 			if err != nil {
 				log.Fatalf("statssink: statsd sink for %q: %v", cfg.UDPAddress, err)

@@ -107,7 +107,9 @@ stats_sinks:
         envoy_grpc:
           cluster_name: ""
 `))
-	// statsd tcp_cluster_name (UDP-only reject)
+	// statsd tcp_cluster_name (ACCEPT since phase 55 / ADR-0272 — the node in
+	// `head` satisfies the node-required arm; the cluster is unknown, so this
+	// seed exercises the unknown-cluster reject added in Task 4)
 	f.Add([]byte(head + `stats_sinks:
   - name: envoy.stat_sinks.statsd
     typed_config:

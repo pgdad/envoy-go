@@ -1699,7 +1699,17 @@ admin:
     socket_address: {address: 127.0.0.1, port_value: 9901}
 static_resources:
   listeners: []
-  clusters: []
+  clusters:
+    - name: mc
+      connect_timeout: 1s
+      type: STATIC
+      load_assignment:
+        cluster_name: mc
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: 127.0.0.1, port_value: 9999}
 ` + topLevel
 }
 
@@ -2072,16 +2082,6 @@ func TestStatsdSink_Rejects(t *testing.T) {
 		errSubs  []string
 	}{
 		{
-			name: "tcp_cluster_name",
-			topLevel: `stats_sinks:
-  - name: envoy.stat_sinks.statsd
-    typed_config:
-      "@type": ` + statsdSinkType + `
-      tcp_cluster_name: statsd
-`,
-			errSubs: []string{"bootstrap:", "tcp_cluster_name", "UDP-only"},
-		},
-		{
 			name: "missing_statsd_specifier",
 			topLevel: `stats_sinks:
   - name: envoy.stat_sinks.statsd
@@ -2120,6 +2120,194 @@ func TestStatsdSink_Rejects(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestStatsdSink_AcceptTCPClusterName is the LIFT: phase 48 strict-rejected this.
+func TestStatsdSink_AcceptTCPClusterName(t *testing.T) {
+	bs, err := Load(strings.NewReader(statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      tcp_cluster_name: mc
+      prefix: myprefix
+`)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.StatsdSinkConfigs); got != 1 {
+		t.Fatalf("len(StatsdSinkConfigs) = %d, want 1", got)
+	}
+	cfg := bs.StatsdSinkConfigs[0]
+	if cfg.TCPClusterName != "mc" {
+		t.Errorf("TCPClusterName = %q, want %q", cfg.TCPClusterName, "mc")
+	}
+	if cfg.UDPAddress != "" {
+		t.Errorf("UDPAddress = %q, want \"\" (the tagged-union invariant: exactly one arm is set)", cfg.UDPAddress)
+	}
+	if cfg.Prefix != "myprefix" {
+		t.Errorf("Prefix = %q, want %q", cfg.Prefix, "myprefix")
+	}
+}
+
+func TestStatsdSink_AcceptTCPClusterNameDefaultPrefix(t *testing.T) {
+	bs, err := Load(strings.NewReader(statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      tcp_cluster_name: mc
+`)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := bs.StatsdSinkConfigs[0].Prefix; got != "envoy" {
+		t.Errorf("Prefix = %q, want the %q default", got, "envoy")
+	}
+}
+
+// TestStatsdSink_TCPArmDispatchedBeforeNilAddressReject is TRAP 2, pinned.
+//
+// bootstrap.go's ordering comment records that GetAddress() returns nil for BOTH
+// a missing statsd_specifier AND a tcp_cluster_name arm — which is why the
+// tcp_cluster_name REJECT had to run first. After the lift the meaning INVERTS:
+// the tcp_cluster_name arm must be DISPATCHED (accept-and-return) before the
+// nil-address reject fires, or a perfectly valid TCP config is rejected as
+// "missing statsd_specifier".
+//
+// This test fails with exactly that misleading error if the arms are reordered.
+func TestStatsdSink_TCPArmDispatchedBeforeNilAddressReject(t *testing.T) {
+	_, err := Load(strings.NewReader(statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      tcp_cluster_name: mc
+`)))
+	if err != nil {
+		t.Fatalf("a tcp_cluster_name sink must NOT be rejected; got %v "+
+			"(if this says \"statsd_specifier is required\", the nil-address reject "+
+			"ran before the tcp_cluster_name dispatch)", err)
+	}
+}
+
+// The missing-oneof reject must STILL fire — the lift must not turn it into an
+// accept with two empty arms.
+func TestStatsdSink_StillRejectsMissingSpecifier(t *testing.T) {
+	_, err := Load(strings.NewReader(statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      prefix: x
+`)))
+	if err == nil {
+		t.Fatal("Load: want a reject for a missing statsd_specifier, got nil")
+	}
+	for _, sub := range []string{"bootstrap:", "statsd", "statsd_specifier"} {
+		if !strings.Contains(err.Error(), sub) {
+			t.Errorf("error should contain %q: %q", sub, err.Error())
+		}
+	}
+}
+
+// TestStatsdSink_TCPRejectsMissingNode: AMEND-TCP-NODE. Either field alone fails.
+func TestStatsdSink_TCPRejectsMissingNode(t *testing.T) {
+	const sink = `stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      tcp_cluster_name: mc
+`
+	const clusters = `
+static_resources:
+  listeners: []
+  clusters:
+    - name: mc
+      connect_timeout: 1s
+      type: STATIC
+      load_assignment:
+        cluster_name: mc
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: 127.0.0.1, port_value: 9999}
+`
+	const admin = `
+admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 9901}
+`
+	cases := []struct {
+		name string
+		node string
+	}{
+		{"no node at all", ""},
+		{"node.id only", "node: { id: sd-node }\n"},
+		{"node.cluster only", "node: { cluster: sd-cluster }\n"},
+		{"node with empty id", "node: { id: \"\", cluster: sd-cluster }\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(strings.NewReader(tc.node + admin + clusters + sink))
+			if err == nil {
+				t.Fatalf("Load: want a node-required reject, got nil")
+			}
+			for _, sub := range []string{"bootstrap:", "stats_sinks[0]", "tcp_cluster_name", "node.id", "node.cluster"} {
+				if !strings.Contains(err.Error(), sub) {
+					t.Errorf("error should contain %q: %q", sub, err.Error())
+				}
+			}
+		})
+	}
+}
+
+// TestStatsdSink_TCPBothNodeFieldsBoots: the positive control.
+func TestStatsdSink_TCPBothNodeFieldsBoots(t *testing.T) {
+	if _, err := Load(strings.NewReader(statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      tcp_cluster_name: mc
+`))); err != nil {
+		t.Fatalf("Load with node.id + node.cluster: %v", err)
+	}
+}
+
+// TestStatsdSink_UDPArmNeedsNoNode is the CONTROL PROBE, mirrored: the reference
+// boots a UDP statsd sink with NO node at all. The node requirement is
+// TCP-SPECIFIC and must not leak onto the UDP arm.
+func TestStatsdSink_UDPArmNeedsNoNode(t *testing.T) {
+	const cfg = `admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 9901}
+static_resources:
+  listeners: []
+  clusters: []
+stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      address: { socket_address: { address: 127.0.0.1, port_value: 8125 } }
+`
+	if _, err := Load(strings.NewReader(cfg)); err != nil {
+		t.Fatalf("a UDP statsd sink must boot with NO node: %v", err)
+	}
+}
+
+// TestStatsdSink_TCPRejectsUnknownCluster: reference parity, not envoy-go-strict.
+func TestStatsdSink_TCPRejectsUnknownCluster(t *testing.T) {
+	_, err := Load(strings.NewReader(statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": ` + statsdSinkType + `
+      tcp_cluster_name: c_nonexistent
+`)))
+	if err == nil {
+		t.Fatal("Load: want an unknown-cluster reject, got nil")
+	}
+	for _, sub := range []string{"bootstrap:", "stats_sinks[0]", "tcp_cluster_name", "c_nonexistent", "unknown cluster"} {
+		if !strings.Contains(err.Error(), sub) {
+			t.Errorf("error should contain %q: %q", sub, err.Error())
+		}
 	}
 }
 
