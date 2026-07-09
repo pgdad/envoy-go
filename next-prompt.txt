@@ -26,68 +26,63 @@ If ANY check prints output, the sentinel does NOT fire: proceed with the stage b
 
 Check (3) fails SAFE by construction: a future family whose rows use a slug not listed above reads as "never opened", which BLOCKS `stop` rather than falsely triggering it. A false "not done" costs one wasted session; a false "done" ends the project early. When you open a new family, add its row-summary slug here.
 
-**SENTINEL RE-CHECKED 2026-07-09 — it does NOT fire. Do NOT create `stop`.** Evidence: (a) **ROW 55 IS `in-progress`** (lifecycle-state 3; the IMPL remains); (b) the **Observability family** STAYS OPEN even after row 55 — `graphite` + OTLP-metrics sinks, tracing `custom_tags`/`spawn_upstream_span`/`http_service`/force-trace, the tap filter; (c) the **Operational-tooling family** STAYS OPEN — xDS-sourced dry-validation, an admin-API live-reload-and-validate endpoint, an RTDS/SDS validate companion; (d) FIVE families have never been opened — **HTTP/3 + QUIC**, **gRPC**, **xDS / dynamic config**, **Runtime + hot restart**, **WASM host**.
+**⚠ CHECK (1) IS NOW PERMANENTLY SILENT — and that is EXPECTED, not a signal to stop.** As of phase 55 every chartered ROADMAP table row is `done`; unchartered work lives in the **prose family paragraphs**, never in rows (ROADMAP §Schema: "Families are not rows"). Check (1) will therefore print nothing until a future BRAINSTORM registers a new `in-progress` row. **The sentinel is an AND of all three checks.** Do NOT read a silent check (1) as "the project is finished" — checks (2) and (3) are what carry the remaining work, and both currently print output.
 
-**STATUS AS OF 2026-07-09: phase 55 (`stats-sink-statsd-tcp`) PLAN is DONE and LANDED. Row 55 `in-progress`, lifecycle-state 3.**
+**SENTINEL RE-CHECKED 2026-07-09 (post-phase-55-IMPL, verified mechanically) — it does NOT fire. Do NOT create `stop`.** Evidence, from the actual command output:
+- (1) prints NOTHING (all rows `done` — see the warning above).
+- (2) prints: `remaining deferred (not-yet-chartered) candidates: graphite/OTLP-metrics sinks + tracing custom_tags/spawn_upstream_span/http_service/force-trace + the tap filter.` ⇒ the **Observability family STAYS OPEN**. (`the statsd tcp_cluster_name transport` was consumed by phase 55 and removed; `dog_statsd` was ALSO removed — rows 49+50 consumed every field the `DogStatsdSink` proto has, so listing it was stale and would have sent a future session to re-charter done work.)
+- (3) prints: `NEVER OPENED: HTTP/3`, `NEVER OPENED: gRPC`, `NEVER OPENED: xDS`, `NEVER OPENED: Runtime`, `NEVER OPENED: WASM` ⇒ **FIVE families have never been opened.**
+- The **Operational-tooling family** also STAYS OPEN (xDS-sourced dry-validation, an admin-API live-reload-and-validate endpoint, an RTDS/SDS validate companion).
 
-**THE NEXT ACTION: the phase-55 (`stats-sink-statsd-tcp`) IMPL — the FINAL stage of this phase.**
+**STATUS AS OF 2026-07-09: phase 55 (`stats-sink-statsd-tcp`) IMPL is DONE and LANDED. Row 55 `done`. The phase-55 lifecycle is COMPLETE.** Squash `d38aa66e`, FF-merged to `master` and pushed. Counts at exit: stat surface **1200 (+0)** · fixtures **100** · fuzzers **52** · BackendKind tail **38** · DECISIONS tail **ADR-0272** (next-free **ADR-0273**).
+
+**THE NEXT ACTION: charter the NEXT PHASE (row 56) — its BRAINSTORM.**
 
 ==============================================
 
-## What is already DECIDED — do NOT re-litigate
+## What THIS session does (a BRAINSTORM, lifecycle-state 0 → 1)
 
-The BRAINSTORM settled Q1–Q5. The SPEC executed seven live probes and AMENDED three of them. The **PLAN resolved all five §12 D-questions, corrected the SPEC in three places, and strengthened one assertion that would otherwise have been vacuous.**
-
-**Precedence: PLAN > SPEC > BRAINSTORM.** Where they disagree, the later one wins. Do not re-open a settled question.
-
-- **Q1 writer shape → BOUNDED CHANNEL + WRITER GOROUTINE** (the `MetricsServiceSink`/ADR-0262 shape). `delta.apply` runs in the WRITER, not `Submit` (ADR-0263).
-- **Q2 dial → `Cluster.DialSink(ctx) (net.Conn, error)`**, NOT `Cluster.Dial`. TWO returns, not three (`Dial` is `(net.Conn, Endpoint, error)`). Shares a NEW private `dialAndTLS` extracted from `dialPicked`. **`ownPermit=false` is NOT sufficient** — `dialPicked` still Incs both `upstream_cx_*` counters and wraps in `connWithGauge`, whose `dec` would underflow a permit `DialSink` never took. No permit, no counters, no wrapper, bare conn.
-- **Q3 error policy → BOUNDED ACCUMULATE + LINE-ALIGNED RESUME.** On a write error: `conn.Close()`, `conn = nil`, `pending = pending[bytes.LastIndexByte(pending[:n], '\n')+1:]`, compacted to the front. `maxPendingBytes = 1 << 20`; `dropOldestLines` drops whole LINES.
-- **Q4 differential → payload parity CROSS-SIDE + THREE subject-exact assertions** (`ConnCount()==1`, `UnparsedCount()==0`, `c_statsd.upstream_cx_total==0`).
-- **Q5 envelope → SINGLE FLAT ROW, ADR-0272.** **14 tasks. The ADR-0045 gate is TOUCHED, NOT EXCEEDED ⇒ NO SPLIT.**
-- **AMEND-TCP-NODE:** the TCP arm requires BOTH `node.id` and `node.cluster`. The UDP arm requires neither.
-- **AMEND-TCP-USEDONLY:** the reference emits only USED stats. Assert NAMED SUBSETS, never whole sets.
-
-## What THIS session does (the IMPL, lifecycle-state 3 → DONE)
-
-1. Re-verify the cold-start baselines (below) against the CURRENT master tip (`git log --oneline -1` — do not assume).
-2. **Execute `docs/envoy-go/phases/55-stats-sink-statsd-tcp/PLAN.md`, Tasks 1–14, in order.** Every task carries complete TDD steps, real production code, real test code, exact commands with expected output, and its own deliberate-break liveness check. **The PLAN is the instruction set — read it, do not re-derive it.**
-3. **Subagent-driven** (`feedback_execution_style`) in a **FRESH worktree** (`feedback_git_worktrees`):
-   ```sh
-   git worktree add .worktrees/phase-55-impl -b phase-55-stats-sink-statsd-tcp-impl master
-   ```
-   One fresh subagent per task, controller review between tasks. Subagents commit **LOCALLY ONLY** (`feedback_subagents_no_push`). The CONTROLLER verifies each commit, re-runs the per-task gate on the frozen HEAD, cleans leaked files, squashes at stage-close, and pushes.
-4. **The CONTROLLER performs Task 12 (the four deliberate breaks) ITSELF.** A subagent that writes both the break and the assertion can make them agree. Task 12 carries two extra obligations the PLAN spells out: break **(c)** must additionally be shown to PASS once the stability barrier is removed (proving the barrier is what bites), and break **(b)**'s subset-vacuity must be OBSERVED AND RECORDED, not assumed.
-5. Land the ADR-0052 atomic six-gate bundle (Task 14): write ADR-0272, the BEHAVIOR_CONTRACT delta, flip **row 55 → `done`**, remove `the statsd tcp_cluster_name transport` from the Observability family's deferred-candidate sentence (the family STAYS OPEN), advance STATE.md, then **ROLL THIS FILE FORWARD to the NEXT PHASE's BRAINSTORM**.
-6. NO new live probes are needed. The SPEC executed all seven empirical pins; the PLAN re-verified every source citation. If a probe nonetheless becomes necessary, run it — do not guess. Use a FRESH receiver/container per arm (`feedback_probe_fresh_container_per_arm`).
-
-## Four traps the IMPL must not walk into
-
-- **`statsdrecv` is a DATAGRAM parser and this is MEASURED, not hypothetical.** The probe's ~200 KB post-reconnect write arrived in `recv()` chunks capped at 65536 bytes, **splitting lines mid-token**. The TCP listener must read line-at-a-time through `bufio` with a carried remainder and DISCARD an incomplete trailing line at EOF — the no-duplication argument DEPENDS on that discard. PLAN Task 2 traces a concrete split-read byte-for-byte.
-- **The `bootstrap.go:556-561` ordering constraint survives the lift with INVERTED meaning.** `GetAddress()` returns nil for BOTH a missing oneof AND a `tcp_cluster_name` arm, which is why the reject ran FIRST. After the lift the `tcp_cluster_name` arm must be **DISPATCHED** before the nil-`address` reject fires, or a valid TCP config is rejected as "missing `statsd_specifier`". PLAN Task 3 pins this with a dedicated regression test. **And `tcp_cluster_name` lives at SIX Go sites, not one** — including a SECOND fuzz seed at `statssink_fuzz_test.go:110-115` that the SPEC never mentions.
-- **`TCPStatsdSink` is the statsd sinks' FIRST background mutator.** A `-run`-subset `-race` will MISS the class of failure it introduces (`reference_full_suite_race_after_background_mutator`). The merge gate runs a FULL-package `-race` on `internal/statssink`, `internal/cluster`, AND `test/differential`.
-- **Two API facts the PLAN's review gate caught, which WILL break the build if forgotten:** `endpointFromAddr` is `func(net.Addr) Endpoint` (`cluster_test.go:110`) — pass `ln.Addr()`, never `ln.Addr().String()`. And **`fixture.TB` has NO `Logf`** (`fixture.go:64-68` — it deliberately avoids importing `testing`); the `0098` driver records the reference's values with `log.Printf`. **Re-verify every other line citation before editing at it.**
+1. Re-verify the cold-start baselines (below) against the CURRENT master tip (`git log --oneline -1` — do not assume; expect `d38aa66e`).
+2. **Invoke `superpowers:brainstorming`.** This is a creative/charter stage — the skill is mandatory before any plan-mode or design work.
+3. **Pick the next deferred candidate WITH THE HUMAN.** The loop RE-OPENS here; the human picks. Do not pick unilaterally. Present the real, currently-open options:
+   - **Observability family (OPEN)** — `graphite` stats sink · OTLP-metrics stats sink · tracing `custom_tags` / `spawn_upstream_span` / `http_service` / force-trace · the **tap filter**.
+   - **Operational-tooling family (OPEN)** — xDS-sourced dry-validation · an admin-API live-reload-and-validate endpoint · an RTDS/SDS validate companion.
+   - **Open a NEW family** — HTTP/3 + QUIC · gRPC · **xDS / dynamic config** · Runtime + hot restart · WASM host. (Note: xDS/CDS is now an *explicit* forward-dependency — ADR-0272 records that phase 55's static-cluster `tcp_cluster_name` reject must MOVE to the cluster manager when CDS lands.)
+4. **Register the new row `in-progress` AT the BRAINSTORM commit** — the ROADMAP §Schema invariant. If you open a new family, **add its row-summary slug to the sentinel's check-(3) list in this file.**
+5. Run the 4–6-question user dialogue, settle the envelope against the **ADR-0045 split gate**, anticipate the counts, and write `docs/envoy-go/phases/56-<slug>/BRAINSTORM.md`.
+6. Land the ADR-0052 bundle: advance `STATE.md`, flip the ROADMAP row, then **ROLL THIS FILE FORWARD to the phase-56 SPEC.**
+7. Docs-only stage. **No production code.** Fresh worktree `.worktrees/phase-56-brainstorm`, branch `phase-56-<slug>-brainstorm`.
 
 ## Honor throughout (the discipline, unchanged)
-- **Lifecycle = one stage per session.** This session: the phase-55 IMPL ONLY. It is the LAST stage of phase 55.
+- **Lifecycle = one stage per session.** This session: the phase-56 BRAINSTORM ONLY.
 - **Subagent-driven execution** (`feedback_execution_style`) in a **fresh worktree** (`feedback_git_worktrees`); subagents commit LOCALLY only (`feedback_subagents_no_push`); the CONTROLLER verifies each commit, re-runs gates on the frozen HEAD, does deliberate-break/liveness verification ITSELF, and SQUASHES + PUSHES at stage-close (`feedback_subagent_autocommit_claudemd` · `feedback_push_to_origin`). Per-task gates: `gofmt -l` + `golangci-lint` + `go vet` + `go build ./...` (`feedback_pertask_gofmt_lint`).
-- **Path targeting** (`feedback_subagent_worktree_path_targeting`): pin the canonical worktree root in every dispatch, give worktree-relative paths, and after each task verify `git -C /home/esa/git/envoy-go status --porcelain` is EMPTY (the main checkout must never be written).
+- **COMMIT BEFORE YOU BREAK.** `git restore <file>` reverts to **HEAD**, not to "before the break". Three phase-55 subagents destroyed their own uncommitted work this way. Finish → gate → **commit** → only then break, restore, and re-run with `-count=1`.
+- **Path targeting** (`feedback_subagent_worktree_path_targeting`): pin the canonical worktree root in every dispatch, give worktree-relative paths, and after each task verify `git -C /home/esa/git/envoy-go status --porcelain` is EMPTY (the main checkout must never be written; `next-prompt.txt` is the ONE exception — it is gitignored).
 - **GIT HYGIENE** (`feedback_subagent_worktree_detach`): revert a deliberate break with `git restore <file>` ONLY. Never `git checkout <sha>`, never `git commit --amend`. Re-verify `git branch --show-current` after every break. Deliberate-break runs ALWAYS use `-count=1` (`reference_differential_break_protocol_count1`).
-- **Differential `-run` selector** (`reference_differential_run_selector`): use `-run 'TestDifferential/0098-stats-sink-statsd-tcp'`. A bare `-run '0098'` matches ZERO subtests and reports a vacuous PASS.
-- **Process anchors:** ADR-0106 · ADR-0044 (ADR §Decision+§Consequences at IMPL; §Context drafted at SPEC §13) · ADR-0045 (split soft gate — re-armed: if a task split pushes the total past 15, STOP and re-open as 55.1/55.2) · ADR-0080 (byte-stable rejects) · ADR-0052 (atomic six-gate bundle) · ADR-0227 (reference `envoyproxy/envoy:contrib-v1.37.2`) · ADR-0262 (bounded-channel writer-goroutine sink) · ADR-0263 (delta in the WRITER) · ADR-0252 (the `max_connections` permit `DialSink` must NOT take) · next-free **ADR-0272**.
+- **Differential `-run` selector** (`reference_differential_run_selector`): `go test -run '<NNNN>'` matches ZERO subtests and reports a vacuous PASS. Always `-run 'TestDifferential/<NNNN>-<slug>'`.
+- **Full-suite runs must be UNLOADED.** Phase 55's Gate 3 flaked on an untouched package (`internal/filter/hcm/h2` `TestServerConn_TinyWindowDelivery`, i/o timeout) purely because it ran concurrently with two `-race` suites. Isolated on the frozen HEAD it passed 5/5 in 0.073 s. Do not run the unit suite and a `-race` suite at the same time, and do not accept a timing failure in an untouched package without isolate-re-running it.
+- **Process anchors:** ADR-0106 · ADR-0044 (ADR §Decision+§Consequences at IMPL; §Context drafted at SPEC §13) · ADR-0045 (split soft gate) · ADR-0080 (byte-stable rejects) · ADR-0052 (atomic six-gate bundle) · ADR-0227 (reference `envoyproxy/envoy:contrib-v1.37.2`) · next-free **ADR-0273**.
 - Re-verify baselines fresh at cold-start against current HEAD:
-  - `ls -d test/fixtures/[0-9][0-9][0-9][0-9]* | wc -l` → expect **99** (next fixture dir: `0098-stats-sink-statsd-tcp`; **100** at IMPL exit)
-  - `grep -rh '^func Fuzz' --include='*.go' --exclude-dir=.worktrees . | wc -l` → expect **52** (stays 52 — reconcile per `reference_fuzzer_count_docs_drift`)
-  - `grep -nE '^## ADR-0[0-9]+' docs/envoy-go/DECISIONS.md | tail -1` → expect **ADR-0271** (next-free **ADR-0272**)
-  - `grep -n "BackendKind = " test/differential/fixture/fixture.go | tail -1` → expect **38** (stays 38 — the receiver is driver-owned)
-  - stat surface → **1200** (stays 1200; ZERO delta — any `stats.NewCounter*` in this phase is a plan violation)
+  - `ls -d test/fixtures/[0-9][0-9][0-9][0-9]* | wc -l` → expect **100** (tail `0098-stats-sink-statsd-tcp`; next fixture dir `0099-…`)
+  - `grep -rh '^func Fuzz' --include='*.go' --exclude-dir=.worktrees . | wc -l` → expect **52** (reconcile per `reference_fuzzer_count_docs_drift`)
+  - `grep -nE '^## ADR-0[0-9]+' docs/envoy-go/DECISIONS.md | tail -1` → expect **ADR-0272** (next-free **ADR-0273**)
+  - `grep -n "BackendKind = " test/differential/fixture/fixture.go | tail -1` → expect **38**
+  - stat surface → **1200**
+
+## Carried forward from phase 55 — read before designing anything adjacent
+
+- **ADR-0272 leaves ONE named forward-dependency:** envoy-go has **no CDS**, so `parseStatsdTCPArm` validates `tcp_cluster_name` against `static_resources.clusters` at PARSE time (which *is* boot time today). **When the xDS family opens and CDS lands, that reject MUST move to the cluster manager.** `cmd/envoy-go/main.go` already carries a defensive `cm.Get` fatal + a `// when CDS lands, this static check must move` marker.
+- **`Cluster.DialSink` is STATS-SINKS-ONLY.** It takes no `max_connections` permit and increments no `upstream_cx_*`. Any data-plane caller wanting a connection MUST use `Dial`. Its doc comment says so; enforce it in review.
+- **`internal/statssink` must never import `internal/cluster`.** The seam is a `DialFunc`. Guard: `go list -deps ./internal/statssink/ | grep 'envoy-go/internal/cluster'` prints nothing.
+- **`TCPStatsdSink` is the statsd sinks' FIRST background mutator** ⇒ a `-run`-subset `-race` is not evidence for `internal/statssink`. Full-package only.
+- **Coverage boundaries phase 55 accepted (boundaries, not gaps):** the line-aligned resume is UNIT-proven, not differentially proven (`0098`'s receiver never dies); cross-side `ConnCount` equality is infeasible **by the histogram boundary**; the emitted line SET differs structurally (the reference emits only USED stats) so only NAMED SUBSETS are asserted; `membership_total == 1` is asserted but targeted by no deliberate break.
 
 ## Read first (in order)
-1. THIS FILE — the cold-start router (phase-55 IMPL is next; it is the final stage of the phase).
-2. `docs/envoy-go/phases/55-stats-sink-statsd-tcp/PLAN.md` — **THE INSTRUCTION SET.** Global Constraints; the five D-question resolutions (each argued from source evidence); the FINAL ADR-0045 split-gate re-check; the file-structure table; the three traps; **Tasks 1–14, each a complete TDD spine with real code**; the self-review (SPEC coverage map, §6 reject-roster row-by-row coverage, the three SPEC corrections, the two BLOCKERs the review gate caught).
-3. `docs/envoy-go/phases/55-stats-sink-statsd-tcp/SPEC.md` — the design authority beneath the PLAN. §3 the design; §6 the reject roster; §8 the `0098` fixture + four deliberate breaks; §11 the executed empirical pins (evidence for every reference claim); §13 the ADR-0272 §Context draft to transcribe.
-4. `docs/envoy-go/phases/55-stats-sink-statsd-tcp/BRAINSTORM.md` — the Q1–Q5 dialogue. **Superseded by the SPEC on Q2/Q3/Q4's rationale, and by the PLAN on every D-question.**
-5. `docs/envoy-go/STATE.md` — the active-phase header (`phase 55 PLAN done`) + full history.
-6. The as-built source the PLAN cites: `internal/cluster/cluster.go` (`Dial` `:536`, `PickEndpoint` `:506`, `dialPicked` `:576-607`, the Incs `:600-601`, `connDec` `:359-365`, `connWithGauge` `:721-742`), `internal/statssink/{statsd.go,udp.go,delta.go,flusher.go,sink.go}` (`emitStatsdLines` `udp.go:58`; `Sink` `sink.go:18-21`; consts `:33-48`; `Close` `:140-153`), `internal/bootstrap/bootstrap.go` (`StatsdSinkConfig` `:289-300`, `Proto` `:351`, `Load` `:467`, `parseStatsSinks` `:484-517`, `parseStatsdSinkConfig` `:554-579`), `cmd/envoy-go/main.go` (`cm` `:105`, `minNode` `:151-155`, sink loop `:194-232`, sink-close defer `:234-246`), `test/helpers/statsdrecv/`, `test/fixtures/0092-stats-sink-statsd/`.
-7. `internal/grpcclient/grpcclient.go:128-141` — the cluster-re-lookup-per-dial callback the `main.go` dial closure mirrors.
-8. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — especially `reference_full_suite_race_after_background_mutator`, `reference_line_parser_extension_delimiter_reuse`, `reference_delta_sink_differential_stability_barrier`, `reference_periodic_sink_differential_two_receivers`, `reference_host_gateway_ip_docker_desktop`, `reference_membership_total_vs_healthy_gauge`, `reference_differential_backendcount_min_one`, `reference_differential_run_selector`, `reference_differential_break_protocol_count1`, `reference_differential_asserter_dispatch`, `reference_differential_fixture_dispatch_constraint`, `reference_stats_sink_emits_used_only`, `reference_cluster_sink_dial_unaccounted`, `reference_fuzzer_count_docs_drift`, `reference_differential_fullsuite_startup_flake`, `reference_admin_interface_wire_name_collision` (CLOSED for this row — plain statsd hoists no tags), and the `feedback_*` execution discipline.
+1. THIS FILE — the cold-start router (a phase-56 BRAINSTORM is next; the human picks the candidate).
+2. `docs/envoy-go/STATE.md` — the active-phase header (`phase 55 IMPL done`) + full history. The phase-55 entry records the deliberate-break protocol that **refuted the PLAN's own prediction**; read it before trusting any future PLAN's vacuity analysis.
+3. `docs/envoy-go/ROADMAP.md` — §Schema, the family paragraphs, and the deferred-candidate sentences that define what is still open.
+4. `docs/envoy-go/DECISIONS.md` — **ADR-0272** (the tail) for the statsd TCP transport; ADR-0045/0052/0080/0106 for process.
+5. `docs/envoy-go/BEHAVIOR_CONTRACT.md` — the phase-55 block.
+6. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — the `feedback_*` execution discipline, and the `reference_*` traps. **Two NEW lessons from phase 55 are worth writing down if they are not already there:**
+   - *A deliberate break can fail at the WRONG assertion.* Phase 55's break (b) failed earlier than the PLAN predicted, masking the very assertion the PLAN added to make it reliable. Always confirm **which** assertion fired — and when a break masks another, add an ISOLATING break for the masked one.
+   - *`t.Fatalf` in a multi-property test makes later assertions unreachable dead code.* Phase 55's Task 7 had three properties that no break had ever exercised. Use `t.Errorf` for independent properties; reserve `t.Fatalf` for a broken harness precondition.
