@@ -3,6 +3,29 @@ This file is a SELF-ADVANCING router for driving the project forward one stage a
 
 TERMINATION SENTINEL: if — and ONLY if — ALL work is complete (every chartered ROADMAP row/phase is `done`, EVERY family's deferred-candidate list is ALSO empty, and STATE.md's NEXT shows there is NO next stage left to perform), create an empty file named `stop` at the git root with `: > /home/esa/git/envoy-go/stop` and EXIT without further action.
 
+Evaluate it MECHANICALLY, not by eye. All three checks must print NOTHING:
+```sh
+# (1) every ROADMAP row is `done`
+grep -oE '^\| [0-9.]+ \| [a-z0-9-]+ \| [0-9.,  ]* \| (planned|in-progress|blocked|done[^|]*)' docs/envoy-go/ROADMAP.md \
+  | awk -F'|' '{gsub(/ /,"",$5); if ($5 !~ /^done/) print "NOT DONE: row"$2}'
+
+# (2) no family still carries deferred candidates
+grep -oE 'remaining deferred \(not-yet-chartered\) candidates:[^.]*\.' docs/envoy-go/ROADMAP.md
+
+# (3) every WORK family has been opened, i.e. at least one row summary names it
+#     ("<Family>-family row"). NOTE: family HEADINGS never contain rows -- rows live
+#     in the main table (ROADMAP §Schema: "Families are not rows"). Do NOT try to
+#     count rows under a `### ... family` heading; that check is meaningless.
+#     `Deprecated / edge features` is intentionally out of scope and excluded.
+for slug in HTTP-filters Network-filters Load-balancing Upstream-robustness Observability \
+            Operational-tooling HTTP/3 gRPC xDS Runtime WASM; do
+  grep -qi -- "$slug-family row" docs/envoy-go/ROADMAP.md || echo "NEVER OPENED: $slug"
+done
+```
+If ANY check prints output, the sentinel does NOT fire: proceed with the stage below and do NOT create `stop`.
+
+Check (3) fails SAFE by construction: a future family whose rows use a slug not listed above reads as "never opened", which BLOCKS `stop` rather than falsely triggering it. A false "not done" costs one wasted session; a false "done" ends the project early. When you open a new family, add its row-summary slug here.
+
 **SENTINEL RE-CHECKED 2026-07-08 — it does NOT fire. Do NOT create `stop`.** Evidence: (a) **ROW 55 IS `in-progress`** (lifecycle-state 2; the PLAN and IMPL remain); (b) the **Observability family** STAYS OPEN even after row 55 — `graphite` + OTLP-metrics sinks, tracing `custom_tags`/`spawn_upstream_span`/`http_service`/force-trace, the tap filter; (c) the **Operational-tooling family** STAYS OPEN — xDS-sourced dry-validation, an admin-API live-reload-and-validate endpoint, an RTDS/SDS validate companion; (d) FIVE families have never been opened — **HTTP/3 + QUIC**, **gRPC**, **xDS / dynamic config**, **Runtime + hot restart**, **WASM host**.
 
 **STATUS AS OF 2026-07-08: phase 55 (`stats-sink-statsd-tcp`) SPEC is DONE and LANDED (`1eecd76e`, FF-merged to master + pushed). Row 55 `in-progress`, lifecycle-state 2.**
@@ -25,7 +48,7 @@ The BRAINSTORM settled Q1–Q5 via user dialogue. The SPEC then executed the liv
 
 ## What THIS session does (the PLAN, lifecycle-state 2 → 3)
 
-1. Re-verify the cold-start baselines (below) against master tip `1eecd76e`. Do NOT trust any count in this file without re-running the commands.
+1. Re-verify the cold-start baselines (below) against the CURRENT master tip (`a6a651bc` at the time this router was written; run `git log --oneline -1` — do not assume). Do NOT trust any count in this file without re-running the commands.
 2. Invoke `superpowers:writing-plans` and decompose **SPEC §10** (14 indicative tasks) into a bite-sized TDD spine. Apply the **plan-document-reviewer gate** (dispatch a review of the PLAN against the SPEC *and the actual as-built source* — every prior PLAN that skipped it leaked wrong line citations, wrong test snippets, or wrong import lists).
 3. **Resolve the FIVE §12 D-questions:**
    - **D-TCP-CLOSE (LOAD-BEARING).** The race-free mechanism by which `Close` reaches the writer-goroutine-owned `conn` to unwedge a blocked `Write`. `cancel()` CANNOT interrupt a raw `net.Conn` (unlike a gRPC stream — this is precisely where the `MetricsServiceSink` precedent stops transferring). Candidates: an `atomic.Pointer[net.Conn]`, a ctx-watching closer goroutine, or relying solely on a per-write `SetWriteDeadline`. **Must be `-race`-PROVEN at IMPL, not argued in prose.**
