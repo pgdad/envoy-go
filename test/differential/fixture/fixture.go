@@ -619,10 +619,22 @@ type PerHostBackendKind interface {
 	BackendKindAt(i int) BackendKind
 }
 
-// HostMount describes a file bind-mount from the test host into the reference
-// container. The file at HostPath must exist on the host before the container
-// starts. HostPath is the absolute host-side file path; ContainerPath is the
-// absolute in-container target path.
+// HostMount describes a bind-mount from the test host into the reference
+// container. The runner pre-creates HostPath before starting the container so
+// Docker binds the intended kind of inode.
+//
+// Dir=false (the default) mounts a single FILE — the 0006-access-log shape,
+// where the proxy appends to one known path.
+//
+// Dir=true mounts a DIRECTORY — required when the proxy creates files whose
+// names the test cannot predict (e.g. the tap filter's file_per_tap sink, which
+// writes <path_prefix>_<trace_id>.json once per matching stream). The directory
+// is created 0o777 because the reference envoy runs as uid 101 inside the
+// container and must be able to create files in it.
+//
+// ContainerPath must NOT live under a sticky, world-writable directory such as
+// /tmp: with fs.protected_regular=2 (Ubuntu CI) envoy gets EACCES creating files
+// there. Use a dedicated non-sticky dir, e.g. /envoy-go-test/.
 //
 // This type is defined here (in the leaf fixture package) so that driver
 // packages can use it without importing testcontainers-go directly. The runner
@@ -631,6 +643,7 @@ type PerHostBackendKind interface {
 type HostMount struct {
 	HostPath      string
 	ContainerPath string
+	Dir           bool
 }
 
 // ReferenceLogMounter is an OPTIONAL driver-side interface the runner invokes

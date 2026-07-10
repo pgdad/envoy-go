@@ -2746,3 +2746,41 @@ func TestChain_post_Destroy_DynamicMetadata_returns_nil(t *testing.T) {
 		t.Errorf("expected nil encoder DynamicMetadata post-Destroy; got %v", cbe.DynamicMetadata())
 	}
 }
+
+// A both-sided filter (the SAME value in Decoder and Encoder) has OnDestroy
+// invoked exactly once, via the Decoder branch of Destroy()'s if/else-if.
+func TestDestroy_BothSidedFilterOnDestroyFiresOnce(t *testing.T) {
+	f := &recordingFilter{}
+	chain := NewFilterChain([]HTTPFilter{{Name: "both", Decoder: f, Encoder: f}}, nil)
+	chain.Destroy()
+	if got := f.destroyed.Load(); got != 1 {
+		t.Errorf("OnDestroy fired %d times, want exactly 1", got)
+	}
+}
+
+// THE HAZARD, pinned: with a Decoder present, an ENCODER-ONLY value's OnDestroy
+// is UNREACHABLE (chain.go:670 is an `else if`). Any filter that hangs a
+// stream-end side effect off a distinct encoder value silently never fires it.
+func TestDestroy_EncoderOnlyOnDestroyUnreachableWhenDecoderPresent(t *testing.T) {
+	dec := &recordingFilter{}
+	enc := &recordingFilter{}
+	chain := NewFilterChain([]HTTPFilter{{Name: "split", Decoder: dec, Encoder: encodeRecorder{f: enc}}}, nil)
+	chain.Destroy()
+	if got := dec.destroyed.Load(); got != 1 {
+		t.Errorf("decoder OnDestroy fired %d times, want 1", got)
+	}
+	if got := enc.destroyed.Load(); got != 0 {
+		t.Errorf("encoder OnDestroy fired %d times, want 0 — "+
+			"if this ever becomes 1, the tap filter's ONE-SHARED-VALUE constraint can be relaxed", got)
+	}
+}
+
+// And an encoder-ONLY filter (no Decoder) DOES get OnDestroy, via the else-if.
+func TestDestroy_EncoderOnlyFilterWithNoDecoderFires(t *testing.T) {
+	enc := &recordingFilter{}
+	chain := NewFilterChain([]HTTPFilter{{Name: "enc-only", Encoder: encodeRecorder{f: enc}}}, nil)
+	chain.Destroy()
+	if got := enc.destroyed.Load(); got != 1 {
+		t.Errorf("encoder-only OnDestroy fired %d times, want 1", got)
+	}
+}

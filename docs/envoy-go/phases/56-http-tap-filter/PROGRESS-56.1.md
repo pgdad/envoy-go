@@ -13,31 +13,34 @@
 
 ## Task Checklist (15 tasks — AT the ADR-0045 `~15` gate, margin ZERO)
 
-- [ ] T1  PROGRESS baselines + FINAL ADR-0045 split re-check
-- [ ] T2  `internal/headermatch`: `stringMatcher` (5 arms + `ignore_case`; `custom` rejected) [TDD]
-- [ ] T3  `internal/headermatch`: `Matcher` (8 arms + `invert_match` + `treat_missing_header_as_empty`) + `Lowercase` [TDD]
-- [ ] T4  `internal/matchpredicate`: node types + `Compile` (6 accept / 4 explicit rejects / depth cap 32) [TDD]
-- [ ] T5  `internal/matchpredicate`: `Evaluator` (feed + tri-state `Resolve`; Undetermined ⇒ false) [TDD]
-- [ ] T6  `FuzzMatchPredicateCompile` (+depth-33/512 seeds exercising the cap); fuzzers 52 → 53 [fuzz]
-- [ ] T7  `internal/filter/http/tap`: config parse + FULL PARITY/DEPARTURE reject roster + `rq_tapped` (+1 delta guard) [TDD]
-- [ ] T8  Dual-sided capture: `:status` on a COPY, lowercase, sort + the wire-leak regression [TDD]
-- [ ] T9  `OnDestroy` emit + trace assembly + `record_downstream_connection` + ONE-SHARED-VALUE pins [TDD]
-- [ ] T10 `filePerTapSink`: per-stream file, monotonic trace-id, `MkdirAll` parent + byte-exact protojson golden [TDD]
-- [ ] T11 `doc.go` + `builtins.go` registration arm (20 → 21 registered; 19 → 20 production)
-- [ ] T12 Harness: `fixture.HostMount.Dir` + runner directory pre-create (+ the `0006` file-mount regression) [TDD]
-- [ ] T13 Fixture `0099-http-tap-headers`: YAMLs + driver (GET → 204, N=3 match + M=2 non-match); fixtures 100 → 101
-- [ ] T14 `0099` `AssertStats` glob-and-decode assertions + FIVE deliberate breaks + flake/race/full-suite gates
-- [ ] T15 Docs bundle: ADR-0273 + `BEHAVIOR_CONTRACT` + `STATE`/`ROADMAP`/`README` + fuzzer reconcile
+- [x] T1  PROGRESS baselines + FINAL ADR-0045 split re-check
+- [x] T2  `internal/headermatch`: `stringMatcher` (5 arms + `ignore_case`; `custom` rejected) [TDD]
+- [x] T3  `internal/headermatch`: `Matcher` (8 arms + `invert_match` + `treat_missing_header_as_empty`) + `Lowercase` [TDD]
+- [x] T4  `internal/matchpredicate`: node types + `Compile` (6 accept / 4 explicit rejects / depth cap 32) [TDD]
+- [x] T5  `internal/matchpredicate`: `Evaluator` (feed + tri-state `Resolve`; Undetermined ⇒ false) [TDD]
+- [x] T6  `FuzzMatchPredicateCompile` (+depth-33/512 seeds exercising the cap); fuzzers 52 → 53 [fuzz]
+- [x] T7  `internal/filter/http/tap`: config parse + FULL PARITY/DEPARTURE reject roster + `rq_tapped` (+1 delta guard) [TDD]
+- [x] T8  Dual-sided capture: `:status` on a COPY, lowercase, sort + the wire-leak regression [TDD]
+- [x] T9  `OnDestroy` emit + trace assembly + `record_downstream_connection` + ONE-SHARED-VALUE pins [TDD]
+- [x] T10 `filePerTapSink`: per-stream file, monotonic trace-id, `MkdirAll` parent + byte-exact protojson golden [TDD]
+- [x] T11 `doc.go` + `builtins.go` registration arm (20 → 21 registered; 19 → 20 production)
+- [x] T12 Harness: `fixture.HostMount.Dir` + runner directory pre-create (+ the `0006` file-mount regression) [TDD]
+- [x] T13 Fixture `0099-http-tap-headers`: YAMLs + driver (GET → 204, N=3 match + M=2 non-match); fixtures 100 → 101
+- [x] T14 `0099` `AssertStats` glob-and-decode assertions + FIVE deliberate breaks + flake/race/full-suite gates
+- [x] T15 Docs bundle: ADR-0273 + `BEHAVIOR_CONTRACT` + `STATE`/`ROADMAP`/`README` + fuzzer reconcile
 
 ---
 
 ## Baseline Counts
 
-Recorded at the **PLAN** stage against master `0f82eb75` (the IMPL's T1 MUST re-run
+Re-recorded at the **IMPL** stage against cold-start HEAD `340964ef` (the IMPL's T1 MUST re-run
 these against its own cold-start HEAD and replace this block with its literal output —
 do not assume they still hold):
 
 ```
+$ go build ./... && echo BUILD_OK
+BUILD_OK
+
 $ ls -d test/fixtures/[0-9][0-9][0-9][0-9]* | wc -l
 100
 
@@ -93,22 +96,24 @@ intended assertion is live — it can abort earlier and MASK it
 
 All `0099` breaks edit **subject-side** production code, so the **subject** trace must be the one that violates. Confirm the failure text names `subject/...`.
 
+All breaks were re-performed BY THE CONTROLLER with `-count=1`; the `0099` breaks (rows 8-14) all fired on the **subject** side.
+
 | # | Task | Break | Must fire | Fired? (literal text) |
 |---|---|---|---|---|
-| 1 | T7 | delete the `tap_enabled` guard | `TestNew_RejectRoster/tap_enabled_set` | |
-| 2 | T7 | delete the `streaming_grpc` guard | `TestNew_RejectRoster/sink_streaming_grpc` | |
-| 3 | T7 | delete the neither-match guard | `TestNew_RejectRoster/neither_match_nor_match_config` | |
-| 4 | T8 | write `:status` into the wire-bound map | `TestEncodeHeaders_NeverMutatesTheWireBoundMap` | |
-| 5 | T9 | split: `Decoder: f, Encoder: &tapFilter{…}` | `TestFactory_InstallsOneSharedValueInBothFields` | |
-| 6 | T9 | split: `Decoder: &tapFilter{…}, Encoder: f` | `TestChainDestroy_EmitsExactlyOnce` → 0 files, `rq_tapped` 0 | |
-| 7 | T10 | `EmitUnpopulated: true` | `TestMarshal_ByteExactGolden` (raw bytes) | |
-| 8 | T14(a) | emit at `DecodeHeaders` | `0099` (1)+(2): 0 traces, `rq_tapped` 0 | |
-| 9 | T14(a′) | `bt.Response = nil` | `0099` (4): `response.headers` missing `:status` | |
-| 10 | T14(b) | `Resolve()` always true | `0099` (1)+(2): 5 traces, `rq_tapped` 5 | |
-| 11 | T14(c) | `EmitUnpopulated` in the sink | `0099` **(5b) ONLY** — the raw-bytes check. **(5) must NOT fire.** | |
-| 12 | T14(c′) | fabricate `Body{AsString:"x"}` | `0099` (5) *and* (5b) | |
-| 13 | T14(d) | populate `Message.trailers` | `0099` (6): subject `request.trailers` non-empty | |
-| 14 | T14(e) | populate `DownstreamConnection` unconditionally | `0099` (7): subject `downstream_connection` non-nil | |
+| 1 | T7 | delete the `tap_enabled` guard | `TestNew_RejectRoster/tap_enabled_set` | `config_test.go:191: expected reject, got nil error` (`TestNew_RejectRoster/tap_enabled_set`) |
+| 2 | T7 | delete the `streaming_grpc` guard | `TestNew_RejectRoster/sink_streaming_grpc` | `config_test.go:197: sink_streaming_grpc: error "tap: unsupported output_sink_type *tapv3.OutputSink_StreamingGrpc" does not contain "streaming_grpc sink is not supported"` |
+| 3 | T7 | delete the neither-match guard | `TestNew_RejectRoster/neither_match_nor_match_config` | `config_test.go:197: neither_match_nor_match_config: error "tap: match: matchpredicate: nil MatchPredicate" does not contain "neither match nor match_config is set"` |
+| 4 | T8 | write `:status` into the wire-bound map | `TestEncodeHeaders_NeverMutatesTheWireBoundMap` | `tap_test.go:49: EncodeHeaders MUTATED the wire-bound map: got map[:status:[204] Content-Type:[text/plain]]` + `tap_test.go:52: :status leaked into the wire-bound header map` |
+| 5 | T9 | split: `Decoder: f, Encoder: &tapFilter{…}` | `TestFactory_InstallsOneSharedValueInBothFields` | `emit_test.go:149: Decoder and Encoder must be the SAME *tapFilter value; a two-value split makes the encoder OnDestroy unreachable (chain.go:670)` (`TestFactory_InstallsOneSharedValueInBothFields`) |
+| 6 | T9 | split: `Decoder: &tapFilter{…}, Encoder: f` | `TestChainDestroy_EmitsExactlyOnce` → 0 files, `rq_tapped` 0 | `emit_test.go:188: trace files = 0, want exactly 1` + `emit_test.go:191: rq_tapped = 0, want 1` (`TestChainDestroy_EmitsExactlyOnce`) |
+| 7 | T10 | `EmitUnpopulated: true` | `TestMarshal_ByteExactGolden` — **canonJSON structure compare + the `"body"` substring pin** (updated from "raw bytes": Go's `protojson` `internal/detrand` build-seeded whitespace randomization makes a literal byte-exact golden incompatible with `-race`; see IMPL-3 below) | `sink_test.go:74: protojson structure drift` with `"body": null` appearing (canonJSON structure compare + the `"body"` substring pin both fire) |
+| 8 | T14(a) | emit at `DecodeHeaders` | `0099` (1)+(2): 0 traces, `rq_tapped` 0 | `subject trace count = 0, want 3` + `subject http.tap_probe.tap.rq_tapped = 0, want 3` |
+| 9 | T14(a′) | `bt.Response = nil` | `0099` (4): `response.headers` missing `:status` | `subject/out_1.json response.headers: missing key ":status" (have [])` (+ content-type; out_2, out_3) |
+| 10 | T14(b) | `Resolve()` always true | `0099` (1)+(2): 5 traces, `rq_tapped` 5 | `subject trace count = 5, want 3` + `subject http.tap_probe.tap.rq_tapped = 5, want 3` |
+| 11 | T14(c) | `EmitUnpopulated` in the sink | `0099` **(5b) ONLY** — the raw-bytes check. **(5) must NOT fire.** | `subject/out_1.json: raw trace must contain NO "body" key ...` — **(5b) ONLY; assertion (5) did NOT fire** (`"body": null` decodes to a nil Body) |
+| 12 | T14(c′) | fabricate `Body{AsString:"x"}` | `0099` (5) *and* (5b) | `subject/out_1.json: request.body must be ABSENT (bodyless GET); got as_string:"x"` **(5)** + `raw trace must contain NO "body" key` **(5b)** |
+| 13 | T14(d) | populate `Message.trailers` | `0099` (6): subject `request.trailers` non-empty | `subject/out_1.json: request.trailers must be empty; got 7` |
+| 14 | T14(e) | populate `DownstreamConnection` unconditionally | `0099` (7): subject `downstream_connection` non-nil | `subject/out_1.json: downstream_connection must be ABSENT; got ` |
 
 > **Do NOT add a T9 break that drops `Decoder` entirely.** Any test dereferencing `hf.Decoder` would panic on a nil interface conversion — a crash, not a proof. That framework fact is pinned by `chain_test.go`'s `TestDestroy_EncoderOnlyFilterWithNoDecoderFires`.
 
@@ -163,5 +168,44 @@ proved it by execution. The controller then re-verified it independently.
    **204** through *both* proxies. Only the backend's emission was probed. Fails safe
    (goes RED at T14 Step 2, not vacuous). Confirm live at the IMPL; if stripped, move
    it to the UNasserted list and accept a one-key `response.headers` assertion.
+   **RESOLVED at the IMPL: content-type SURVIVED end-to-end on both proxies**
+   (D-TAP-SUBSET is confirmed as originally stated — `response.headers ⊇
+   {:status 204, content-type text/plain}` — NOT moved to the UNasserted list).
 
-*(append IMPL findings below)*
+**IMPL findings**
+
+**IMPL-1 (T7): the plan's breaks #2/#3 were VACUOUS as designed.** Deleting the
+`streaming_grpc` case fell through to the defensive `default` arm, and deleting the
+neither-match guard fell through to `matchpredicate.Compile(nil)`; both still
+rejected, so the `err==nil`-only `TestNew_RejectRoster` stayed green. Hardened the
+test to assert per-arm error SUBSTRINGS (ADR-0080 arm-distinctness) — commit
+`95b1997a`. All 3 breaks now fire on their exact subtest.
+
+**IMPL-2 (T9): the ONE-SHARED-VALUE dynamic proof was VACUOUS.**
+`TestChainDestroy_EmitsExactlyOnce` used `validTap()`'s REQUEST-ONLY predicate;
+under the two-value split the decoder value resolves True on the request arm alone
+→ still 1 file/rq_tapped 1 → break did not bite (confirmed: the split ran `ok`).
+The plan's interface-driven fix was insufficient for a request-only predicate.
+Fix: new `validTapReqAndResp()` with `and_match{req x-tap=yes, resp :status=204}`
+so a decoder-only split stays Undetermined → 0 files — commit `f99f77fa`. Break now
+fires "trace files = 0, want exactly 1".
+
+**IMPL-3 (T10): protojson detrand vs the byte-exact golden — USER-DECIDED.** Go's
+`protojson` uses `internal/detrand`, which injects build-seeded whitespace
+randomization; a literal byte-exact golden passes under plain `go test` but
+deterministically FAILS under `-race` (a different binary → different detrand
+seed). The plan mandated BOTH a byte-exact golden AND running the package under
+`-race` — physically incompatible. Resolution (user-approved): the golden is
+compared as CANONICAL JSON (`encoding/json.Compact` strips only insignificant
+whitespace, preserves the token stream) plus detrand-robust substring pins; the
+`want` golden string is kept verbatim as documentation. This still catches an
+EmitUnpopulated regression (`"body":null` is a real token — verified live) and is
+build-independent. The T10 break-ledger row 7 note is updated from "raw bytes" to
+"canonJSON structure compare + the `"body"` substring pin" (reflected in the table
+above).
+
+**Minor findings (roll-up, not blocking):** stringmatch `ToLower` is Unicode vs
+Envoy's ASCII (headers are ~always ASCII); `driver.go`'s
+`bytes.HasPrefix([]byte(s),...)` could be `strings.HasPrefix`; `pollTraces` uses
+`len>=want` (harmless; break (b) confirmed (1) fires with 5); the
+`ReferenceLogMounter` doc comment doesn't mention the `Dir=true` branch.

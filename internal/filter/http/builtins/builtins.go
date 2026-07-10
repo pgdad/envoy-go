@@ -1,13 +1,13 @@
-// Package builtins registers the twenty built-in HTTP filters (router,
+// Package builtins registers the twenty-one built-in HTTP filters (router,
 // adaptive_concurrency, admission_control, bandwidthlimit, buffer,
 // compressor, cors, csrf, envoygotest, extauthz, extproc, fault,
 // header_mutation, jwtauthn, localratelimit, lua, oauth2, ratelimit, rbac,
-// wasm) plus their five per-route validators (header_mutation, oauth2, lua,
-// ratelimit, wasm) into an *filter_http.HTTPRegistry. Unlike
+// tap, wasm) plus their five per-route validators (header_mutation, oauth2,
+// lua, ratelimit, wasm) into an *filter_http.HTTPRegistry. Unlike
 // internal/filter/network/builtins, no Deps struct is needed: HTTP filter
 // construction defers all boot-singleton injection (ClusterManager,
 // DrainManager, HTTPClient, TracingExporters) to per-chain build time via
-// hcm.ListenerCtx/FactoryCtx, not to registration time — none of the 20
+// hcm.ListenerCtx/FactoryCtx, not to registration time — none of the 21
 // Register calls below captures a boot singleton in a closure (phase 51,
 // ADR-0268).
 package builtins
@@ -33,13 +33,15 @@ import (
 	"github.com/pgdad/envoy-go/internal/filter/http/ratelimit"
 	"github.com/pgdad/envoy-go/internal/filter/http/rbac"
 	"github.com/pgdad/envoy-go/internal/filter/http/router"
+	"github.com/pgdad/envoy-go/internal/filter/http/tap"
 	"github.com/pgdad/envoy-go/internal/filter/http/wasm"
 )
 
-// RegisterBuiltins registers the twenty built-in HTTP filters and their five
-// per-route validators into reg. It mirrors the registration calls in
-// cmd/envoy-go/main.go and does NOT Freeze (the caller freezes after any
-// additional registration).
+// RegisterBuiltins registers the twenty-one built-in HTTP filters and their
+// five per-route validators into reg. The HTTP registry is built and
+// populated here and frozen by the caller (internal/boot/boot.go:
+// NewHTTPRegistry, RegisterBuiltins, Freeze); RegisterBuiltins itself does
+// NOT Freeze (the caller freezes after any additional registration).
 func RegisterBuiltins(reg *filter_http.HTTPRegistry) {
 	reg.Register(router.TypeURL, router.New)
 	reg.Register(adaptive_concurrency.TypeURL, adaptive_concurrency.New)
@@ -60,6 +62,7 @@ func RegisterBuiltins(reg *filter_http.HTTPRegistry) {
 	reg.Register(oauth2.TypeURL, oauth2.New)
 	reg.Register(ratelimit.TypeURL, ratelimit.New)
 	reg.Register(rbac.TypeURL, rbac.New)
+	reg.Register(tap.TypeURL, tap.New)
 	reg.Register(wasm.TypeURL, wasm.New)
 	header_mutation.RegisterPerRouteValidator(reg)
 	oauth2.RegisterPerRouteValidator(reg)

@@ -135,3 +135,18 @@ func (baseOnlyStub) DriveSubject(_ context.Context, _ string) ([]byte, error)   
 func (baseOnlyStub) ProbeAdmin(_ context.Context, _, _ string) ([]byte, []byte, error) {
 	return nil, nil, nil
 }
+
+// TestHostMount_DirFieldExists is the Task 12 (D-TAP-DIRMOUNT) TDD anchor:
+// HostMount gains a Dir bool field so the runner can pre-create a directory
+// mount (for file_per_tap's unpredictable-filename sink) instead of always
+// pre-creating a single file. Dir must default to false, preserving the
+// 0006-access-log single-file-mount behavior byte-for-byte.
+func TestHostMount_DirFieldExists(t *testing.T) {
+	m := HostMount{HostPath: "/tmp/x", ContainerPath: "/envoy-go-test/taps", Dir: true}
+	if !m.Dir {
+		t.Errorf("HostMount.Dir must be settable")
+	}
+	if (HostMount{HostPath: "/tmp/y", ContainerPath: "/c"}).Dir {
+		t.Errorf("HostMount.Dir must default to false (file mount), preserving the 0006 behavior")
+	}
+}

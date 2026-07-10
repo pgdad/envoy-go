@@ -123,6 +123,7 @@ import (
 	_ "github.com/pgdad/envoy-go/test/fixtures/0096-lb-priority/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0097-lb-panic-threshold/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0098-stats-sink-statsd-tcp/driver"
+	_ "github.com/pgdad/envoy-go/test/fixtures/0099-http-tap-headers/driver"
 	"github.com/pgdad/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -1145,6 +1146,16 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	if rlm, ok := d.(fixture.ReferenceLogMounter); ok {
 		hostMounts := rlm.ReferenceHostMounts()
 		for _, hm := range hostMounts {
+			if hm.Dir {
+				// Directory mount: envoy (uid 101) creates files inside it.
+				if ferr := os.MkdirAll(hm.HostPath, 0o777); ferr != nil {
+					t.Fatalf("ref mount mkdir %s: %v", hm.HostPath, ferr)
+				}
+				if ferr := os.Chmod(hm.HostPath, 0o777); ferr != nil {
+					t.Fatalf("ref mount chmod %s: %v", hm.HostPath, ferr)
+				}
+				continue
+			}
 			// Pre-create the host file so Docker bind-mounts a file (not a dir).
 			f, ferr := os.OpenFile(hm.HostPath, os.O_CREATE|os.O_WRONLY, 0o666)
 			if ferr != nil {
@@ -2109,6 +2120,16 @@ func runBootRejectFixture(ctx context.Context, t *testing.T, root string, pin *E
 	if rlm, ok := d.(fixture.ReferenceLogMounter); ok {
 		hostMounts = rlm.ReferenceHostMounts()
 		for _, hm := range hostMounts {
+			if hm.Dir {
+				// Directory mount: envoy (uid 101) creates files inside it.
+				if ferr := os.MkdirAll(hm.HostPath, 0o777); ferr != nil {
+					t.Fatalf("ref mount mkdir %s: %v", hm.HostPath, ferr)
+				}
+				if ferr := os.Chmod(hm.HostPath, 0o777); ferr != nil {
+					t.Fatalf("ref mount chmod %s: %v", hm.HostPath, ferr)
+				}
+				continue
+			}
 			// Pre-create the host file ONLY if it does not already exist;
 			// 0037's bind-mount points at a real (pre-existing) .wasm blob
 			// borrowed from fixture-0036/bytecode and we MUST NOT truncate it.
