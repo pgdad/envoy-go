@@ -34,7 +34,13 @@ Check (3) fails SAFE by construction: a future family whose rows use a slug not 
 - (3) prints: `NEVER OPENED: HTTP/3`, `NEVER OPENED: gRPC`, `NEVER OPENED: xDS`, `NEVER OPENED: Runtime`, `NEVER OPENED: WASM` ⇒ **FIVE families have never been opened.**
 - The **Operational-tooling family** also STAYS OPEN (xDS-sourced dry-validation, an admin-API live-reload-and-validate endpoint, an RTDS/SDS validate companion).
 
-**STATUS AS OF 2026-07-10: phase 56.1 (`http-tap-filter`, HEADERS leg) SPEC is DONE and LANDED. Row 56 is `in-progress`.** The squash for this stage is the **PARENT of the current master tip** (a router cannot name its own sha: writing it changes it — verify with `git log --oneline -2`). Counts at exit (docs-only, UNCHANGED): stat surface **1200** · fixtures **100** · fuzzers **52** · BackendKind tail **38** · DECISIONS tail **ADR-0272** (next-free **ADR-0273**).
+**STATUS AS OF 2026-07-10: phase 56.1 (`http-tap-filter`, HEADERS leg) SPEC is DONE and LANDED. Row 56 is `in-progress`.** Counts at exit (docs-only, UNCHANGED): stat surface **1200** · fixtures **100** · fuzzers **52** · BackendKind tail **38** · DECISIONS tail **ADR-0272** (next-free **ADR-0273**).
+
+**Locating the stage squash (a router cannot name its own sha — writing the sha changes it).** Identify it by SUBJECT, never by sha and never by position:
+```sh
+git log --oneline --grep='^phase 56.1 (http-tap-filter, headers leg) SPEC' -1
+```
+This stage folded its own `next-prompt.txt` roll INTO the squash (per `reference_next_prompt_tracked_despite_gitignore`), so the squash **IS** the master tip — *unless* a router-only fixup commit sits on top. **Do not assume either shape.** The phase-55 / phase-56-BRAINSTORM-era routers left the roll as a SEPARATE commit above the squash and so told you to look at the tip's *parent*; that was true for them and is **NOT** a general rule. The `--grep` above is correct in every shape.
 
 **THE NEXT ACTION: the phase-56.1 (`http-tap-filter`, HEADERS leg) PLAN.**
 
