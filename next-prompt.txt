@@ -42,7 +42,7 @@ Check (3) fails SAFE by construction: a future family whose rows use a slug not 
 
 ## What THIS session does (a SPEC, lifecycle-state 1 → 2)
 
-1. Re-verify the cold-start baselines (below) against the CURRENT master tip (`git log --oneline -1` — do not assume; expect `359d0b67`).
+1. Re-verify the cold-start baselines (below) against the CURRENT master tip (`git log --oneline -1` — do not assume). The BRAINSTORM squash is `359d0b67`; the tip is that commit plus this router-roll commit on top, so **expect `359d0b67` to be the tip's parent, not the tip.** (A router cannot name its own sha: writing it changes it. Verify with `git merge-base --is-ancestor 359d0b67 HEAD`.)
 2. **Read `docs/envoy-go/phases/56-http-tap-filter/BRAINSTORM.md` in full.** It is the charter. Do NOT re-derive it and do NOT re-open its seven settled pins (Q0–Q6) — a SPEC pins the charter empirically, it does not relitigate it.
 3. **Write `docs/envoy-go/phases/56-http-tap-filter/SPEC-56.1.md`.** Phase 56 is SPLIT, so it follows the **phase-44 per-leg convention**: one shared `BRAINSTORM.md`, then `SPEC-56.1.md` / `PLAN-56.1.md` / `PROGRESS-56.1.md`, and later the 56.2 set. (Phase 56's dir currently has no `README.md`; phases 39 and 44 both do — add one.)
 4. **EXECUTE the ten `D-TAP-*` empirical pins IN-SESSION** against `envoyproxy/envoy:contrib-v1.37.2` (ADR-0004 / ADR-0227) on a Docker **bridge** network (`reference_docker_probe_bridge_network` — `--network host` is useless under Docker Desktop), `--concurrency 1`, with a **FRESH probe container per arm** (`feedback_probe_fresh_container_per_arm` — `docker logs` accumulates across `docker restart`). The BRAINSTORM §10 names all ten; the load-bearing ones are:
