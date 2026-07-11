@@ -8,6 +8,7 @@ import (
 	commontapv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/common/tap/v3"
 	httptapv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/tap/v3"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 	"github.com/pgdad/envoy-go/internal/matchpredicate"
@@ -22,10 +23,24 @@ const filterName = "envoy.filters.http.tap"
 // config is the immutable, per-listener compiled tap configuration. It is
 // shared by every *tapFilter minted for a stream.
 type config struct {
-	prog       *matchpredicate.Program
-	sink       *filePerTapSink
-	rqTapped   *stats.Counter
-	recordConn bool
+	prog         *matchpredicate.Program
+	sink         *filePerTapSink
+	rqTapped     *stats.Counter
+	recordConn   bool
+	bodyAsString bool   // 56.2: JSON_BODY_AS_STRING vs _AS_BYTES render choice
+	maxRx        uint32 // 56.2: request-body cap (nil wrapper -> 1024)
+	maxTx        uint32 // 56.2: response-body cap (nil wrapper -> 1024)
+}
+
+// resolveCap returns the per-direction body cap. A nil UInt32Value wrapper
+// means the field was unset, which the reference caps at 1024 bytes
+// (AMEND-TAP-BODY2-DEFAULTCAP). A PRESENT wrapper uses its value, including 0
+// (a 0 cap yields an empty-but-truncated body, distinct from unbounded).
+func resolveCap(w *wrapperspb.UInt32Value) uint32 {
+	if w == nil {
+		return 1024
+	}
+	return w.GetValue()
 }
 
 // New is the ADR-0071 two-step factory: it parses + compiles once, then returns
@@ -110,9 +125,12 @@ func parseConfig(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (*config, error) {
 	}
 	s := oc.GetSinks()[0]
 
+	var asString bool
 	switch f := s.GetFormat(); f {
-	case taptapv3.OutputSink_JSON_BODY_AS_STRING, taptapv3.OutputSink_JSON_BODY_AS_BYTES:
-		// Indistinguishable at 56.1: `body` is never populated. 56.2 diverges.
+	case taptapv3.OutputSink_JSON_BODY_AS_STRING:
+		asString = true
+	case taptapv3.OutputSink_JSON_BODY_AS_BYTES:
+		asString = false // the proto default
 	case taptapv3.OutputSink_PROTO_BINARY,
 		taptapv3.OutputSink_PROTO_BINARY_LENGTH_DELIMITED,
 		taptapv3.OutputSink_PROTO_TEXT:
@@ -146,7 +164,14 @@ func parseConfig(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (*config, error) {
 		return nil, fmt.Errorf("tap: %w", err)
 	}
 
-	cfg := &config{prog: prog, sink: sink, recordConn: t.GetRecordDownstreamConnection()}
+	cfg := &config{
+		prog:         prog,
+		sink:         sink,
+		recordConn:   t.GetRecordDownstreamConnection(),
+		bodyAsString: asString,
+		maxRx:        resolveCap(oc.GetMaxBufferedRxBytes()),
+		maxTx:        resolveCap(oc.GetMaxBufferedTxBytes()),
+	}
 	// Registered at filter-parse (not per-stream) so it reads 0 with no taps.
 	// The `.tap.` segment is HARDCODED, not the http_filters[] entry name.
 	if ctx.Stats != nil {

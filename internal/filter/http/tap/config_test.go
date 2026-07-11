@@ -14,6 +14,7 @@ import (
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 	"github.com/pgdad/envoy-go/internal/stats"
@@ -245,5 +246,69 @@ func TestNew_NilAndGarbageTypedConfig(t *testing.T) {
 	bad := &anypb.Any{TypeUrl: TypeURL, Value: []byte{0xff, 0xff, 0xff}}
 	if _, err := New(bad, ctx); err == nil {
 		t.Errorf("garbage typed_config: want error")
+	}
+}
+
+// mustParseTapWithCaps builds a valid Tap config with the given format and
+// per-direction body caps, parses it, and returns the resolved *config.
+func mustParseTapWithCaps(t *testing.T, format taptapv3.OutputSink_Format, rx, tx *wrapperspb.UInt32Value) *config {
+	t.Helper()
+	dir := t.TempDir()
+	tp := &httptapv3.Tap{CommonConfig: &commontapv3.CommonExtensionConfig{
+		ConfigType: &commontapv3.CommonExtensionConfig_StaticConfig{StaticConfig: &taptapv3.TapConfig{
+			Match: reqTapYes(),
+			OutputConfig: &taptapv3.OutputConfig{
+				Sinks:              []*taptapv3.OutputSink{fileSink(filepath.Join(dir, "out"))},
+				MaxBufferedRxBytes: rx,
+				MaxBufferedTxBytes: tx,
+			},
+		}},
+	}}
+	tp.GetCommonConfig().GetStaticConfig().GetOutputConfig().GetSinks()[0].Format = format
+	ctx, _ := newCtx()
+	cfg, err := parseConfig(mustAny(t, tp), ctx)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	return cfg
+}
+
+// defaultTapBytesCap is the cap applied when max_buffered_*_bytes is unset
+// (AMEND-TAP-BODY2-DEFAULTCAP; probe-pinned 1024 against contrib-v1.37.2).
+const defaultTapBytesCap = 1024
+
+func TestParseConfig_CapResolution(t *testing.T) {
+	tests := []struct {
+		name   string
+		rx, tx *wrapperspb.UInt32Value // nil = unset
+		wantRx uint32
+		wantTx uint32
+	}{
+		{"both unset -> default 1024", nil, nil, defaultTapBytesCap, defaultTapBytesCap},
+		{"rx present 20 -> 20", wrapperspb.UInt32(20), nil, 20, defaultTapBytesCap},
+		{"tx present 40 -> 40", nil, wrapperspb.UInt32(40), defaultTapBytesCap, 40},
+		{"present ZERO -> 0 (NOT 1024)", wrapperspb.UInt32(0), wrapperspb.UInt32(0), 0, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := mustParseTapWithCaps(t, taptapv3.OutputSink_JSON_BODY_AS_STRING, tt.rx, tt.tx)
+			if cfg.maxRx != tt.wantRx {
+				t.Errorf("maxRx = %d, want %d", cfg.maxRx, tt.wantRx)
+			}
+			if cfg.maxTx != tt.wantTx {
+				t.Errorf("maxTx = %d, want %d", cfg.maxTx, tt.wantTx)
+			}
+		})
+	}
+}
+
+func TestParseConfig_FormatStored(t *testing.T) {
+	asStr := mustParseTapWithCaps(t, taptapv3.OutputSink_JSON_BODY_AS_STRING, nil, nil)
+	if !asStr.bodyAsString {
+		t.Errorf("JSON_BODY_AS_STRING: bodyAsString = false, want true")
+	}
+	asBytes := mustParseTapWithCaps(t, taptapv3.OutputSink_JSON_BODY_AS_BYTES, nil, nil)
+	if asBytes.bodyAsString {
+		t.Errorf("JSON_BODY_AS_BYTES: bodyAsString = true, want false")
 	}
 }

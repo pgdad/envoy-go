@@ -164,3 +164,57 @@ func TestSink_RejectsUncreatableParent(t *testing.T) {
 		t.Errorf("expected a parse-time reject for an uncreatable path_prefix parent")
 	}
 }
+
+// marshalBody renders b through a minimal HttpBufferedTrace and canonicalizes
+// the JSON (reusing canonJSON — no re-implementation of json.Compact).
+func marshalBody(t *testing.T, b *datatapv3.Body) string {
+	t.Helper()
+	raw, err := marshalOpts.Marshal(&datatapv3.HttpBufferedTrace{
+		Request: &datatapv3.HttpBufferedTrace_Message{Body: b},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err) // AS_STRING sanitize must PREVENT this
+	}
+	return canonJSON(t, raw)
+}
+
+func TestBodyProto_AsString(t *testing.T) {
+	s := marshalBody(t, bodyProto([]byte("0123456789"), false, true))
+	if !strings.Contains(s, `"as_string":"0123456789"`) {
+		t.Errorf("AS_STRING render missing as_string: %s", s)
+	}
+	if strings.Contains(s, `"as_bytes"`) {
+		t.Errorf("AS_STRING must NOT render as_bytes: %s", s)
+	}
+	if !strings.Contains(s, `"truncated":false`) {
+		t.Errorf("truncated:false must be emitted (EmitDefaultValues): %s", s)
+	}
+}
+
+func TestBodyProto_AsBytesBase64(t *testing.T) {
+	// AMEND-TAP-BODY2-BYTES: "abcdefghij" -> "YWJjZGVmZ2hpag==" (Go-native).
+	s := marshalBody(t, bodyProto([]byte("abcdefghij"), false, false))
+	if !strings.Contains(s, `"as_bytes":"YWJjZGVmZ2hpag=="`) {
+		t.Errorf("AS_BYTES render wrong base64: %s", s)
+	}
+	if strings.Contains(s, `"as_string"`) {
+		t.Errorf("AS_BYTES must NOT render as_string: %s", s)
+	}
+}
+
+func TestBodyProto_TruncatedTrue(t *testing.T) {
+	s := marshalBody(t, bodyProto([]byte("0123456789"), true, true))
+	if !strings.Contains(s, `"truncated":true`) {
+		t.Errorf("truncated:true must render: %s", s)
+	}
+}
+
+func TestBodyProto_AsStringSanitizesNonUTF8(t *testing.T) {
+	// D-TAP-BODY-UTF8: raw string(buf) would make protojson.Marshal ERROR and
+	// the sink swallow it -> whole-trace drop. Sanitize keeps the trace.
+	nonUTF8 := []byte{0xff, 0xfe, 0x41, 0x42}            // invalid UTF-8 + "AB"
+	s := marshalBody(t, bodyProto(nonUTF8, false, true)) // marshalBody Fatalfs on error
+	if !strings.Contains(s, "AB") {
+		t.Errorf("sanitized as_string should retain the valid tail: %s", s)
+	}
+}

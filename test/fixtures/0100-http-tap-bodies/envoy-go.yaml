@@ -1,0 +1,64 @@
+# Subject (envoy-go) bootstrap for 0100-http-tap-bodies.
+# Same document shape as envoy.yaml modulo:
+#   - admin port_value: {{.AdminPort}} (runner-allocated) vs the reference's
+#     fixed 9901.
+#   - cluster type: STATIC (envoy-go convention) vs STRICT_DNS.
+#   - backend address: 127.0.0.1 (envoy-go runs on the host loopback) vs
+#     {{.BackendHost}} == host.docker.internal for the containerized reference.
+#   - file_per_tap.path_prefix: {{.TapPrefix}} is a HOST directory the subject
+#     (running as the invoking user, not uid 101) owns directly -- no bind
+#     mount needed.
+# stat_prefix stays "tap_probe", identical to the reference, so the emitted
+# stat name matches side-to-side. Predicate is any_match: true and the caps
+# (max_buffered_rx_bytes/max_buffered_tx_bytes) mirror envoy.yaml exactly.
+admin:
+  address:
+    socket_address: {address: 0.0.0.0, port_value: {{.AdminPort}}}
+static_resources:
+  listeners:
+  - name: listener_0
+    address:
+      socket_address: {address: 0.0.0.0, port_value: {{.ListenerPort}}}
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: tap_probe
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: vh
+              domains: ["*"]
+              routes:
+              - match: {prefix: "/"}
+                route: {cluster: backend}
+          http_filters:
+          - name: envoy.filters.http.tap
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.tap.v3.Tap
+              common_config:
+                static_config:
+                  match:
+                    any_match: true
+                  output_config:
+                    max_buffered_rx_bytes: {{.Cap}}
+                    max_buffered_tx_bytes: {{.Cap}}
+                    sinks:
+                    - format: JSON_BODY_AS_STRING
+                      file_per_tap:
+                        path_prefix: {{.TapPrefix}}
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+  - name: backend
+    connect_timeout: 1s
+    type: STATIC
+    load_assignment:
+      cluster_name: backend
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: {address: {{.BackendHost}}, port_value: {{.BackendPort}}}

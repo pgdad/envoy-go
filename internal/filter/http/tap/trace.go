@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	datatapv3 "github.com/envoyproxy/go-control-plane/envoy/data/tap/v3"
@@ -68,13 +69,20 @@ func (f *tapFilter) OnDestroy() {
 func (f *tapFilter) buildTrace() *datatapv3.TraceWrapper {
 	bt := &datatapv3.HttpBufferedTrace{}
 	if f.sawReq {
-		// Body and Trailers stay nil: no body at 56.1 (a zero-length body message
-		// OMITS the field), and trailers are structurally invisible to envoy-go's
+		// Trailers stay nil: trailers are structurally invisible to envoy-go's
 		// filters. EmitDefaultValues renders nil repeated Trailers as [].
-		bt.Request = &datatapv3.HttpBufferedTrace_Message{Headers: toHeaderValues(f.reqHdrs)}
+		m := &datatapv3.HttpBufferedTrace_Message{Headers: toHeaderValues(f.reqHdrs)}
+		if f.sawReqBody {
+			m.Body = bodyProto(f.reqBody, f.reqTrunc, f.cfg.bodyAsString)
+		}
+		bt.Request = m
 	}
 	if f.sawResp {
-		bt.Response = &datatapv3.HttpBufferedTrace_Message{Headers: toHeaderValues(f.respHdrs)}
+		m := &datatapv3.HttpBufferedTrace_Message{Headers: toHeaderValues(f.respHdrs)}
+		if f.sawRespBody {
+			m.Body = bodyProto(f.respBody, f.respTrunc, f.cfg.bodyAsString)
+		}
+		bt.Response = m
 	}
 	if f.cfg.recordConn && f.decCB != nil {
 		bt.DownstreamConnection = &datatapv3.Connection{
@@ -84,6 +92,27 @@ func (f *tapFilter) buildTrace() *datatapv3.TraceWrapper {
 	}
 	return &datatapv3.TraceWrapper{
 		Trace: &datatapv3.TraceWrapper_HttpBufferedTrace{HttpBufferedTrace: bt},
+	}
+}
+
+// bodyProto renders a captured body as a data/tap/v3.Body. Under AS_STRING the
+// bytes are sanitized to valid UTF-8 (D-TAP-BODY-UTF8): Go's protojson.Marshal
+// ERRORS on invalid UTF-8 in a proto3 string field and the sink swallows that
+// error (trace.go OnDestroy), so a raw non-UTF8 body would silently drop the
+// whole trace. strings.ToValidUTF8 is a documented DEPARTURE from the
+// reference's lossy C++ mangling -- lossless-of-the-trace and deterministic.
+// AS_BYTES base64-encodes arbitrary bytes faithfully (the proto default).
+// EmitDefaultValues renders truncated unconditionally (AMEND-TAP-BODY2-TRUNCFLAG).
+func bodyProto(buf []byte, trunc bool, asString bool) *datatapv3.Body {
+	if asString {
+		return &datatapv3.Body{
+			BodyType:  &datatapv3.Body_AsString{AsString: strings.ToValidUTF8(string(buf), "�")},
+			Truncated: trunc,
+		}
+	}
+	return &datatapv3.Body{
+		BodyType:  &datatapv3.Body_AsBytes{AsBytes: buf},
+		Truncated: trunc,
 	}
 }
 

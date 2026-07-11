@@ -24,6 +24,14 @@ type tapFilter struct {
 	respHdrs http.Header
 	sawReq   bool
 	sawResp  bool
+
+	// 56.2 body capture: filter-owned accumulation (buffer/buffer.go SHAPE).
+	reqBody     []byte
+	reqTrunc    bool
+	respBody    []byte
+	respTrunc   bool
+	sawReqBody  bool // hook fired at least once (distinct from len(reqBody)==0)
+	sawRespBody bool
 }
 
 func (f *tapFilter) SetDecoderCallbacks(cb envoyhttp.DecoderFilterCallbacks) { f.decCB = cb }
@@ -56,11 +64,36 @@ func (f *tapFilter) EncodeHeaders(headers http.Header, _ bool) envoyhttp.FilterH
 	return envoyhttp.Continue
 }
 
-// Tap observes headers only; the data and trailer hooks are inert pass-throughs.
-func (f *tapFilter) DecodeData(_ []byte, _ bool) envoyhttp.FilterDataStatus {
+// accumulate appends chunk to buf, honoring the byte limit. Truncation is
+// strict `>` (AMEND-TAP-BODY2-BOUNDARY): a body EXACTLY at the limit is NOT
+// truncated. Once the limit is reached *trunc is set and no further bytes are
+// appended. Returns the (possibly-grown) buffer.
+func accumulate(buf []byte, trunc *bool, chunk []byte, limit uint32) []byte {
+	room := int(limit) - len(buf)
+	if len(chunk) > room { // strict >: len(chunk) fits iff len(chunk) <= room
+		if room > 0 {
+			buf = append(buf, chunk[:room]...)
+		}
+		*trunc = true
+		return buf
+	}
+	return append(buf, chunk...)
+}
+
+// DecodeData accumulates the request body up to cfg.maxRx. Tap is a READ-ONLY
+// observer: it returns DataContinue ALWAYS (never StopIteration/OverwriteBody)
+// so the body flows unperturbed to the upstream. endStream is accepted for
+// signature conformance; the buffer IS the state, no finalization is needed.
+func (f *tapFilter) DecodeData(data []byte, _ bool) envoyhttp.FilterDataStatus {
+	f.sawReqBody = true
+	f.reqBody = accumulate(f.reqBody, &f.reqTrunc, data, f.cfg.maxRx)
 	return envoyhttp.DataContinue
 }
-func (f *tapFilter) EncodeData(_ []byte, _ bool) envoyhttp.FilterDataStatus {
+
+// EncodeData is symmetric into respBody up to cfg.maxTx.
+func (f *tapFilter) EncodeData(data []byte, _ bool) envoyhttp.FilterDataStatus {
+	f.sawRespBody = true
+	f.respBody = accumulate(f.respBody, &f.respTrunc, data, f.cfg.maxTx)
 	return envoyhttp.DataContinue
 }
 func (f *tapFilter) DecodeTrailers(http.Header) envoyhttp.FilterTrailersStatus {

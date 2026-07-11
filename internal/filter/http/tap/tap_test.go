@@ -1,6 +1,7 @@
 package tap
 
 import (
+	"bytes"
 	"net/http"
 	"reflect"
 	"testing"
@@ -104,5 +105,115 @@ func TestEncodeHeaders_NoStatusWhenCallbacksAbsent(t *testing.T) {
 	f.EncodeHeaders(http.Header{"Content-Type": {"text/plain"}}, true)
 	if _, ok := f.respHdrs[":status"]; ok {
 		t.Errorf(":status must be absent when no encoder callbacks are set")
+	}
+}
+
+func newBodyFilter(maxRx, maxTx uint32) *tapFilter {
+	return &tapFilter{cfg: &config{maxRx: maxRx, maxTx: maxTx}}
+}
+
+func TestDecodeData_SingleChunkUnderCap(t *testing.T) {
+	f := newBodyFilter(20, 20)
+	if st := f.DecodeData([]byte("0123456789"), true); st != envoyhttp.DataContinue {
+		t.Errorf("DecodeData status = %v, want DataContinue (tap is read-only)", st)
+	}
+	if string(f.reqBody) != "0123456789" {
+		t.Errorf("reqBody = %q, want %q", f.reqBody, "0123456789")
+	}
+	if f.reqTrunc {
+		t.Errorf("reqTrunc = true, want false (10 < cap 20)")
+	}
+	if !f.sawReqBody {
+		t.Errorf("sawReqBody = false, want true (hook fired)")
+	}
+}
+
+func TestDecodeData_MultiChunkAccumulates(t *testing.T) {
+	f := newBodyFilter(100, 100)
+	f.DecodeData([]byte("AAA"), false)
+	f.DecodeData([]byte("BBB"), false)
+	f.DecodeData(nil, true) // synthetic end (connection.go:653)
+	if string(f.reqBody) != "AAABBB" {
+		t.Errorf("reqBody = %q, want %q (chunks must concatenate)", f.reqBody, "AAABBB")
+	}
+	if f.reqTrunc {
+		t.Errorf("reqTrunc = true, want false")
+	}
+}
+
+func TestDecodeData_Over32KiBAccumulates(t *testing.T) {
+	f := newBodyFilter(1<<20, 1<<20) // 1 MiB cap, above 32 KiB
+	chunk := bytes.Repeat([]byte("x"), 32*1024)
+	f.DecodeData(chunk, false)
+	f.DecodeData(chunk, true) // 64 KiB total across two real-sized chunks
+	if len(f.reqBody) != 64*1024 {
+		t.Errorf("reqBody len = %d, want %d (must accumulate across >32KiB)", len(f.reqBody), 64*1024)
+	}
+	if f.reqTrunc {
+		t.Errorf("reqTrunc = true, want false (64KiB < 1MiB cap)")
+	}
+}
+
+func TestDecodeData_AtCapNotTruncated(t *testing.T) { // strict-> boundary
+	f := newBodyFilter(10, 10)
+	f.DecodeData([]byte("0123456789"), true) // exactly 10 == cap
+	if string(f.reqBody) != "0123456789" {
+		t.Errorf("reqBody = %q, want full 10 bytes", f.reqBody)
+	}
+	if f.reqTrunc {
+		t.Errorf("reqTrunc = true, want FALSE (body length == cap is NOT truncated; strict >)")
+	}
+}
+
+func TestDecodeData_OverCapTruncates(t *testing.T) {
+	f := newBodyFilter(10, 10)
+	f.DecodeData([]byte("0123456789ABCDEF"), true) // 16 > cap 10
+	if string(f.reqBody) != "0123456789" {
+		t.Errorf("reqBody = %q, want first 10 bytes only", f.reqBody)
+	}
+	if !f.reqTrunc {
+		t.Errorf("reqTrunc = false, want true (16 > cap 10)")
+	}
+}
+
+func TestDecodeData_ChunkStraddlesCap(t *testing.T) {
+	f := newBodyFilter(10, 10)
+	f.DecodeData([]byte("012345"), false)  // 6 bytes, under cap
+	f.DecodeData([]byte("6789ABCD"), true) // 6+8=14 > 10: append prefix "6789" (4 = 10-6)
+	if string(f.reqBody) != "0123456789" {
+		t.Errorf("reqBody = %q, want %q (only cap-capturedLen prefix of the straddling chunk)", f.reqBody, "0123456789")
+	}
+	if !f.reqTrunc {
+		t.Errorf("reqTrunc = false, want true (14 > cap 10)")
+	}
+}
+
+func TestDecodeData_CapZeroNonEmpty_EmptyButTruncated(t *testing.T) {
+	f := newBodyFilter(0, 0)
+	f.DecodeData([]byte("nonempty"), true)
+	if len(f.reqBody) != 0 {
+		t.Errorf("reqBody len = %d, want 0 (cap 0 captures nothing)", len(f.reqBody))
+	}
+	if !f.reqTrunc {
+		t.Errorf("reqTrunc = false, want true (cap 0 + non-empty body -> truncated)")
+	}
+	if !f.sawReqBody {
+		t.Errorf("sawReqBody = false, want true (hook fired -> body must be PRESENT even when empty)")
+	}
+}
+
+func TestEncodeData_SymmetricIntoRespBody(t *testing.T) {
+	f := newBodyFilter(20, 5)
+	if st := f.EncodeData([]byte("HELLOWORLD"), true); st != envoyhttp.DataContinue {
+		t.Errorf("EncodeData status = %v, want DataContinue", st)
+	}
+	if string(f.respBody) != "HELLO" {
+		t.Errorf("respBody = %q, want %q (cap 5)", f.respBody, "HELLO")
+	}
+	if !f.respTrunc {
+		t.Errorf("respTrunc = false, want true (10 > cap 5)")
+	}
+	if !f.sawRespBody {
+		t.Errorf("sawRespBody = false, want true")
 	}
 }

@@ -1,6 +1,7 @@
 package tap
 
 import (
+	"bytes"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -189,6 +190,42 @@ func TestChainDestroy_EmitsExactlyOnce(t *testing.T) {
 	}
 	if got := counterValue(t, reg, "http.hcm_probe.tap.rq_tapped"); got != 1 {
 		t.Errorf("rq_tapped = %d, want 1", got)
+	}
+}
+
+func TestBuildTrace_BodyPresentWhenHookFired_EmptyButTruncated(t *testing.T) {
+	f := &tapFilter{cfg: &config{bodyAsString: true}}
+	f.sawReq, f.reqHdrs = true, http.Header{}
+	f.sawReqBody, f.reqBody, f.reqTrunc = true, nil, true // cap-0 shape
+	raw, err := marshalOpts.Marshal(f.buildTrace())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"body"`)) {
+		t.Errorf("empty-but-truncated body must be PRESENT (hook fired): %s", raw)
+	}
+	// Compact before matching the truncated flag: internal/detrand injects
+	// build-seeded whitespace into protojson output (0/1/2 spaces after a
+	// colon), so a raw-bytes match on `"truncated": true` flakes under -race.
+	// canonJSON (sink_test.go) strips it -- the ADR-0273 detrand caveat, the
+	// same pattern the TestBodyProto_* marshal tests already use.
+	if !bytes.Contains([]byte(canonJSON(t, raw)), []byte(`"truncated":true`)) {
+		t.Errorf("empty-but-truncated body must carry truncated:true: %s", raw)
+	}
+}
+
+func TestBuildTrace_BodyOmittedWhenHookNeverFired(t *testing.T) {
+	f := &tapFilter{cfg: &config{bodyAsString: true}}
+	f.sawReq, f.reqHdrs = true, http.Header{}
+	// sawReqBody stays FALSE (bodyless stream)
+	raw, err := marshalOpts.Marshal(f.buildTrace())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// RAW-BYTES check: a decode cannot tell OMITTED from null (PROGRESS-56.1
+	// IMPL-1). Grep the raw bytes for any "body" key.
+	if bytes.Contains(raw, []byte(`"body"`)) {
+		t.Errorf("body must be OMITTED when the hook never fired: %s", raw)
 	}
 }
 
