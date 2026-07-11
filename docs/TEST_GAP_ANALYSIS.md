@@ -130,9 +130,11 @@ transitions, TLS *config-build* rejections. Gaps (see §4 for ranking):
 - **Upstream connection reset *mid-response-body*** (`router.go:625-628`) is a distinct
   code path (returns `ActionResponse{Status: resp.StatusCode}, picked, err` with a partial
   status and no body) exercised by no test.
-- **Runtime TLS handshake failures** (missing client cert vs `RequireAndVerifyClientCert`,
-  SNI mismatch with no catch-all, ALPN negotiation failure) — all TLS negative coverage is
-  config-build-time, none is a live handshake rejection.
+- **Runtime TLS handshake failures** — partially closed in this pass (see §3): a live
+  aborted-handshake test for unmatched-SNI-with-no-catch-all now exists. Still uncovered:
+  missing client cert vs `RequireAndVerifyClientCert` (blocked — envoy-go build-rejects
+  `require_client_certificate`, so there is no runtime mTLS to drive) and ALPN negotiation
+  failure.
 - **No downstream `idle_timeout` / `stream_idle_timeout` / `request_timeout`** exists at
   the HCM level at all — a slow/idle client is never timed out (feature gap, not just a
   test gap).
@@ -164,6 +166,7 @@ intermittent CI failures ever appear. Not worth pre-emptive churn.
 | Change | File | Type | Risk |
 |---|---|---|---|
 | HTTP/1.1 request-validation robustness suite (12 shapes; 4 divergences pinned) | `internal/filter/hcm/connection_robustness_test.go` (new) | New tests, deterministic, no Docker | none (test-only) |
+| Live TLS handshake abort on unmatched SNI with no catch-all (accept-loop path, not just chain selection) | `internal/listener/tls_handshake_negative_test.go` (new) | New test, deterministic, no Docker | none (test-only) |
 | `-race` on the CI unit job | `.github/workflows/ci.yml` | CI hardening | none |
 | Fuzz smoke matrix: 1 → 9 riskiest parsers | `.github/workflows/ci.yml` | CI hardening | none |
 
@@ -192,9 +195,10 @@ Ordered by (a) risk of silent incorrectness vs Envoy, (b) breadth of code exerci
    reference Envoy (differential, because the correct outcome — truncated 200 vs 502 vs
    stream-reset — must be pinned to Envoy, not guessed). Low-medium effort.
 
-3. **Runtime TLS handshake-failure tests** (unit, deterministic): missing client cert vs
-   `RequireAndVerifyClientCert`; SNI mismatch with no catch-all chain; ALPN mismatch.
-   Closes the "all TLS negatives are config-build-time" gap. Low effort, no Docker.
+3. **Remaining runtime TLS handshake-failure tests.** The unmatched-SNI-no-catch-all abort
+   is now covered (§3). Still open: ALPN negotiation failure; and missing-client-cert
+   rejection — the latter first needs `require_client_certificate` to be a supported runtime
+   feature (it currently build-rejects), so feature + test land together. Low-medium effort.
 
 4. **Downstream timeout coverage** — but the feature (`idle_timeout` /
    `stream_idle_timeout` / `request_timeout`) does not exist yet; the test and the feature
