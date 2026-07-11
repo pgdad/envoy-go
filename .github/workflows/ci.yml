@@ -21,8 +21,13 @@ jobs:
         uses: golangci/golangci-lint-action@v6.5.2
         with:
           version: v1.64.8
-      - name: go test (unit, -short)
-        run: go test -short ./...
+      - name: go test (unit, -short, -race)
+        # -race is load-bearing here: the codebase carries an extensive
+        # race-fix history and several tests whose only assertion is that
+        # `go test -race` stays clean (e.g. internal/filter/network/chain_test.go
+        # "the 28.1b race surface must be EMPTY", sdsfile debounce-race group).
+        # Without -race those tests are vacuous in CI.
+        run: go test -short -race ./...
 
   differential:
     needs: lint-vet-test
@@ -40,9 +45,28 @@ jobs:
       - name: differential suite
         run: go test ./test/differential/... -timeout 5m -v
 
-  fuzz-bootstrap:
+  fuzz-smoke:
     needs: lint-vet-test
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # One short engine run per riskiest parser. The seed corpora already run
+      # as ordinary unit tests under `go test ./...`; this job additionally
+      # drives the mutation engine briefly to surface NEW crashers on the
+      # attacker-reachable parse surfaces (config, HTTP/2 codec, access-log
+      # format strings, TLS context, wire codecs). Each target is bounded so
+      # the whole matrix stays well under a couple of minutes.
+      matrix:
+        include:
+          - { pkg: internal/bootstrap,                 target: FuzzBootstrapLoad }      # bootstrap config (ADR-0018)
+          - { pkg: internal/filter/hcm,                target: FuzzHCMConfigParse }     # HCM typed_config
+          - { pkg: internal/accesslog,                 target: FuzzAccessLogFormat }    # access-log format strings
+          - { pkg: internal/filter/hcm/h2,             target: FuzzHPACKDecode }        # HTTP/2 HPACK decode
+          - { pkg: internal/filter/hcm/h2,             target: FuzzFrameStream }        # HTTP/2 frame stream
+          - { pkg: internal/tls,                       target: FuzzTLSContextParse }    # TLS context config
+          - { pkg: internal/filter/network/kafkabroker, target: FuzzKafkaDecode }       # Kafka wire codec
+          - { pkg: internal/filter/network/mongoproxy,  target: FuzzMongoDecode }       # Mongo/BSON wire codec
+          - { pkg: internal/filter/network/redisproxy,  target: FuzzRESPDecode }        # RESP wire codec
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -51,5 +75,5 @@ jobs:
           cache: true
       - name: go mod download
         run: go mod download
-      - name: fuzz bootstrap loader (30s budget, ADR-0018)
-        run: go test ./internal/bootstrap/ -fuzz=FuzzBootstrapLoad -fuzztime=30s -run=^$
+      - name: fuzz ${{ matrix.target }} (30s budget)
+        run: go test ./${{ matrix.pkg }}/ -run=^$ -fuzz=^${{ matrix.target }}$ -fuzztime=30s
