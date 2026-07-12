@@ -161,6 +161,7 @@ import (
 	// set). The named metricsconfigv3 import below both registers the descriptor
 	// and provides the typed MetricsServiceConfig for the parse arm.
 	metricsconfigv3 "github.com/envoyproxy/go-control-plane/envoy/config/metrics/v3"
+	graphitestatsdv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/stat_sinks/graphite_statsd/v3"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -236,6 +237,17 @@ var statsdSinkTypeURL = "type.googleapis.com/" + string((&metricsconfigv3.Statsd
 // at the already-imported metricsconfigv3 package (config/metrics/v3, v1.32.4).
 // A test asserts it equals the SPEC §11 string.
 var dogStatsdSinkTypeURL = "type.googleapis.com/" + string((&metricsconfigv3.DogStatsdSink{}).ProtoReflect().Descriptor().FullName())
+
+// graphiteStatsdSinkTypeURL is the typed_config TypeURL for the graphite_statsd
+// UDP stats sink (envoy.extensions.stat_sinks.graphite_statsd.v3.GraphiteStatsdSink)
+// — the FIRST `envoy.extensions.…` typed-extension stat-sink type URL (its three
+// siblings are inline envoy.config.metrics.v3 types). DERIVED from the proto
+// descriptor (the metricsServiceTypeURL precedent —
+// reference_network_filter_typeurl_extensions). The message resolves at the CORE
+// go-control-plane/envoy module (graphite is a CORE extension — SPEC-57
+// AMEND-GR-IMAGE; zero new go.mod modules). A test asserts it equals the
+// SPEC-57 §11 live-verified string.
+var graphiteStatsdSinkTypeURL = "type.googleapis.com/" + string((&graphitestatsdv3.GraphiteStatsdSink{}).ProtoReflect().Descriptor().FullName())
 
 // AccessLogConfig is the parsed-but-not-yet-opened representation of one
 // envoy.access_loggers.file entry from HCM access_log[]. The sink itself is
@@ -315,6 +327,22 @@ type DogStatsdSinkConfig struct {
 	UDPAddress          string // socket_address host:port (an IP literal:port; net.ResolveUDPAddr-resolvable)
 	Prefix              string // DogStatsdSink.prefix, default "envoy" when empty
 	MaxBytesPerDatagram uint64 // NEW (ADR-0267): 0 (absent or explicit) means "one metric per datagram" (phase-49 behavior, UNCHANGED); >0 batches consecutive lines up to the cap
+}
+
+// GraphiteStatsdSinkConfig is the parsed graphite_statsd UDP stats-sink config
+// from one top-level stats_sinks[] GraphiteStatsdSink entry (ADR-0275). The sink
+// is constructed in cmd/envoy-go/main.go after Load returns. Tags are folded
+// into the metric NAME as ;k=v pairs at emit time (the sink's concern, not
+// parse's). A missing statsd_specifier / nil socket_address is a
+// REFERENCE-PARITY reject; an EXPLICIT max_bytes_per_datagram: 0 is a
+// REFERENCE-PARITY reject (the PGV gt:0 rule — the wrapper type distinguishes
+// absent from explicit 0); an ABSENT max_bytes_per_datagram parses to 0 =
+// one line per datagram. socket_address.protocol is accepted-and-IGNORED;
+// prefix defaults to "envoy" when empty.
+type GraphiteStatsdSinkConfig struct {
+	UDPAddress          string // socket_address host:port (net.ResolveUDPAddr-resolvable)
+	Prefix              string // GraphiteStatsdSink.prefix, default "envoy" when empty
+	MaxBytesPerDatagram uint64 // 0 (absent only — explicit 0 is parse-rejected) = one line per datagram; >0 batches up to the cap
 }
 
 // StatsSinkConfig is the parsed metrics_service stats-sink config from one
@@ -414,13 +442,26 @@ type Bootstrap struct {
 	StatsdSinkConfigs []StatsdSinkConfig
 	// DogStatsdSinkConfigs is the parsed top-level stats_sinks[] dog_statsd UDP
 	// sink entries (ADR-0266), in declaration order. Empty when no DogStatsdSink
-	// stats_sinks[] entry is configured. Per ADR-0266/ADR-0080: an EXPLICITLY set
-	// max_bytes_per_datagram and a missing dog_statsd_specifier/socket_address are
-	// rejected at parse time. socket_address.protocol is accepted-and-ignored
-	// (dial UDP regardless). prefix defaults to "envoy" when empty. The
-	// DogStatsdSink is built in cmd/envoy-go/main.go after Load returns (and ONLY
-	// when this slice is non-empty).
+	// stats_sinks[] entry is configured. Per ADR-0266/ADR-0080: a missing
+	// dog_statsd_specifier/socket_address is rejected at parse time;
+	// max_bytes_per_datagram is HONORED (ADR-0267; 0/absent = one metric per
+	// datagram). socket_address.protocol is accepted-and-ignored (dial UDP
+	// regardless). prefix defaults to "envoy" when empty. The DogStatsdSink is
+	// built in cmd/envoy-go/main.go after Load returns (and ONLY when this slice
+	// is non-empty).
 	DogStatsdSinkConfigs []DogStatsdSinkConfig
+	// GraphiteStatsdSinkConfigs is the parsed top-level stats_sinks[]
+	// graphite_statsd UDP sink entries (ADR-0275), in declaration order. Empty
+	// when no GraphiteStatsdSink stats_sinks[] entry is configured. Per
+	// ADR-0275/ADR-0080: a missing statsd_specifier/socket_address is rejected
+	// at parse time; an EXPLICIT max_bytes_per_datagram: 0 is rejected at parse
+	// time (the PGV gt:0 rule — the *wrapperspb.UInt64Value distinguishes
+	// absent from explicit 0); an ABSENT max_bytes_per_datagram parses to 0 =
+	// one line per datagram. socket_address.protocol is accepted-and-ignored
+	// (dial UDP regardless). prefix defaults to "envoy" when empty. The
+	// GraphiteStatsdSink is built in cmd/envoy-go/main.go after Load returns
+	// (and ONLY when this slice is non-empty).
+	GraphiteStatsdSinkConfigs []GraphiteStatsdSinkConfig
 	// FlushInterval is the stats_flush_interval (default 5s when absent/non-positive
 	// — D-MS-FLUSH). Parsed-and-stored even when no stats_sinks[] entry exists
 	// (inert in that case — D-MS-FLUSH-INERT); the Flusher uses it only when
@@ -484,9 +525,10 @@ func Load(r io.Reader) (*Bootstrap, error) {
 // stats_sinks[] entries (ADR-0262). stats_flush_interval is ALWAYS stored on
 // result.FlushInterval, even with no stats_sinks[] (inert — D-MS-FLUSH-INERT).
 // stats_flush_on_admin is STRICT-REJECTED (ADR-0080; envoy-go ships only the
-// periodic stats_flush_interval loop). Each stats_sinks[] entry must carry a
-// metrics_service typed_config; a sibling sink TypeURL is rejected naming both
-// the offending and the supported TypeURL (reference_strict_reject_sibling_typeurl_gap).
+// periodic stats_flush_interval loop). Each stats_sinks[] entry must carry one
+// of the four supported typed_config types (metrics_service, statsd,
+// dog_statsd, graphite_statsd); a sibling sink TypeURL is rejected naming all
+// four supported TypeURLs (reference_strict_reject_sibling_typeurl_gap).
 func parseStatsSinks(bs *bootstrapv3.Bootstrap, result *Bootstrap) error {
 	result.FlushInterval = statsFlushIntervalDefault
 	if d := bs.GetStatsFlushInterval(); d != nil {
@@ -515,8 +557,12 @@ func parseStatsSinks(bs *bootstrapv3.Bootstrap, result *Bootstrap) error {
 			if err := parseDogStatsdSinkConfig(tc, i, result); err != nil {
 				return err
 			}
+		case graphiteStatsdSinkTypeURL:
+			if err := parseGraphiteStatsdSinkConfig(tc, i, result); err != nil {
+				return err
+			}
 		default:
-			return fmt.Errorf("bootstrap: stats_sinks[%d]: unsupported sink type %q (envoy-go supports the metrics_service sink %q, the statsd sink %q, and the dog_statsd sink %q)", i, tc.GetTypeUrl(), metricsServiceTypeURL, statsdSinkTypeURL, dogStatsdSinkTypeURL)
+			return fmt.Errorf("bootstrap: stats_sinks[%d]: unsupported sink type %q (envoy-go supports the metrics_service sink %q, the statsd sink %q, the dog_statsd sink %q, and the graphite_statsd sink %q)", i, tc.GetTypeUrl(), metricsServiceTypeURL, statsdSinkTypeURL, dogStatsdSinkTypeURL, graphiteStatsdSinkTypeURL)
 		}
 	}
 	return nil
@@ -676,6 +722,38 @@ func parseDogStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
 		UDPAddress:          addr,
 		Prefix:              prefix,
 		MaxBytesPerDatagram: dsd.GetMaxBytesPerDatagram().GetValue(),
+	})
+	return nil
+}
+
+// parseGraphiteStatsdSinkConfig parses one graphite_statsd UDP stats sink
+// typed_config and appends a GraphiteStatsdSinkConfig (ADR-0275). Like
+// DogStatsdSink, the statsd_specifier oneof has ONLY the address member
+// (graphite_statsd.pb.go: GraphiteStatsdSink_Address is the sole arm — no
+// tcp_cluster_name sibling, UDP-only by construction). Rejects (ADR-0080,
+// both REFERENCE-PARITY, SPEC-57 §11 A4a/A4b): a missing statsd_specifier /
+// nil socket_address (via parseUDPSinkAddressAndPrefix); an EXPLICIT
+// max_bytes_per_datagram: 0 (the PGV gt:0 rule — non-nil wrapper with value
+// 0; an ABSENT wrapper parses to 0 = one-line-per-datagram, NOT rejected).
+// NOTE the landed dog_statsd parse does NOT enforce its identical PGV rule
+// (bootstrap.go parseDogStatsdSinkConfig consumes GetValue() unchecked) —
+// a pre-existing phase-50 parity gap, deferred (SPEC-57 §2), NOT fixed here.
+func parseGraphiteStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
+	var g graphitestatsdv3.GraphiteStatsdSink
+	if err := tc.UnmarshalTo(&g); err != nil {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: graphite_statsd typed_config: %w", idx, err)
+	}
+	addr, prefix, err := parseUDPSinkAddressAndPrefix(g.GetAddress().GetSocketAddress(), g.GetPrefix(), "graphite_statsd", "statsd_specifier", idx)
+	if err != nil {
+		return err
+	}
+	if w := g.GetMaxBytesPerDatagram(); w != nil && w.GetValue() == 0 {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: graphite_statsd max_bytes_per_datagram must be greater than 0", idx)
+	}
+	result.GraphiteStatsdSinkConfigs = append(result.GraphiteStatsdSinkConfigs, GraphiteStatsdSinkConfig{
+		UDPAddress:          addr,
+		Prefix:              prefix,
+		MaxBytesPerDatagram: g.GetMaxBytesPerDatagram().GetValue(),
 	})
 	return nil
 }

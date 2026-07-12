@@ -26,48 +26,46 @@ If ANY check prints output, the sentinel does NOT fire: proceed with the stage b
 
 Check (3) fails SAFE by construction: a future family whose rows use a slug not listed above reads as "never opened", which BLOCKS `stop` rather than falsely triggering it. A false "not done" costs one wasted session; a false "done" ends the project early. When you open a new family, add its row-summary slug here.
 
-**Check (1) is NON-SILENT** (row 57 `stats-sink-graphite` is `in-progress`; check (1) prints `NOT DONE: row 57`). **The sentinel does NOT fire** — an open row alone blocks it, and (2)+(3) still carry work besides. Do NOT create `stop`.
+**SENTINEL RE-CHECKED 2026-07-12 (post-phase-57-IMPL) — it does NOT fire. Do NOT create `stop`.** Evidence:
+- (1) prints NOTHING — every chartered row is `done` (row 57 flipped at the phase-57 IMPL). **An all-done row table ALONE does NOT fire the sentinel** — checks (2) and (3) both still print output and each independently blocks `stop`.
+- (2) prints the Observability family's LIVE deferred-candidates sentence: OTLP-metrics stats sink + tracing `custom_tags`/`spawn_upstream_span`/`http_service`/force-trace + **the NEW dog_statsd explicit-`max_bytes_per_datagram: 0` parity fix** (recorded at phase 57 per SPEC-57 §2). ⇒ the **Observability family STAYS OPEN**. (NOTE: a second, HISTORICAL sentence in the family line reads "candidates were:" — deliberately non-matching; only the "candidates:" sentence is live.)
+- (3) prints `NEVER OPENED: HTTP/3`, `gRPC`, `xDS`, `Runtime`, `WASM` ⇒ FIVE families never opened; the **Operational-tooling family** also STAYS OPEN (its deferred candidates live in its family section prose).
 
-**SENTINEL RE-CHECKED 2026-07-11 (post-phase-57-PLAN) — it does NOT fire. Do NOT create `stop`.** Evidence:
-- (1) prints `NOT DONE: row 57` ⇒ phase 57 is OPEN (the IMPL is the next stage). Blocks `stop` outright.
-- (2) prints the Observability family's deferred candidates ⇒ the **Observability family STAYS OPEN** (OTLP-metrics sink + tracing `custom_tags`/`spawn_upstream_span`/`http_service`/force-trace; the IMPL ADDS the dog_statsd explicit-`max_bytes_per_datagram: 0` parity candidate per SPEC-57 §2).
-- (3) prints `NEVER OPENED: HTTP/3`, `gRPC`, `xDS`, `Runtime`, `WASM` ⇒ FIVE families never opened; the **Operational-tooling family** also STAYS OPEN.
+**STATUS AS OF 2026-07-12: phase 57 (`stats-sink-graphite`) is COMPLETE — row 57 `done` (sole leg, ADR-0106). NO phase is currently open.** The phase-57 IMPL landed: `internal/statssink/graphite.go` `GraphiteStatsdSink` (tags folded into the metric NAME as `;k=v` via the ~10-LoC `graphiteTagSuffix`; FOURTH sink-private `deltaState`); the phase-50 batching pair HOISTED to shared `appendBatchLine`/`flushBatch` in `udp.go` (D-GR-BATCHSHARE, dog_statsd tests byte-untouched); `parseGraphiteStatsdSinkConfig` + the FIRST `envoy.extensions.…` stat-sink type URL + the FOUR-sink sibling-reject (THREE test rows — a third found at IMPL beyond the PLAN's two) + the NEW explicit-zero reject (PGV parity); the fourth `main.go` loop; the additive `statsdrecv` `;k=v` extension; `FuzzGraphiteStatsdSinkConfigParse`; the `0101-stats-sink-graphite` merged tags+batching differential — five controller-executed breaks each firing its OWN assertion + non-break (d) order-reversal-green, 20/20 flake, full-package `-race`. ADR-0275 ANCHORED (§Decision/§Consequences per ADR-0044).
 
-**STATUS AS OF 2026-07-11: phase 57 (`stats-sink-graphite`) is OPEN — row 57 is `in-progress`; the BRAINSTORM, the SPEC, and the PLAN have LANDED.** The PLAN session resolved all three SPEC §12 D-questions: **D-GR-BATCHSHARE → GENERALIZE** (hoist `appendLine`/`flush` into shared `appendBatchLine`/`flushBatch` free functions in `internal/statssink/udp.go`; zero direct test call sites verified ⇒ dog_statsd tests stay byte-untouched, doubling as the refactor's regression proof); **D-GR-SPLIT → NO sub-split** (11 tasks, margin 4 under the ADR-0045 ceiling); **break-(b) → the SPEC §8.1 shape is VACUOUS** (`statsdrecv.ingestLine` parses a `|#`-formatted line into the IDENTICAL tag buckets — a PLAN-time re-derivation catch per `feedback_brief_citations_not_evidence`) and is REPLACED by (b1) tag-drop + (b2) an UnparsedCount-ISOLATING extra-malformed-line break, plus (c1)/(c2) isolating the two batching proofs and non-break (d) order-reversal-stays-green. `docs/envoy-go/phases/57-stats-sink-graphite/PLAN.md` is the 11-task TDD spine; `PROGRESS.md` is scaffolded (baselines fill at IMPL Task 1).
-
-**Current counts (verified at the phase-57 PLAN; UNCHANGED — docs-only):** fixtures **102** (tail `0100-http-tap-bodies`) · fuzzers **53** · DECISIONS tail **ADR-0274** (next-free **ADR-0275**) · BackendKind tail **38** (`H2GoawayResponder`) · stat surface **1201** · new Go packages **0** · new go.mod modules **0**. Anticipated at IMPL exit: fixtures **103** (`0101-stats-sink-graphite`) · fuzzers **54** · DECISIONS tail **ADR-0275** · stat surface **1201 (+0)** · BackendKind **38 (+0)** · **+0 modules/packages**.
+**Current counts (verified at the phase-57 IMPL exit):** fixtures **103** (tail `0101-stats-sink-graphite`) · fuzzers **54** · DECISIONS tail **ADR-0275** (next-free **ADR-0276**) · BackendKind tail **38** (`H2GoawayResponder`) · stat surface **1201 (+0)** · new Go packages **0** · new go.mod modules **0**.
 
 **Locating the stage squash (a router cannot name its own sha — writing the sha changes it).** Identify it by SUBJECT, never by sha and never by position:
 ```sh
-git log --oneline --grep='^phase 57 (stats-sink-graphite) PLAN' -1
+git log --oneline --grep='^phase 57 (stats-sink-graphite) IMPL' -1
 ```
-This stage folded its own `next-prompt.txt` roll INTO the squash (per `reference_next_prompt_tracked_despite_gitignore`). The squash is NOT necessarily the master tip: parallel-workstream commits can land on top of it. ALWAYS `git fetch` + re-verify counts against the ACTUAL current master tip at the start of the IMPL session.
+This stage folded its own `next-prompt.txt` roll INTO the squash (per `reference_next_prompt_tracked_despite_gitignore`). The squash is NOT necessarily the master tip: parallel-workstream commits can land on top of it. ALWAYS `git fetch` + re-verify counts against the ACTUAL current master tip at the start of the next session.
 
-**THE NEXT ACTION: the phase-57 IMPL (lifecycle-state 3 → done) — execute PLAN.md task-by-task, subagent-driven.**
+**THE NEXT ACTION: RE-OPEN the loop — the next phase's BRAINSTORM (lifecycle-state 0 → 1).**
 
 ==============================================
 
-## What THIS session does (the phase-57 IMPL, lifecycle-state 3 → done)
+## What THIS session does (the next-phase BRAINSTORM)
 
-Phase 57 is OPEN (row 57 `in-progress`; BRAINSTORM + SPEC + PLAN landed). This session performs the **IMPL**: execute `docs/envoy-go/phases/57-stats-sink-graphite/PLAN.md`'s 11 tasks. Fresh worktree per `feedback_git_worktrees` (e.g. `.worktrees/phase-57-impl`, branch `phase-57-stats-sink-graphite-impl`). **Skill gates: `superpowers:subagent-driven-development` (per `feedback_execution_style`) + `superpowers:test-driven-development` per task + `superpowers:verification-before-completion` at close.**
+No phase is open. This session picks the next subject and performs its BRAINSTORM (docs-only; fresh worktree per `feedback_git_worktrees`, e.g. `.worktrees/phase-58-brainstorm`; register the new row `in-progress` in ROADMAP at the BRAINSTORM commit per the §Schema invariant; charter ADR-0276 as the row's anchor).
 
-1. **Read PLAN.md FIRST** — the Global Constraints, the Orientation brief (the verified `file:line` map), the D-question resolutions (BATCHSHARE generalize / no-split / the redesigned break roster), then the 11 tasks. PROGRESS.md's baseline block fills at Task 1.
-2. **Subagent execution discipline** (the PLAN's header block): per-task briefs pin the CANONICAL WORKTREE ROOT + worktree-relative paths (`feedback_subagent_worktree_path_targeting`); every brief carries the GIT-HYGIENE block (`git restore` only — no `checkout <sha>`/`--amend`; `feedback_subagent_worktree_detach`); subagents commit LOCALLY only (`feedback_subagents_no_push`, `feedback_subagent_autocommit_claudemd` — don't fight the auto-commit, VERIFY each one); per-task `gofmt -l` + `golangci-lint` on touched packages (`feedback_pertask_gofmt_lint`); reviewers RE-DERIVE the brief's citations from source (`feedback_brief_citations_not_evidence`).
-3. **Task 9 (deliberate breaks) is CONTROLLER-EXECUTED, never delegated** — five breaks + one non-break, each confirmed firing its OWN assertion (`reference_differential_break_protocol_count1` `-count=1`; `reference_deliberate_break_wrong_assertion`); 20/20 flake gate; FULL-package `-race` (`reference_full_suite_race_after_background_mutator`).
-4. **The six-gate at Task 10**, then Task 11 lands ADR-0275 §Decision/§Consequences (ADR-0044), BEHAVIOR_CONTRACT, STATE.md, ROADMAP (**row 57 flips `done`** — ADR-0106, sole leg; the family deferred-list rolls graphite OUT and the dog_statsd explicit-zero parity candidate IN), PROGRESS close, and ROLLS THIS FILE FORWARD (the next router decision: the Observability family and Operational-tooling stay open, five families never opened — the sentinel will NOT fire; do NOT create `stop`).
-5. **Land the IMPL** (the controller squashes the worktree branch onto master + pushes per `feedback_push_to_origin`; the router roll folds into the squash).
+**Subject selection (the phase-57 precedent: after phase 56 landed, the loop was re-opened by a HUMAN PICK).** If the human has named a subject in this session's prompt, take it. Otherwise PAUSE and ask, presenting the candidate menu:
+1. **Observability deferred candidates** (the family stays open): the dog_statsd explicit-`max_bytes_per_datagram: 0` parity fix (SMALLEST — a one-arm parse addition + tests; reuses the phase-57 reject shape verbatim); the OTLP-metrics stats sink (a gRPC sink over the phase-47 Flusher seam); tracing `custom_tags`/`spawn_upstream_span`/`http_service`/force-trace (phase-46 follow-ons).
+2. **Operational-tooling deferred candidates** (family open — see its ROADMAP family section).
+3. **Open a NEW family** (five never opened): HTTP/3, gRPC, xDS, Runtime, WASM — each a large charter; xDS was declined at the phase-57 pick but remains the most consequential.
+(When a new family opens, ADD its row-summary slug to the sentinel check-(3) list above.)
 
 ## Honor throughout (the discipline, unchanged)
-- **Lifecycle = one stage per session.** This session: the phase-57 IMPL.
-- **Differential traps:** `reference_differential_run_selector` (`-run 'TestDifferential/0101'`, NEVER bare) · `reference_differential_break_protocol_count1` · `reference_deliberate_break_wrong_assertion` · `reference_fatalf_makes_assertions_unreachable` · `reference_delta_sink_differential_stability_barrier` · `reference_periodic_sink_differential_two_receivers` · `reference_streaming_sink_differential_framing` · `reference_stats_sink_emits_used_only` · `reference_admin_interface_wire_name_collision` · `reference_membership_total_vs_healthy_gauge` · `reference_framing_break_needs_unparsed_counter` · `reference_differential_backendcount_min_one` · `reference_differential_fixture_dispatch_constraint` · `reference_differential_asserter_dispatch` · `reference_fixture_workload_constant_desync` (numReq=7 + the ~172-char cluster name + cap 200 are COUPLED constants — named once, Task 8) · `reference_differential_fullsuite_startup_flake` · `reference_host_gateway_ip_docker_desktop` · `reference_dogstatsd_tag_order_unsorted` (graphite sibling: cross-side tag assertions SET-based ONLY).
-- **`next-prompt.txt` IS TRACKED** — edit it inside the stage worktree, fold into the squash; locate commits by SUBJECT (`git log --grep`), never by position.
-- **Process anchors:** ADR-0044 (ADR-0275 lands here) · ADR-0045 (escape-valve unconsumed) · ADR-0080 · ADR-0106 (row 57 flips `done` here). Next-free ADR is **ADR-0275**.
+- **Lifecycle = one stage per session.** This session: the next phase's BRAINSTORM ONLY (docs-only; NO production `.go` changes at a BRAINSTORM).
+- **Process anchors:** ADR-0044 (ADR §Context drafts at SPEC, §Decision/§Consequences at IMPL) · ADR-0045 (split gate ~15 tasks) · ADR-0080 (strict-reject anti-silent-divergence) · ADR-0106 (row flips `done` at the final IMPL six-gate). Next-free ADR is **ADR-0276**.
+- **Live probes at SPEC time** use fresh containers per arm (`reference_probe_fresh_container_per_arm`) against the `envoyproxy/envoy:contrib-v1.37.2` pin (`reference_envoy_contrib_image_tagging`).
+- **`next-prompt.txt` IS TRACKED** — edit it inside the stage worktree, fold into the stage commit; locate commits by SUBJECT (`git log --grep`), never by position.
+- Baselines: RE-VERIFY the counts above against the actual master tip at session start (`git fetch` first; parallel workstreams land test-only commits).
 
 ## Read first (in order)
-1. THIS FILE — the cold-start router (the phase-57 IMPL is next).
-2. `docs/envoy-go/phases/57-stats-sink-graphite/PLAN.md` — the 11-task spine (Global Constraints · Orientation · D-question resolutions · the redesigned Task-9 break roster).
-3. `docs/envoy-go/phases/57-stats-sink-graphite/SPEC.md` — the pinned design (§3), the empirical pins (§11), the differential envelope (§8).
-4. `docs/envoy-go/phases/57-stats-sink-graphite/PROGRESS.md` — the scaffold (baselines fill at Task 1; break log fills at Task 9).
-5. The reuse substrate — `internal/statssink/{dogstatsd.go,delta.go,udp.go}` + `internal/bootstrap/bootstrap.go` + `cmd/envoy-go/main.go` + `test/helpers/statsdrecv/statsdrecv.go` + `test/fixtures/0094-stats-sink-dogstatsd-batching/` (the 0101 clone base).
-6. `docs/envoy-go/STATE.md` — the active-phase header (phase 57 PLAN done).
-7. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — the `feedback_*` execution discipline + the `reference_*` traps.
+1. THIS FILE — the cold-start router (the next-phase BRAINSTORM is next; subject may need a human pick).
+2. `docs/envoy-go/ROADMAP.md` — the family sections' deferred-candidate lists (Observability + Operational-tooling) + the never-opened families.
+3. `docs/envoy-go/STATE.md` — the active-phase header (phase 57 IMPL done; no phase open).
+4. `docs/envoy-go/DECISIONS.md` tail (ADR-0275) — the graphite row's §Decision/§Consequences (the reject-shape precedent the dog_statsd parity candidate would reuse).
+5. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — the `feedback_*` execution discipline + the `reference_*` traps.
+6. A prior BRAINSTORM for the 12-section shape — `docs/envoy-go/phases/57-stats-sink-graphite/BRAINSTORM.md`.

@@ -125,6 +125,7 @@ import (
 	_ "github.com/pgdad/envoy-go/test/fixtures/0098-stats-sink-statsd-tcp/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0099-http-tap-headers/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0100-http-tap-bodies/driver"
+	_ "github.com/pgdad/envoy-go/test/fixtures/0101-stats-sink-graphite/driver"
 	"github.com/pgdad/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

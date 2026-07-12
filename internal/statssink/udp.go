@@ -4,6 +4,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -77,4 +78,47 @@ func emitStatsdLines(batch []*dto.MetricFamily, nameAndTags func(fam *dto.Metric
 			emit(name + ":" + strconv.FormatInt(int64(v), 10) + suffix + tagSuffix)
 		}
 	}
+}
+
+// appendBatchLine accumulates line into buf, flushing buf as its own datagram
+// FIRST (via flushBatch → write) if appending would make it STRICTLY exceed
+// maxBytesPerDatagram (the comparison is `>`, NOT `>=` — a buffer that lands
+// EXACTLY at the cap after appending still fits, live-proven for dog_statsd at
+// AMEND-DSDB-BOUNDARY and re-proven for graphite at SPEC-57 §11 A3). When buf
+// is EMPTY, the line is ALWAYS accepted unconditionally — even if the line
+// alone exceeds the cap — which is what makes an oversized single line "sent
+// alone" fall out of the SAME general algorithm with NO special-cased branch:
+// on the NEXT call, buf.Len() already exceeds the cap, so ANY next line's
+// prospective size trivially exceeds it too, forcing a flush of the oversized
+// line alone; if the oversized line is the LAST in the batch, Submit's
+// trailing flushBatch sends it. maxBytesPerDatagram == 0 (absent field) needs
+// NO special case either: every append past the first exceeds a cap of 0, so
+// every line flushes alone — the one-line-per-datagram behavior exactly.
+// Hoisted VERBATIM from the phase-50 DogStatsdSink methods (ADR-0267) so
+// DogStatsdSink and GraphiteStatsdSink share ONE tested implementation
+// (D-GR-BATCHSHARE, ADR-0275); the phase-50 dog_statsd batching tests are the
+// regression anchor, byte-untouched by the hoist.
+func appendBatchLine(buf *strings.Builder, line string, maxBytesPerDatagram uint64, write func(string)) {
+	if buf.Len() == 0 {
+		buf.WriteString(line)
+		return
+	}
+	prospective := uint64(buf.Len()) + 1 + uint64(len(line)) // +1 for the "\n" separator
+	if prospective > maxBytesPerDatagram {
+		flushBatch(buf, write)
+		buf.WriteString(line)
+		return
+	}
+	buf.WriteByte('\n')
+	buf.WriteString(line)
+}
+
+// flushBatch writes buf's contents as ONE datagram via write (if non-empty)
+// and resets it.
+func flushBatch(buf *strings.Builder, write func(string)) {
+	if buf.Len() == 0 {
+		return
+	}
+	write(buf.String()) // the udpWriter write — rate-limit-logged-and-dropped on error
+	buf.Reset()
 }

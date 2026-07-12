@@ -1869,12 +1869,13 @@ func TestStatsSink_Rejects(t *testing.T) {
 			errSubs: []string{"bootstrap:", "cluster_name"},
 		},
 		{
-			// Now that metrics_service, statsd, AND dog_statsd are all supported sinks,
-			// the sibling-reject is for a genuinely unknown-but-real sink type
-			// (envoy.config.metrics.v3.HystrixSink, which no dispatch arm handles —
-			// a fabricated TypeURL fails earlier at protojson Any-resolution, before
-			// parseStatsSinks ever runs, so this must be a REAL registered message).
-			// The error names ALL THREE supported sinks.
+			// Now that metrics_service, statsd, dog_statsd, AND graphite_statsd are
+			// all supported sinks, the sibling-reject is for a genuinely
+			// unknown-but-real sink type (envoy.config.metrics.v3.HystrixSink, which
+			// no dispatch arm handles — a fabricated TypeURL fails earlier at
+			// protojson Any-resolution, before parseStatsSinks ever runs, so this
+			// must be a REAL registered message). The error names ALL FOUR supported
+			// sinks.
 			name: "sibling_unknown_sink",
 			topLevel: `stats_sinks:
   - name: envoy.stat_sinks.hystrix
@@ -1882,7 +1883,7 @@ func TestStatsSink_Rejects(t *testing.T) {
       "@type": type.googleapis.com/envoy.config.metrics.v3.HystrixSink
       num_buckets: 10
 `,
-			errSubs: []string{"bootstrap:", "metrics_service", "statsd", "dog_statsd"},
+			errSubs: []string{"bootstrap:", "metrics_service", "statsd", "dog_statsd", "graphite_statsd"},
 		},
 		{
 			name: "stats_flush_on_admin",
@@ -2092,12 +2093,13 @@ func TestStatsdSink_Rejects(t *testing.T) {
 			errSubs: []string{"bootstrap:", "socket_address", "statsd_specifier"},
 		},
 		{
-			// Now that metrics_service, statsd, AND dog_statsd are all supported sinks,
-			// the sibling-reject is for a genuinely unknown-but-real sink type
-			// (envoy.config.metrics.v3.HystrixSink, which no dispatch arm handles —
-			// a fabricated TypeURL fails earlier at protojson Any-resolution, before
-			// parseStatsSinks ever runs, so this must be a REAL registered message).
-			// The error names ALL THREE supported sinks.
+			// Now that metrics_service, statsd, dog_statsd, AND graphite_statsd are
+			// all supported sinks, the sibling-reject is for a genuinely
+			// unknown-but-real sink type (envoy.config.metrics.v3.HystrixSink, which
+			// no dispatch arm handles — a fabricated TypeURL fails earlier at
+			// protojson Any-resolution, before parseStatsSinks ever runs, so this
+			// must be a REAL registered message). The error names ALL FOUR supported
+			// sinks.
 			name: "sibling_unknown_typeurl",
 			topLevel: `stats_sinks:
   - name: envoy.stat_sinks.hystrix
@@ -2105,7 +2107,7 @@ func TestStatsdSink_Rejects(t *testing.T) {
       "@type": type.googleapis.com/envoy.config.metrics.v3.HystrixSink
       num_buckets: 10
 `,
-			errSubs: []string{"bootstrap:", "metrics_service", "statsd", "dog_statsd"},
+			errSubs: []string{"bootstrap:", "metrics_service", "statsd", "dog_statsd", "graphite_statsd"},
 		},
 	}
 	for _, tc := range cases {
@@ -2472,7 +2474,7 @@ func TestDogStatsdSink_Rejects(t *testing.T) {
 		{
 			// A genuinely unknown-but-real sink type (HystrixSink, so protojson can
 			// resolve the Any before parseStatsSinks's default arm rejects it) now
-			// names ALL THREE supported sinks.
+			// names ALL FOUR supported sinks.
 			name: "sibling_unknown_typeurl",
 			topLevel: `stats_sinks:
   - name: envoy.stat_sinks.hystrix
@@ -2480,7 +2482,7 @@ func TestDogStatsdSink_Rejects(t *testing.T) {
       "@type": type.googleapis.com/envoy.config.metrics.v3.HystrixSink
       num_buckets: 10
 `,
-			errSubs: []string{"bootstrap:", "metrics_service", "statsd", "dog_statsd"},
+			errSubs: []string{"bootstrap:", "metrics_service", "statsd", "dog_statsd", "graphite_statsd"},
 		},
 	}
 	for _, tc := range cases {
@@ -2723,5 +2725,191 @@ func TestDogStatsdSink_IPv6AddressBracketed(t *testing.T) {
 	}
 	if got, want := bs.DogStatsdSinkConfigs[0].UDPAddress, "[::1]:8125"; got != want {
 		t.Errorf("UDPAddress: got %q, want %q", got, want)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Phase 57: graphite_statsd UDP stats sink (ADR-0275)
+// ----------------------------------------------------------------------------
+
+// graphiteStatsdSinkType is the TypeURL for the graphite_statsd UDP stats sink
+// — SUPPORTED as of phase 57 (ADR-0275). It is the live-verified string that
+// matches the descriptor-derived graphiteStatsdSinkTypeURL in bootstrap.go.
+const graphiteStatsdSinkType = "type.googleapis.com/envoy.extensions.stat_sinks.graphite_statsd.v3.GraphiteStatsdSink"
+
+// TestGraphiteStatsdSink_TypeURLConstant guards against a proto-package rename:
+// the descriptor-derived graphiteStatsdSinkTypeURL must equal the
+// live-verified string (reference_network_filter_typeurl_extensions /
+// verify-typeurl-via-descriptor).
+func TestGraphiteStatsdSink_TypeURLConstant(t *testing.T) {
+	const want = "type.googleapis.com/envoy.extensions.stat_sinks.graphite_statsd.v3.GraphiteStatsdSink"
+	if graphiteStatsdSinkTypeURL != want {
+		t.Errorf("graphiteStatsdSinkTypeURL: got %q, want %q", graphiteStatsdSinkTypeURL, want)
+	}
+}
+
+// TestGraphiteStatsdSink_AcceptFullConfig: a graphite_statsd sink with a UDP
+// socket_address, an explicit prefix, and max_bytes_per_datagram ⇒ 1
+// GraphiteStatsdSinkConfig with all three fields set.
+func TestGraphiteStatsdSink_AcceptFullConfig(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.graphite_statsd
+    typed_config:
+      "@type": ` + graphiteStatsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125}
+      prefix: gpfx
+      max_bytes_per_datagram: 512
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.GraphiteStatsdSinkConfigs); got != 1 {
+		t.Fatalf("GraphiteStatsdSinkConfigs: got %d, want 1", got)
+	}
+	want := GraphiteStatsdSinkConfig{UDPAddress: "127.0.0.1:8125", Prefix: "gpfx", MaxBytesPerDatagram: 512}
+	if got := bs.GraphiteStatsdSinkConfigs[0]; got != want {
+		t.Errorf("GraphiteStatsdSinkConfigs[0]: got %+v, want %+v", got, want)
+	}
+}
+
+// TestGraphiteStatsdSink_AcceptDefaults: omitting prefix and
+// max_bytes_per_datagram ⇒ Prefix defaults to "envoy" and MaxBytesPerDatagram
+// is 0 (absent-cap = one line per datagram — NOT rejected; only an EXPLICIT 0
+// is).
+func TestGraphiteStatsdSink_AcceptDefaults(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.graphite_statsd
+    typed_config:
+      "@type": ` + graphiteStatsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125}
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.GraphiteStatsdSinkConfigs); got != 1 {
+		t.Fatalf("GraphiteStatsdSinkConfigs: got %d, want 1", got)
+	}
+	want := GraphiteStatsdSinkConfig{UDPAddress: "127.0.0.1:8125", Prefix: "envoy", MaxBytesPerDatagram: 0}
+	if got := bs.GraphiteStatsdSinkConfigs[0]; got != want {
+		t.Errorf("GraphiteStatsdSinkConfigs[0]: got %+v, want %+v", got, want)
+	}
+}
+
+// TestGraphiteStatsdSink_AcceptProtocolTCPIgnored: protocol: TCP on a
+// socket_address is accepted-and-ignored; envoy-go always dials UDP (the
+// dog_statsd posture).
+func TestGraphiteStatsdSink_AcceptProtocolTCPIgnored(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.graphite_statsd
+    typed_config:
+      "@type": ` + graphiteStatsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125, protocol: TCP}
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.GraphiteStatsdSinkConfigs); got != 1 {
+		t.Fatalf("GraphiteStatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got := bs.GraphiteStatsdSinkConfigs[0].UDPAddress; got != "127.0.0.1:8125" {
+		t.Errorf("UDPAddress: got %q, want %q", got, "127.0.0.1:8125")
+	}
+}
+
+// TestGraphiteStatsdSink_AcceptHostnameAddress: a hostname (non-IP) address
+// is accepted — the DOCUMENTED phase-48/49 DEPARTURE from the reference's
+// "malformed IP address" boot-reject (SPEC-57 §11 A4c).
+func TestGraphiteStatsdSink_AcceptHostnameAddress(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.graphite_statsd
+    typed_config:
+      "@type": ` + graphiteStatsdSinkType + `
+      address:
+        socket_address: {address: localhost, port_value: 8125}
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.GraphiteStatsdSinkConfigs); got != 1 {
+		t.Fatalf("GraphiteStatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.GraphiteStatsdSinkConfigs[0].UDPAddress, "localhost:8125"; got != want {
+		t.Errorf("UDPAddress: got %q, want %q", got, want)
+	}
+}
+
+// TestGraphiteStatsdSink_IPv6AddressBracketed is the graphite_statsd sibling
+// of TestDogStatsdSink_IPv6AddressBracketed (both parsers share the
+// parseUDPSinkAddressAndPrefix tail).
+func TestGraphiteStatsdSink_IPv6AddressBracketed(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.graphite_statsd
+    typed_config:
+      "@type": ` + graphiteStatsdSinkType + `
+      address:
+        socket_address: {address: "::1", port_value: 8125}
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.GraphiteStatsdSinkConfigs); got != 1 {
+		t.Fatalf("GraphiteStatsdSinkConfigs: got %d, want 1", got)
+	}
+	if got, want := bs.GraphiteStatsdSinkConfigs[0].UDPAddress, "[::1]:8125"; got != want {
+		t.Errorf("UDPAddress: got %q, want %q", got, want)
+	}
+}
+
+// TestGraphiteStatsdSink_Rejects covers each graphite_statsd strict-reject
+// arm.
+func TestGraphiteStatsdSink_Rejects(t *testing.T) {
+	cases := []struct {
+		name     string
+		topLevel string
+		errSubs  []string
+	}{
+		{
+			name: "missing_statsd_specifier",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.graphite_statsd
+    typed_config:
+      "@type": ` + graphiteStatsdSinkType + `
+      prefix: x
+`,
+			errSubs: []string{"bootstrap:", "graphite_statsd", "statsd_specifier"},
+		},
+		{
+			name: "explicit_max_bytes_per_datagram_zero",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.graphite_statsd
+    typed_config:
+      "@type": ` + graphiteStatsdSinkType + `
+      address:
+        socket_address: {address: 127.0.0.1, port_value: 8125}
+      max_bytes_per_datagram: 0
+`,
+			errSubs: []string{"bootstrap:", "graphite_statsd max_bytes_per_datagram must be greater than 0"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(strings.NewReader(statsBootstrap(tc.topLevel)))
+			if err == nil {
+				t.Fatalf("Load: want error for %s, got nil", tc.name)
+			}
+			for _, sub := range tc.errSubs {
+				if !strings.Contains(err.Error(), sub) {
+					t.Errorf("error should contain %q: %q", sub, err.Error())
+				}
+			}
+		})
 	}
 }

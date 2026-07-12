@@ -16,29 +16,34 @@ import (
 	"sync"
 )
 
-// Server reads statsd/DogStatsd line-protocol UDP datagrams
-// (<prefix>.<name>:<value>|<type>[|#tag1:val1,...]) and accumulates, per full
-// wire name: the running SUM of every |c (counter) value (DeltaSum — under
-// the always-delta statsd counter model the per-flush deltas sum to the
-// cumulative total, == K after K requests), the last-seen |g (gauge) absolute
-// value (Gauge), and the datagram COUNT (SeenCount). Because the sink emits
-// exactly one datagram per metric name per flush, SeenCount(name) is the
-// number of flushes that included name — the delta stability-barrier signal
-// (an idle counter's 0-delta |c line still increments SeenCount).
+// Server reads statsd/DogStatsd/graphite line-protocol UDP datagrams
+// (<prefix>.<name>[;k1=v1;k2=v2...]:<value>|<type>[|#tag1:val1,...]) and
+// accumulates, per TAG-STRIPPED wire name: the running SUM of every |c
+// (counter) value (DeltaSum — under the always-delta statsd counter model the
+// per-flush deltas sum to the cumulative total, == K after K requests), the
+// last-seen |g (gauge) absolute value (Gauge), and the datagram COUNT
+// (SeenCount). Because the sink emits exactly one datagram per metric name
+// per flush, SeenCount(name) is the number of flushes that included name —
+// the delta stability-barrier signal (an idle counter's 0-delta |c line still
+// increments SeenCount).
 //
 // A DogStatsd sink's tag-hoisting (stats.ExtractTags — SN1/SN2 hoist e.g. a
-// cluster/HCM-prefix identifier OUT of the name and into a tag) means a single
-// WIRE NAME can legitimately carry MULTIPLE, DISTINCT tag-variants — e.g. a
-// bootstrap's admin interface has its OWN internal http_conn_manager stats
-// under stat_prefix "admin", which collapses to the SAME residual wire name
-// (e.g. "http.downstream_rq_total") as a test listener's stat_prefix, differing
-// only by the envoy.http_conn_manager_prefix tag VALUE. A plain per-name SUM
-// (DeltaSum) or per-name last-seen tag set (Tags) is therefore ambiguous/
-// cross-contaminated whenever more than one tag-variant shares a name (e.g.
-// the admin interface's own startup readiness-probe traffic bleeds into a
-// test listener's counter of the same wire name). DeltaSumTagged disambiguates
-// by requiring an EXACT tag-set match, accumulating a SEPARATE running sum per
-// (name, tag-signature) pair.
+// cluster/HCM-prefix identifier OUT of the name and into a "|#k:v,..." tag
+// suffix) and a graphite sink's tag-folding (the SAME hoisted tags instead
+// embedded IN the name as ";k=v" pairs, e.g.
+// "grpfx.cluster.upstream_rq_total;envoy.cluster_name=b:7|c", ADR-0275) both
+// mean a single WIRE NAME can legitimately carry MULTIPLE, DISTINCT
+// tag-variants — e.g. a bootstrap's admin interface has its OWN internal
+// http_conn_manager stats under stat_prefix "admin", which collapses to the
+// SAME residual wire name (e.g. "http.downstream_rq_total") as a test
+// listener's stat_prefix, differing only by the envoy.http_conn_manager_prefix
+// tag VALUE. A plain per-name SUM (DeltaSum) or per-name last-seen tag set
+// (Tags) is therefore ambiguous/cross-contaminated whenever more than one
+// tag-variant shares a name (e.g. the admin interface's own startup
+// readiness-probe traffic bleeds into a test listener's counter of the same
+// wire name). DeltaSumTagged disambiguates by requiring an EXACT tag-set
+// match, accumulating a SEPARATE running sum per (name, tag-signature) pair.
+// Both tag grammars feed this SAME machinery, keyed by the tag-stripped name.
 type Server struct {
 	conn *net.UDPConn
 
@@ -242,18 +247,29 @@ func (s *Server) readLoop() {
 	}
 }
 
-// ingestLine parses ONE complete statsd/DogStatsd line
-// (<name>:<value>|<type>[|#tag1:val1,...]) and updates the value accumulators.
-// It assumes s.mu is HELD by the caller. It returns (name, true) when the line
-// was accounted, and ("", false) when it was not — either a structural parse
-// failure or an unknown metric type; both bump unparsed (except a blank line,
-// which is neither).
+// ingestLine parses ONE complete statsd/DogStatsd/graphite line
+// (<name>[;k1=v1;k2=v2...]:<value>|<type>[|#tag1:val1,...]) and updates the
+// value accumulators. It assumes s.mu is HELD by the caller. It returns
+// (name, true) when the line was accounted, and ("", false) when it was not
+// — either a structural parse failure or an unknown metric type; both bump
+// unparsed (except a blank line, which is neither).
 //
 // The first-pipe-then-colon split (phase 49): neither name nor value contains
 // '|', so the FIRST '|' unambiguously separates "name:value" from "type[|#tags]"
 // — a tagged line's tag suffix contains its OWN colons, which a last-colon split
 // would mis-take for the name/value boundary. This degenerates to the exact
 // prior behavior on a tagless line (line-parser-extension delimiter-reuse gotcha).
+//
+// Graphite tag-folding (phase 57, ADR-0275): a graphite sink hoists tags INTO
+// the name as ";k=v" pairs instead of a dog_statsd "|#" suffix, e.g.
+// "grpfx.cluster.upstream_rq_total;envoy.cluster_name=b:7|c". This reuses the
+// SAME two delimiters without disturbing either existing split: graphite tags
+// precede the value colon, so "head" (everything before the first '|') is
+// "name;tags:value" and the LAST-':' split still lands on the value colon
+// because a tag VALUE never contains ':' (the reference's tag values here are
+// response-code-classes/cluster/HCM-prefix names, and stats.IsValidName
+// excludes ':' from envoy-go's own emitted names) — so name ends up holding
+// "name;tags" intact, which is then split on ';' below.
 func (s *Server) ingestLine(line string) (string, bool) {
 	line = strings.TrimSpace(line)
 	if line == "" {
@@ -276,13 +292,34 @@ func (s *Server) ingestLine(line string) (string, bool) {
 		s.unparsed++
 		return "", false
 	}
+	// Graphite name-embedded tags (phase 57, ADR-0275): "<name>;k1=v1;k2=v2".
+	// ADDITIVE by construction: statsd/dog_statsd wire names cannot contain ';'
+	// (stats.IsValidName's charset — registry.go NamePattern), so this block is
+	// a no-op for every pre-57 line shape (0092/0093/0094/0098 unaffected). The
+	// parsed pairs feed the SAME lineTags the '|#' path feeds, so Tags()/
+	// DeltaSumTagged()/tagSignature work unchanged on the TAG-STRIPPED name.
+	var lineTags map[string]string
+	if semi := strings.IndexByte(name, ';'); semi >= 0 {
+		tagPart := name[semi+1:]
+		name = name[:semi]
+		lineTags = make(map[string]string, 2)
+		for _, pair := range strings.Split(tagPart, ";") {
+			eq := strings.IndexByte(pair, '=')
+			if eq < 0 {
+				s.unparsed++ // a ';'-bearing name whose pair lacks '=' is unaccountable
+				return "", false
+			}
+			lineTags[pair[:eq]] = pair[eq+1:]
+		}
+	}
 	rest := line[pipe1+1:] // "type[|#tag1:val1,...]"
 	typ := rest
-	var lineTags map[string]string
 	if pipe2 := strings.IndexByte(rest, '|'); pipe2 >= 0 {
 		typ = rest[:pipe2]
 		tagPart := strings.TrimPrefix(rest[pipe2+1:], "#")
-		lineTags = make(map[string]string)
+		if lineTags == nil {
+			lineTags = make(map[string]string)
+		}
 		for _, pair := range strings.Split(tagPart, ",") {
 			if c := strings.IndexByte(pair, ':'); c >= 0 {
 				lineTags[pair[:c]] = pair[c+1:]

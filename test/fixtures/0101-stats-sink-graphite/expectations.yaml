@@ -1,0 +1,170 @@
+# Phase 57 fixture 0101-stats-sink-graphite expectations (ADR-0019 — prose;
+# the driver is the enforcer via AssertStats; this file is documentation).
+#
+# This fixture proves the phase 57 graphite_statsd sink (ADR-0275): the
+# tag-in-name wire grammar "<prefix>.<residual>[;envoy.k=v;...]:<value>|<c|g>"
+# (the ONE novel piece of phase 57 vs dog_statsd's trailing "|#k:v" suffix)
+# PLUS the D-GR-BATCHSHARE shared appendBatchLine/flushBatch REAL multi-metric
+# datagram batching (hoisted verbatim from the phase-50 dog_statsd sink,
+# ADR-0267). D-GR-FIXTURE (SPEC-57): this is a MERGED fixture — it folds
+# together what would otherwise have been a separate 0093-shape (tags) and a
+# separate 0094-shape (batching) fixture into ONE dir, since both proofs run
+# over the identical workload. As a result fixture numbering skips: 0100 →
+# 0101 → 0102 (NOT 0101/0102 as two graphite fixtures + a 0103 for the next
+# unrelated fixture).
+#
+# ## D-GR-CAP: the byte-math design (computed EXACTLY, not hand-estimated)
+#
+# Computed via a throwaway t.Logf(len(...)) against the REAL production
+# graphiteTagSuffix/stats.ExtractTags code (internal/statssink/graphite.go) at
+# Task 8 authoring time:
+#
+#   grpfx.cluster.upstream_rq_total;envoy.cluster_name=<171-char backendName>:7|c -> 226 bytes
+#   grpfx.cluster.membership_total;envoy.cluster_name=<171-char backendName>:1|g  -> 225 bytes
+#   grpfx.http.downstream_rq_total;envoy.http_conn_manager_prefix=hcm_local:7|c   ->  75 bytes
+#   grpfx.http.downstream_rq_xx;envoy.response_code_class=2;envoy.http_conn_manager_prefix=hcm_local:7|c -> 100 bytes
+#
+# maxBytesPerDatagram = 200. The two envoy.cluster_name-tagged lines (226/225
+# bytes) EACH ALONE exceed the cap -> ALWAYS flushed alone (appendBatchLine
+# flushes any prior buffer content before accepting an oversized line into a
+# fresh, empty buffer; the very next line after an oversized one trivially
+# exceeds the cap too, forcing another flush before it is appended -- this
+# holds regardless of registry walk order). The two
+# envoy.http_conn_manager_prefix-tagged lines (75/100 bytes) are comfortably
+# under the cap -- even together with the "\n" separator (75+1+100 = 176 <=
+# 200) they fit in ONE datagram, and in practice co-batch with each other and
+# the many other short envoy-go/reference self-stat lines that flush every
+# interval. The PLAN's ~171-char backendName estimate (mirroring 0094's
+# 172-char precedent, minus the shorter graphite tag-fold overhead) needed NO
+# adjustment -- the computed 226/225-byte lines already clear the 200-byte cap
+# with a comfortable margin, and the 75/100-byte HCM lines already sit far
+# enough under it that co-batching is not marginal.
+#
+# ## The graphite tag-in-name grammar (AMEND-GR-TAGFORMAT, ADR-0275)
+#
+# UNLIKE dog_statsd's trailing "|#key:val,..." suffix, graphite_statsd folds
+# tags INTO the metric NAME as ";envoy.k=v" pairs preceding the value colon:
+# "<prefix>.<residual>;envoy.k1=v1;envoy.k2=v2:<value>|<c|g>". A tag-free name
+# carries NO ';' at all. Keys use the dotted envoy.<tag> form (the
+# formatTagSuffix precedent); values are emitted in ExtractTags's NATURAL
+# (unsorted) slice order — the reference's two-tag order (response_code_class,
+# http_conn_manager_prefix) is the REVERSE of envoy-go's emission order, a
+# documented cross-side coverage boundary (AMEND-GR-TAGORDER) — this fixture
+# asserts tag SETS (order-independent maps.Equal), never literal tag ORDER.
+#
+# On the receive side (Task 7), statsdrecv.ingestLine additively parses the
+# ";k=v" pairs out of the name BEFORE the existing '|'/':' split logic runs
+# (graphite tags precede the value colon, dog_statsd/statsd tags never contain
+# ';' — stats.IsValidName's charset excludes it), keying DeltaSumTagged/Tags()
+# on the STRIPPED "<prefix>.<residual>" name — the SAME lookup keys the
+# dog_statsd fixtures use.
+#
+# ## Everything else is the 0093/0094 design, unchanged
+#
+# Topology (single-listener plaintext H1; HTTPFixedBody backend; driver-owned
+# in-process statsdrecv UDP receivers with MaxLinesInAnyDatagram()/
+# LinesInDatagram(name)/UnparsedCount() accessors):
+#   l_test (hcm_local)  — one downstream HTTP/1.1 listener; route prefix "/" →
+#                         cluster <171-char backendName> (HTTPFixedBody,
+#                         17-byte body).
+#   <backendName>       — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
+#   graphite receiver    — driver-owned in-process statsdrecv.Server on a
+#                         driver-allocated UDP port, bound 0.0.0.0:<port> so the
+#                         Docker reference container can send datagrams to the
+#                         host via the bridge gateway IP (HostGatewayIP).
+#
+# A bootstrap-level stats_sinks[] graphite_statsd entry (GraphiteStatsdSink
+# TypeURL, UDP address, prefix, an EXPLICIT max_bytes_per_datagram: 200) on
+# BOTH sides + stats_flush_interval: 0.5s. NO node field is needed —
+# graphite_statsd carries no proxy identifier.
+#
+# The WIRE-name correction (stats.ExtractTags), the admin same-name collision
+# fix (DeltaSumTagged, not plain DeltaSum), the delta-SUM model + post-
+# convergence stability barrier, the two-private-receivers + hard Close()
+# discipline, and the LOCAL hostGatewayIP duplicate (import-cycle avoidance)
+# are ALL cloned VERBATIM from 0094-stats-sink-dogstatsd-batching (itself
+# cloned from 0093-stats-sink-dogstatsd) — see those fixtures'
+# expectations.yaml/README.md for the full rationale, unaffected by the
+# tag-format/batching change here (batching is a pure transport-layer concern
+# applied strictly AFTER a line string already exists).
+#
+# ## Workload + release barrier
+#
+# Each side fires K = 7 deterministic GET /probe requests (Host:
+# graphite.example, UA: graphite-probe/1; all 2xx). The driver POLLS that
+# side's private receiver until the deterministic COUNTER subset's per-flush
+# deltas SUM to == 7 (DeltaSumTagged — the release barrier; never a fixed
+# sleep), then awaits >= 2 further flushes (the stability barrier) before
+# snapshotting the delta-SUMs + tag sets + gauge + gauge tags + the two
+# batching-specific readings + the receiver's UnparsedCount().
+#
+# ## Asserted (cross-side EXACT on the deterministic COUNTER WIRE-NAME subset +
+#              their tag SETS + the absolute GAUGE subset + its tag SET +
+#              the two batching-specific proofs, both sides; PLUS a
+#              SUBJECT-ONLY UnparsedCount()==0 proof)
+#
+# This is a name-SUBSET, NOT the whole datagram/line set (the surfaces differ
+# cross-side — the reference emits many more lines including |ms timer
+# histograms that envoy-go lacks). Names are the POST-EXTRACTION,
+# POST-TAG-STRIP WIRE names, prefix-joined: the receiver keys on the full
+# <prefix>.<residual> line with tags stripped back out.
+#
+#   grpfx.cluster.upstream_rq_total
+#     present, delta-SUM == 7, tags == {envoy.cluster_name: <backendName>}
+#   grpfx.http.downstream_rq_total
+#     present, delta-SUM == 7, tags == {envoy.http_conn_manager_prefix: hcm_local}
+#   grpfx.http.downstream_rq_xx
+#     present, delta-SUM == 7,
+#     tags == {envoy.response_code_class: "2", envoy.http_conn_manager_prefix: hcm_local}
+#
+#   Absolute gauge (D-DSD-GAUGE-SUBSET):
+#     grpfx.cluster.membership_total == 1, tags == {envoy.cluster_name: <backendName>}
+#
+#   Batching (D-GR-BATCHSHARE):
+#     MaxLinesInAnyDatagram() > 1 (batching actually occurred)
+#     LinesInDatagram(grpfx.cluster.upstream_rq_total) == (1, true)
+#       (the deliberately-oversized line stayed alone)
+#
+#   SUBJECT-ONLY (never cross-side):
+#     UnparsedCount() == 0 for the SUBJECT receiver — a correct envoy-go
+#       subject emits only |c/|g graphite lines, so every ingested line must
+#       parse (reference_framing_break_needs_unparsed_counter; SPEC-57 §8.1).
+#
+# ## UNasserted (vary side-to-side / impl-specific / non-deterministic)
+#
+#   The WHOLE datagram/line set (the reference emits many more lines including
+#       |ms timer histograms that envoy-go lacks; lazy-instantiation grows the
+#       set over time).
+#   Non-deterministic gauges (server.uptime, *_active, connection churn).
+#   Per-datagram framing + line ORDER within a datagram
+#       (reference_streaming_sink_differential_framing).
+#   The EXACT per-flush datagram COUNT or which specific OTHER lines co-batch
+#       with which — only "at least one multi-line datagram was observed" is
+#       asserted, not a precise packing schedule (the registry walk order and
+#       the full self-stat line set are not pinned cross-side).
+#   |ms timer lines (histogram side-channel; envoy-go has no histograms) and
+#       the REFERENCE's UnparsedCount() (it legitimately produces unparsed
+#       lines from those timers — only the subject's count is asserted).
+#   The literal tag ORDER on the wire (asserted as an order-independent SET;
+#       the reference's two-tag order is the REVERSE of envoy-go's —
+#       AMEND-GR-TAGORDER).
+#   `_NNN` exact-status-code names (AMEND-GR-EXACTCODE-SUBSET) — only the
+#       `_xx` class-collapsed names are in the subset.
+#   Whole-registry-vs-used-only breadth (the reference emits many stats
+#       envoy-go's lazily-instantiated registry has not yet touched).
+#   The proxy identifier (graphite_statsd has none — no node field).
+#   Flush cadence / connection count (UDP is connectionless).
+#
+# Cross-refs: phase 57 SPEC/PLAN + ADR-0275 + D-GR-CAP/BATCHSHARE/FIXTURE +
+#             the phase-49/50 0093/0094 fixtures (cloned verbatim) +
+#             reference_dogstatsd_tag_order_unsorted +
+#             reference_line_parser_extension_delimiter_reuse +
+#             reference_framing_break_needs_unparsed_counter +
+#             reference_delta_sink_differential_stability_barrier +
+#             reference_periodic_sink_differential_two_receivers +
+#             reference_differential_grpc_receiver_driver_owned +
+#             reference_concurrency_differential_release_barrier +
+#             reference_docker_probe_bridge_network +
+#             reference_host_gateway_ip_docker_desktop +
+#             reference_membership_total_vs_healthy_gauge +
+#             reference_differential_break_protocol_count1.

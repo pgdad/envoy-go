@@ -741,3 +741,326 @@ func TestTCPLeavesDatagramAccessorsUnpopulated(t *testing.T) {
 		t.Error("LinesInDatagram must be unpopulated on the TCP path")
 	}
 }
+
+// TestGraphiteTwoTagCounter covers phase 57 Task 7: a graphite line folds tags
+// INTO the name as ";k=v" pairs. The receiver must strip them off the name,
+// key DeltaSumTagged/Tags by the STRIPPED name, and treat the full ';'-bearing
+// wire text as NOT a key in its own right (DeltaSum on it must miss).
+func TestGraphiteTwoTagCounter(t *testing.T) {
+	srv, err := statsdrecv.NewAtAddr("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewAtAddr: %v", err)
+	}
+	defer srv.Close()
+
+	conn, err := net.Dial("udp", srv.Addr())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	strippedName := "grpfx.http.downstream_rq_xx"
+	fullLine := strippedName + ";envoy.response_code_class=2;envoy.http_conn_manager_prefix=hcm"
+	msg := fullLine + ":5|c"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatalf("Write %q: %v", msg, err)
+	}
+
+	waitSeen(t, srv, strippedName, 1)
+
+	wantTags := map[string]string{
+		"envoy.response_code_class":      "2",
+		"envoy.http_conn_manager_prefix": "hcm",
+	}
+	sum, ok := srv.DeltaSumTagged(strippedName, wantTags)
+	if !ok {
+		t.Error("DeltaSumTagged: expected ok=true on the stripped name")
+	} else if sum != 5 {
+		t.Errorf("DeltaSumTagged: got %v, want 5", sum)
+	}
+
+	gotTags, tagsOK := srv.Tags(strippedName)
+	if !tagsOK {
+		t.Error("Tags: expected ok=true on the stripped name")
+	} else if !maps.Equal(gotTags, wantTags) {
+		t.Errorf("Tags: got %v, want %v", gotTags, wantTags)
+	}
+
+	// The unstripped, ';'-bearing name must NOT be a key in its own right.
+	if _, fullOK := srv.DeltaSum(fullLine); fullOK {
+		t.Error("DeltaSum(fullLine-name): expected ok=false; the ';'-bearing name must not be a key")
+	}
+}
+
+// TestGraphiteOneTagGauge covers a single-tag graphite |g line.
+func TestGraphiteOneTagGauge(t *testing.T) {
+	srv, err := statsdrecv.NewAtAddr("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewAtAddr: %v", err)
+	}
+	defer srv.Close()
+
+	conn, err := net.Dial("udp", srv.Addr())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	strippedName := "grpfx.cluster.membership_total"
+	msg := strippedName + ";envoy.cluster_name=b:1|g"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatalf("Write %q: %v", msg, err)
+	}
+
+	waitSeen(t, srv, strippedName, 1)
+
+	gval, gok := srv.Gauge(strippedName)
+	if !gok {
+		t.Error("Gauge: expected ok=true on the stripped name")
+	} else if gval != 1 {
+		t.Errorf("Gauge: got %v, want 1", gval)
+	}
+
+	wantTags := map[string]string{"envoy.cluster_name": "b"}
+	gotTags, ok := srv.Tags(strippedName)
+	if !ok {
+		t.Fatal("Tags: expected ok=true")
+	}
+	if !maps.Equal(gotTags, wantTags) {
+		t.Errorf("Tags: got %v, want %v", gotTags, wantTags)
+	}
+}
+
+// TestGraphiteTagFreeLineUnchanged is the regression proof: a tag-free
+// graphite-style line parses exactly as before the phase 57 extension.
+func TestGraphiteTagFreeLineUnchanged(t *testing.T) {
+	srv, err := statsdrecv.NewAtAddr("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewAtAddr: %v", err)
+	}
+	defer srv.Close()
+
+	conn, err := net.Dial("udp", srv.Addr())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	name := "grpfx.server.uptime"
+	msg := name + ":3|g"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatalf("Write %q: %v", msg, err)
+	}
+
+	waitSeen(t, srv, name, 1)
+
+	gval, gok := srv.Gauge(name)
+	if !gok {
+		t.Fatal("Gauge: expected ok=true")
+	}
+	if gval != 3 {
+		t.Errorf("Gauge: got %v, want 3", gval)
+	}
+	if tags, ok := srv.Tags(name); ok || tags != nil {
+		t.Errorf("Tags(tag-free graphite name): got (%v, %v), want (nil, false)", tags, ok)
+	}
+	if n := srv.UnparsedCount(); n != 0 {
+		t.Errorf("UnparsedCount = %d, want 0", n)
+	}
+}
+
+// TestGraphiteMissingEqualsInPair covers a ';'-bearing name whose tag segment
+// lacks '=': the line must be unaccountable (UnparsedCount==1) with no
+// deltaSums/tags entry under any name.
+func TestGraphiteMissingEqualsInPair(t *testing.T) {
+	srv, err := statsdrecv.NewAtAddr("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewAtAddr: %v", err)
+	}
+	defer srv.Close()
+
+	conn, err := net.Dial("udp", srv.Addr())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	msg := "grpfx.x;badpair:1|c"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatalf("Write %q: %v", msg, err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.UnparsedCount() == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if n := srv.UnparsedCount(); n != 1 {
+		t.Errorf("UnparsedCount: got %d, want 1", n)
+	}
+	if _, ok := srv.DeltaSum("grpfx.x"); ok {
+		t.Error("DeltaSum(grpfx.x): expected ok=false; the malformed pair must not be accounted")
+	}
+	if _, ok := srv.Tags("grpfx.x"); ok {
+		t.Error("Tags(grpfx.x): expected ok=false; the malformed pair must not be accounted")
+	}
+	if _, ok := srv.DeltaSum("grpfx.x;badpair"); ok {
+		t.Error("DeltaSum(grpfx.x;badpair): expected ok=false; the malformed pair must not be accounted")
+	}
+}
+
+// TestGraphiteDeltaAccumulation covers delta accumulation across two graphite
+// lines carrying the SAME tag set on the same stripped name: 3+2 == 5.
+func TestGraphiteDeltaAccumulation(t *testing.T) {
+	srv, err := statsdrecv.NewAtAddr("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewAtAddr: %v", err)
+	}
+	defer srv.Close()
+
+	conn, err := net.Dial("udp", srv.Addr())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	strippedName := "grpfx.cluster.upstream_rq_total"
+	for _, msg := range []string{
+		strippedName + ";envoy.cluster_name=b:3|c",
+		strippedName + ";envoy.cluster_name=b:2|c",
+	} {
+		if _, err := conn.Write([]byte(msg)); err != nil {
+			t.Fatalf("Write %q: %v", msg, err)
+		}
+	}
+
+	waitSeen(t, srv, strippedName, 2)
+
+	wantTags := map[string]string{"envoy.cluster_name": "b"}
+	sum, ok := srv.DeltaSumTagged(strippedName, wantTags)
+	if !ok {
+		t.Fatal("DeltaSumTagged: expected ok=true")
+	}
+	if sum != 5 {
+		t.Errorf("DeltaSumTagged: got %v, want 5", sum)
+	}
+}
+
+// TestGraphiteAndDogStatsdCoexist covers a dog_statsd '|#'-tagged line and a
+// graphite ';'-tagged line for DIFFERENT names sharing one receiver: both
+// grammars must bucket correctly through the same tag machinery.
+func TestGraphiteAndDogStatsdCoexist(t *testing.T) {
+	srv, err := statsdrecv.NewAtAddr("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewAtAddr: %v", err)
+	}
+	defer srv.Close()
+
+	conn, err := net.Dial("udp", srv.Addr())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	dsdName := "dsdpfx.cluster.upstream_rq_total"
+	grName := "grpfx.cluster.upstream_rq_total"
+	for _, msg := range []string{
+		dsdName + ":4|c|#envoy.cluster_name:backend",
+		grName + ";envoy.cluster_name=backend:9|c",
+	} {
+		if _, err := conn.Write([]byte(msg)); err != nil {
+			t.Fatalf("Write %q: %v", msg, err)
+		}
+	}
+
+	waitSeen(t, srv, dsdName, 1)
+	waitSeen(t, srv, grName, 1)
+
+	wantTags := map[string]string{"envoy.cluster_name": "backend"}
+
+	dsdSum, dsdOK := srv.DeltaSumTagged(dsdName, wantTags)
+	if !dsdOK || dsdSum != 4 {
+		t.Errorf("DeltaSumTagged(dsdName): got (%v, %v), want (4, true)", dsdSum, dsdOK)
+	}
+	grSum, grOK := srv.DeltaSumTagged(grName, wantTags)
+	if !grOK || grSum != 9 {
+		t.Errorf("DeltaSumTagged(grName): got (%v, %v), want (9, true)", grSum, grOK)
+	}
+}
+
+// TestGraphiteMultiLineDatagram covers the batching signal: a two-line
+// datagram where the second line carries graphite tags must key
+// LinesInDatagram by the STRIPPED name.
+func TestGraphiteMultiLineDatagram(t *testing.T) {
+	srv, err := statsdrecv.NewAtAddr("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewAtAddr: %v", err)
+	}
+	defer srv.Close()
+
+	conn, err := net.Dial("udp", srv.Addr())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	strippedName := "grpfx.cluster.upstream_cx_total"
+	line1 := "grpfx.other.metric:1|c"
+	line2 := strippedName + ";envoy.cluster_name=b:2|c"
+	if _, err := conn.Write([]byte(line1 + "\n" + line2)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	waitSeen(t, srv, strippedName, 1)
+
+	lines, ok := srv.LinesInDatagram(strippedName)
+	if !ok || lines != 2 {
+		t.Errorf("LinesInDatagram(%s): got (%v, %v), want (2, true)", strippedName, lines, ok)
+	}
+}
+
+// TestGraphiteResetClears is the confirm-test for Reset(): the graphite tag
+// state lives in the existing maps, so Reset() clears it the same way it
+// clears dog_statsd tag state.
+func TestGraphiteResetClears(t *testing.T) {
+	srv, err := statsdrecv.NewAtAddr("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewAtAddr: %v", err)
+	}
+	defer srv.Close()
+
+	conn, err := net.Dial("udp", srv.Addr())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	strippedName := "grpfx.cluster.reset_check"
+	msg := strippedName + ";envoy.cluster_name=b:6|c"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatalf("Write %q: %v", msg, err)
+	}
+
+	waitSeen(t, srv, strippedName, 1)
+	if _, ok := srv.Tags(strippedName); !ok {
+		t.Fatal("Tags: expected ok=true before Reset")
+	}
+
+	srv.Reset()
+
+	if _, ok := srv.DeltaSum(strippedName); ok {
+		t.Error("DeltaSum after Reset: expected ok=false")
+	}
+	if _, ok := srv.DeltaSumTagged(strippedName, map[string]string{"envoy.cluster_name": "b"}); ok {
+		t.Error("DeltaSumTagged after Reset: expected ok=false")
+	}
+	if tags, ok := srv.Tags(strippedName); ok || tags != nil {
+		t.Errorf("Tags after Reset: got (%v, %v), want (nil, false)", tags, ok)
+	}
+	if n := srv.SeenCount(strippedName); n != 0 {
+		t.Errorf("SeenCount after Reset: got %d, want 0", n)
+	}
+}

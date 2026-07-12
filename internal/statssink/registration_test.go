@@ -97,3 +97,31 @@ func TestNoNewStat_DogStatsdRegistrationGuard(t *testing.T) {
 		t.Fatalf("dog_statsd sink+flusher constructors registered %d metric(s); D-DSD-STATS-FINAL requires +0", after)
 	}
 }
+
+// TestNoNewStat_GraphiteRegistrationGuard pins D-GR-STATS +0: the graphite_statsd
+// UDP sink surface delta is +0. Constructing a GraphiteStatsdSink + Flusher against
+// a fresh registry must register ZERO new metrics — the reference registers no
+// graphite_statsd-scoped stat and dials no sink cluster, and UDP write drops are
+// rate-limit-LOGGED, not counted. This proves no graphite_statsd-scoped name is
+// added to the stat surface (surface stays 1201).
+func TestNoNewStat_GraphiteRegistrationGuard(t *testing.T) {
+	reg := stats.NewRegistry()
+	if before := countMetrics(reg); before != 0 {
+		t.Fatalf("fresh registry should have 0 metrics, got %d", before)
+	}
+
+	// The exact main.go construction shape: a GraphiteStatsdSink over a UDP
+	// address, then a Flusher over the registry/interval/sinks.
+	sink, err := NewGraphiteStatsdSink("127.0.0.1:65535", "envoy", 0)
+	if err != nil {
+		t.Fatalf("NewGraphiteStatsdSink: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+
+	flusher := NewFlusher(reg, 500*time.Millisecond, []Sink{sink})
+	_ = flusher
+
+	if after := countMetrics(reg); after != 0 {
+		t.Fatalf("graphite_statsd sink+flusher constructors registered %d metric(s); D-GR-STATS requires +0", after)
+	}
+}
