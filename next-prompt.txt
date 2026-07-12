@@ -1,6 +1,8 @@
 === AUTONOMOUS LOOP CONTROL (read FIRST) ===
 This file is a SELF-ADVANCING router for driving the project forward one stage at a time. Each session performs EXACTLY ONE lifecycle stage of the active phase (BRAINSTORM → SPEC → PLAN → IMPL — one stage per session, the project discipline), lands it (commit + push per `feedback_push_to_origin`), then ROLLS THIS FILE FORWARD to point at the next stage.
 
+**STANDING DIRECTIVE (human, 2026-07-12): the loop runs AUTONOMOUSLY until the termination sentinel fires.** When a phase completes and the sentinel does NOT fire, the roller SELF-PICKS the next subject — smallest defensible candidate first (record the pick + the rejected alternatives in the BRAINSTORM) — and does NOT pause for a human pick. When the sentinel DOES fire, create the `stop` file per the rule below and exit.
+
 TERMINATION SENTINEL: if — and ONLY if — ALL work is complete (every chartered ROADMAP row/phase is `done`, EVERY family's deferred-candidate list is ALSO empty, and STATE.md's NEXT shows there is NO next stage left to perform), create an empty file named `stop` at the git root with `: > /home/esa/git/envoy-go/stop` and EXIT without further action.
 
 Evaluate it MECHANICALLY, not by eye. All three checks must print NOTHING:
@@ -26,46 +28,45 @@ If ANY check prints output, the sentinel does NOT fire: proceed with the stage b
 
 Check (3) fails SAFE by construction: a future family whose rows use a slug not listed above reads as "never opened", which BLOCKS `stop` rather than falsely triggering it. A false "not done" costs one wasted session; a false "done" ends the project early. When you open a new family, add its row-summary slug here.
 
-**SENTINEL RE-CHECKED 2026-07-12 (post-phase-57-IMPL) — it does NOT fire. Do NOT create `stop`.** Evidence:
+**SENTINEL RE-CHECKED 2026-07-12 (post-phase-57-IMPL, master `2825ca90`, run MECHANICALLY) — it does NOT fire. Do NOT create `stop`.** Evidence:
 - (1) prints NOTHING — every chartered row is `done` (row 57 flipped at the phase-57 IMPL). **An all-done row table ALONE does NOT fire the sentinel** — checks (2) and (3) both still print output and each independently blocks `stop`.
-- (2) prints the Observability family's LIVE deferred-candidates sentence: OTLP-metrics stats sink + tracing `custom_tags`/`spawn_upstream_span`/`http_service`/force-trace + **the NEW dog_statsd explicit-`max_bytes_per_datagram: 0` parity fix** (recorded at phase 57 per SPEC-57 §2). ⇒ the **Observability family STAYS OPEN**. (NOTE: a second, HISTORICAL sentence in the family line reads "candidates were:" — deliberately non-matching; only the "candidates:" sentence is live.)
+- (2) prints the Observability family's LIVE deferred-candidates sentence: OTLP-metrics stats sink + tracing `custom_tags`/`spawn_upstream_span`/`http_service`/force-trace + **the dog_statsd explicit-`max_bytes_per_datagram: 0` parity fix** (recorded at phase 57 per SPEC-57 §2). ⇒ the **Observability family STAYS OPEN**. (NOTE `reference_sentinel_deferred_sentence_live_vs_historical`: a second, HISTORICAL sentence in the family line reads "candidates were:" — deliberately non-matching; only the "candidates:" sentence is live. After ANY deferred-list edit, re-run the check-(2) grep and require EXACTLY ONE match with the intended content.)
 - (3) prints `NEVER OPENED: HTTP/3`, `gRPC`, `xDS`, `Runtime`, `WASM` ⇒ FIVE families never opened; the **Operational-tooling family** also STAYS OPEN (its deferred candidates live in its family section prose).
 
-**STATUS AS OF 2026-07-12: phase 57 (`stats-sink-graphite`) is COMPLETE — row 57 `done` (sole leg, ADR-0106). NO phase is currently open.** The phase-57 IMPL landed: `internal/statssink/graphite.go` `GraphiteStatsdSink` (tags folded into the metric NAME as `;k=v` via the ~10-LoC `graphiteTagSuffix`; FOURTH sink-private `deltaState`); the phase-50 batching pair HOISTED to shared `appendBatchLine`/`flushBatch` in `udp.go` (D-GR-BATCHSHARE, dog_statsd tests byte-untouched); `parseGraphiteStatsdSinkConfig` + the FIRST `envoy.extensions.…` stat-sink type URL + the FOUR-sink sibling-reject (THREE test rows — a third found at IMPL beyond the PLAN's two) + the NEW explicit-zero reject (PGV parity); the fourth `main.go` loop; the additive `statsdrecv` `;k=v` extension; `FuzzGraphiteStatsdSinkConfigParse`; the `0101-stats-sink-graphite` merged tags+batching differential — five controller-executed breaks each firing its OWN assertion + non-break (d) order-reversal-green, 20/20 flake, full-package `-race`. ADR-0275 ANCHORED (§Decision/§Consequences per ADR-0044).
+**STATUS AS OF 2026-07-12: phase 57 (`stats-sink-graphite`) is COMPLETE — row 57 `done` (sole leg, ADR-0106). NO phase is currently open. The next subject is PICKED (see below).**
 
-**Current counts (verified at the phase-57 IMPL exit):** fixtures **103** (tail `0101-stats-sink-graphite`) · fuzzers **54** · DECISIONS tail **ADR-0275** (next-free **ADR-0276**) · BackendKind tail **38** (`H2GoawayResponder`) · stat surface **1201 (+0)** · new Go packages **0** · new go.mod modules **0**.
+**Current counts (verified at the phase-57 IMPL exit, master `2825ca90`):** fixtures **103** (tail `0101-stats-sink-graphite`) · fuzzers **54** · DECISIONS tail **ADR-0275** (next-free **ADR-0276**) · BackendKind tail **38** (`H2GoawayResponder`) · stat surface **1201 (+0)** · new Go packages **0** · new go.mod modules **0**. RE-VERIFY against the actual master tip at session start (`git fetch` first; parallel workstreams land test-only commits).
 
-**Locating the stage squash (a router cannot name its own sha — writing the sha changes it).** Identify it by SUBJECT, never by sha and never by position:
+**Locating the phase-57 stage squash** (a router cannot name its own sha — writing the sha changes it; identify by SUBJECT, never by position):
 ```sh
 git log --oneline --grep='^phase 57 (stats-sink-graphite) IMPL' -1
 ```
-This stage folded its own `next-prompt.txt` roll INTO the squash (per `reference_next_prompt_tracked_despite_gitignore`). The squash is NOT necessarily the master tip: parallel-workstream commits can land on top of it. ALWAYS `git fetch` + re-verify counts against the ACTUAL current master tip at the start of the next session.
 
-**THE NEXT ACTION: RE-OPEN the loop — the next phase's BRAINSTORM (lifecycle-state 0 → 1).**
+**THE NEXT ACTION: the phase-58 BRAINSTORM (lifecycle-state 0 → 1) — subject PICKED per the standing directive: the `dog_statsd` explicit-`max_bytes_per_datagram: 0` parity fix** (working slug `stats-sink-dogstatsd-explicit-zero`; the BRAINSTORM may refine the slug).
 
 ==============================================
 
-## What THIS session does (the next-phase BRAINSTORM)
+## What THIS session does (the phase-58 BRAINSTORM)
 
-No phase is open. This session picks the next subject and performs its BRAINSTORM (docs-only; fresh worktree per `feedback_git_worktrees`, e.g. `.worktrees/phase-58-brainstorm`; register the new row `in-progress` in ROADMAP at the BRAINSTORM commit per the §Schema invariant; charter ADR-0276 as the row's anchor).
+Perform the BRAINSTORM for the picked subject (docs-only; NO production `.go` changes at a BRAINSTORM; fresh worktree per `feedback_git_worktrees`, e.g. `.worktrees/phase-58-brainstorm`; register row 58 `in-progress` in ROADMAP at the BRAINSTORM commit per the §Schema invariant; charter **ADR-0276** as the row's anchor; use the 12-section BRAINSTORM shape — `docs/envoy-go/phases/57-stats-sink-graphite/BRAINSTORM.md` is the template).
 
-**Subject selection (the phase-57 precedent: after phase 56 landed, the loop was re-opened by a HUMAN PICK).** If the human has named a subject in this session's prompt, take it. Otherwise PAUSE and ask, presenting the candidate menu:
-1. **Observability deferred candidates** (the family stays open): the dog_statsd explicit-`max_bytes_per_datagram: 0` parity fix (SMALLEST — a one-arm parse addition + tests; reuses the phase-57 reject shape verbatim); the OTLP-metrics stats sink (a gRPC sink over the phase-47 Flusher seam); tracing `custom_tags`/`spawn_upstream_span`/`http_service`/force-trace (phase-46 follow-ons).
-2. **Operational-tooling deferred candidates** (family open — see its ROADMAP family section).
-3. **Open a NEW family** (five never opened): HTTP/3, gRPC, xDS, Runtime, WASM — each a large charter; xDS was declined at the phase-57 pick but remains the most consequential.
-(When a new family opens, ADD its row-summary slug to the sentinel check-(3) list above.)
+**The picked subject:** the reference's `DogStatsdSink` proto carries the IDENTICAL PGV `gt: 0` rule on `max_bytes_per_datagram` that graphite's phase-57 parse arm now enforces, but the landed phase-50 dog_statsd parse consumes an explicit 0 UNCHECKED (`parseDogStatsdSinkConfig` — `bootstrap.go` consumes `GetValue()` directly; the field is a `*wrapperspb.UInt64Value`, so nil-absent IS distinguishable from explicit-0). The fix: mirror the phase-57 reject arm verbatim (`dog_statsd max_bytes_per_datagram must be greater than 0`, ADR-0080 distinct substring), + tests (accept-absent / reject-explicit-0 sibling rows), + a fuzz seed in the EXISTING `FuzzDogStatsdSinkConfigParse`, + the BEHAVIOR_CONTRACT §deferred-parity sentence flip. ANTICIPATED SMALLEST ROW YET: likely NO new fixture (a parse-reject is boot-time; probe whether the reference's reject wording matches SPEC-57 §11 A4b verbatim — ONE fresh-container probe arm may suffice, `reference_probe_fresh_container_per_arm`), +0 stat surface, +0 fuzzers (seed added to the existing fuzzer — verify the count stays 54 per `reference_fuzzer_count_docs_drift`), +0 packages/modules.
+**Why this pick (record in the BRAINSTORM):** smallest defensible candidate — a one-arm parse addition reusing a shape landed THIS WEEK; closes a recorded reference-parity gap (SPEC-57 §2). Rejected alternatives: OTLP-metrics sink (a full gRPC sink row), tracing follow-ons (larger, tap the phase-46 seams), opening a new family (xDS the most consequential but a large charter — revisit when the Observability tail is drained).
+**BRAINSTORM D-questions to charter (SPEC probes):** D-DZ-REJECTMSG (the reference's exact boot-reject wording for dog_statsd explicit-0 — probe, don't assume it matches graphite's); D-DZ-FIXTURE (differential-provable? boot-rejects are parse-time — the phase-49/50/57 reject rosters were proven by unit tests + fuzz seeds, NOT fixtures; anticipate NO new fixture); D-DZ-DOCSHAPE (BEHAVIOR_CONTRACT already names the gap in TWO places — SPEC must list both edit sites; ADR-0275 §Consequences also names it, historical, do NOT edit).
+Then ROLL THIS FILE FORWARD to the phase-58 SPEC (fold the roll into the stage commit) and land it (commit + push per `feedback_push_to_origin`).
 
 ## Honor throughout (the discipline, unchanged)
-- **Lifecycle = one stage per session.** This session: the next phase's BRAINSTORM ONLY (docs-only; NO production `.go` changes at a BRAINSTORM).
-- **Process anchors:** ADR-0044 (ADR §Context drafts at SPEC, §Decision/§Consequences at IMPL) · ADR-0045 (split gate ~15 tasks) · ADR-0080 (strict-reject anti-silent-divergence) · ADR-0106 (row flips `done` at the final IMPL six-gate). Next-free ADR is **ADR-0276**.
+- **Lifecycle = one stage per session.** This session: the phase-58 BRAINSTORM ONLY. Subsequent sessions: SPEC → PLAN → IMPL, one per session, router-driven.
+- **Process anchors:** ADR-0044 (ADR §Context drafts at SPEC, §Decision/§Consequences at IMPL) · ADR-0045 (split gate ~15 tasks — this row anticipates ~5-7) · ADR-0080 (strict-reject anti-silent-divergence; DISTINCT per-arm substrings) · ADR-0106 (row 58 flips `done` at its IMPL six-gate). Next-free ADR is **ADR-0276**.
 - **Live probes at SPEC time** use fresh containers per arm (`reference_probe_fresh_container_per_arm`) against the `envoyproxy/envoy:contrib-v1.37.2` pin (`reference_envoy_contrib_image_tagging`).
-- **`next-prompt.txt` IS TRACKED** — edit it inside the stage worktree, fold into the stage commit; locate commits by SUBJECT (`git log --grep`), never by position.
-- Baselines: RE-VERIFY the counts above against the actual master tip at session start (`git fetch` first; parallel workstreams land test-only commits).
+- **`next-prompt.txt` IS TRACKED** — edit it inside the stage worktree, fold into the stage commit; locate commits by SUBJECT (`git log --grep`), never by position (`reference_next_prompt_tracked_despite_gitignore`).
+- **After any ROADMAP deferred-list edit:** re-run the sentinel check-(2) grep — EXACTLY ONE live match, correct content (`reference_sentinel_deferred_sentence_live_vs_historical`). When row 58 lands `done`, the family sentence rolls the dog_statsd candidate OUT (OTLP + the tracing quartet remain ⇒ check (2) still prints ⇒ the sentinel still does not fire).
+- **Deferred maintenance (fold into the next statssink-touching row, from the phase-57 final review):** F-1 the 0101 driver's counter tag snapshot records the EXPECTED map (near-dead `maps.Equal`; snapshot observed tags like the gauge path); F-2 `udp.go` `udpWriter` doc comment still names two sinks (three embed it now); F-3 BEHAVIOR_CONTRACT 0101 note says "`differential.HostGatewayIP` helper" where the driver deliberately uses its LOCAL duplicate.
 
 ## Read first (in order)
-1. THIS FILE — the cold-start router (the next-phase BRAINSTORM is next; subject may need a human pick).
-2. `docs/envoy-go/ROADMAP.md` — the family sections' deferred-candidate lists (Observability + Operational-tooling) + the never-opened families.
-3. `docs/envoy-go/STATE.md` — the active-phase header (phase 57 IMPL done; no phase open).
-4. `docs/envoy-go/DECISIONS.md` tail (ADR-0275) — the graphite row's §Decision/§Consequences (the reject-shape precedent the dog_statsd parity candidate would reuse).
-5. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — the `feedback_*` execution discipline + the `reference_*` traps.
-6. A prior BRAINSTORM for the 12-section shape — `docs/envoy-go/phases/57-stats-sink-graphite/BRAINSTORM.md`.
+1. THIS FILE — the cold-start router (the phase-58 BRAINSTORM is next; subject picked: dog_statsd explicit-zero parity).
+2. `docs/envoy-go/DECISIONS.md` ADR-0275 + `docs/envoy-go/phases/57-stats-sink-graphite/SPEC.md` §2 + §11 A4b — the recorded gap + the graphite reject shape this row mirrors.
+3. `internal/bootstrap/bootstrap.go` — `parseDogStatsdSinkConfig` (the unchecked `GetValue()` consume) vs `parseGraphiteStatsdSinkConfig` (the reject-arm template landed at phase 57).
+4. `docs/envoy-go/ROADMAP.md` — the Observability family section (the deferred-candidates LIVE sentence this row will edit at its IMPL).
+5. `docs/envoy-go/STATE.md` — the active-phase header (phase 57 IMPL done; no phase open).
+6. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — the `feedback_*` execution discipline + the `reference_*` traps.
