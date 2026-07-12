@@ -28,56 +28,48 @@ If ANY check prints output, the sentinel does NOT fire: proceed with the stage b
 
 Check (3) fails SAFE by construction: a future family whose rows use a slug not listed above reads as "never opened", which BLOCKS `stop` rather than falsely triggering it. A false "not done" costs one wasted session; a false "done" ends the project early. When you open a new family, add its row-summary slug here.
 
-**SENTINEL RE-CHECKED 2026-07-12 (at the phase-58 PLAN, run MECHANICALLY) — it does NOT fire. Do NOT create `stop`.** The PLAN is docs-only and did NOT touch the ROADMAP, so the state is unchanged from the phase-58 SPEC:
-- (1) prints `NOT DONE: row58` — row 58 is `in-progress` (the phase is open); clears when row 58 flips `done` at the phase-58 IMPL six-gate.
-- (2) prints the Observability family's LIVE deferred-candidates sentence (OTLP-metrics + the tracing quartet + the dog_statsd explicit-`max_bytes_per_datagram: 0` parity fix — the phase-58 subject, which STAYS in the live sentence until the phase-58 IMPL rolls it OUT at row-done). EXACTLY ONE live "candidates:" match. ⇒ Observability STAYS OPEN.
+**SENTINEL RE-CHECKED 2026-07-12 (at the phase-58 IMPL six-gate, run MECHANICALLY) — it does NOT fire. Do NOT create `stop`.** The phase-58 IMPL landed (row 58 `done`); the state after it:
+- (1) prints NOTHING — every ROADMAP row is now `done` (row 58 flipped `done` at the phase-58 IMPL six-gate).
+- (2) prints EXACTLY ONE live "candidates:" sentence — the Observability family's `remaining deferred (not-yet-chartered) candidates: OTLP-metrics stats sink + tracing custom_tags/spawn_upstream_span/http_service/force-trace.` (the dog_statsd explicit-`max_bytes_per_datagram: 0` candidate was rolled OUT at the phase-58 IMPL). ⇒ Observability STAYS OPEN. (One live match, `reference_sentinel_deferred_sentence_live_vs_historical`.)
 - (3) prints `NEVER OPENED: HTTP/3`, `gRPC`, `xDS`, `Runtime`, `WASM` ⇒ FIVE families never opened; Operational-tooling also STAYS OPEN.
 
-**STATUS AS OF 2026-07-12: phase 58 (`stats-sink-dogstatsd-explicit-zero`) is OPEN — the PLAN is DONE (row 58 `in-progress`, lifecycle-state 2 → 3). The next stage is the phase-58 IMPL.** The PLAN decomposes SPEC-58 into a 6-task TDD spine (all mechanical — no empirical question survives the SPEC); `PLAN.md` + `PROGRESS.md` are landed.
+Checks (2) and (3) print ⇒ the sentinel does NOT fire.
 
-**Current counts (verified at the phase-58 PLAN, master `3c6739ae` pre-commit):** fixtures **103** (tail `0101-stats-sink-graphite`) · fuzzers **54** · DECISIONS tail **ADR-0275** (next-free **ADR-0276**, the row-58 anchor) · BackendKind tail **38** (`H2GoawayResponder`) · stat surface **1201** · new Go packages **0** · new go.mod modules **0**. RE-VERIFY against the actual master tip at session start (`git fetch` first).
+**STATUS AS OF 2026-07-12: phase 58 (`stats-sink-dogstatsd-explicit-zero`) is COMPLETE — the IMPL landed (row 58 `done`, lifecycle-state done). The next stage is a NEW phase-59 BRAINSTORM (the roller SELF-PICKS the subject per the standing directive).** The phase-58 IMPL was subagent-driven: the reject arm + test convert + 3 doc fixes (Task 2), the fuzz seed (Task 3), the four BEHAVIOR_CONTRACT edits (Task 4), verification + the full 103-dir differential (Task 5), ADR-0276 body + STATE/ROADMAP + PROGRESS close + this router roll (Task 6).
 
-**Locating the phase-58 PLAN stage squash** (a router cannot name its own sha — identify by SUBJECT, never by position):
+**Current counts (verified at the phase-58 IMPL six-gate, on the frozen HEAD):** fixtures **103** (tail `0101-stats-sink-graphite`) · fuzzers **54** · DECISIONS tail **ADR-0276** (next-free **ADR-0277**) · BackendKind tail **38** (`H2GoawayResponder`) · stat surface **1201** · new Go packages **0** · new go.mod modules **0**. RE-VERIFY against the actual master tip at session start (`git fetch` first).
+
+**Locating the phase-58 IMPL stage squash** (a router cannot name its own sha — identify by SUBJECT, never by position):
 ```sh
-git log --oneline --grep='^phase 58 (stats-sink-dogstatsd-explicit-zero) PLAN' -1
+git log --oneline --grep='^phase 58 (stats-sink-dogstatsd-explicit-zero) IMPL' -1
 ```
 
-**THE NEXT ACTION: the phase-58 IMPL (lifecycle-state 3 → done).**
+**THE NEXT ACTION: the phase-59 BRAINSTORM (a NEW row; lifecycle-state 0 → 1).**
 
 ==============================================
 
-## What THIS session does (the phase-58 IMPL)
+## What THIS session does (the phase-59 BRAINSTORM)
 
-Perform the IMPL for phase 58 — subagent-driven (`feedback_execution_style`, `superpowers:subagent-driven-development`) in a FRESH worktree off master (`.worktrees/phase-58-impl`, branch `phase-58-stats-sink-dogstatsd-explicit-zero-impl`, per `feedback_git_worktrees`). Execute `PLAN.md`'s 6-task TDD spine task-by-task; subagents commit LOCALLY only (`feedback_subagents_no_push`); the controller VERIFIES each commit, executes the Task-2 Step-5 `-count=1` liveness break ITSELF (never delegated), re-runs the full suite on the FINAL frozen HEAD, squashes, and pushes at stage-close (`feedback_push_to_origin`). Row 58 flips `in-progress` → `done` at the six-gate (ADR-0106, the SOLE leg).
+Perform the BRAINSTORM for a NEW phase 59 — docs-only (a BRAINSTORM makes NO production `.go` changes), in a FRESH worktree off master (`.worktrees/phase-59-brainstorm`, branch `phase-59-<slug>-brainstorm`, per `feedback_git_worktrees`). Use `superpowers:brainstorming`.
 
-**The IMPL's job** — land the SMALLEST row the project has chartered: a FOUR-line strict-reject arm in `parseDogStatsdSinkConfig` (`bootstrap.go`, before the append) mirroring the phase-57 graphite arm (`bootstrap.go:750-752`) VERBATIM modulo the sink name (`dog_statsd max_bytes_per_datagram must be greater than 0`, ADR-0080-distinct), plus its test/doc reconciliation. RE-DERIVE every `file:line` cite from source AGAIN (`feedback_brief_citations_not_evidence` — the roster is PLAN §"Edit-site roster" / SPEC-58 §12; re-verify against the actual master tip):
-- **T1** baselines into PROGRESS + the ADR-0045 single-flat-row re-check (fixtures 103 / fuzzers 54 actual `^func Fuzz` / stat 1201 / DECISIONS tail ADR-0275).
-- **T2** [TDD; CONTROLLER-EXECUTED break] the reject arm (`if w := dsd.GetMaxBytesPerDatagram(); w != nil && w.GetValue() == 0 { return fmt.Errorf(...) }`, before the append) + the TEST CONVERT (delete `TestDogStatsdSink_AcceptMaxBytesPerDatagramZero`, add an `explicit_max_bytes_per_datagram_zero` row to `TestDogStatsdSink_Rejects` with `errSubs: []string{"bootstrap:", "dog_statsd max_bytes_per_datagram must be greater than 0"}`; KEEP `…Absent` + `…Accept512`) + the 3 `bootstrap.go` doc-comment fixes (struct field, func doc, graphite NOTE) — all in ONE TDD task (test-first, ends GREEN; splitting would commit a red test); prove the arm LIVE with a `-count=1` deliberate break (`reference_differential_break_protocol_count1` + `reference_deliberate_break_wrong_assertion`).
-- **T3** a SEED (explicit `max_bytes_per_datagram: 0`) to the EXISTING `FuzzDogStatsdSinkConfigParse` — NOT a new fuzzer; count STAYS 54 (`reference_fuzzer_count_docs_drift`, re-count after).
-- **T4** the four `BEHAVIOR_CONTRACT.md` edits (`:785` rejects [+ the OPTIONAL "three sinks"→"four" staleness fix], `:787` batching, `:821` graphite NOTE flip, `:834` consumption summary).
-- **T5** verification — +0 stat surface (four registration guards) + the full 103-dir differential (byte-stable) + the six-gate on the frozen HEAD.
-- **T6** ADR-0276 body (§Decision/§Consequences on the SPEC §13 §Context) + STATE/ROADMAP (row 58 `done`, the deferred-list roll [dog_statsd OUT], then re-run the sentinel check-(2) grep — EXACTLY ONE live "candidates:" match, `reference_sentinel_deferred_sentence_live_vs_historical`) + PROGRESS close + the router roll to the next router decision.
+**SELF-PICK THE SUBJECT (standing directive — smallest defensible candidate first; record the pick + the rejected alternatives IN THE BRAINSTORM).** The live deferred-candidate pool (ROADMAP sentinel check-(2)) is the Observability family's `OTLP-metrics stats sink + tracing custom_tags/spawn_upstream_span/http_service/force-trace`; Operational-tooling is also open, and five families (HTTP/3, gRPC, xDS, Runtime, WASM) are never-opened. Per "smallest defensible candidate first", INVESTIGATE the remaining Observability candidates' sizes at the BRAINSTORM before committing — a single tracing knob (e.g. a `custom_tags` header/literal tag or a force-trace decision) is plausibly smaller than a whole new OTLP-metrics gRPC stats sink (new proto type-URL + likely a new streaming receiver + a fixture), but VERIFY that against source before picking. Record the chosen subject and the rejected alternatives (and why) in the BRAINSTORM per ADR-0044. Opening a new family instead of continuing Observability is also defensible IF the smallest Observability candidate turns out large — weigh it explicitly.
 
-The PLAN pins the exact task boundaries + the six-gate. Then ROLL THIS FILE FORWARD to the next router decision (the phase-58 IMPL landing does NOT fire the sentinel — Observability + Operational-tooling stay open, five families never opened; per the standing directive the roller SELF-PICKS the next subject in that BRAINSTORM) and land it (commit + push per `feedback_push_to_origin`).
+**The BRAINSTORM's job** — frame the picked row's mission, non-purposes, the D-questions (the empirical uncertainties the SPEC will pin via live probes against `envoyproxy/envoy:contrib-v1.37.2`, `reference_probe_fresh_container_per_arm`), the anticipated split disposition (ADR-0045), and the next-free ADR anchor (**ADR-0277**). Draft the ROADMAP row (a new row NN opened `in-progress` per the project row-open convention) and add the new family's row-summary slug to the sentinel check-(3) list here IF a new family is opened. RE-DERIVE every `file:line` from source (`feedback_brief_citations_not_evidence`).
+
+Then ROLL THIS FILE FORWARD to point at the phase-59 SPEC and land it (commit + push per `feedback_push_to_origin`).
 
 ## Honor throughout (the discipline, unchanged)
-- **Lifecycle = one stage per session.** This session: the phase-58 IMPL ONLY. After it lands: the next router decision (a new BRAINSTORM — the roller self-picks the smallest defensible candidate).
-- **Process anchors:** ADR-0044 (ADR §Context at SPEC — DONE; §Decision/§Consequences at THIS IMPL) · ADR-0045 (split gate ~15 tasks — this row 6, escape-valve UNCONSUMED) · ADR-0080 (distinct per-arm substrings — `dog_statsd …` vs graphite's `graphite_statsd …`) · ADR-0106 (row 58 flips `done` at its IMPL six-gate, the SOLE leg). Next-free ADR is **ADR-0276** (the row-58 anchor).
-- **The IMPL is subagent-driven** (`feedback_execution_style`, `feedback_subagent_autocommit_claudemd`, `feedback_subagents_no_push`): subagents commit LOCALLY only; the controller squashes at stage-close and pushes. Watch the worktree hygiene traps (`feedback_subagent_worktree_detach`, `feedback_subagent_worktree_path_targeting`) even though this row is tiny.
-- **The NON-additive test edit is the row's load-bearing risk:** `TestDogStatsdSink_AcceptMaxBytesPerDatagramZero` asserts the OLD (buggy) accept behavior; CONVERT it, do not merely supplement. Prove the new reject arm LIVE with `-count=1`.
+- **Lifecycle = one stage per session.** This session: the phase-59 BRAINSTORM ONLY. After it lands: the phase-59 SPEC.
+- **Process anchors:** ADR-0044 (ADR §Context drafted at the SPEC, §Decision/§Consequences at the IMPL) · ADR-0045 (split gate ~15 tasks) · ADR-0080 (distinct per-arm substrings) · ADR-0106 (a row flips `done` at its IMPL six-gate). Next-free ADR is **ADR-0277**.
+- **Subagent-driven execution** for the IMPL stages (`feedback_execution_style`, `feedback_subagent_autocommit_claudemd`, `feedback_subagents_no_push`): subagents commit LOCALLY only; the controller squashes at stage-close and pushes. Docs-only BRAINSTORM/SPEC/PLAN stages may be controller-authored.
 - **`next-prompt.txt` IS TRACKED** — edit it inside the stage worktree, fold into the stage commit; locate commits by SUBJECT (`git log --grep`), never by position (`reference_next_prompt_tracked_despite_gitignore`).
-- **After the phase-58 IMPL ROADMAP deferred-list edit:** re-run the sentinel check-(2) grep — EXACTLY ONE live match (OTLP-metrics + the tracing quartet; dog_statsd rolled OUT). ⇒ check (2) still prints ⇒ the sentinel still does NOT fire.
-- **Deferred maintenance (fold into the next `udp.go`/statssink-driver-touching row — NOT this one, which touches neither; from the phase-57 final review):** F-1 the 0101 driver's counter tag snapshot records the EXPECTED map; F-2 `udp.go` `udpWriter` doc comment names two sinks (three embed it now); F-3 BEHAVIOR_CONTRACT 0101 note says "`differential.HostGatewayIP` helper" where the driver uses its LOCAL duplicate. Recorded in the phase-58 BRAINSTORM §11.
+- **Deferred maintenance (fold into the next `udp.go`/statssink-driver-touching row — carried from the phase-57 final review; phase 58 touched NEITHER so these are STILL OPEN):** F-1 the 0101 driver's counter tag snapshot records the EXPECTED map; F-2 `udp.go` `udpWriter` doc comment names two sinks (three embed it now); F-3 BEHAVIOR_CONTRACT 0101 note says "`differential.HostGatewayIP` helper" where the driver uses its LOCAL duplicate. (An OTLP-metrics or tracing row will likely NOT touch `udp.go` either — these ride until a statsd/graphite/dog_statsd sink row reopens.)
 
 ## Read first (in order)
-1. THIS FILE — the cold-start router (the phase-58 IMPL is next; subject: dog_statsd explicit-zero parity).
-2. `docs/envoy-go/phases/58-stats-sink-dogstatsd-explicit-zero/PLAN.md` — the 6-task TDD spine (the Task boundary note, the Edit-site roster, per-task code).
-3. `docs/envoy-go/phases/58-stats-sink-dogstatsd-explicit-zero/PROGRESS.md` — the scaffold (Task 1 fills baselines; the break log; the final counts).
-4. `docs/envoy-go/phases/58-stats-sink-dogstatsd-explicit-zero/SPEC.md` — the pinned SPEC (§11 the live-probe pins, §12 the edit-site roster, §13 the ADR-0276 §Context draft).
-5. `docs/envoy-go/phases/57-stats-sink-graphite/{PLAN.md,PROGRESS.md}` — the template shape (the graphite arm this row mirrors; the break-log/PROGRESS conventions).
-6. `internal/bootstrap/bootstrap.go` — `parseDogStatsdSinkConfig` (`:712`, the unchecked `GetValue()` `:724`, the append `:721`) vs the graphite arm template (`:750-752`); the doc-comment sites (`:329`, `:702-711`, `:738-740`).
-7. `internal/bootstrap/bootstrap_test.go` — `TestDogStatsdSink_Rejects` (`:2458`), `…AcceptMaxBytesPerDatagramZero` (`:2548`, convert), `…Absent` (`:2526`, keep), `…Accept512` (`:2503`, keep), the graphite reject row (`:2889-2900`, template).
-8. `internal/bootstrap/dogstatsd_fuzz_test.go` — the existing fuzzer (add the explicit-0 seed; graphite precedent `graphite_fuzz_test.go:63-70`).
-9. `docs/envoy-go/BEHAVIOR_CONTRACT.md` — the four edit sites (`:785`, `:787`, `:821`, `:834`).
-10. `docs/envoy-go/{ROADMAP.md,STATE.md,DECISIONS.md}` — the Observability family section + row 58; the active-phase header (PLAN done; IMPL next); the ADR-0275 tail (ADR-0276 lands at T6).
-11. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — the `feedback_*` execution discipline + the `reference_*` traps.
+1. THIS FILE — the cold-start router (the phase-59 BRAINSTORM is next; SELF-PICK the subject).
+2. `docs/envoy-go/ROADMAP.md` — the family sections + the LIVE deferred-candidate sentence (the self-pick pool); confirm row 58 is `done`.
+3. `docs/envoy-go/STATE.md` — the active-phase header (phase 58 IMPL done; NEXT = the phase-59 BRAINSTORM).
+4. `docs/envoy-go/DECISIONS.md` — the ADR-0276 tail (next-free **ADR-0277**); the Observability-family ADRs (ADR-0266/0267 dog_statsd, ADR-0275 graphite) for the sink substrate.
+5. `docs/envoy-go/phases/58-stats-sink-dogstatsd-explicit-zero/{BRAINSTORM,SPEC,PLAN,PROGRESS}.md` — the just-completed row's shape (the BRAINSTORM template + how a self-pick records rejected alternatives).
+6. `docs/envoy-go/BEHAVIOR_CONTRACT.md` — the stats-sink + tracing sections (what is already consumed vs deferred; the candidate pool's current disposition).
+7. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — the `feedback_*` execution discipline + the `reference_*` traps (esp. the Observability-sink + tracing references).

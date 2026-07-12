@@ -326,7 +326,7 @@ type StatsdSinkConfig struct {
 type DogStatsdSinkConfig struct {
 	UDPAddress          string // socket_address host:port (an IP literal:port; net.ResolveUDPAddr-resolvable)
 	Prefix              string // DogStatsdSink.prefix, default "envoy" when empty
-	MaxBytesPerDatagram uint64 // NEW (ADR-0267): 0 (absent or explicit) means "one metric per datagram" (phase-49 behavior, UNCHANGED); >0 batches consecutive lines up to the cap
+	MaxBytesPerDatagram uint64 // 0 (absent only — explicit 0 is parse-rejected, ADR-0276) = one metric per datagram (phase-49 behavior); >0 batches consecutive lines up to the cap
 }
 
 // GraphiteStatsdSinkConfig is the parsed graphite_statsd UDP stats-sink config
@@ -701,8 +701,11 @@ func parseUDPSinkAddressAndPrefix(sa *corev3.SocketAddress, prefix, sinkLabel, s
 
 // parseDogStatsdSinkConfig parses one dog_statsd UDP stats sink typed_config and
 // appends a DogStatsdSinkConfig to result.DogStatsdSinkConfigs (ADR-0266). It
-// parses the max_bytes_per_datagram field (ADR-0267, phase-50): 0 (absent or
-// explicit) means one metric per datagram (phase-49 behavior, UNCHANGED); >0
+// parses the max_bytes_per_datagram field (ADR-0267, phase-50): an ABSENT
+// max_bytes_per_datagram parses to 0 = one metric per datagram (phase-49
+// behavior); an EXPLICIT max_bytes_per_datagram: 0 is a REFERENCE-PARITY reject
+// (ADR-0276, the PGV gt:0 rule — the *wrapperspb.UInt64Value wrapper makes
+// absent distinguishable from explicit 0, mirroring parseGraphiteStatsdSinkConfig); >0
 // enables real multi-metric batching with the given byte cap. A missing
 // dog_statsd_specifier / nil socket_address is a REFERENCE-PARITY reject (the
 // reference PGV-rejects it). UNLIKE StatsdSink, DogStatsdSink's oneof has ONLY
@@ -717,6 +720,9 @@ func parseDogStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
 	addr, prefix, err := parseUDPSinkAddressAndPrefix(dsd.GetAddress().GetSocketAddress(), dsd.GetPrefix(), "dog_statsd", "dog_statsd_specifier", idx)
 	if err != nil {
 		return err
+	}
+	if w := dsd.GetMaxBytesPerDatagram(); w != nil && w.GetValue() == 0 {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: dog_statsd max_bytes_per_datagram must be greater than 0", idx)
 	}
 	result.DogStatsdSinkConfigs = append(result.DogStatsdSinkConfigs, DogStatsdSinkConfig{
 		UDPAddress:          addr,
@@ -735,9 +741,9 @@ func parseDogStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
 // nil socket_address (via parseUDPSinkAddressAndPrefix); an EXPLICIT
 // max_bytes_per_datagram: 0 (the PGV gt:0 rule — non-nil wrapper with value
 // 0; an ABSENT wrapper parses to 0 = one-line-per-datagram, NOT rejected).
-// NOTE the landed dog_statsd parse does NOT enforce its identical PGV rule
-// (bootstrap.go parseDogStatsdSinkConfig consumes GetValue() unchecked) —
-// a pre-existing phase-50 parity gap, deferred (SPEC-57 §2), NOT fixed here.
+// NOTE the sibling dog_statsd parse enforces the IDENTICAL PGV rule as of
+// phase 58 (ADR-0276) — parseDogStatsdSinkConfig rejects an explicit
+// max_bytes_per_datagram: 0 with its own dog_statsd-prefixed substring.
 func parseGraphiteStatsdSinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
 	var g graphitestatsdv3.GraphiteStatsdSink
 	if err := tc.UnmarshalTo(&g); err != nil {

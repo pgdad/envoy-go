@@ -43,13 +43,21 @@ static_resources:
       "@type": ` + dogStatsdType + `
       address: { socket_address: { address: 127.0.0.1, port_value: 8125, protocol: TCP } }
 `))
-	// max_bytes_per_datagram set (reject)
+	// max_bytes_per_datagram: 512 set (accept)
 	f.Add([]byte(head + `stats_sinks:
   - name: envoy.stat_sinks.dog_statsd
     typed_config:
       "@type": ` + dogStatsdType + `
       address: { socket_address: { address: 127.0.0.1, port_value: 8125 } }
       max_bytes_per_datagram: 512
+`))
+	// explicit max_bytes_per_datagram: 0 (reject — ADR-0276)
+	f.Add([]byte(head + `stats_sinks:
+  - name: envoy.stat_sinks.dog_statsd
+    typed_config:
+      "@type": ` + dogStatsdType + `
+      address: { socket_address: { address: 127.0.0.1, port_value: 8125 } }
+      max_bytes_per_datagram: 0
 `))
 	// missing dog_statsd_specifier (reject)
 	f.Add([]byte(head + `stats_sinks:
