@@ -28,48 +28,57 @@ If ANY check prints output, the sentinel does NOT fire: proceed with the stage b
 
 Check (3) fails SAFE by construction: a future family whose rows use a slug not listed above reads as "never opened", which BLOCKS `stop` rather than falsely triggering it. A false "not done" costs one wasted session; a false "done" ends the project early. When you open a new family, add its row-summary slug here.
 
-**SENTINEL RE-CHECKED 2026-07-12 (at the phase-58 IMPL six-gate, run MECHANICALLY) — it does NOT fire. Do NOT create `stop`.** The phase-58 IMPL landed (row 58 `done`); the state after it:
-- (1) prints NOTHING — every ROADMAP row is now `done` (row 58 flipped `done` at the phase-58 IMPL six-gate).
-- (2) prints EXACTLY ONE live "candidates:" sentence — the Observability family's `remaining deferred (not-yet-chartered) candidates: OTLP-metrics stats sink + tracing custom_tags/spawn_upstream_span/http_service/force-trace.` (the dog_statsd explicit-`max_bytes_per_datagram: 0` candidate was rolled OUT at the phase-58 IMPL). ⇒ Observability STAYS OPEN. (One live match, `reference_sentinel_deferred_sentence_live_vs_historical`.)
+**SENTINEL RE-CHECKED 2026-07-12 (at the phase-59 BRAINSTORM, run MECHANICALLY) — it does NOT fire. Do NOT create `stop`.** The phase-59 BRAINSTORM landed (row 59 OPENED `in-progress`); the state after it:
+- (1) prints `NOT DONE: row 59` — row 59 (`tracing-custom-tags-literal`) was registered `in-progress` at the phase-59 BRAINSTORM commit per the ROADMAP §Schema invariant (a row opens `in-progress` and flips `done` only at its IMPL six-gate). This ALONE blocks `stop`. (This is a CHANGE from the phase-58 IMPL state, where check (1) was silent — a newly-opened in-progress row is expected and correct.)
+- (2) prints EXACTLY ONE live "candidates:" sentence — the Observability family's `remaining deferred (not-yet-chartered) candidates: OTLP-metrics stats sink + tracing custom_tags/spawn_upstream_span/http_service/force-trace.` (UNCHANGED at the BRAINSTORM; `custom_tags` NARROWS to its non-literal types only at the phase-59 IMPL). ⇒ Observability STAYS OPEN. (One live match, `reference_sentinel_deferred_sentence_live_vs_historical`.)
 - (3) prints `NEVER OPENED: HTTP/3`, `gRPC`, `xDS`, `Runtime`, `WASM` ⇒ FIVE families never opened; Operational-tooling also STAYS OPEN.
 
-Checks (2) and (3) print ⇒ the sentinel does NOT fire.
+All three checks print ⇒ the sentinel does NOT fire.
 
-**STATUS AS OF 2026-07-12: phase 58 (`stats-sink-dogstatsd-explicit-zero`) is COMPLETE — the IMPL landed (row 58 `done`, lifecycle-state done). The next stage is a NEW phase-59 BRAINSTORM (the roller SELF-PICKS the subject per the standing directive).** The phase-58 IMPL was subagent-driven: the reject arm + test convert + 3 doc fixes (Task 2), the fuzz seed (Task 3), the four BEHAVIOR_CONTRACT edits (Task 4), verification + the full 103-dir differential (Task 5), ADR-0276 body + STATE/ROADMAP + PROGRESS close + this router roll (Task 6).
+**STATUS AS OF 2026-07-12: phase 59 (`tracing-custom-tags-literal`) is CHARTERED and BRAINSTORMED — the BRAINSTORM landed (row 59 `in-progress`, lifecycle-state 0 → 1). The next stage is the phase-59 SPEC.** The subject was SELF-PICKED per the standing directive (smallest defensible candidate; rejected alternatives recorded in the BRAINSTORM §2.1): tracing `custom_tags`, scoped to the `literal` `CustomTag` type only — the TWELFTH Observability-family row and the FIRST tracing follow-on since phase 46. It lifts the wholesale `custom_tags unsupported` reject (`internal/tracing/config.go:82-83`), emits a `literal` tag as a static `{tag, value}` span attribute (appended in `BuildServerSpan`, `span.go:64` — ONE change covers both the OTLP and Zipkin exporters via the shared `Span.Attrs []KV` seam), and PARSE-REJECTS `request_header`/`environment`/`metadata` loudly (distinct substrings, ADR-0080; a documented envoy-go-strict DEPARTURE — the reference supports them).
 
-**Current counts (verified at the phase-58 IMPL six-gate, on the frozen HEAD):** fixtures **103** (tail `0101-stats-sink-graphite`) · fuzzers **54** · DECISIONS tail **ADR-0276** (next-free **ADR-0277**) · BackendKind tail **38** (`H2GoawayResponder`) · stat surface **1201** · new Go packages **0** · new go.mod modules **0**. RE-VERIFY against the actual master tip at session start (`git fetch` first).
+**Current counts (verified at the phase-59 BRAINSTORM, on the frozen HEAD; UNCHANGED — a BRAINSTORM is docs-only):** fixtures **103** (tail `0101-stats-sink-graphite`) · fuzzers **54** · DECISIONS tail **ADR-0276** (next-free **ADR-0277**) · BackendKind tail **38** (`H2GoawayResponder`) · stat surface **1201** · new Go packages **0** · new go.mod modules **0**. RE-VERIFY against the actual master tip at session start (`git fetch` first).
 
-**Locating the phase-58 IMPL stage squash** (a router cannot name its own sha — identify by SUBJECT, never by position):
+**Locating the phase-59 BRAINSTORM stage squash** (a router cannot name its own sha — identify by SUBJECT, never by position):
 ```sh
-git log --oneline --grep='^phase 58 (stats-sink-dogstatsd-explicit-zero) IMPL' -1
+git log --oneline --grep='^phase 59 (tracing-custom-tags-literal) BRAINSTORM' -1
 ```
 
-**THE NEXT ACTION: the phase-59 BRAINSTORM (a NEW row; lifecycle-state 0 → 1).**
+**THE NEXT ACTION: the phase-59 SPEC (lifecycle-state 1 → 2; row 59 stays `in-progress`).**
 
 ==============================================
 
-## What THIS session does (the phase-59 BRAINSTORM)
+## What THIS session does (the phase-59 SPEC)
 
-Perform the BRAINSTORM for a NEW phase 59 — docs-only (a BRAINSTORM makes NO production `.go` changes), in a FRESH worktree off master (`.worktrees/phase-59-brainstorm`, branch `phase-59-<slug>-brainstorm`, per `feedback_git_worktrees`). Use `superpowers:brainstorming`.
+Perform the SPEC for phase 59 — docs-only (a SPEC makes NO production `.go` changes), in a FRESH worktree off master (`.worktrees/phase-59-spec`, branch `phase-59-tracing-custom-tags-literal-spec`, per `feedback_git_worktrees`). The SPEC PINS every empirical uncertainty the BRAINSTORM raised (the D-CT-* questions) via LIVE probes against `envoyproxy/envoy:contrib-v1.37.2` (`reference_probe_fresh_container_per_arm`, `reference_envoy_contrib_image_tagging`), RE-DERIVES every `file:line` from source (`feedback_brief_citations_not_evidence`), and drafts ADR-0277 §Context (ADR-0044).
 
-**SELF-PICK THE SUBJECT (standing directive — smallest defensible candidate first; record the pick + the rejected alternatives IN THE BRAINSTORM).** The live deferred-candidate pool (ROADMAP sentinel check-(2)) is the Observability family's `OTLP-metrics stats sink + tracing custom_tags/spawn_upstream_span/http_service/force-trace`; Operational-tooling is also open, and five families (HTTP/3, gRPC, xDS, Runtime, WASM) are never-opened. Per "smallest defensible candidate first", INVESTIGATE the remaining Observability candidates' sizes at the BRAINSTORM before committing — a single tracing knob (e.g. a `custom_tags` header/literal tag or a force-trace decision) is plausibly smaller than a whole new OTLP-metrics gRPC stats sink (new proto type-URL + likely a new streaming receiver + a fixture), but VERIFY that against source before picking. Record the chosen subject and the rejected alternatives (and why) in the BRAINSTORM per ADR-0044. Opening a new family instead of continuing Observability is also defensible IF the smallest Observability candidate turns out large — weigh it explicitly.
+**The D-CT-* questions to dispose (from BRAINSTORM §10 — RE-READ it):**
+- **D-CT-SCOPE** — confirm the LITERAL-only slice (the three other types reject loudly with distinct substrings).
+- **D-CT-LITERAL-WIRE** — the reference's literal-tag wire form on the OTLP span (key = the `tag` name, value = `literal.value` as a STRING `AnyValue`, appended after the built-ins). ONE fresh-container probe with a configured literal `custom_tag`, observed via the `test/helpers/otlptrace` receiver (`reference_docker_probe_bridge_network` + `reference_host_gateway_ip_docker_desktop` for reachability; VERIFY the span decode actually ran — no vacuous empty capture).
+- **D-CT-ZIPKIN-WIRE** — the same literal tag on the Zipkin span (in the Zipkin `tags` map). Probe a Zipkin-provider config.
+- **D-CT-PRECEDENCE** — append vs override when a literal tag's `tag` collides with a built-in attribute key (e.g. `tag: "http.method"`). Anticipated APPEND; the probe pins it.
+- **D-CT-CONFIG-SEAM** — the `TracingConfig` field shape (`config.go:24`) + how the parsed tags thread to `BuildServerSpan` (a new parameter vs `SpanInputs` vs a field); RE-DERIVE the `accesslog_emit.go:55`/`:116` call sites + `connection.go` `f.tracingConfig` access.
+- **D-CT-REJECT** — the three unsupported types' exact reject substrings (ADR-0080 distinct) + the empty-`tag`/typeless handling (RE-DERIVE `CustomTag.tag` PGV `min_len: 1` from `custom_tag.pb.validate.go:61-64`; decide envoy-go's own reject vs the reference PGV boot-reject). Confirm (one probe arm) the reference ACCEPTS `request_header`/`environment`/`metadata` — so the reject is a real DEPARTURE.
+- **D-CT-FIXTURE** — ONE new OTLP fixture or TWO (OTLP + Zipkin)? New dir(s) vs extend `0087`/`0088` (`reference_differential_fixture_dispatch_constraint` — one dir = one runner branch; do NOT mutate the pure baselines). Fixtures **103 → 104** (or **105**).
+- **D-CT-FUZZSEED** — a SEED to the EXISTING `FuzzHCMConfigParse` (`internal/filter/hcm/fuzz_test.go:25`); CONFIRM the HCM fuzzer reaches the tracing-config parse arm; fuzzer count STAYS 54 (`reference_fuzzer_count_docs_drift` — reconcile before AND after).
+- **D-CT-SPLIT** — the ADR-0045 disposition (SINGLE FLAT ROW anticipated, ~9–13 tasks; escape-valve armable only if a Zipkin fixture leg surprises the count upward).
+- **D-CT-DOCSHAPE** — the full edit-site roster (BRAINSTORM §6), RE-DERIVED against source.
 
-**The BRAINSTORM's job** — frame the picked row's mission, non-purposes, the D-questions (the empirical uncertainties the SPEC will pin via live probes against `envoyproxy/envoy:contrib-v1.37.2`, `reference_probe_fresh_container_per_arm`), the anticipated split disposition (ADR-0045), and the next-free ADR anchor (**ADR-0277**). Draft the ROADMAP row (a new row NN opened `in-progress` per the project row-open convention) and add the new family's row-summary slug to the sentinel check-(3) list here IF a new family is opened. RE-DERIVE every `file:line` from source (`feedback_brief_citations_not_evidence`).
-
-Then ROLL THIS FILE FORWARD to point at the phase-59 SPEC and land it (commit + push per `feedback_push_to_origin`).
+**The SPEC's job** — dispose every D-CT-* (each probe on a FRESH container), pin the exact production edit shape (the literal-parse + three reject arms in `NewConfig`, the `TracingConfig` field, the `BuildServerSpan` append + signature, the two call-site threadings), enumerate the test/fixture/fuzz roster, RE-DERIVE every `file:line`, and draft **ADR-0277 §Context** (§Decision/§Consequences land at the IMPL per ADR-0044). Then ROLL THIS FILE FORWARD to point at the phase-59 PLAN and land it (commit + push per `feedback_push_to_origin`).
 
 ## Honor throughout (the discipline, unchanged)
-- **Lifecycle = one stage per session.** This session: the phase-59 BRAINSTORM ONLY. After it lands: the phase-59 SPEC.
+- **Lifecycle = one stage per session.** This session: the phase-59 SPEC ONLY. After it lands: the phase-59 PLAN.
 - **Process anchors:** ADR-0044 (ADR §Context drafted at the SPEC, §Decision/§Consequences at the IMPL) · ADR-0045 (split gate ~15 tasks) · ADR-0080 (distinct per-arm substrings) · ADR-0106 (a row flips `done` at its IMPL six-gate). Next-free ADR is **ADR-0277**.
 - **Subagent-driven execution** for the IMPL stages (`feedback_execution_style`, `feedback_subagent_autocommit_claudemd`, `feedback_subagents_no_push`): subagents commit LOCALLY only; the controller squashes at stage-close and pushes. Docs-only BRAINSTORM/SPEC/PLAN stages may be controller-authored.
 - **`next-prompt.txt` IS TRACKED** — edit it inside the stage worktree, fold into the stage commit; locate commits by SUBJECT (`git log --grep`), never by position (`reference_next_prompt_tracked_despite_gitignore`).
-- **Deferred maintenance (fold into the next `udp.go`/statssink-driver-touching row — carried from the phase-57 final review; phase 58 touched NEITHER so these are STILL OPEN):** F-1 the 0101 driver's counter tag snapshot records the EXPECTED map; F-2 `udp.go` `udpWriter` doc comment names two sinks (three embed it now); F-3 BEHAVIOR_CONTRACT 0101 note says "`differential.HostGatewayIP` helper" where the driver uses its LOCAL duplicate. (An OTLP-metrics or tracing row will likely NOT touch `udp.go` either — these ride until a statsd/graphite/dog_statsd sink row reopens.)
+- **Deferred maintenance (fold into the next `udp.go`/statssink-driver-touching row — carried from the phase-57 final review; phases 58 AND 59 touch NEITHER so these are STILL OPEN):** F-1 the 0101 driver's counter tag snapshot records the EXPECTED map; F-2 `udp.go` `udpWriter` doc comment names two sinks (three embed it now); F-3 BEHAVIOR_CONTRACT 0101 note says "`differential.HostGatewayIP` helper" where the driver uses its LOCAL duplicate. (A tracing row does NOT touch `udp.go`; these ride until the OTLP-metrics or another statsd/graphite/dog_statsd sink row reopens.)
 
 ## Read first (in order)
-1. THIS FILE — the cold-start router (the phase-59 BRAINSTORM is next; SELF-PICK the subject).
-2. `docs/envoy-go/ROADMAP.md` — the family sections + the LIVE deferred-candidate sentence (the self-pick pool); confirm row 58 is `done`.
-3. `docs/envoy-go/STATE.md` — the active-phase header (phase 58 IMPL done; NEXT = the phase-59 BRAINSTORM).
-4. `docs/envoy-go/DECISIONS.md` — the ADR-0276 tail (next-free **ADR-0277**); the Observability-family ADRs (ADR-0266/0267 dog_statsd, ADR-0275 graphite) for the sink substrate.
-5. `docs/envoy-go/phases/58-stats-sink-dogstatsd-explicit-zero/{BRAINSTORM,SPEC,PLAN,PROGRESS}.md` — the just-completed row's shape (the BRAINSTORM template + how a self-pick records rejected alternatives).
-6. `docs/envoy-go/BEHAVIOR_CONTRACT.md` — the stats-sink + tracing sections (what is already consumed vs deferred; the candidate pool's current disposition).
-7. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — the `feedback_*` execution discipline + the `reference_*` traps (esp. the Observability-sink + tracing references).
+1. THIS FILE — the cold-start router (the phase-59 SPEC is next; the subject is PICKED — tracing `custom_tags` literal).
+2. `docs/envoy-go/phases/59-tracing-custom-tags-literal/BRAINSTORM.md` — the picked row's full framing: the mission (§1), the design decisions (§2), the edit-site roster (§6), the ADR anchor (§7), the deferred items (§8), and the D-CT-* questions the SPEC disposes (§10).
+3. `docs/envoy-go/ROADMAP.md` — row 59 `in-progress`; the Observability family prose (the phase-59 CHARTERED sentence); the LIVE deferred sentence (still ONE live match — `custom_tags` narrows at the IMPL, not the SPEC).
+4. `docs/envoy-go/STATE.md` — the active-phase header (phase 59 BRAINSTORM done; NEXT = the phase-59 SPEC).
+5. `docs/envoy-go/DECISIONS.md` — the ADR-0276 tail (next-free **ADR-0277**); the phase-46 tracing ADRs (esp. ADR-0260, the tracing engine/exporter seams) for the span-attribute substrate.
+6. `internal/tracing/{config.go,span.go}` + `internal/filter/hcm/accesslog_emit.go` — the parse home (`NewConfig`), the span-attribute seam (`Span.Attrs`/`BuildServerSpan`), and the two `BuildServerSpan` call sites the SPEC RE-DERIVES.
+7. `docs/envoy-go/BEHAVIOR_CONTRACT.md` — the tracing section (the current `custom_tags`-unsupported statement the IMPL flips).
+8. Project memories at `~/.claude/projects/-home-esa-git-envoy-go/memory/` — the `feedback_*` execution discipline + the `reference_*` traps (esp. the tracing references: `reference_tracing_upstream_cluster_framework_gap`, `reference_b3_parent_is_incoming_spanid`, `reference_phase_46_tracing_split`, and the differential-probe/fixture traps).
