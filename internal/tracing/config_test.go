@@ -1,6 +1,8 @@
 package tracing
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -102,7 +104,7 @@ func TestNewConfigAcceptMinimal(t *testing.T) {
 		t.Fatalf("NewConfig err = %v, want nil", err)
 	}
 	want := &TracingConfig{ClientSampling: 100, RandomSampling: 100, OverallSampling: 100, ServiceName: "svc", ClusterName: "c"}
-	if *got != *want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("NewConfig = %+v, want %+v", got, want)
 	}
 }
@@ -386,6 +388,105 @@ func TestNewConfigRejectArms(t *testing.T) {
 			}
 			if got != nil {
 				t.Fatalf("NewConfig(%s) returned non-nil config %+v on reject", tc.name, got)
+			}
+		})
+	}
+}
+
+// customTagLiteral builds a *typetracingv3.CustomTag of the `literal` type.
+func customTagLiteral(tag, value string) *typetracingv3.CustomTag {
+	return &typetracingv3.CustomTag{
+		Tag:  tag,
+		Type: &typetracingv3.CustomTag_Literal_{Literal: &typetracingv3.CustomTag_Literal{Value: value}},
+	}
+}
+
+// TestNewConfigAcceptCustomTagLiteral: a literal custom tag parses into
+// TracingConfig.CustomTags as a {Key,Str} KV on the OTel provider path.
+func TestNewConfigAcceptCustomTagLiteral(t *testing.T) {
+	tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+	tr.CustomTags = []*typetracingv3.CustomTag{customTagLiteral("env", "prod")}
+	cfg, err := NewConfig(tr)
+	if err != nil {
+		t.Fatalf("NewConfig accept literal: unexpected err %v", err)
+	}
+	if len(cfg.CustomTags) != 1 {
+		t.Fatalf("CustomTags len = %d, want 1", len(cfg.CustomTags))
+	}
+	if got := cfg.CustomTags[0]; got.Key != "env" || got.Str != "prod" || got.IsInt {
+		t.Errorf("CustomTags[0] = %+v, want {Key:env Str:prod IsInt:false}", got)
+	}
+}
+
+// TestNewConfigAcceptCustomTagLiteralZipkin: the same literal tag also parses on
+// the Zipkin provider path (provider-neutral parse, set after the switch).
+func TestNewConfigAcceptCustomTagLiteralZipkin(t *testing.T) {
+	tr := zipkinProvider(t, &tracev3.ZipkinConfig{
+		CollectorCluster:         "z",
+		CollectorEndpointVersion: tracev3.ZipkinConfig_HTTP_JSON,
+	})
+	tr.CustomTags = []*typetracingv3.CustomTag{customTagLiteral("env", "prod")}
+	cfg, err := NewConfig(tr)
+	if err != nil {
+		t.Fatalf("NewConfig accept literal (zipkin): unexpected err %v", err)
+	}
+	if len(cfg.CustomTags) != 1 || cfg.CustomTags[0].Key != "env" || cfg.CustomTags[0].Str != "prod" {
+		t.Fatalf("CustomTags = %+v, want one {env,prod}", cfg.CustomTags)
+	}
+}
+
+// TestNewConfigRejectCustomTagArms: each unsupported / structurally-invalid
+// custom tag rejects with its ADR-0080-distinct substring.
+func TestNewConfigRejectCustomTagArms(t *testing.T) {
+	tests := []struct {
+		name    string
+		tag     *typetracingv3.CustomTag
+		wantSub string
+	}{
+		{
+			name:    "empty-tag",
+			tag:     customTagLiteral("", "v"),
+			wantSub: "custom_tags empty tag",
+		},
+		{
+			name:    "empty-literal-value",
+			tag:     customTagLiteral("env", ""),
+			wantSub: "empty value",
+		},
+		{
+			name:    "request_header",
+			tag:     &typetracingv3.CustomTag{Tag: "h", Type: &typetracingv3.CustomTag_RequestHeader{RequestHeader: &typetracingv3.CustomTag_Header{Name: "x-h"}}},
+			wantSub: "request_header type unsupported",
+		},
+		{
+			name:    "environment",
+			tag:     &typetracingv3.CustomTag{Tag: "e", Type: &typetracingv3.CustomTag_Environment_{Environment: &typetracingv3.CustomTag_Environment{Name: "E"}}},
+			wantSub: "environment type unsupported",
+		},
+		{
+			name:    "metadata",
+			tag:     &typetracingv3.CustomTag{Tag: "m", Type: &typetracingv3.CustomTag_Metadata_{Metadata: &typetracingv3.CustomTag_Metadata{}}},
+			wantSub: "metadata type unsupported",
+		},
+		{
+			name:    "typeless",
+			tag:     &typetracingv3.CustomTag{Tag: "t"}, // no Type oneof set
+			wantSub: "missing type",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+			tr.CustomTags = []*typetracingv3.CustomTag{tc.tag}
+			got, err := NewConfig(tr)
+			if err == nil {
+				t.Fatalf("NewConfig(%s) err = nil, want reject; got %+v", tc.name, got)
+			}
+			if got != nil {
+				t.Fatalf("NewConfig(%s) returned non-nil config on reject: %+v", tc.name, got)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("NewConfig(%s) err = %q, want substring %q", tc.name, err.Error(), tc.wantSub)
 			}
 		})
 	}

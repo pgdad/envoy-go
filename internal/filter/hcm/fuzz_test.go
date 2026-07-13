@@ -9,6 +9,8 @@ import (
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	tracingv3 "github.com/envoyproxy/go-control-plane/envoy/type/tracing/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
@@ -27,6 +29,19 @@ func FuzzHCMConfigParse(f *testing.F) {
 	f.Add(wellFormed.GetTypeUrl(), wellFormed.GetValue())
 	f.Add("type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager", []byte{})
 	f.Add("type.googleapis.com/google.protobuf.StringValue", []byte("hello"))
+
+	// Phase 59: a custom_tags seed — one accepted `literal` + one rejected
+	// `request_header` type. The custom_tags loop runs BEFORE the provider check
+	// (config.go), so this seed exercises both the accept-append and a reject arm.
+	withCustomTags := mkHCM(func(h *hcmv3.HttpConnectionManager) {
+		h.Tracing = &hcmv3.HttpConnectionManager_Tracing{
+			CustomTags: []*tracingv3.CustomTag{
+				{Tag: "env", Type: &tracingv3.CustomTag_Literal_{Literal: &tracingv3.CustomTag_Literal{Value: "prod"}}},
+				{Tag: "hdr", Type: &tracingv3.CustomTag_RequestHeader{RequestHeader: &tracingv3.CustomTag_Header{Name: "x-req"}}},
+			},
+		}
+	})
+	f.Add(withCustomTags.GetTypeUrl(), withCustomTags.GetValue())
 
 	cm := mkOneClusterManagerTB(f)
 	httpReg := testHTTPRegistry()

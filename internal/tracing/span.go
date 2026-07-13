@@ -61,8 +61,8 @@ type Span struct {
 // the tracing Decision d, the per-request SpanInputs in, and the wall-clock
 // start/end times. The 16 built-in attributes are always emitted; the optional
 // guid:x-client-trace-id attribute is emitted only when in.ClientTraceID != "".
-func BuildServerSpan(d Decision, in SpanInputs, start, end time.Time) *Span {
-	attrs := make([]KV, 0, 17) // 16 always-present + 1 optional
+func BuildServerSpan(d Decision, in SpanInputs, customTags []KV, start, end time.Time) *Span {
+	attrs := make([]KV, 0, 17+len(customTags)) // 16 always-present + 1 optional + custom
 
 	// 16 built-in attributes (§11 D-TRACE-SPAN)
 	attrs = append(attrs,
@@ -92,6 +92,14 @@ func BuildServerSpan(d Decision, in SpanInputs, start, end time.Time) *Span {
 		attrs = append(attrs, KV{Key: "guid:x-client-trace-id", Str: in.ClientTraceID})
 	}
 
+	// Custom tags (literal). Upsert-by-key: a tag whose key collides with a built-in
+	// OVERRIDES it (last-write-wins, matching the reference OTel tracer — SPEC-59 §11
+	// arm precedence-otlp), NOT append-duplicate. The common non-colliding case is a
+	// pure append. Cost is O(builtins) per tag — negligible (≤17 built-ins, few tags).
+	for _, ct := range customTags {
+		upsertAttr(&attrs, ct)
+	}
+
 	return &Span{
 		TraceID:      d.TraceID,
 		SpanID:       d.SpanID,
@@ -104,6 +112,20 @@ func BuildServerSpan(d Decision, in SpanInputs, start, end time.Time) *Span {
 		Attrs:        attrs,
 		Authority:    in.Authority,
 	}
+}
+
+// upsertAttr sets ct by key: replaces an existing attribute with the same key
+// (last-write-wins), else appends. Keeps envoy-go's OTLP toProto (which emits every
+// KV as a distinct wire attribute) consistent with the reference's single overridden
+// attribute AND with the Zipkin encoder's tags map (which already last-write-wins).
+func upsertAttr(attrs *[]KV, ct KV) {
+	for i := range *attrs {
+		if (*attrs)[i].Key == ct.Key {
+			(*attrs)[i] = ct
+			return
+		}
+	}
+	*attrs = append(*attrs, ct)
 }
 
 // toProto converts the internal Span to its OTLP wire representation.

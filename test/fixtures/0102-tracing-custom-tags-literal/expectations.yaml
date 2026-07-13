@@ -1,0 +1,109 @@
+# Phase 59 fixture 0102-tracing-custom-tags-literal expectations (ADR-0019 —
+# prose; the driver is the enforcer via AssertStats; this file is
+# documentation). Cloned from 0087-tracing-otlp (phase 46.1b); adds ONE new
+# assertion — the literal `custom_tags` entry configured in the HCM `tracing`
+# block appears as an OTLP span attribute, by key, on every exported span,
+# cross-side.
+#
+# Topology (single-listener plaintext H1; HTTPFixedBody backend; driver-owned
+# in-process OTLP TraceService gRPC receiver):
+#   l_test (hcm_local) — one downstream HTTP/1.1 listener; route prefix "/" →
+#                        cluster c_backend (HTTPFixedBody, 17-byte body). HCM
+#                        carries a `tracing` block (OpenTelemetry provider,
+#                        service_name "0102", random_sampling 100%) naming
+#                        c_otlp_collector — exporting one OTLP Span per completed
+#                        request to the driver-owned receiver. The `tracing`
+#                        block ALSO carries a `custom_tags` literal entry
+#                        (tag "custom_env", value "prod-literal"), sibling of
+#                        `provider` — a non-colliding key so parity is clean
+#                        (the collision/override case is the phase 59 Task-2
+#                        Zipkin unit test, not this fixture).
+#   c_backend          — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
+#   c_otlp_collector   — driver-owned in-process TraceService receiver
+#                        (test/helpers/otlptrace/; new in phase 46.1b) on a
+#                        driver-allocated stable port, bound 0.0.0.0:<port> so the
+#                        reference container (host.docker.internal) AND the subject
+#                        (127.0.0.1) both reach it. The cluster carries the
+#                        mandatory http2_protocol_options:{} for gRPC framing +
+#                        plaintext h2c (D-OTLP-RECEIVER — no TLS).
+#
+# Reference Envoy contrib-v1.37.2 (STRICT_DNS via host.docker.internal) vs
+# envoy-go (STATIC, in-process).
+#
+# ## Workload
+#
+# Each side fires N+M = 12 requests:
+#   N = 8 PLAIN: GET /trace, Host: trace.example, UA: trace-probe/1. No inbound
+#       trace context. random_sampling 100% => each is a fresh locally-sampled span.
+#   M = 4 CONTINUATION: + Traceparent: 00-aaa...aaa-bbb...bbb-01. The proxy
+#       CONTINUES the inbound trace (keeps the inbound trace-id; sets parent_span_id
+#       to the inbound parent span id).
+# The driver POLLS the receiver's Count() to >= 12 (poll-to-converge; the reference
+# buffers spans and flushes on a timer / buffer-fill — never a fixed sleep).
+# Per-side separation: the receiver is Reset() at the start of each side's drive.
+#
+# ## Framing NOT asserted
+#
+# The cross-side assertion is on the per-span PAYLOAD aggregated across all
+# received spans — NOT the Export-call count, per-call batch sizes, connection
+# count, or flush cadence, which legitimately vary side-to-side
+# (reference_streaming_sink_differential_framing).
+#
+# ## Asserted (cross-side EXACT on the STABLE per-span subset, both sides)
+#
+#   len(spans) == 12   (zero-span pass is vacuous — proves decode ran on BOTH sides)
+#   Every span:
+#     name                        == "ingress"
+#     kind                        == SPAN_KIND_SERVER (= 2)
+#     StartTimeUnixNano           != 0  (non-zero; PRESENCE + ordering, not value)
+#     EndTimeUnixNano             != 0
+#     StartTimeUnixNano           < EndTimeUnixNano
+#     attrs["http.method"]        == "GET"
+#     attrs["component"]          == "proxy"
+#     attrs["downstream_cluster"] == "-"
+#     attrs["response_flags"]     == "-"
+#     attrs["http.status_code"]   == "200" (normalized: int or string form accepted)
+#     attrs["request_size"]       == "0"   (normalized: GET, no body)
+#     attrs["response_size"]      == "17"  (normalized: HTTPFixedBody 17-byte body)
+#     attrs["http.url"]           PRESENT (value includes host+path; UNasserted exact)
+#     attrs["http.protocol"]      PRESENT
+#     attrs["user_agent"]         PRESENT
+#     attrs["guid:x-request-id"]  KEY PRESENT (value varies — UNasserted)
+#     attrs["upstream_cluster"]   KEY PRESENT (value UNasserted — framework gap; see below)
+#     attrs["upstream_cluster.name"] KEY PRESENT (value UNasserted — framework gap)
+#     attrs["custom_env"]         == "prod-literal" (phase 59 literal custom_tags;
+#                                                     asserted by KEY — OTLP attribute
+#                                                     order is non-deterministic)
+#   Continuation prong (M = 4 spans where trace_id == contTraceID):
+#     trace_id     == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (the fixed inbound trace-id)
+#     parent_span_id == bbbbbbbbbbbbbbbb               (the fixed inbound parent id)
+#   Resource.attributes:
+#     service.name == "0102"   (cross-side EXACT on VALUE)
+#
+# PLUS the subject-side flat /stats counters:
+#   tracing.opentelemetry.spans_sent    == 12
+#   tracing.opentelemetry.spans_dropped == 0
+#
+# ## UNasserted (vary side-to-side / impl-specific)
+#
+#   trace_id / span_id VALUES (except the continuation prong trace_id).
+#   start/end time VALUES — non-deterministic.
+#   x-request-id / peer.address / node_id / zone VALUES.
+#   upstream_cluster / upstream_cluster.name VALUES — framework gap (see below).
+#   Export-call count / per-call batch sizes / connection count — framing.
+#   telemetry.sdk.* resource attrs / ScopeSpans.scope.name+version — impl-specific
+#       (envoy-go is not cpp; SDK attrs not emitted).
+#
+# ## upstream_cluster framework-gap deviation
+#
+# The upstream cluster name is NOT plumbed to envoy-go's request-completion seam
+# (same gap as the Lua bridge's UpstreamCluster() which returns ""). envoy-go
+# emits upstream_cluster = "" and upstream_cluster.name = ""; the reference Envoy
+# emits the real cluster name "c_backend". KEYS are present on both sides; VALUES
+# are explicitly UNasserted cross-side. Documented in README.md.
+#
+# Cross-refs: phase 59 SPEC §10 D-CT-* + ADR-0277 (literal custom_tags parse +
+#             span-emit upsert) + phase 46.1b SPEC §12 D-TRACE-* + ADR-0260 +
+#             reference_streaming_sink_differential_framing +
+#             reference_differential_grpc_receiver_driver_owned +
+#             reference_phase_46_tracing_split.

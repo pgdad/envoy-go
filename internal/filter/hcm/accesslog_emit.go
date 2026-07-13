@@ -52,7 +52,7 @@ func (f *Filter) emitAccessLog(r *http.Request, statusCode int, bytesSent int64,
 			ClientTraceID:     r.Header.Get("X-Client-Trace-Id"),
 			Authority:         r.Host,
 		}
-		f.exporter.Export(tracing.BuildServerSpan(*traceDecision, in, start, time.Now()))
+		f.exporter.Export(tracing.BuildServerSpan(*traceDecision, in, f.tracingConfig.CustomTags, start, time.Now()))
 	}
 	if statusCode == 0 || len(f.accessLog) == 0 {
 		return
@@ -113,7 +113,7 @@ func (f *Filter) emitAccessLogH2(req h2.H2Request, statusCode int, bytesSent int
 			ClientTraceID:     clientTraceID,
 			Authority:         req.Authority,
 		}
-		f.exporter.Export(tracing.BuildServerSpan(*traceDecision, in, start, time.Now()))
+		f.exporter.Export(tracing.BuildServerSpan(*traceDecision, in, f.tracingConfig.CustomTags, start, time.Now()))
 	}
 	if statusCode == 0 || len(f.accessLog) == 0 {
 		return

@@ -85,7 +85,7 @@ func TestZipkinEncodeSpan(t *testing.T) {
 
 	start := time.Unix(0, 1_000_000_000)
 	end := start.Add(10 * time.Millisecond)
-	span := BuildServerSpan(d, in, start, end)
+	span := BuildServerSpan(d, in, nil, start, end)
 
 	b, err := encodeZipkinSpans([]*Span{span}, false, true)
 	if err != nil {
@@ -532,4 +532,37 @@ func TestZipkinExporter_PostShapeEmptyHostname(t *testing.T) {
 		t.Errorf("host = %q, want %q (cluster fallback)", posts[0].host, zkCluster)
 	}
 	_, _ = sent, dropped
+}
+
+// TestZipkinEncodeCustomTagLiteral: a literal custom tag surfaces in the Zipkin v2
+// `tags` map; node_id/zone stay dropped (the 14-tag roster is unchanged otherwise).
+func TestZipkinEncodeCustomTagLiteral(t *testing.T) {
+	d := freshDecision()
+	in := freshInputs()
+	in.Authority = "127.0.0.1:10000"
+	in.NodeID = "node-x"
+	in.Zone = "zone-y"
+	start := time.Unix(0, 1_000_000_000)
+	end := start.Add(10 * time.Millisecond)
+	span := BuildServerSpan(d, in, []KV{{Key: "custom_env", Str: "prod-literal"}}, start, end)
+
+	b, err := encodeZipkinSpans([]*Span{span}, false, true)
+	if err != nil {
+		t.Fatalf("encodeZipkinSpans err = %v", err)
+	}
+	var got struct {
+		Tags map[string]string `json:"tags"`
+	}
+	if err := json.Unmarshal(b[1:len(b)-1], &got); err != nil {
+		t.Fatalf("decode span: %v (%s)", err, b)
+	}
+	if got.Tags["custom_env"] != "prod-literal" {
+		t.Errorf("tags[custom_env] = %q, want prod-literal", got.Tags["custom_env"])
+	}
+	if _, ok := got.Tags["node_id"]; ok {
+		t.Errorf("tags[node_id] present, want dropped by the Zipkin encoder")
+	}
+	if _, ok := got.Tags["zone"]; ok {
+		t.Errorf("tags[zone] present, want dropped by the Zipkin encoder")
+	}
 }

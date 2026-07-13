@@ -57,7 +57,7 @@ func TestSpanBuildFresh(t *testing.T) {
 	start := time.Now()
 	end := start.Add(10 * time.Millisecond)
 
-	s := BuildServerSpan(d, in, start, end)
+	s := BuildServerSpan(d, in, nil, start, end)
 
 	if s.Name != "ingress" {
 		t.Errorf("Name = %q, want %q", s.Name, "ingress")
@@ -148,7 +148,7 @@ func TestSpanBuildAuthority(t *testing.T) {
 	start := time.Now()
 	end := start.Add(5 * time.Millisecond)
 
-	s := BuildServerSpan(d, in, start, end)
+	s := BuildServerSpan(d, in, nil, start, end)
 
 	if s.Authority != "127.0.0.1:10000" {
 		t.Errorf("Authority = %q, want %q", s.Authority, "127.0.0.1:10000")
@@ -175,7 +175,7 @@ func TestSpanBuildContinued(t *testing.T) {
 	start := time.Now()
 	end := start.Add(5 * time.Millisecond)
 
-	s := BuildServerSpan(d, in, start, end)
+	s := BuildServerSpan(d, in, nil, start, end)
 
 	if s.ParentSpanID != parent {
 		t.Errorf("ParentSpanID = %v, want %v", s.ParentSpanID, parent)
@@ -190,7 +190,7 @@ func TestSpanBuildClientTraceID(t *testing.T) {
 	start := time.Now()
 	end := start.Add(5 * time.Millisecond)
 
-	s := BuildServerSpan(d, in, start, end)
+	s := BuildServerSpan(d, in, nil, start, end)
 
 	if v := attrStr(s.Attrs, "guid:x-client-trace-id"); v != "abc" {
 		t.Errorf("guid:x-client-trace-id = %q, want %q", v, "abc")
@@ -204,7 +204,7 @@ func TestSpanToProtoFresh(t *testing.T) {
 	start := time.Unix(0, 1_000_000_000)
 	end := time.Unix(0, 1_010_000_000)
 
-	s := BuildServerSpan(d, in, start, end)
+	s := BuildServerSpan(d, in, nil, start, end)
 	pb := s.toProto()
 
 	// TraceId / SpanId
@@ -280,7 +280,7 @@ func TestSpanToProtoContinued(t *testing.T) {
 	start := time.Now()
 	end := start.Add(5 * time.Millisecond)
 
-	s := BuildServerSpan(d, in, start, end)
+	s := BuildServerSpan(d, in, nil, start, end)
 	pb := s.toProto()
 
 	if len(pb.ParentSpanId) != 8 {
@@ -319,4 +319,45 @@ func protoKVMap(attrs []*commonpb.KeyValue) map[string]*commonpb.AnyValue {
 		m[kv.Key] = kv.Value
 	}
 	return m
+}
+
+// TestSpanCustomTagsAppend: a NON-colliding literal custom tag appears in Attrs
+// after the built-ins; the built-ins are untouched.
+func TestSpanCustomTagsAppend(t *testing.T) {
+	d := freshDecision()
+	in := freshInputs()
+	start := time.Now()
+	end := start.Add(time.Millisecond)
+	s := BuildServerSpan(d, in, []KV{{Key: "custom_env", Str: "prod-literal"}}, start, end)
+
+	if v := attrStr(s.Attrs, "custom_env"); v != "prod-literal" {
+		t.Errorf("custom_env = %q, want prod-literal", v)
+	}
+	if v := attrStr(s.Attrs, "http.method"); v != "GET" {
+		t.Errorf("built-in http.method = %q, want GET (unperturbed)", v)
+	}
+}
+
+// TestSpanCustomTagsUpsertOverridesBuiltin: a literal tag whose key collides with
+// a built-in OVERRIDES it (last-write-wins) — exactly ONE attribute with that key,
+// carrying the custom value (the reference OVERRIDE semantics, SPEC §11 precedence).
+func TestSpanCustomTagsUpsertOverridesBuiltin(t *testing.T) {
+	d := freshDecision()
+	in := freshInputs() // built-in http.method == "GET"
+	start := time.Now()
+	end := start.Add(time.Millisecond)
+	s := BuildServerSpan(d, in, []KV{{Key: "http.method", Str: "COLLIDE-VALUE"}}, start, end)
+
+	n := 0
+	for _, kv := range s.Attrs {
+		if kv.Key == "http.method" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("http.method attribute count = %d, want 1 (upsert, not append-duplicate)", n)
+	}
+	if v := attrStr(s.Attrs, "http.method"); v != "COLLIDE-VALUE" {
+		t.Errorf("http.method = %q, want COLLIDE-VALUE (override)", v)
+	}
 }

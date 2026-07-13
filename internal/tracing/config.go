@@ -9,6 +9,7 @@ import (
 
 	tracev3 "github.com/envoyproxy/go-control-plane/envoy/config/trace/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	tracingv3 "github.com/envoyproxy/go-control-plane/envoy/type/tracing/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -29,6 +30,11 @@ type TracingConfig struct {
 	ClusterName     string
 	Provider        ProviderKind
 	Zipkin          *ZipkinSettings // non-nil iff Provider == ProviderZipkin
+	// CustomTags are the parsed `literal` custom tags (provider-neutral), appended
+	// by BuildServerSpan as UPSERT-by-key span attributes (last-write-wins on a
+	// built-in-key collision, matching the reference). Empty/nil when the HCM tracing
+	// block configures no custom_tags — the byte-stable no-tags path.
+	CustomTags []KV
 }
 
 // ProviderKind names the parsed tracing provider (D-TRACE-ZIPKIN-CONFIG-SHAPE);
@@ -79,8 +85,9 @@ func NewConfig(t *hcmv3.HttpConnectionManager_Tracing) (*TracingConfig, error) {
 	if t.GetMaxPathTagLength() != nil {
 		return nil, fmt.Errorf("tracing: max_path_tag_length is unsupported")
 	}
-	if len(t.GetCustomTags()) > 0 {
-		return nil, fmt.Errorf("tracing: custom_tags unsupported")
+	customTags, err := parseCustomTags(t.GetCustomTags())
+	if err != nil {
+		return nil, err
 	}
 	if t.GetSpawnUpstreamSpan() != nil {
 		return nil, fmt.Errorf("tracing: spawn_upstream_span unsupported")
@@ -105,14 +112,57 @@ func NewConfig(t *hcmv3.HttpConnectionManager_Tracing) (*TracingConfig, error) {
 	randomSampling := pct(t.GetRandomSampling(), 100)
 	overallSampling := pct(t.GetOverallSampling(), 100)
 
+	var cfg *TracingConfig
 	switch tc.MessageName() {
 	case otelTypeName:
-		return parseOTel(tc, clientSampling, randomSampling, overallSampling)
+		cfg, err = parseOTel(tc, clientSampling, randomSampling, overallSampling)
 	case zipkinTypeName:
-		return parseZipkin(tc, clientSampling, randomSampling, overallSampling)
+		cfg, err = parseZipkin(tc, clientSampling, randomSampling, overallSampling)
 	default:
 		return nil, fmt.Errorf("tracing: provider %s unsupported (only OpenTelemetry or Zipkin)", tc.GetTypeUrl())
 	}
+	if err != nil {
+		return nil, err
+	}
+	cfg.CustomTags = customTags
+	return cfg, nil
+}
+
+// parseCustomTags converts the HCM tracing custom_tags into a provider-neutral
+// []KV. Only the `literal` CustomTag type is supported (a static {tag, value}
+// STRING span attribute); request_header/environment/metadata are STRICT-REJECTED
+// loudly (envoy-go-strict DEPARTURE, ADR-0080 — the reference accepts them). Three
+// PGV-parity structural rejects (empty tag / empty literal.value / typeless) mirror
+// the reference boot-reject (both reject — NOT a departure). All six substrings are
+// ADR-0080-distinct. The empty-tag check precedes the type dispatch (the reference
+// PGV evaluates `tag` min_len before the required `type` oneof).
+func parseCustomTags(tags []*tracingv3.CustomTag) ([]KV, error) {
+	if len(tags) == 0 {
+		return nil, nil
+	}
+	out := make([]KV, 0, len(tags))
+	for _, ct := range tags {
+		if ct.GetTag() == "" {
+			return nil, fmt.Errorf("tracing: custom_tags empty tag")
+		}
+		switch {
+		case ct.GetLiteral() != nil:
+			v := ct.GetLiteral().GetValue()
+			if v == "" {
+				return nil, fmt.Errorf("tracing: custom_tags literal tag %q empty value", ct.GetTag())
+			}
+			out = append(out, KV{Key: ct.GetTag(), Str: v})
+		case ct.GetRequestHeader() != nil:
+			return nil, fmt.Errorf("tracing: custom_tags request_header type unsupported")
+		case ct.GetEnvironment() != nil:
+			return nil, fmt.Errorf("tracing: custom_tags environment type unsupported")
+		case ct.GetMetadata() != nil:
+			return nil, fmt.Errorf("tracing: custom_tags metadata type unsupported")
+		default:
+			return nil, fmt.Errorf("tracing: custom_tags tag %q missing type", ct.GetTag())
+		}
+	}
+	return out, nil
 }
 
 // parseOTel parses an OpenTelemetryConfig typed_config Any into a TracingConfig
