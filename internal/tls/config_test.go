@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	quicv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/quic/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -970,4 +971,124 @@ func TestNewUpstreamConfig_SDS(t *testing.T) {
 			t.Errorf("error = %q, want %q (byte-identical to the pre-60.2 reject)", err.Error(), want)
 		}
 	})
+}
+
+// mkQUICDownstreamTS wraps a QuicDownstreamTransport (envoy.transport_sockets.quic)
+// carrying an inner DownstreamTlsContext into a *corev3.TransportSocket. When
+// certPEM/keyPEM are nil, the inner CommonTlsContext carries no
+// tls_certificates (used to exercise the mandatory-TLS empty-cert error).
+func mkQUICDownstreamTS(t *testing.T, certPEM, keyPEM []byte, alpn []string) *corev3.TransportSocket {
+	t.Helper()
+	common := &tlsv3.CommonTlsContext{AlpnProtocols: alpn}
+	if certPEM != nil || keyPEM != nil {
+		common.TlsCertificates = []*tlsv3.TlsCertificate{
+			{
+				CertificateChain: inlineBytes(certPEM),
+				PrivateKey:       inlineBytes(keyPEM),
+			},
+		}
+	}
+	inner := &quicv3.QuicDownstreamTransport{
+		DownstreamTlsContext: &tlsv3.DownstreamTlsContext{CommonTlsContext: common},
+	}
+	anyMsg, err := anypb.New(inner)
+	if err != nil {
+		t.Fatalf("anypb.New: %v", err)
+	}
+	return &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.quic",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: anyMsg},
+	}
+}
+
+// mkQUICDownstreamTSEarlyData is mkQUICDownstreamTS plus an explicit
+// enable_early_data (0-RTT) value on the QuicDownstreamTransport, used to
+// exercise the phase-61.1 0-RTT strict-reject (ADR-0080).
+func mkQUICDownstreamTSEarlyData(t *testing.T, certPEM, keyPEM []byte, alpn []string, enableEarlyData bool) *corev3.TransportSocket {
+	t.Helper()
+	common := &tlsv3.CommonTlsContext{AlpnProtocols: alpn}
+	if certPEM != nil || keyPEM != nil {
+		common.TlsCertificates = []*tlsv3.TlsCertificate{
+			{
+				CertificateChain: inlineBytes(certPEM),
+				PrivateKey:       inlineBytes(keyPEM),
+			},
+		}
+	}
+	inner := &quicv3.QuicDownstreamTransport{
+		DownstreamTlsContext: &tlsv3.DownstreamTlsContext{CommonTlsContext: common},
+		EnableEarlyData:      wrapperspb.Bool(enableEarlyData),
+	}
+	anyMsg, err := anypb.New(inner)
+	if err != nil {
+		t.Fatalf("anypb.New: %v", err)
+	}
+	return &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.quic",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: anyMsg},
+	}
+}
+
+// TestNewQUICDownstreamConfig_Rejects0RTT verifies the phase-61.1 strict
+// reject of quic_downstream_transport.enable_early_data (0-RTT), which the
+// reference supports but the minimal slice does not (ADR-0080).
+func TestNewQUICDownstreamConfig_Rejects0RTT(t *testing.T) {
+	ts := mkQUICDownstreamTSEarlyData(t, pki.leafCertPEM, pki.leafKeyPEM, []string{"h3"}, true)
+	_, err := NewQUICDownstreamConfig(ts, "")
+	if err == nil || !strings.Contains(err.Error(), "enable_early_data") {
+		t.Fatalf("expected enable_early_data reject, got %v", err)
+	}
+}
+
+// containsStr reports whether ss contains s.
+func containsStr(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// TestNewQUICDownstreamConfig_ALPNh3 verifies the QUIC transport socket unwrap
+// reuses commonTLSContextToConfig: the inner DownstreamTlsContext's cert loads
+// and alpn_protocols:["h3"] lands in NextProtos.
+func TestNewQUICDownstreamConfig_ALPNh3(t *testing.T) {
+	ts := mkQUICDownstreamTS(t, pki.leafCertPEM, pki.leafKeyPEM, []string{"h3"})
+	dc, err := NewQUICDownstreamConfig(ts, "")
+	if err != nil {
+		t.Fatalf("NewQUICDownstreamConfig: %v", err)
+	}
+	if len(dc.TLSConfig.Certificates) == 0 {
+		t.Errorf("no certificates loaded from the inner DownstreamTlsContext")
+	}
+	if !containsStr(dc.TLSConfig.NextProtos, "h3") {
+		t.Errorf("NextProtos = %v, want to contain \"h3\"", dc.TLSConfig.NextProtos)
+	}
+}
+
+// TestNewQUICDownstreamConfig_MandatoryTLS verifies a QUIC transport socket with
+// no cert (empty inner DownstreamTlsContext) errors — mandatory TLS.
+func TestNewQUICDownstreamConfig_MandatoryTLS(t *testing.T) {
+	ts := mkQUICDownstreamTS(t, nil, nil, []string{"h3"})
+	_, err := NewQUICDownstreamConfig(ts, "")
+	if err == nil {
+		t.Fatal("expected error for a QUIC transport socket with no cert, got nil")
+	}
+	if !strings.Contains(err.Error(), "no tls_certificates configured") {
+		t.Errorf("error %q is not the mandatory-TLS empty-cert error", err.Error())
+	}
+}
+
+// TestNewQUICDownstreamConfig_WrongTypeURL verifies a non-QUIC transport socket
+// type URL is rejected.
+func TestNewQUICDownstreamConfig_WrongTypeURL(t *testing.T) {
+	ts := &corev3.TransportSocket{
+		Name:       "bogus",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: &anypb.Any{TypeUrl: "type.googleapis.com/bogus.Bogus"}},
+	}
+	_, err := NewQUICDownstreamConfig(ts, "")
+	if err == nil || !strings.Contains(err.Error(), "unexpected quic transport_socket type_url") {
+		t.Fatalf("expected wrong-type-URL error, got %v", err)
+	}
 }

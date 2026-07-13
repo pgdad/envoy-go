@@ -117,6 +117,17 @@ type chainInfo struct {
 	netChainFactory func() []network.NetworkFilter
 }
 
+// listenerKind discriminates the transport a listenerRuntime binds. kindTCP
+// (the zero value) uses net.Listen("tcp", …) + the acceptLoop/serveConnection
+// stream path; kindQUIC (phase 61.1) binds net.ListenUDP + a quic-go listener
+// and uses the quicAcceptLoop/serveQUICConnection path (internal/listener/quic.go).
+type listenerKind int
+
+const (
+	kindTCP listenerKind = iota
+	kindQUIC
+)
+
 // listenerRuntime is the phase-03 replacement for builtListener. It holds
 // everything needed to bind, accept, and dispatch connections on one listener.
 //
@@ -132,6 +143,7 @@ type listenerRuntime struct {
 	addr    string
 	netLn   net.Listener
 	tlsMode bool
+	kind    listenerKind // 61.1: kindTCP (default) or kindQUIC
 	// 07.2 (Task 9, ADR-0078) chain-match fields. chainSpecs and defaultSpec
 	// describe the parsed `filter_chains[]` + `default_filter_chain` shape per
 	// ADR-0081's 8-dimension algorithm; `chainByName` looks up the per-chain
@@ -165,6 +177,31 @@ type listenerRuntime struct {
 	// 08.2 (Task 5) drain fast-path field. Field-local (not chasing back through
 	// *Manager) to minimize hot-path indirection per ADR-0094.
 	dm *drain.Manager
+	// 61.1 QUIC close path: udpConn is the bound UDP socket; quicCloser holds
+	// the quic-go *Listener (as an io.Closer so this struct stays quic-go-free —
+	// quic.go owns the concrete type). Both are closed by Start-unwind + Stop
+	// (quic-go's Listener.Close does not close the underlying packet conn).
+	udpConn    *net.UDPConn
+	quicCloser io.Closer
+}
+
+// closeBind closes whichever bound sockets a listenerRuntime holds (TCP
+// net.Listener or the QUIC quicCloser + udpConn), nil-guarded and nil-out after
+// each. Used by both the Start-unwind and Stop teardown so the two paths stay
+// uniform across kindTCP/kindQUIC.
+func (rt *listenerRuntime) closeBind() {
+	if rt.quicCloser != nil {
+		_ = rt.quicCloser.Close()
+		rt.quicCloser = nil
+	}
+	if rt.udpConn != nil {
+		_ = rt.udpConn.Close()
+		rt.udpConn = nil
+	}
+	if rt.netLn != nil {
+		_ = rt.netLn.Close()
+		rt.netLn = nil
+	}
 }
 
 // Manager owns every listener materialized from static_resources.listeners[]
@@ -317,6 +354,33 @@ func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
 	rt.downstreamCxActive = r.NewGauge(prefix + "downstream_cx_active")
 }
 
+// validateQUICOptions strict-rejects the udp_listener_config.quic_options tuning
+// sub-fields the phase-61.1 minimal slice does not honor (ADR-0080 distinct
+// substrings; the reference SUPPORTS these — a documented envoy-go-strict
+// DEPARTURE). idle_timeout / crypto_handshake_timeout / downstream_socket_config
+// and the nested core QuicProtocolOptions knobs are accepted-and-ignored.
+func validateQUICOptions(name string, q *listenerv3.QuicProtocolOptions) error {
+	if q == nil {
+		return nil
+	}
+	if q.GetProofSourceConfig() != nil {
+		return fmt.Errorf("listener: %q: quic_options.proof_source_config is not supported in phase 61.1", name)
+	}
+	if q.GetConnectionIdGeneratorConfig() != nil {
+		return fmt.Errorf("listener: %q: quic_options.connection_id_generator_config is not supported in phase 61.1", name)
+	}
+	if q.GetRejectNewConnections() {
+		return fmt.Errorf("listener: %q: quic_options.reject_new_connections is not supported in phase 61.1", name)
+	}
+	if q.GetServerPreferredAddressConfig() != nil {
+		return fmt.Errorf("listener: %q: quic_options.server_preferred_address_config is not supported in phase 61.1", name)
+	}
+	if ff := q.GetEnabled(); ff != nil && ff.GetDefaultValue() != nil && !ff.GetDefaultValue().GetValue() {
+		return fmt.Errorf("listener: %q: quic_options.enabled=false (runtime-disabled QUIC) is not supported in phase 61.1", name)
+	}
+	return nil
+}
+
 // buildListenerRuntimeWithCtx validates one Listener proto and constructs its
 // listenerRuntime (including all chainInfo entries, ChainSpecs, default chain,
 // listener-filter factories, and lf-pipeline timeout). allowH2C is threaded
@@ -356,6 +420,20 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		return nil, fmt.Errorf("listener: %q: filter_chains must be non-empty", name)
 	}
 
+	// Phase 61.1: udp_listener_config.quic_options presence marks a QUIC/H3
+	// listener (the reference's own QUIC marker). A QUIC listener binds UDP and
+	// stands a quic-go listener (Start branches on kind); its transport socket is
+	// envoy.transport_sockets.quic (decoded below), and mandatory TLS applies.
+	kind := kindTCP
+	if l.GetUdpListenerConfig().GetQuicOptions() != nil {
+		kind = kindQUIC
+	}
+	if kind == kindQUIC {
+		if err := validateQUICOptions(name, l.GetUdpListenerConfig().GetQuicOptions()); err != nil {
+			return nil, err
+		}
+	}
+
 	catchAllCount := 0
 	anyTLS := false
 	anyPlaintext := false
@@ -380,16 +458,28 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		// Decode transport_socket (nil = plaintext, non-nil = TLS).
 		var chainTLS *stdtls.Config
 		if ts := fc.GetTransportSocket(); ts != nil {
-			// sdsProvider: nil at all pre-60.2 call sites (NewManager,
-			// NewManagerWithBaseDir, and test callers), so an
-			// SDS-bound tls_certificate_sds_secret_configs here still errors
-			// ("requires a live SDS provider"), matching pre-60.2 behavior.
-			dc, err := internaltls.NewDownstreamConfig(ts, baseDir, sdsProvider)
-			if err != nil {
-				return nil, fmt.Errorf("listener: %q: filter_chains[%d]: %w", name, i, err)
+			var dc *internaltls.DownstreamConfig
+			var derr error
+			if kind == kindQUIC {
+				// QUIC has no SDS delivery path (phase 61.1 minimal slice);
+				// envoy.transport_sockets.quic wraps an inline DownstreamTlsContext.
+				dc, derr = internaltls.NewQUICDownstreamConfig(ts, baseDir)
+			} else {
+				// sdsProvider: nil at all pre-60.2 call sites (NewManager,
+				// NewManagerWithBaseDir, and test callers), so an
+				// SDS-bound tls_certificate_sds_secret_configs here still errors
+				// ("requires a live SDS provider"), matching pre-60.2 behavior.
+				dc, derr = internaltls.NewDownstreamConfig(ts, baseDir, sdsProvider)
+			}
+			if derr != nil {
+				return nil, fmt.Errorf("listener: %q: filter_chains[%d]: %w", name, i, derr)
 			}
 			chainTLS = dc.TLSConfig
 			anyTLS = true
+		} else if kind == kindQUIC {
+			// Config-parity reject: a QUIC listener has no plaintext form; TLS is
+			// baked into the transport (mandatory TLS).
+			return nil, fmt.Errorf("listener: %q: filter_chains[%d]: quic listener requires a transport_socket (mandatory TLS)", name, i)
 		} else {
 			anyPlaintext = true
 		}
@@ -545,6 +635,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		name:                    name,
 		addr:                    fmt.Sprintf("%s:%d", addr.GetAddress(), addr.GetPortValue()),
 		tlsMode:                 anyTLS,
+		kind:                    kind,
 		chainSpecs:              chainSpecs,
 		defaultSpec:             defaultSpec,
 		defaultChain:            defaultChain,
@@ -687,12 +778,14 @@ func parseChainSpec(name string, fm *listenerv3.FilterChainMatch) (*listenerfilt
 	if sn := fm.GetServerNames(); len(sn) > 0 {
 		spec.ServerNames = append([]string(nil), sn...)
 	}
-	// transport_protocol: validate against the v3 enum domain.
+	// transport_protocol: validate against the v3 enum domain. "quic" is
+	// accepted for QUIC/H3 listeners (phase 61.1); the runtime chain-match
+	// semantics for a QUIC connection land at leg 61.2.
 	switch tp := fm.GetTransportProtocol(); tp {
-	case "", "tls", "raw_buffer":
+	case "", "tls", "raw_buffer", "quic":
 		spec.TransportProtocol = tp
 	default:
-		return nil, fmt.Errorf("transport_protocol %q must be \"tls\" or \"raw_buffer\" or empty", tp)
+		return nil, fmt.Errorf("transport_protocol %q must be \"tls\", \"raw_buffer\", \"quic\", or empty", tp)
 	}
 	// application_protocols: copy slice.
 	if ap := fm.GetApplicationProtocols(); len(ap) > 0 {
@@ -865,12 +958,23 @@ func (m *Manager) Start(ctx context.Context) error {
 		return fmt.Errorf("listener: Start already called")
 	}
 	for i, rt := range m.runtimes {
+		if rt.kind == kindQUIC {
+			// 61.1: bind UDP + stand a quic-go listener; startQUIC launches its
+			// own accept goroutine (mirroring the TCP path's launch below) and
+			// registers the reused per-listener metrics on the resolved address.
+			if err := rt.startQUIC(ctx, m.registry); err != nil {
+				for j := 0; j < i; j++ {
+					m.runtimes[j].closeBind()
+				}
+				return fmt.Errorf("listener: %q: bind %s: %w", rt.name, rt.addr, err)
+			}
+			continue
+		}
 		ln, err := net.Listen("tcp", rt.addr)
 		if err != nil {
 			// Unwind: close any already-bound listeners.
 			for j := 0; j < i; j++ {
-				_ = m.runtimes[j].netLn.Close()
-				m.runtimes[j].netLn = nil
+				m.runtimes[j].closeBind()
 			}
 			return fmt.Errorf("listener: %q: bind %s: %w", rt.name, rt.addr, err)
 		}
@@ -888,6 +992,11 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	for _, rt := range m.runtimes {
 		rt := rt
+		if rt.kind == kindQUIC {
+			// QUIC runtimes launched their accept loop inside startQUIC; they
+			// have no rt.netLn to capture.
+			continue
+		}
 		// Capture rt.netLn here (under the held startedMu, before any concurrent
 		// Stop can nil-write it) and pass it as a parameter to acceptLoop. Earlier
 		// versions read rt.netLn from inside the goroutine, which raced with
@@ -1263,10 +1372,12 @@ func (m *Manager) Listeners() []Info {
 	defer m.startedMu.Unlock()
 	out := make([]Info, 0, len(m.runtimes))
 	for _, rt := range m.runtimes {
-		if rt.netLn == nil {
-			continue
+		switch {
+		case rt.kind == kindQUIC && rt.udpConn != nil:
+			out = append(out, Info{Name: rt.name, Addr: rt.udpConn.LocalAddr().String()})
+		case rt.netLn != nil:
+			out = append(out, Info{Name: rt.name, Addr: rt.netLn.Addr().String()})
 		}
-		out = append(out, Info{Name: rt.name, Addr: rt.netLn.Addr().String()})
 	}
 	return out
 }
@@ -1298,10 +1409,9 @@ func (m *Manager) Stop() {
 	m.startedMu.Lock()
 	defer m.startedMu.Unlock()
 	for _, rt := range m.runtimes {
-		if rt.netLn != nil {
-			_ = rt.netLn.Close()
-			rt.netLn = nil
-		}
+		// closeBind tears down whichever sockets are set (TCP netLn or the QUIC
+		// quicCloser + udpConn), nil-guarded + nil-out after each.
+		rt.closeBind()
 	}
 	m.started = false
 }

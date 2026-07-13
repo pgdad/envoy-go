@@ -36,15 +36,15 @@ quic-go (`github.com/quic-go/quic-go`) is imported ONLY in `internal/listener/qu
 
 ## Task checklist (mirrors PLAN-61.1)
 
-- [ ] **Task 1** — PROGRESS scaffold + baselines + the 61.1 design pins. (folded into the PLAN commit)
-- [ ] **Task 2** — lift the `transport_protocol "quic"` filter-chain-match reject + flip the reject test + a positive test. [TDD]
-- [ ] **Task 3** — `internal/tls.NewQUICDownstreamConfig` (unwrap the QUIC transport socket, reuse `commonTLSContextToConfig`, ALPN h3, mandatory-TLS error). [TDD]
-- [ ] **Task 4** — the `listenerKind` discriminant + the QUIC transport-socket branch + the mandatory-TLS config-parity reject in `buildListenerRuntimeWithCtx`. [TDD]
-- [ ] **Task 5** — add `github.com/quic-go/quic-go v0.54.1` (the FIRST external module) + `go mod tidy` + a compile-gate smoke test. [module + TDD]
-- [ ] **Task 6** — the UDP/QUIC listen path (`Start` kind-branch + `quicAcceptLoop`/`serveQUICConnection` handshake substrate in `quic.go` + `Stop`/`Listeners` kind-awareness) + the subject-side handshake integration test (local quic-go client, ALPN h3 + TLS 1.3). [TDD + -race]
-- [ ] **Task 7** — the QUIC strict-reject roster (0-RTT + `quic_options` tuning sub-fields, ADR-0080 distinct substrings). [TDD]
-- [ ] **Task 8** — BEHAVIOR_CONTRACT HTTP/3 QUIC-substrate section. [docs]
-- [ ] **Task 9** — ADR-0279 §Decision/§Consequences + STATE + ROADMAP row-61-stays-in-progress verify + sentinel re-check + six-gate + router roll to the 61.2 PLAN. [docs + verify]
+- [x] **Task 1** — PROGRESS scaffold + baselines + the 61.1 design pins. (folded into the PLAN commit)
+- [x] **Task 2** — lift the `transport_protocol "quic"` filter-chain-match reject + flip the reject test + a positive test. [TDD]
+- [x] **Task 3** — `internal/tls.NewQUICDownstreamConfig` (unwrap the QUIC transport socket, reuse `commonTLSContextToConfig`, ALPN h3, mandatory-TLS error). [TDD]
+- [x] **Task 4** — the `listenerKind` discriminant + the QUIC transport-socket branch + the mandatory-TLS config-parity reject in `buildListenerRuntimeWithCtx`. [TDD]
+- [x] **Task 5** — add `github.com/quic-go/quic-go v0.54.1` (the FIRST external module) + `go mod tidy` + a compile-gate smoke test. [module + TDD]
+- [x] **Task 6** — the UDP/QUIC listen path (`Start` kind-branch + `quicAcceptLoop`/`serveQUICConnection` handshake substrate in `quic.go` + `Stop`/`Listeners` kind-awareness) + the subject-side handshake integration test (local quic-go client, ALPN h3 + TLS 1.3). [TDD + -race]
+- [x] **Task 7** — the QUIC strict-reject roster (0-RTT + `quic_options` tuning sub-fields, ADR-0080 distinct substrings). [TDD]
+- [x] **Task 8** — BEHAVIOR_CONTRACT HTTP/3 QUIC-substrate section. [docs]
+- [x] **Task 9** — ADR-0279 §Decision/§Consequences + STATE + ROADMAP row-61-stays-in-progress verify + sentinel re-check + six-gate + router roll to the 61.2 PLAN. [docs + verify]
 
 ## Six-gate (recorded at Task 9 — RUN in the worktree `.worktrees/phase-61.1-impl`)
 

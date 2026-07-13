@@ -7,14 +7,16 @@ import (
 	"fmt"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	quicv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/quic/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 
 	xds "github.com/pgdad/envoy-go/internal/xds"
 )
 
 const (
-	downstreamTLSContextTypeURL = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext"
-	upstreamTLSContextTypeURL   = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext"
+	downstreamTLSContextTypeURL    = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext"
+	upstreamTLSContextTypeURL      = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext"
+	quicDownstreamTransportTypeURL = "type.googleapis.com/envoy.extensions.transport_sockets.quic.v3.QuicDownstreamTransport"
 )
 
 // DownstreamConfig is the phase-03 output of parsing a DownstreamTlsContext.
@@ -74,6 +76,38 @@ func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string, provider xd
 		}
 		cfg.ClientCAs = pool
 		cfg.ClientAuth = stdtls.RequireAndVerifyClientCert
+	}
+	return &DownstreamConfig{TLSConfig: cfg}, nil
+}
+
+// NewQUICDownstreamConfig parses a *corev3.TransportSocket whose typed_config is
+// a QuicDownstreamTransport (envoy.transport_sockets.quic), unwraps the inner
+// DownstreamTlsContext, and builds the *stdtls.Config via the SHARED
+// commonTLSContextToConfig (so ALPN from alpn_protocols, cert loading, and the
+// mandatory-TLS empty-cert error are reused). QUIC carries no SDS in phase 61.1,
+// so the provider argument to commonTLSContextToConfig is nil. Errors begin with
+// "tls: downstream: ". (Phase 61.1, ADR-0279.)
+func NewQUICDownstreamConfig(ts *corev3.TransportSocket, baseDir string) (*DownstreamConfig, error) {
+	if ts == nil {
+		return nil, fmt.Errorf("tls: downstream: nil transport_socket")
+	}
+	if ts.GetTypedConfig() == nil || ts.GetTypedConfig().GetTypeUrl() != quicDownstreamTransportTypeURL {
+		return nil, fmt.Errorf("tls: downstream: unexpected quic transport_socket type_url %q", ts.GetTypedConfig().GetTypeUrl())
+	}
+	qt := &quicv3.QuicDownstreamTransport{}
+	if err := ts.GetTypedConfig().UnmarshalTo(qt); err != nil {
+		return nil, fmt.Errorf("tls: downstream: quic transport_socket unmarshal: %w", err)
+	}
+	if qt.GetEnableEarlyData().GetValue() {
+		return nil, fmt.Errorf("tls: downstream: quic enable_early_data (0-RTT) is not supported in phase 61.1")
+	}
+	dtc := qt.GetDownstreamTlsContext()
+	if dtc == nil {
+		return nil, fmt.Errorf("tls: downstream: quic transport_socket has no downstream_tls_context")
+	}
+	cfg, err := commonTLSContextToConfig(dtc.GetCommonTlsContext(), baseDir, "downstream", nil)
+	if err != nil {
+		return nil, err
 	}
 	return &DownstreamConfig{TLSConfig: cfg}, nil
 }

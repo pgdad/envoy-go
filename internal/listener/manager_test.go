@@ -23,6 +23,7 @@ import (
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	networkrbacv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/rbac/v3"
 	tcpproxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
+	quicv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/quic/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -703,6 +704,181 @@ func testCAPool(t *testing.T) *x509.CertPool {
 	return pool
 }
 
+// mkQUICDownstreamTS builds a corev3.TransportSocket carrying a
+// QuicDownstreamTransport (envoy.transport_sockets.quic) wrapping an inner
+// DownstreamTlsContext, mirroring internal/tls's Task-3 test pattern. When
+// certPEM/keyPEM are both empty, the inner CommonTlsContext carries no
+// tls_certificates.
+func mkQUICDownstreamTS(t *testing.T, certPEM, keyPEM string, alpn []string) *corev3.TransportSocket {
+	t.Helper()
+	common := &tlsv3.CommonTlsContext{AlpnProtocols: alpn}
+	if certPEM != "" || keyPEM != "" {
+		common.TlsCertificates = []*tlsv3.TlsCertificate{{
+			CertificateChain: &corev3.DataSource{
+				Specifier: &corev3.DataSource_InlineBytes{InlineBytes: []byte(certPEM)},
+			},
+			PrivateKey: &corev3.DataSource{
+				Specifier: &corev3.DataSource_InlineBytes{InlineBytes: []byte(keyPEM)},
+			},
+		}}
+	}
+	inner := &quicv3.QuicDownstreamTransport{
+		DownstreamTlsContext: &tlsv3.DownstreamTlsContext{CommonTlsContext: common},
+	}
+	a, err := anypb.New(inner)
+	if err != nil {
+		t.Fatalf("anypb.New QuicDownstreamTransport: %v", err)
+	}
+	return &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.quic",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: a},
+	}
+}
+
+// mkQUICListener builds a single-chain Listener carrying a
+// udp_listener_config.quic_options marker (the kindQUIC discriminant) and a
+// benign, never-dispatched-in-61.1 tcp_proxy filter (mkTcpProxyFilter) so the
+// chain resolves. When certPEM/keyPEM are both empty, the chain carries NO
+// transport_socket at all — used to exercise the QUIC mandatory-TLS reject.
+func mkQUICListener(t *testing.T, clusterName, certPEM, keyPEM string, alpn []string) *listenerv3.Listener {
+	t.Helper()
+	filter := mkTcpProxyFilter(t, clusterName)
+	var ts *corev3.TransportSocket
+	if certPEM != "" || keyPEM != "" {
+		ts = mkQUICDownstreamTS(t, certPEM, keyPEM, alpn)
+	}
+	return &listenerv3.Listener{
+		Name: "quic_listener",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+				Protocol:      corev3.SocketAddress_UDP,
+			},
+		}},
+		UdpListenerConfig: &listenerv3.UdpListenerConfig{
+			QuicOptions: &listenerv3.QuicProtocolOptions{},
+		},
+		FilterChains: []*listenerv3.FilterChain{
+			{TransportSocket: ts, Filters: []*listenerv3.Filter{filter}},
+		},
+	}
+}
+
+// mkQUICListenerWithOptions is mkQUICListener plus a mutate hook applied to
+// the udp_listener_config.quic_options QuicProtocolOptions, used to exercise
+// the phase-61.1 QUIC strict-reject roster (ADR-0080) and the
+// accepted-and-ignored sub-fields.
+func mkQUICListenerWithOptions(t *testing.T, clusterName, certPEM, keyPEM string, alpn []string, mutate func(*listenerv3.QuicProtocolOptions)) *listenerv3.Listener {
+	t.Helper()
+	l := mkQUICListener(t, clusterName, certPEM, keyPEM, alpn)
+	q := &listenerv3.QuicProtocolOptions{}
+	if mutate != nil {
+		mutate(q)
+	}
+	l.UdpListenerConfig.QuicOptions = q
+	return l
+}
+
+// containsStr reports whether ss contains s.
+func containsStr(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// TestBuildListenerRuntime_QUICKind verifies a udp_listener_config.quic_options
+// listener builds with kind=kindQUIC and its chain TLS carries ALPN h3.
+func TestBuildListenerRuntime_QUICKind(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	l := mkQUICListener(t, "c_echo", testAlphaCertPEM, testAlphaKeyPEM, []string{"h3"})
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager(quic listener): %v", err)
+	}
+	rt := mgr.runtimes[0]
+	if rt.kind != kindQUIC {
+		t.Errorf("kind = %d, want kindQUIC", rt.kind)
+	}
+	// The single chain's TLS carries ALPN h3.
+	var ci *chainInfo
+	for _, c := range rt.chainByName {
+		ci = c
+	}
+	if ci == nil || ci.tlsCfg == nil || !containsStr(ci.tlsCfg.NextProtos, "h3") {
+		t.Errorf("QUIC chain TLS did not carry ALPN h3: %+v", ci)
+	}
+}
+
+// TestBuildListenerRuntime_QUICMandatoryTLS verifies a QUIC listener whose chain
+// has no transport socket is boot-rejected (mandatory TLS, config parity).
+func TestBuildListenerRuntime_QUICMandatoryTLS(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	l := mkQUICListener(t, "c_echo", "", "", nil) // no transport socket
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err == nil {
+		t.Fatal("expected mandatory-TLS reject for a QUIC listener with no transport_socket, got nil")
+	}
+	if !strings.Contains(err.Error(), "quic listener requires a transport_socket") {
+		t.Errorf("error %q is not the mandatory-TLS reject", err.Error())
+	}
+}
+
+// TestBuildListenerRuntime_QUICStrictRejects verifies the phase-61.1
+// quic_options tuning sub-field strict-reject roster (ADR-0080): each
+// sub-field the minimal slice does not honor produces a distinct-substring
+// error, even though the reference itself supports these fields.
+func TestBuildListenerRuntime_QUICStrictRejects(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*listenerv3.QuicProtocolOptions)
+		substr string
+	}{
+		{"proof_source_config", func(q *listenerv3.QuicProtocolOptions) { q.ProofSourceConfig = &corev3.TypedExtensionConfig{Name: "x"} }, "proof_source_config"},
+		{"connection_id_generator", func(q *listenerv3.QuicProtocolOptions) {
+			q.ConnectionIdGeneratorConfig = &corev3.TypedExtensionConfig{Name: "x"}
+		}, "connection_id_generator_config"},
+		{"reject_new_connections", func(q *listenerv3.QuicProtocolOptions) { q.RejectNewConnections = true }, "reject_new_connections"},
+		{"server_preferred_address", func(q *listenerv3.QuicProtocolOptions) {
+			q.ServerPreferredAddressConfig = &corev3.TypedExtensionConfig{Name: "x"}
+		}, "server_preferred_address_config"},
+		{"enabled_runtime_disabled", func(q *listenerv3.QuicProtocolOptions) {
+			q.Enabled = &corev3.RuntimeFeatureFlag{DefaultValue: wrapperspb.Bool(false)}
+		}, "quic_options.enabled=false"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+			l := mkQUICListenerWithOptions(t, "c_echo", testAlphaCertPEM, testAlphaKeyPEM, []string{"h3"}, tc.mutate)
+			boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+			_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+			if err == nil || !strings.Contains(err.Error(), tc.substr) {
+				t.Fatalf("case %s: expected reject naming %q, got %v", tc.name, tc.substr, err)
+			}
+		})
+	}
+}
+
+// TestBuildListenerRuntime_QUICAcceptsIgnoredOptions verifies idle_timeout
+// (and by extension crypto_handshake_timeout / downstream_socket_config / the
+// nested core QuicProtocolOptions knobs, not independently exercised here) is
+// accepted-and-ignored rather than strict-rejected.
+func TestBuildListenerRuntime_QUICAcceptsIgnoredOptions(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	l := mkQUICListenerWithOptions(t, "c_echo", testAlphaCertPEM, testAlphaKeyPEM, []string{"h3"}, func(q *listenerv3.QuicProtocolOptions) {
+		q.IdleTimeout = durationpb.New(30 * time.Second) // accept-and-ignore
+	})
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	if _, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry()); err != nil {
+		t.Fatalf("idle_timeout should be accepted-and-ignored, got %v", err)
+	}
+}
+
 // selectByServerNameFromMgr is the phase-07.2 Task-10 replacement for the
 // pre-refactor getConfigForClientFromMgr helper. It runs the unified
 // chain-match algorithm (listenerfilter.SelectChain) over the first
@@ -1169,9 +1345,9 @@ func TestParseChainSpecSilentlyIgnoresDirectSourcePrefixRanges(t *testing.T) {
 	}
 }
 
-// TestParseChainSpecRejectsUnknownTransportProtocol verifies that the
+// TestParseChainSpecRejectsUnknownTransportProtocol verifies the
 // transport_protocol enum domain is enforced at parse: only "tls",
-// "raw_buffer", or "" are accepted.
+// "raw_buffer", "quic", or "" are accepted (phase 61.1 lifted "quic").
 func TestParseChainSpecRejectsUnknownTransportProtocol(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
@@ -1184,17 +1360,29 @@ func TestParseChainSpecRejectsUnknownTransportProtocol(t *testing.T) {
 			},
 		}},
 		FilterChains: []*listenerv3.FilterChain{{
-			FilterChainMatch: &listenerv3.FilterChainMatch{TransportProtocol: "quic"},
+			FilterChainMatch: &listenerv3.FilterChainMatch{TransportProtocol: "sctp"},
 			Filters:          []*listenerv3.Filter{filter},
 		}},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err == nil {
-		t.Fatal("expected error for transport_protocol=quic, got nil")
+		t.Fatal("expected error for transport_protocol=sctp, got nil")
 	}
-	if !strings.Contains(err.Error(), `transport_protocol "quic"`) {
+	if !strings.Contains(err.Error(), `transport_protocol "sctp"`) {
 		t.Errorf("error %q does not name the bad value", err.Error())
+	}
+}
+
+// TestParseChainSpec_QUICTransportProtocolAccepted verifies phase 61.1 lifted
+// the transport_protocol "quic" reject: the value now parses into the ChainSpec.
+func TestParseChainSpec_QUICTransportProtocolAccepted(t *testing.T) {
+	spec, err := parseChainSpec("l/fc[0]", &listenerv3.FilterChainMatch{TransportProtocol: "quic"})
+	if err != nil {
+		t.Fatalf("parseChainSpec(quic): unexpected error: %v", err)
+	}
+	if spec.TransportProtocol != "quic" {
+		t.Errorf("TransportProtocol = %q, want %q", spec.TransportProtocol, "quic")
 	}
 }
 
