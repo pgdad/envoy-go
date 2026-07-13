@@ -58,8 +58,11 @@ type chainEntry struct {
 // string and seeds it onto every per-stream FilterChain via
 // chain.SetListenerPrincipal in dispatchRequest / chainDispatchAction.WriteH2.
 type ListenerCtx struct {
-	HasTLS            bool
-	AllowH2C          bool
+	HasTLS   bool
+	AllowH2C bool
+	// IsQUIC marks the enclosing listener as QUIC/H3 (phase 61.2 — gates
+	// codec_type HTTP3). Inert as of Task 2; Task 3 adds the accept/reject.
+	IsQUIC            bool
 	ListenerPrincipal string
 	// HTTPClient is the shared `*httpclient.Client` framework primitive
 	// (ADR-0177) threaded into per-filter factories via FactoryCtx.HTTPClient
@@ -235,6 +238,15 @@ func parseFilterWithCtx(tc *anypb.Any, clusters *cluster.Manager, lc ListenerCtx
 	case hcmv3.HttpConnectionManager_HTTP2:
 		if !lc.HasTLS && !lc.AllowH2C {
 			return nil, fmt.Errorf("hcm: codec_type HTTP2 requires TLS transport_socket (or --allow-h2c for conformance testing)")
+		}
+	case hcmv3.HttpConnectionManager_HTTP3:
+		// Phase 61.2 (ADR-0281): codec_type HTTP3 is served on a QUIC listener
+		// (udp_listener_config.quic_options → kindQUIC → lc.IsQUIC). On a
+		// non-QUIC listener it is a config-parity boot-reject (SPEC-61 §11 arm
+		// reject-B — the reference rejects "HTTP/3 codec configured on non-QUIC
+		// listener."). QUIC bakes TLS 1.3 into the transport, so no HasTLS check.
+		if !lc.IsQUIC {
+			return nil, fmt.Errorf("hcm: codec_type HTTP3 requires a QUIC (udp_listener_config) listener")
 		}
 	default:
 		return nil, fmt.Errorf("hcm: codec_type %s is not supported in phase 05.1", codecType)

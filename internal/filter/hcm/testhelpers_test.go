@@ -1,6 +1,9 @@
 package hcm
 
 import (
+	"testing"
+
+	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/pgdad/envoy-go/internal/cluster"
@@ -34,4 +37,20 @@ func testHTTPRegistry() *filter_http.HTTPRegistry {
 // now call this helper with the same two-arg shape.
 func parseFilterTest(tc *anypb.Any, clusters *cluster.Manager) (*Filter, error) {
 	return parseFilterWithCtx(tc, clusters, ListenerCtx{}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
+}
+
+// parseFilterQUIC is the QUIC-listener counterpart of parseFilterTest: it
+// builds an HCM via mkHCM(modify), parses it with
+// ListenerCtx{IsQUIC: true, HasTLS: true} (QUIC is mandatory-TLS per
+// phase-61.1) rather than a zero-value ListenerCtx, and Fatals on error.
+// Used by phase 61.2 Task 3 tests to exercise the codec_type HTTP3
+// accept-on-QUIC arm.
+func parseFilterQUIC(t *testing.T, modify func(*hcmv3.HttpConnectionManager)) *Filter {
+	t.Helper()
+	cm := mkClusterManager(t)
+	f, err := parseFilterWithCtx(mkHCM(modify), cm, ListenerCtx{IsQUIC: true, HasTLS: true}, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil)
+	if err != nil {
+		t.Fatalf("parseFilterQUIC: unexpected error: %v", err)
+	}
+	return f
 }

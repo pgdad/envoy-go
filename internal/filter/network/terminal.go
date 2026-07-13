@@ -5,6 +5,7 @@ package network
 import (
 	"context"
 	"net"
+	"net/http"
 )
 
 // NetworkFilter is the sealed common interface every chain filter satisfies —
@@ -46,4 +47,19 @@ type TerminalFilter interface {
 	// NOT close the conn for a terminal filter; Handle's own defer conn.Close()
 	// runs — byte-identical to the retired terminal path).
 	Handle(ctx context.Context, downstream net.Conn)
+}
+
+// H3Terminal is a TerminalFilter that can additionally serve a single HTTP/3
+// request via quic-go's http3.Server handler contract. The QUIC listen path
+// (internal/listener/quic.go) type-asserts an accepted connection's chain
+// terminal filter to this interface and drives it via
+// http3.Server{Handler: http.HandlerFunc(t.ServeH3)}.ServeQUICConn(conn).
+// Stdlib-typed (*http.Request / http.ResponseWriter) so quic-go stays confined
+// to internal/listener — the hcm terminal (which implements ServeH3) never
+// imports quic-go. Phase 61.2, ADR-0281.
+//
+//nolint:revive // ADR-0215 reserves the network.* filter interface names.
+type H3Terminal interface {
+	TerminalFilter
+	ServeH3(w http.ResponseWriter, r *http.Request)
 }

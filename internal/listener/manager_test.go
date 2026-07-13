@@ -780,6 +780,55 @@ func mkQUICListenerWithOptions(t *testing.T, clusterName, certPEM, keyPEM string
 	return l
 }
 
+// mkQUICListenerHCM is the phase 61.2 Task 2 HCM-carrying sibling of
+// mkQUICListener: a single-chain QUIC listener whose filter chain carries a
+// real HCM typed_config (codecType-parameterized, mkHCMFilterWithCodec)
+// instead of the 61.1 handshake-only tcp_proxy filter. Used to prove the
+// IsQUIC thread (network.FactoryCtx → hcm.ListenerCtx) compiles and a QUIC
+// listener still builds an HCM chain — codec_type AUTO needs no HTTP3
+// accept (deferred to Task 3). Base helper for Tasks 3/8.
+func mkQUICListenerHCM(t *testing.T, certPEM, keyPEM string, codecType hcmv3.HttpConnectionManager_CodecType) *listenerv3.Listener {
+	t.Helper()
+	filter := mkHCMFilterWithCodec(t, codecType)
+	var ts *corev3.TransportSocket
+	if certPEM != "" || keyPEM != "" {
+		ts = mkQUICDownstreamTS(t, certPEM, keyPEM, []string{"h3"})
+	}
+	return &listenerv3.Listener{
+		Name: "quic_listener_hcm",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+				Protocol:      corev3.SocketAddress_UDP,
+			},
+		}},
+		UdpListenerConfig: &listenerv3.UdpListenerConfig{
+			QuicOptions: &listenerv3.QuicProtocolOptions{},
+		},
+		FilterChains: []*listenerv3.FilterChain{
+			{TransportSocket: ts, Filters: []*listenerv3.Filter{filter}},
+		},
+	}
+}
+
+// TestBuildListenerRuntime_QUICThreadsIsQUIC verifies the listener kind is
+// threaded into the HCM parse context: manager.go's kindQUIC discriminant
+// reaches network.FactoryCtx.IsQUIC (and thence hcm.ListenerCtx.IsQUIC) at
+// both FactoryCtx build sites (filter_chains[] and default_filter_chain).
+// The load-bearing assertion — IsQUIC actually gating codec_type HTTP3 — is
+// proven end-to-end by Task 3's accept-on-QUIC/reject-off-QUIC tests; this
+// task's test guards that the plumbing compiles and a QUIC listener still
+// builds an HCM chain with codec_type AUTO (no HTTP3 accept needed yet).
+func TestBuildListenerRuntime_QUICThreadsIsQUIC(t *testing.T) {
+	l := mkQUICListenerHCM(t, testAlphaCertPEM, testAlphaKeyPEM, hcmv3.HttpConnectionManager_AUTO)
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	if _, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry()); err != nil {
+		t.Fatalf("NewManager(quic+hcm): %v", err)
+	}
+}
+
 // containsStr reports whether ss contains s.
 func containsStr(ss []string, s string) bool {
 	for _, v := range ss {
@@ -1664,8 +1713,17 @@ func mkRouterAny(t *testing.T) *anypb.Any {
 // typed_config with a direct_response /health → 200 OK route.
 func mkHCMFilter(t *testing.T) *listenerv3.Filter {
 	t.Helper()
+	return mkHCMFilterWithCodec(t, hcmv3.HttpConnectionManager_HTTP1)
+}
+
+// mkHCMFilterWithCodec is mkHCMFilter parameterized by codec_type (phase
+// 61.2 Task 2 — needed to build a QUIC+HCM chain with codec_type AUTO,
+// which the QUIC mandatory-TLS path is compatible with today; codec_type
+// HTTP3 is not accepted until Task 3).
+func mkHCMFilterWithCodec(t *testing.T, codecType hcmv3.HttpConnectionManager_CodecType) *listenerv3.Filter {
+	t.Helper()
 	hcmProto := &hcmv3.HttpConnectionManager{
-		CodecType:  hcmv3.HttpConnectionManager_HTTP1,
+		CodecType:  codecType,
 		StatPrefix: "ingress_http",
 		RouteSpecifier: &hcmv3.HttpConnectionManager_RouteConfig{
 			RouteConfig: &routev3.RouteConfiguration{

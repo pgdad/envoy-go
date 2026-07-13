@@ -49,6 +49,7 @@ func NewNetworkFactory(
 			ListenerCtx{
 				HasTLS:             ctx.HasTLS,
 				AllowH2C:           ctx.AllowH2C,
+				IsQUIC:             ctx.IsQUIC,
 				ListenerPrincipal:  ctx.ListenerPrincipal,
 				HTTPClient:         httpClient,
 				NodeServiceCluster: ctx.NodeServiceCluster,

@@ -192,6 +192,35 @@ func TestParseFilter_CodecTypeAUTO_Accepts_BothCases(t *testing.T) {
 	}
 }
 
+// TestListenerCtxIsQUICField is the hcm-side counterpart of
+// network.TestFactoryCtxPerChainFields (phase 61.2 Task 2): proves
+// ListenerCtx carries an IsQUIC bool round-trip. IsQUIC is inert in
+// parseFilterWithCtx as of this task (Task 3 adds the codec_type HTTP3
+// gate); this only guards the struct-field plumbing compiles.
+func TestListenerCtxIsQUICField(t *testing.T) {
+	lc := ListenerCtx{HasTLS: true, IsQUIC: true}
+	if !lc.IsQUIC {
+		t.Fatalf("ListenerCtx field round-trip failed: %+v", lc)
+	}
+	var zero ListenerCtx
+	if zero.IsQUIC {
+		t.Fatalf("zero-value ListenerCtx.IsQUIC = true, want false")
+	}
+}
+
+// TestParseFilter_CodecTypeAUTO_AcceptsIsQUIC verifies AUTO is accepted on a
+// QUIC listener context exactly as it is on a non-QUIC one (phase 61.2 Task
+// 2 — IsQUIC does not yet gate anything; Task 3 adds the HTTP3 accept).
+func TestParseFilter_CodecTypeAUTO_AcceptsIsQUIC(t *testing.T) {
+	cm := mkClusterManager(t)
+	any := mkHCM(func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_AUTO })
+	for _, lc := range []ListenerCtx{{HasTLS: true, IsQUIC: true}, {HasTLS: false, IsQUIC: false}} {
+		if _, err := parseFilterWithCtx(any, cm, lc, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil); err != nil {
+			t.Errorf("AUTO + lc=%+v should be accepted, got: %v", lc, err)
+		}
+	}
+}
+
 // TestParseFilter_CodecTypeHTTP1_Accepts_BothCases verifies that HTTP1 is
 // accepted regardless of TLS context.
 func TestParseFilter_CodecTypeHTTP1_Accepts_BothCases(t *testing.T) {
@@ -204,8 +233,23 @@ func TestParseFilter_CodecTypeHTTP1_Accepts_BothCases(t *testing.T) {
 	}
 }
 
-func TestParseFilter_CodecTypeHTTP3(t *testing.T) {
-	expectErr(t, func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP3 }, "codec_type HTTP3")
+// TestParseFilter_CodecTypeHTTP3_RejectsOnNonQUICListener verifies codec_type
+// HTTP3 on a non-QUIC (TCP) listener is boot-rejected — config parity with the
+// reference (SPEC-61 §11 arm reject-B: "HTTP/3 codec configured on non-QUIC
+// listener.").
+func TestParseFilter_CodecTypeHTTP3_RejectsOnNonQUICListener(t *testing.T) {
+	expectErr(t, func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP3 },
+		"codec_type HTTP3 requires a QUIC")
+}
+
+// TestParseFilter_CodecTypeHTTP3_AcceptsOnQUICListener verifies codec_type HTTP3
+// is ACCEPTED when the enclosing listener is QUIC (lc.IsQUIC=true) — phase 61.2
+// lifted the blanket reject.
+func TestParseFilter_CodecTypeHTTP3_AcceptsOnQUICListener(t *testing.T) {
+	f := parseFilterQUIC(t, func(h *hcmv3.HttpConnectionManager) { h.CodecType = hcmv3.HttpConnectionManager_HTTP3 })
+	if f.codecType != hcmv3.HttpConnectionManager_HTTP3 {
+		t.Errorf("codecType = %v, want HTTP3", f.codecType)
+	}
 }
 
 func TestParseFilter_CodecTypeAUTO(t *testing.T) {

@@ -149,5 +149,6 @@ type FactoryCtx struct {
 	HasTLS             bool   // chain has a *stdtls.Config (hcm.ListenerCtx.HasTLS)
 	AllowH2C           bool   // --allow-h2c (hcm.ListenerCtx.AllowH2C)
 	ListenerPrincipal  string // per-chain leaf-cert principal (hcm.ListenerCtx.ListenerPrincipal)
+	IsQUIC             bool   // listener kind == kindQUIC (phase 61.2 — gates codec_type HTTP3 accept)
 	NodeServiceCluster string // bootstrap node.cluster (hcm.ListenerCtx.NodeServiceCluster)
 }

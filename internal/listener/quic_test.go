@@ -3,12 +3,16 @@ package listener
 import (
 	"context"
 	stdtls "crypto/tls"
+	"io"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	quic "github.com/quic-go/quic-go"
+	http3 "github.com/quic-go/quic-go/http3"
 
 	"github.com/pgdad/envoy-go/internal/stats"
 )
@@ -90,5 +94,57 @@ func TestQUICListener_HandshakeALPNh3(t *testing.T) {
 	// completion — poll briefly.
 	if got := pollCounter(t, reg, "listener."+normalizeAddr(addr)+".downstream_cx_total", 1, 2*time.Second); got < 1 {
 		t.Errorf("downstream_cx_total = %d, want >= 1", got)
+	}
+}
+
+// TestQUICListener_ServesH3GET is the leg-61.2 subject-side proof: a QUIC
+// listener whose HCM has codec_type HTTP3 and a direct_response /health route
+// (mkQUICListenerHCM) serves an H3 GET to a local quic-go http3.Transport
+// client, returning 200 + "OK\n" over HTTP/3. NO differential (that is 61.3).
+func TestQUICListener_ServesH3GET(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	l := mkQUICListenerHCM(t, testAlphaCertPEM, testAlphaKeyPEM, hcmv3.HttpConnectionManager_HTTP3)
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer mgr.Stop()
+
+	addr := mgr.Listeners()[0].Addr
+
+	rt := &http3.Transport{
+		TLSClientConfig: &stdtls.Config{NextProtos: []string{"h3"}, InsecureSkipVerify: true}, //nolint:gosec // local test
+		QUICConfig:      &quic.Config{},
+	}
+	defer func() { _ = rt.Close() }()
+	client := &http.Client{Transport: rt}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+addr+"/health", nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("H3 GET %s: %v", addr, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if resp.ProtoMajor != 3 {
+		t.Errorf("proto major = %d, want 3 (HTTP/3)", resp.ProtoMajor)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "OK\n" {
+		t.Errorf("body = %q, want %q", string(body), "OK\n")
 	}
 }

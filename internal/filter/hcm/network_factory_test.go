@@ -25,7 +25,7 @@ func TestHCMNewNetworkFactoryBridgesFactoryCtx(t *testing.T) {
 	httpReg := testHTTPRegistry()
 	factory := NewNetworkFactory(cm, reg, nil, httpReg, nil, nil, nil)
 	tc := mkHCM(nil)
-	mk, err := factory(tc, network.FactoryCtx{HasTLS: true, AllowH2C: true, ListenerPrincipal: "spiffe://p", NodeServiceCluster: "svc"})
+	mk, err := factory(tc, network.FactoryCtx{HasTLS: true, AllowH2C: true, ListenerPrincipal: "spiffe://p", IsQUIC: true, NodeServiceCluster: "svc"})
 	if err != nil {
 		t.Fatalf("NewNetworkFactory err: %v", err)
 	}

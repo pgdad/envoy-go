@@ -496,6 +496,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 			HasTLS:             chainTLS != nil,
 			AllowH2C:           allowH2C,
 			ListenerPrincipal:  extractListenerPrincipal(chainTLS),
+			IsQUIC:             kind == kindQUIC,
 			NodeServiceCluster: nodeServiceCluster,
 		}
 		netChainFactory, err := buildNetworkChainFactory(ncfPrefix, fc.GetFilters(), netReg, ncfCtx)
@@ -567,6 +568,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 			HasTLS:             dfcTLS != nil,
 			AllowH2C:           allowH2C,
 			ListenerPrincipal:  extractListenerPrincipal(dfcTLS),
+			IsQUIC:             kind == kindQUIC,
 			NodeServiceCluster: nodeServiceCluster,
 		}
 		dfcNetFactory, err := buildNetworkChainFactory(dfcNetPrefix, dfc.GetFilters(), netReg, dfcNetCtx)

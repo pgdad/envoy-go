@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"net"
+	"net/http"
 	"testing"
 )
 
@@ -57,4 +58,17 @@ func TestNetworkFilterClassify(t *testing.T) {
 	if got := classify(bothFilter{}); got != "terminal" {
 		t.Errorf("both-satisfying classified %q, want terminal", got)
 	}
+}
+
+// h3Double is a local test double proving the H3Terminal interface shape is
+// satisfiable by a TerminalFilter that also serves H3. Local (rather than
+// reusing *hcm.Filter) because the network package must NOT import hcm (would
+// be a cycle — hcm imports network for the Marker/TerminalFilter seam).
+type h3Double struct{ Marker }
+
+func (h3Double) Handle(_ context.Context, _ net.Conn)           {}
+func (h3Double) ServeH3(_ http.ResponseWriter, _ *http.Request) {}
+
+func TestH3TerminalInterfaceShape(t *testing.T) {
+	var _ H3Terminal = h3Double{}
 }

@@ -14,10 +14,21 @@ func TestFactoryCtxPerChainFields(t *testing.T) {
 		HasTLS:             true,
 		AllowH2C:           true,
 		ListenerPrincipal:  "spiffe://x",
+		IsQUIC:             true,
 		NodeServiceCluster: "svc-a",
 	}
-	if !ctx.HasTLS || !ctx.AllowH2C || ctx.ListenerPrincipal != "spiffe://x" || ctx.NodeServiceCluster != "svc-a" || ctx.BaseDir != "/cfg" {
+	if !ctx.HasTLS || !ctx.AllowH2C || ctx.ListenerPrincipal != "spiffe://x" || ctx.NodeServiceCluster != "svc-a" || ctx.BaseDir != "/cfg" || !ctx.IsQUIC {
 		t.Fatalf("FactoryCtx field round-trip failed: %+v", ctx)
+	}
+}
+
+// TestFactoryCtxIsQUICDefaultsFalse verifies the zero-value FactoryCtx (as
+// built on every pre-existing TCP call site) carries IsQUIC=false, so
+// threading the field in (phase 61.2) leaves every TCP path unaffected.
+func TestFactoryCtxIsQUICDefaultsFalse(t *testing.T) {
+	var ctx FactoryCtx
+	if ctx.IsQUIC {
+		t.Fatalf("zero-value FactoryCtx.IsQUIC = true, want false")
 	}
 }
 

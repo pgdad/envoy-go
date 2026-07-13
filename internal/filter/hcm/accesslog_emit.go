@@ -136,6 +136,67 @@ func (f *Filter) emitAccessLogH2(req h2.H2Request, statusCode int, bytesSent int
 	}
 }
 
+// emitAccessLogH3 is the HTTP/3 access-log + span arm (sibling of emitAccessLog
+// (H1) / emitAccessLogH2). It reads from the native *http.Request (like the H1
+// emitAccessLog) but forces Protocol="HTTP/3" in BOTH the span
+// SpanInputs.Protocol and the Record.Protocol: the reference's %PROTOCOL% /
+// :protocol() emit "HTTP/3", not r.Proto's "HTTP/3.0" (the 61.3 differential
+// verifies the exact string cross-side). The span block precedes the
+// access-log early-return (AMEND-TRACE-SPANEND-SEAM), identical ordering to
+// emitAccessLog / emitAccessLogH2. Phase 61.2, ADR-0281.
+func (f *Filter) emitAccessLogH3(r *http.Request, statusCode int, bytesSent int64, picked cluster.Endpoint, start time.Time, respHeaders filter_http.OrderedHeaders, traceDecision *tracing.Decision) {
+	// SPAN BLOCK — must be BEFORE the access-log early-return (AMEND-TRACE-SPANEND-SEAM).
+	if statusCode != 0 && f.exporter != nil && traceDecision != nil && traceDecision.Sample {
+		reqSize := r.ContentLength
+		if reqSize < 0 {
+			reqSize = 0
+		}
+		// URL: scheme://authority/path-and-query. HTTP/3 is TLS-only, so the
+		// scheme is https whenever r.TLS is populated (quic-go always populates
+		// it in production); mirror the H1 nil-tolerant default for the
+		// unit-test path that leaves r.TLS unset.
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		url := scheme + "://" + r.Host + r.URL.RequestURI()
+		in := tracing.SpanInputs{
+			Method:            r.Method,
+			URL:               url,
+			Protocol:          "HTTP/3",
+			StatusCode:        statusCode,
+			UserAgent:         r.Header.Get("User-Agent"),
+			RequestSize:       reqSize,
+			ResponseSize:      bytesSent,
+			UpstreamCluster:   "", // not available at this seam; UNasserted in differential
+			DownstreamCluster: "-",
+			ResponseFlags:     "-",
+			ClientTraceID:     r.Header.Get("X-Client-Trace-Id"),
+			Authority:         r.Host,
+		}
+		f.exporter.Export(tracing.BuildServerSpan(*traceDecision, in, f.tracingConfig.CustomTags, start, time.Now()))
+	}
+	if statusCode == 0 || len(f.accessLog) == 0 {
+		return
+	}
+	rec := &accesslog.Record{
+		StartTime:    start,
+		Method:       r.Method,
+		Path:         r.URL.Path,
+		Protocol:     "HTTP/3",
+		ResponseCode: statusCode,
+		BytesSent:    bytesSent,
+		Duration:     time.Since(start),
+		Authority:    r.Host,
+		UserAgent:    r.Header.Get("User-Agent"),
+		UpstreamHost: upstreamHostString(picked),
+	}
+	f.captureRecordHeaders(rec, reqHeaderLookupH1(r), respHeaderLookup(respHeaders))
+	for _, s := range f.accessLog {
+		s.Submit(rec)
+	}
+}
+
 // captureRecordHeaders fills rec.RequestHeaders / rec.ResponseHeaders from the
 // configured capture union via the supplied lookups. It allocates a map ONLY
 // when the corresponding union is non-empty, so the no-capture path (empty
