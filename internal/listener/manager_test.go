@@ -1405,7 +1405,7 @@ func TestNewManager_ChainSelectionPropagation(t *testing.T) {
 	// bootstrap to declare the filter so SelectChain sees inputs.ServerName.
 	l.ListenerFilters = []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -1573,7 +1573,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithAllow(t *testing.T
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", true /* allowH2C */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err != nil {
 		t.Fatalf("NewManagerWithBaseDirAndAllowH2C(allowH2C=true) = %v, want nil", err)
 	}
@@ -1593,7 +1593,7 @@ func TestNewManagerWithBaseDirAndAllowH2C_HTTP2OnPlaintextWithoutAllow(t *testin
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h2c", "127.0.0.1", 0, mkHCMHTTP2Filter(t)),
 	}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false /* no allow */, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err == nil {
 		t.Fatal("NewManagerWithBaseDirAndAllowH2C(allowH2C=false) accepted plaintext+HTTP2; want error")
 	}
@@ -1754,7 +1754,7 @@ func TestParseListenerFiltersResolvesViaRegistry(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -1784,7 +1784,7 @@ func TestParseListenerFiltersUnknownTypeURLErrors(t *testing.T) {
 		}},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err == nil {
 		t.Fatal("expected error for unknown listener-filter type_url, got nil")
 	}
@@ -2160,7 +2160,7 @@ func TestParseListenerFiltersNilRegistryErrors(t *testing.T) {
 		ListenerFilters: []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil, nil, testNetRegistryWithTerminals(t, cm))
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), nil, nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err == nil {
 		t.Fatal("expected error for non-empty listener_filters[] with nil lfRegistry, got nil")
 	}
@@ -2388,7 +2388,7 @@ func TestUnifiedDispatchTLSWithSNI(t *testing.T) {
 	})
 	l.ListenerFilters = []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -2652,7 +2652,7 @@ func TestManager_Drain(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(10 * time.Millisecond)
-	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, testNetRegistryWithTerminals(t, cm))
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -2671,7 +2671,7 @@ func TestManager_DrainIdempotent(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(10 * time.Millisecond)
-	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, testNetRegistryWithTerminals(t, cm))
+	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, testNetRegistryWithTerminals(t, cm), nil)
 	m.Drain()
 	m.Drain()
 	m.Drain()
@@ -2688,7 +2688,7 @@ func TestManager_AcceptDuringDrainClosesConn(t *testing.T) {
 		mkListener("l_tcp_drain", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(1 * time.Hour)
-	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, testNetRegistryWithTerminals(t, cm))
+	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, testNetRegistryWithTerminals(t, cm), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := m.Start(ctx); err != nil {
@@ -2717,7 +2717,7 @@ func TestManager_StopAfterDrain(t *testing.T) {
 		mkListener("l_tcp", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 	dm := drain.New(10 * time.Millisecond)
-	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, testNetRegistryWithTerminals(t, cm))
+	m, _ := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), dm, nil, testNetRegistryWithTerminals(t, cm), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	_ = m.Start(ctx)
@@ -2803,7 +2803,7 @@ func TestBuildChainPureTerminalThroughNetReg(t *testing.T) {
 		mkListener("l_tcp_net", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
 
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err != nil {
 		t.Fatalf("NewManager([tcp_proxy] via netReg): %v", err)
 	}
@@ -2832,7 +2832,7 @@ func TestBuildChainMixedReadTerminalNowValid(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err != nil {
 		t.Fatalf("NewManager([echo, tcp_proxy]): %v (mixed read+terminal chain must now build)", err)
 	}
@@ -2860,7 +2860,7 @@ func TestBuildChainTerminalNotLastRejected(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err == nil {
 		t.Fatal("NewManager([tcp_proxy, echo]) returned nil error; expected terminal-not-last boot-reject")
 	}
@@ -2884,7 +2884,7 @@ func TestBuildChainMultipleTerminalsRejected(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err == nil {
 		t.Fatal("NewManager([tcp_proxy, hcm]) returned nil error; expected multiple-terminals boot-reject")
 	}
@@ -2899,7 +2899,7 @@ func TestBuildNewPathChainWhenFilterInNetReg(t *testing.T) {
 		mkListener("l_net_echo", "127.0.0.1", 0, mkEchoNetFilter(t)),
 	}, nil)
 
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry())
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry(), nil)
 	if err != nil {
 		t.Fatalf("NewManager(net echo chain): %v", err)
 	}
@@ -2937,7 +2937,7 @@ func TestNetChainLaterIndexNetRegMiss(t *testing.T) {
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry())
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry(), nil)
 	if err == nil {
 		t.Fatal("NewManager(later-index miss) returned nil error; expected unknown-type-url boot-reject")
 	}
@@ -2961,7 +2961,7 @@ func TestOldTerminalRegistryRetired(t *testing.T) {
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_tcp_miss", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry())
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry(), nil)
 	if err == nil {
 		t.Fatal("NewManager(netReg without tcp_proxy, [tcp_proxy]) returned nil; expected unknown-type-url boot-reject (old terminal path retired)")
 	}
@@ -2974,7 +2974,7 @@ func TestOldTerminalRegistryRetired(t *testing.T) {
 	boot2 := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_tcp_ok", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
-	mgr2, err := NewManagerWithBaseDirAndAllowH2C(boot2, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	mgr2, err := NewManagerWithBaseDirAndAllowH2C(boot2, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err != nil {
 		t.Fatalf("NewManager(builtins netReg, [tcp_proxy]): %v", err)
 	}
@@ -2992,7 +2992,7 @@ func TestNilNetRegRejectsFilterChain(t *testing.T) {
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_tcp_nilreg", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil)
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, nil, nil)
 	if err == nil {
 		t.Fatal("NewManager(nil netReg, [tcp_proxy]) returned nil error; expected a boot error (no old terminal path)")
 	}
@@ -3015,7 +3015,7 @@ func TestBuildChainUnknownTypeWordingPreserved(t *testing.T) {
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_unknown", "127.0.0.1", 0, bad),
 	}, nil)
-	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	_, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err == nil {
 		t.Fatal("NewManager(unknown filters[0] type_url) returned nil error; expected unknown-type-url boot-reject")
 	}
@@ -3039,7 +3039,7 @@ func startNetChainListener(t *testing.T, filters ...*listenerv3.Filter) string {
 		FilterChains: []*listenerv3.FilterChain{{Filters: filters}},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry())
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistry(), nil)
 	if err != nil {
 		t.Fatalf("NewManager(net chain): %v", err)
 	}
@@ -3152,7 +3152,7 @@ func startNetChainListenerWithReg(t *testing.T, cm *cluster.Manager, netReg *net
 		FilterChains: []*listenerv3.FilterChain{{Filters: filters}},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, netReg)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, netReg, nil)
 	if err != nil {
 		t.Fatalf("NewManager(net chain w/ terminals): %v", err)
 	}
@@ -3376,7 +3376,7 @@ func TestListenerFilterPeekBufferSizeHintPlumbed(t *testing.T) {
 		}},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -3405,7 +3405,7 @@ func TestListenerFilterPeekBufferSizeHintDefaults(t *testing.T) {
 	}
 	noFilters := mkListener("l_no_lf", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo"))
 	boot := mkBoot(0, []*listenerv3.Listener{withInspector, noFilters}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -3426,7 +3426,7 @@ func TestListenersConcurrentWithStopIsRaceClean(t *testing.T) {
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_race", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
 	}, nil)
-	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	m, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}

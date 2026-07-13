@@ -1,12 +1,15 @@
 package tls
 
 import (
+	"context"
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"fmt"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+
+	xds "github.com/pgdad/envoy-go/internal/xds"
 )
 
 const (
@@ -30,8 +33,10 @@ type UpstreamConfig struct {
 
 // NewDownstreamConfig parses a *corev3.TransportSocket whose typed_config is a
 // DownstreamTlsContext. baseDir is used to resolve filename-based DataSources.
-// Errors begin with "tls: downstream: ".
-func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string) (*DownstreamConfig, error) {
+// provider (phase 60.2, ADR-0280) is consulted when the common_tls_context
+// carries a tls_certificate_sds_secret_configs entry — see
+// commonTLSContextToConfig. Errors begin with "tls: downstream: ".
+func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string, provider xds.SecretProvider) (*DownstreamConfig, error) {
 	if ts == nil {
 		return nil, fmt.Errorf("tls: downstream: nil transport_socket")
 	}
@@ -42,7 +47,7 @@ func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string) (*Downstrea
 	if err := ts.GetTypedConfig().UnmarshalTo(ctx); err != nil {
 		return nil, fmt.Errorf("tls: downstream: unmarshal: %w", err)
 	}
-	cfg, err := commonTLSContextToConfig(ctx.GetCommonTlsContext(), baseDir, "downstream")
+	cfg, err := commonTLSContextToConfig(ctx.GetCommonTlsContext(), baseDir, "downstream", provider)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +106,7 @@ func NewUpstreamConfig(ts *corev3.TransportSocket, baseDir string) (*UpstreamCon
 		return nil, fmt.Errorf("tls: upstream: validation_context.trusted_ca is required (phase 03 does not permit unvalidated upstream TLS)")
 	}
 
-	cfg, err := commonTLSContextToConfig(common, baseDir, "upstream")
+	cfg, err := commonTLSContextToConfig(common, baseDir, "upstream", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -134,25 +139,55 @@ func loadTrustedCAPool(vc *tlsv3.CertificateValidationContext, baseDir, side str
 }
 
 // commonTLSContextToConfig builds a *stdtls.Config carrying Certificates (from
-// tls_certificates[]) and NextProtos (from alpn_protocols), plus
-// tls_params-mapped fields. side is "downstream" or "upstream" and prefixes
-// every error.
+// tls_certificates[] and, downstream-only, an SDS-delivered leaf) and
+// NextProtos (from alpn_protocols), plus tls_params-mapped fields. side is
+// "downstream" or "upstream" and prefixes every error. provider is the
+// phase-60.2 (ADR-0280) SDS seam — consulted only when side=="downstream" and
+// the config carries a tls_certificate_sds_secret_configs entry; nil for
+// upstream/validate callers, which never fetch SDS.
 //
 // Phase-03 forbids the following; each errors with a clear message:
-//   - tls_certificate_sds_secret_configs set
+//   - tls_certificate_sds_secret_configs set (upstream/validate only — see
+//     the ADR-0280 downstream lift below)
 //   - validation_context_sds_secret_config set
 //   - combined_validation_context set
 //   - custom_validator_config set
 //   - match_typed_subject_alt_names set
 //   - verify_certificate_hash / verify_certificate_spki set
 //   - password on key
-func commonTLSContextToConfig(c *tlsv3.CommonTlsContext, baseDir, side string) (*stdtls.Config, error) {
+func commonTLSContextToConfig(c *tlsv3.CommonTlsContext, baseDir, side string, provider xds.SecretProvider) (*stdtls.Config, error) {
 	if c == nil {
 		return nil, fmt.Errorf("tls: %s: common_tls_context is required", side)
 	}
+
+	// SDS-bound downstream server certificate (phase 60.2, ADR-0280). The
+	// upstream/validate paths keep the byte-identical reject (arm 6). Downstream
+	// with a provider present: validate the SdsSecretConfig (arms 1-4,8,9 live in
+	// xds.ParseSDSConfig), then BLOCK on the first Secret (bounded by
+	// initial_fetch_timeout inside the provider) and hold the built leaf; it is
+	// appended to cfg.Certificates after cfg is created below. On timeout /
+	// mgmt-unreachable the provider returns a classified error that PROPAGATES
+	// here → the listener build FAILS → boot FAILS (the documented envoy-go
+	// DEPARTURE from the reference's serve-cert-less behavior, SPEC §3.4).
+	var sdsCert *stdtls.Certificate
 	if len(c.GetTlsCertificateSdsSecretConfigs()) > 0 {
-		return nil, fmt.Errorf("tls: %s: SDS-bound tls_certificate_sds_secret_configs is not supported in phase 03", side)
+		if side != "downstream" {
+			return nil, fmt.Errorf("tls: %s: SDS-bound tls_certificate_sds_secret_configs is not supported in phase 03", side)
+		}
+		secretName, _, _, err := xds.ParseSDSConfig(c.GetTlsCertificateSdsSecretConfigs())
+		if err != nil {
+			return nil, fmt.Errorf("tls: downstream: %w", err)
+		}
+		if provider == nil {
+			return nil, fmt.Errorf("tls: downstream: SDS-delivered certificate requires a live SDS provider (unavailable in this mode)")
+		}
+		cert, err := provider.FetchInitialCertificate(context.Background(), secretName)
+		if err != nil {
+			return nil, fmt.Errorf("tls: downstream: SDS secret %q: %w", secretName, err)
+		}
+		sdsCert = cert
 	}
+
 	if c.GetValidationContextType() != nil {
 		switch c.GetValidationContextType().(type) {
 		case *tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig:
@@ -177,6 +212,10 @@ func commonTLSContextToConfig(c *tlsv3.CommonTlsContext, baseDir, side string) (
 	}
 
 	cfg := &stdtls.Config{}
+
+	if sdsCert != nil {
+		cfg.Certificates = append(cfg.Certificates, *sdsCert)
+	}
 
 	for i, tc := range c.GetTlsCertificates() {
 		if tc.GetPassword() != nil {

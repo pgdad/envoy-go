@@ -38,7 +38,7 @@ func TestNewManager_LiveHandshake_UnmatchedSNI_NoCatchAll_Aborts(t *testing.T) {
 	// tls_inspector is required for SNI to reach SelectChain (ADR-0079).
 	l.ListenerFilters = []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm))
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}

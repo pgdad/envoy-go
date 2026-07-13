@@ -84,7 +84,7 @@ func FuzzTLSContextParse(f *testing.F) {
 		var err error
 		switch side {
 		case "downstream":
-			_, err = NewDownstreamConfig(ts, "")
+			_, err = NewDownstreamConfig(ts, "", nil)
 		case "upstream":
 			_, err = NewUpstreamConfig(ts, "")
 		default:

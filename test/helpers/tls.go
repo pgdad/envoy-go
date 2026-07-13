@@ -55,3 +55,26 @@ func TLSRoundTrip(ctx context.Context, addr, serverName string, rootCAs *x509.Ce
 	}
 	return got, nil
 }
+
+// TLSServedLeaf dials addr, completes a TLS handshake (validating against rootCAs
+// + serverName), and returns the leaf the SERVER presented
+// (ConnectionState().PeerCertificates[0]) — used by cross-side differentials that
+// assert the served certificate identity. It performs no application I/O.
+func TLSServedLeaf(ctx context.Context, addr, serverName string, rootCAs *x509.CertPool) (*x509.Certificate, error) {
+	d := &net.Dialer{}
+	raw, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("tls served leaf: dial: %w", err)
+	}
+	conn := stdtls.Client(raw, &stdtls.Config{ServerName: serverName, RootCAs: rootCAs, MinVersion: stdtls.VersionTLS12, MaxVersion: stdtls.VersionTLS13})
+	defer func() { _ = conn.Close() }()
+	if err := conn.HandshakeContext(ctx); err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("tls served leaf: handshake: %w", err)
+	}
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("tls served leaf: no peer certificates")
+	}
+	return certs[0], nil
+}

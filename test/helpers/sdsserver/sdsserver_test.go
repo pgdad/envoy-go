@@ -145,3 +145,51 @@ func TestStop_Idempotent(t *testing.T) {
 	srv.Stop()
 	srv.Stop()
 }
+
+// TestNewAtAddr_DeliversConfiguredSecret proves NewAtAddr (the caller-owned-
+// lifecycle constructor consumed by the 0103 differential driver) binds the
+// supplied address and serves exactly like New(t), and that the caller (not
+// t.Cleanup) is responsible for Stop.
+func TestNewAtAddr_DeliversConfiguredSecret(t *testing.T) {
+	certPEM, keyPEM := genSelfSignedCert(t)
+	srv, err := NewAtAddr("127.0.0.1:0", WithSecret("s", certPEM, keyPEM))
+	if err != nil {
+		t.Fatalf("NewAtAddr: %v", err)
+	}
+	if srv == nil {
+		t.Fatal("NewAtAddr: got nil server, nil error")
+	}
+	defer srv.Stop()
+
+	client := dialTestClient(t, srv.Addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := client.StreamSecrets(ctx)
+	if err != nil {
+		t.Fatalf("StreamSecrets: %v", err)
+	}
+	req := &discoveryv3.DiscoveryRequest{
+		ResourceNames: []string{"s"},
+		TypeUrl:       secretTypeURL,
+		Node:          &corev3.Node{Id: "n", Cluster: "c"},
+	}
+	if err := stream.Send(req); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	resp, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if len(resp.GetResources()) != 1 {
+		t.Fatalf("Resources: got %d, want 1", len(resp.GetResources()))
+	}
+	var sec tlsv3.Secret
+	if err := resp.GetResources()[0].UnmarshalTo(&sec); err != nil {
+		t.Fatalf("UnmarshalTo(Secret): %v", err)
+	}
+	if sec.GetName() != "s" {
+		t.Errorf("Secret.Name: got %q, want %q", sec.GetName(), "s")
+	}
+}

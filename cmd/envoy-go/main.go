@@ -148,6 +148,15 @@ func main() {
 	// Task 3) for the Zipkin arm's v2-JSON ClusterDispatch POSTs.
 	httpClient := httpclient.New(httpclient.Options{Timeout: 30 * time.Second})
 	tracingProvider := boot.NewTracingProvider(dialer, httpClient, cm, bs.Stats)
+	// Phase 60.2 Task 5 (ADR-0280): pre-scan bs for a downstream SDS-bound TLS
+	// context and, when present, build the blocking xds.SecretProvider — nil
+	// when no listener carries tls_certificate_sds_secret_configs (the tls
+	// lift only engages then). Built here (not inside boot.Construct) because
+	// it needs the shared dialer, mirroring tracingProvider immediately above.
+	sdsProvider, err := boot.NewSDSProvider(dialer, bs, filepath.Dir(*cfgPath), bs.Stats)
+	if err != nil {
+		log.Fatalf("sds provider: %v", err)
+	}
 	// minNode is the minimal Node (Id/Cluster only) shared by the gRPC ALS
 	// access-log sink and the metrics_service stats sink below. The OTLP
 	// access-log sink deliberately does NOT use it — its Resource labels need
@@ -292,7 +301,7 @@ func main() {
 	// listener manager itself) is built by the shared internal/boot.Construct
 	// seam, so main.go's normal boot path and the public validate package
 	// (Task 4) can never silently diverge on what "valid" means.
-	lm, err := boot.Construct(bs, cm, filepath.Dir(*cfgPath), *allowH2C, sinks, drainMgr, httpClient, tracingProvider)
+	lm, err := boot.Construct(bs, cm, filepath.Dir(*cfgPath), *allowH2C, sinks, drainMgr, httpClient, tracingProvider, sdsProvider)
 	if err != nil {
 		log.Fatalf("listener manager: %v", err)
 	}

@@ -1,0 +1,95 @@
+# envoy-go bootstrap for fixture 0103-xds-sds-server-cert.
+#
+# Functionally equivalent to envoy.yaml modulo:
+#   - cluster type: STATIC (envoy-go convention per ADR-0002) vs STRICT_DNS.
+#   - cluster endpoint addresses: 127.0.0.1 (envoy-go runs on the host
+#     loopback) vs host.docker.internal (reference Envoy runs in a Docker
+#     container).
+#   - admin/listener ports independently allocated by the runner.
+#
+# Single-listener downstream-TLS topology: one TLS-terminating tcp_proxy
+# listener (l_sds_tls) whose DownstreamTlsContext carries a
+# tls_certificate_sds_secret_configs entry naming secret "server_cert",
+# fetched over a SotW SDS gRPC stream against cluster sds_cluster — the
+# driver-owned in-process test/helpers/sdsserver receiver on the host
+# loopback. No tls_inspector listener filter is needed (a single filter
+# chain, no SNI match — the 0018-http-rbac precedent).
+#
+# node: {id, cluster} is REQUIRED — SDS boot-fails without it (arm 7,
+# internal/boot.NewSDSProvider).
+#
+# Templating: rendered by the driver's mustRender() at SubjectConfig time.
+# Substitution keys:
+#   {{.AdminPort}}   — admin endpoint port (runner-allocated).
+#   {{.ListenPort}}  — l_sds_tls listener port (runner-allocated).
+#   {{.BackendPort}} — TCP echo backend port (runner-allocated, loopback).
+#   {{.SDSPort}}     — driver-owned sdsserver.Server receiver port
+#                       (driver-allocated; pre-bound on 0.0.0.0:<port> before
+#                       the subject starts).
+node:
+  id: envoygo-node
+  cluster: envoygo-cluster
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+static_resources:
+  listeners:
+    - name: l_sds_tls
+      address:
+        socket_address: { address: 0.0.0.0, port_value: {{.ListenPort}} }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - name: server_cert
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc:
+                              cluster_name: sds_cluster
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_sds_tls
+                cluster: c_backend
+
+  clusters:
+    # c_backend: TCP echo backend on host loopback (BackendCount=1). The
+    # observable is the served leaf, not the echoed bytes.
+    - name: c_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.BackendPort}} }
+    # sds_cluster: driver-owned in-process sdsserver.Server SDS receiver on
+    # host loopback. MANDATORY http2_protocol_options: {} for gRPC framing.
+    # Plaintext h2c — no TLS.
+    - name: sds_cluster
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: sds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.SDSPort}} }

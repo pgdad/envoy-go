@@ -1,9 +1,11 @@
 package tls
 
 import (
+	"context"
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -111,7 +113,7 @@ func TestNewDownstreamConfig_Happy(t *testing.T) {
 				},
 			},
 		})
-		cfg, err := NewDownstreamConfig(ts, "")
+		cfg, err := NewDownstreamConfig(ts, "", nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -138,7 +140,7 @@ func TestNewDownstreamConfig_Happy(t *testing.T) {
 				},
 			},
 		})
-		cfg, err := NewDownstreamConfig(ts, "")
+		cfg, err := NewDownstreamConfig(ts, "", nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -162,7 +164,7 @@ func TestNewDownstreamConfig_Happy(t *testing.T) {
 				AlpnProtocols: []string{"h2", "http/1.1"},
 			},
 		})
-		cfg, err := NewDownstreamConfig(ts, "")
+		cfg, err := NewDownstreamConfig(ts, "", nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -182,7 +184,7 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 	t.Run("wrong type_url", func(t *testing.T) {
 		// Use a non-DownstreamTlsContext proto to get a wrong type_url.
 		ts := makeTransportSocket(t, wrapperspb.String("nope"))
-		_, err := NewDownstreamConfig(ts, "")
+		_, err := NewDownstreamConfig(ts, "", nil)
 		if err == nil {
 			t.Fatal("expected error for wrong type_url, got nil")
 		}
@@ -205,7 +207,7 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 			Name:       "envoy.transport_sockets.tls",
 			ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: anyMsg},
 		}
-		_, err = NewDownstreamConfig(ts, "")
+		_, err = NewDownstreamConfig(ts, "", nil)
 		if err == nil {
 			t.Fatal("expected error for corrupted Any bytes, got nil")
 		}
@@ -221,7 +223,7 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
 			CommonTlsContext: &tlsv3.CommonTlsContext{},
 		})
-		_, err := NewDownstreamConfig(ts, "")
+		_, err := NewDownstreamConfig(ts, "", nil)
 		if err == nil {
 			t.Fatal("expected error for missing tls_certificates, got nil")
 		}
@@ -244,7 +246,7 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 				},
 			},
 		})
-		_, err := NewDownstreamConfig(ts, "")
+		_, err := NewDownstreamConfig(ts, "", nil)
 		if err == nil {
 			t.Fatal("expected error for malformed PEM, got nil")
 		}
@@ -256,7 +258,14 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 		}
 	})
 
-	t.Run("SDS-bound secret", func(t *testing.T) {
+	t.Run("SDS-bound secret, malformed SdsSecretConfig", func(t *testing.T) {
+		// Phase 60.2 (ADR-0280) lifts the wholesale downstream SDS reject:
+		// tls_certificate_sds_secret_configs is now routed through
+		// xds.ParseSDSConfig, whose own reject arms (unprefixed "xds: sds:")
+		// fire for a malformed SdsSecretConfig — here, a missing sds_config —
+		// BEFORE the nil-provider / fetch path is ever reached. See
+		// TestNewDownstreamConfig_SDS for the accept/timeout/nil-provider/
+		// ads-sourced arms exercised via a well-formed config.
 		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
 			CommonTlsContext: &tlsv3.CommonTlsContext{
 				TlsCertificateSdsSecretConfigs: []*tlsv3.SdsSecretConfig{
@@ -264,15 +273,12 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 				},
 			},
 		})
-		_, err := NewDownstreamConfig(ts, "")
+		_, err := NewDownstreamConfig(ts, "", nil)
 		if err == nil {
-			t.Fatal("expected error for SDS-bound secret, got nil")
+			t.Fatal("expected error for malformed SDS-bound secret, got nil")
 		}
-		if !strings.HasPrefix(err.Error(), "tls: ") {
-			t.Errorf("error should begin with 'tls: ', got: %v", err)
-		}
-		if !strings.Contains(err.Error(), "SDS") {
-			t.Errorf("error should contain 'SDS', got: %v", err)
+		if !strings.Contains(err.Error(), "sds_config") {
+			t.Errorf("error should contain 'sds_config', got: %v", err)
 		}
 	})
 
@@ -293,7 +299,7 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 				},
 			},
 		})
-		_, err := NewDownstreamConfig(ts, "")
+		_, err := NewDownstreamConfig(ts, "", nil)
 		if err == nil {
 			t.Fatal("expected error for require_client_certificate without trusted_ca, got nil")
 		}
@@ -329,7 +335,7 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 				},
 			},
 		})
-		cfg, err := NewDownstreamConfig(ts, "")
+		cfg, err := NewDownstreamConfig(ts, "", nil)
 		if err != nil {
 			t.Fatalf("expected success, got: %v", err)
 		}
@@ -357,7 +363,7 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 				},
 			},
 		})
-		_, err := NewDownstreamConfig(ts, "")
+		_, err := NewDownstreamConfig(ts, "", nil)
 		if err == nil {
 			t.Fatal("expected error for custom_validator_config, got nil")
 		}
@@ -385,7 +391,7 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 				},
 			},
 		})
-		_, err := NewDownstreamConfig(ts, "")
+		_, err := NewDownstreamConfig(ts, "", nil)
 		if err == nil {
 			t.Fatal("expected error for match_typed_subject_alt_names, got nil")
 		}
@@ -413,7 +419,7 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 				},
 			},
 		})
-		_, err := NewDownstreamConfig(ts, "")
+		_, err := NewDownstreamConfig(ts, "", nil)
 		if err == nil {
 			t.Fatal("expected error for verify_certificate_hash, got nil")
 		}
@@ -439,7 +445,7 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 				},
 			},
 		})
-		_, err := NewDownstreamConfig(ts, "")
+		_, err := NewDownstreamConfig(ts, "", nil)
 		if err == nil {
 			t.Fatal("expected error for password-protected key, got nil")
 		}
@@ -465,7 +471,7 @@ func TestNewDownstreamConfig_Errors(t *testing.T) {
 				},
 			},
 		})
-		_, err := NewDownstreamConfig(ts, "")
+		_, err := NewDownstreamConfig(ts, "", nil)
 		if err == nil {
 			t.Fatal("expected error for TLSv1_0, got nil")
 		}
@@ -784,4 +790,184 @@ func TestPKISanity(t *testing.T) {
 
 	// Verify strings is used via the other tests to avoid unused import.
 	_ = strings.TrimSpace
+}
+
+// fakeProvider is a test-only xds.SecretProvider whose FetchInitialCertificate
+// returns a canned (cert, err) pair. It mirrors the shape of internal/xds's
+// real Provider without any of the stream-opening machinery.
+type fakeProvider struct {
+	cert *stdtls.Certificate
+	err  error
+}
+
+func (f *fakeProvider) FetchInitialCertificate(ctx context.Context, secretName string) (*stdtls.Certificate, error) {
+	return f.cert, f.err
+}
+
+// sdsSecretConfig builds a valid *tlsv3.SdsSecretConfig (api_config_source,
+// GRPC, V3, envoy_grpc -> cluster, resource_api_version V3) that mut can
+// corrupt to exercise xds.ParseSDSConfig's reject arms from this package's
+// call site. Mirrors internal/xds/config_test.go's sdsCfg helper — duplicated
+// here (rather than imported) because that helper is unexported test-only.
+func sdsSecretConfig(name, cluster string, mut ...func(*corev3.ConfigSource)) *tlsv3.SdsSecretConfig {
+	cs := &corev3.ConfigSource{
+		ConfigSourceSpecifier: &corev3.ConfigSource_ApiConfigSource{
+			ApiConfigSource: &corev3.ApiConfigSource{
+				ApiType:             corev3.ApiConfigSource_GRPC,
+				TransportApiVersion: corev3.ApiVersion_V3,
+				GrpcServices: []*corev3.GrpcService{
+					{
+						TargetSpecifier: &corev3.GrpcService_EnvoyGrpc_{
+							EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{
+								ClusterName: cluster,
+							},
+						},
+					},
+				},
+			},
+		},
+		ResourceApiVersion: corev3.ApiVersion_V3,
+	}
+	for _, m := range mut {
+		m(cs)
+	}
+	return &tlsv3.SdsSecretConfig{
+		Name:      name,
+		SdsConfig: cs,
+	}
+}
+
+// sdsDownstreamTS builds a DownstreamTlsContext whose common_tls_context has a
+// single valid tls_certificate_sds_secret_configs entry (api_config_source
+// GRPC/V3), wrapped in a TransportSocket. mut is forwarded to sdsSecretConfig
+// so callers can corrupt the ConfigSource to probe xds.ParseSDSConfig's reject
+// arms via NewDownstreamConfig.
+func sdsDownstreamTS(t *testing.T, secret, cluster string, mut ...func(*corev3.ConfigSource)) *corev3.TransportSocket {
+	t.Helper()
+	return makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			TlsCertificateSdsSecretConfigs: []*tlsv3.SdsSecretConfig{sdsSecretConfig(secret, cluster, mut...)},
+		},
+	})
+}
+
+// sdsUpstreamTS builds an UpstreamTlsContext whose common_tls_context has a
+// single valid tls_certificate_sds_secret_configs entry plus a trusted_ca (so
+// NewUpstreamConfig's pre-commonTLSContextToConfig trusted_ca check passes and
+// the SDS reject inside commonTLSContextToConfig — arm 6 — is what fires).
+func sdsUpstreamTS(t *testing.T, secret, cluster string) *corev3.TransportSocket {
+	t.Helper()
+	return makeTransportSocket(t, &tlsv3.UpstreamTlsContext{
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			TlsCertificateSdsSecretConfigs: []*tlsv3.SdsSecretConfig{sdsSecretConfig(secret, cluster)},
+			ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+				ValidationContext: &tlsv3.CertificateValidationContext{
+					TrustedCa: inlineBytes(pki.caPEM),
+				},
+			},
+		},
+	})
+}
+
+// TestNewDownstreamConfig_SDS exercises the phase-60.2 (ADR-0280) downstream
+// SDS lift: a well-formed tls_certificate_sds_secret_configs entry is parsed
+// via xds.ParseSDSConfig, then (given a live provider) blocks on
+// FetchInitialCertificate and appends the resulting leaf to cfg.Certificates.
+func TestNewDownstreamConfig_SDS(t *testing.T) {
+	t.Run("accept via fake provider", func(t *testing.T) {
+		leaf, err := stdtls.X509KeyPair(pki.leafCertPEM, pki.leafKeyPEM)
+		if err != nil {
+			t.Fatalf("X509KeyPair: %v", err)
+		}
+		cfg, err := NewDownstreamConfig(sdsDownstreamTS(t, "server_cert", "sds_cluster"), "", &fakeProvider{cert: &leaf})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg == nil || cfg.TLSConfig == nil {
+			t.Fatal("expected non-nil DownstreamConfig with non-nil TLSConfig")
+		}
+		if len(cfg.TLSConfig.Certificates) != 1 {
+			t.Errorf("got %d certificates, want 1", len(cfg.TLSConfig.Certificates))
+		}
+	})
+
+	t.Run("timeout propagation", func(t *testing.T) {
+		providerErr := fmt.Errorf("xds: sds: secret %q: initial fetch timed out after 15s", "server_cert")
+		_, err := NewDownstreamConfig(sdsDownstreamTS(t, "server_cert", "sds_cluster"), "", &fakeProvider{err: providerErr})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "initial fetch timed out") {
+			t.Errorf("error should contain 'initial fetch timed out', got: %v", err)
+		}
+	})
+
+	t.Run("nil provider with valid SDS config", func(t *testing.T) {
+		_, err := NewDownstreamConfig(sdsDownstreamTS(t, "server_cert", "sds_cluster"), "", nil)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "requires a live SDS provider") {
+			t.Errorf("error should contain 'requires a live SDS provider', got: %v", err)
+		}
+	})
+
+	t.Run("ads-sourced ConfigSource rejected before fetch", func(t *testing.T) {
+		leaf, err := stdtls.X509KeyPair(pki.leafCertPEM, pki.leafKeyPEM)
+		if err != nil {
+			t.Fatalf("X509KeyPair: %v", err)
+		}
+		ts := sdsDownstreamTS(t, "server_cert", "sds_cluster", func(cs *corev3.ConfigSource) {
+			cs.ConfigSourceSpecifier = &corev3.ConfigSource_Ads{Ads: &corev3.AggregatedConfigSource{}}
+		})
+		// A fake provider that would ACCEPT is deliberately present: if
+		// ParseSDSConfig's validation didn't run before the fetch, this
+		// config would wrongly succeed instead of rejecting on "ads-sourced".
+		_, err = NewDownstreamConfig(ts, "", &fakeProvider{cert: &leaf})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "ads-sourced") {
+			t.Errorf("error should contain 'ads-sourced', got: %v", err)
+		}
+	})
+
+	t.Run("validation_context_sds_secret_config unchanged (arm 5)", func(t *testing.T) {
+		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+			CommonTlsContext: &tlsv3.CommonTlsContext{
+				TlsCertificates: []*tlsv3.TlsCertificate{
+					{
+						CertificateChain: inlineBytes(pki.leafCertPEM),
+						PrivateKey:       inlineBytes(pki.leafKeyPEM),
+					},
+				},
+				ValidationContextType: &tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
+					ValidationContextSdsSecretConfig: &tlsv3.SdsSecretConfig{Name: "validation-secret"},
+				},
+			},
+		})
+		_, err := NewDownstreamConfig(ts, "", nil)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "validation_context_sds_secret_config is not supported") {
+			t.Errorf("error should contain 'validation_context_sds_secret_config is not supported', got: %v", err)
+		}
+	})
+}
+
+// TestNewUpstreamConfig_SDS asserts arm 6: the upstream (and validate) side
+// keeps the byte-identical pre-60.2 wholesale reject for
+// tls_certificate_sds_secret_configs — SDS delivery is downstream-only.
+func TestNewUpstreamConfig_SDS(t *testing.T) {
+	t.Run("SDS-bound tls_certificate_sds_secret_configs rejected (arm 6)", func(t *testing.T) {
+		_, err := NewUpstreamConfig(sdsUpstreamTS(t, "c", "cl"), "")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		want := "tls: upstream: SDS-bound tls_certificate_sds_secret_configs is not supported in phase 03"
+		if err.Error() != want {
+			t.Errorf("error = %q, want %q (byte-identical to the pre-60.2 reject)", err.Error(), want)
+		}
+	})
 }

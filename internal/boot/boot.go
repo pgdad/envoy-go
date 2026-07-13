@@ -13,6 +13,10 @@ import (
 	"strings"
 	"time"
 
+	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/pgdad/envoy-go/internal/accesslog"
 	"github.com/pgdad/envoy-go/internal/bootstrap"
 	"github.com/pgdad/envoy-go/internal/cluster"
@@ -28,6 +32,8 @@ import (
 	"github.com/pgdad/envoy-go/internal/listener/listenerfilter/tls_inspector"
 	"github.com/pgdad/envoy-go/internal/stats"
 	"github.com/pgdad/envoy-go/internal/tracing"
+	"github.com/pgdad/envoy-go/internal/xds"
+	xdsgrpc "github.com/pgdad/envoy-go/internal/xds/xdsgrpc"
 )
 
 // Construct builds the three filter-type registries (HTTP, listener,
@@ -59,6 +65,7 @@ func Construct(
 	dm *drain.Manager,
 	httpClient *httpclient.Client,
 	tracingProvider *tracing.ExporterProvider,
+	sdsProvider xds.SecretProvider,
 ) (*listener.Manager, error) {
 	httpReg := filter_http.NewHTTPRegistry()
 	httpbuiltins.RegisterBuiltins(httpReg)
@@ -81,7 +88,7 @@ func Construct(
 	netReg.Freeze()
 
 	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(
-		bs.Proto, cm, baseDir, allowH2C, bs.Stats, sinks, httpReg, lfReg, dm, httpClient, netReg,
+		bs.Proto, cm, baseDir, allowH2C, bs.Stats, sinks, httpReg, lfReg, dm, httpClient, netReg, sdsProvider,
 	)
 	if err != nil {
 		return nil, maybeWrapLuaScriptLoadError(err)
@@ -95,6 +102,66 @@ func Construct(
 // and validate call this so neither duplicates the two adapter types.
 func NewTracingProvider(dialer *grpcclient.Dialer, httpClient *httpclient.Client, cm *cluster.Manager, registry *stats.Registry) *tracing.ExporterProvider {
 	return tracing.NewExporterProvider(tracesDialerAdapter{dialer}, zipkinTransportAdapter{httpClient, cm}, registry, 16384, time.Second)
+}
+
+// NewSDSProvider pre-scans bs for the (single, MVP) downstream SDS-bound TLS
+// context and, when present, builds the blocking xds.SecretProvider that
+// internal/tls consults at listener construction (phase 60.2, ADR-0280). It
+// mirrors NewTracingProvider: built once at boot from the shared dialer, then
+// threaded through Construct into the listener build. Returns (nil, nil) when no
+// SDS cert is configured (the nil provider threads harmlessly — the tls lift
+// only engages when a listener actually carries tls_certificate_sds_secret_configs).
+//
+// Enforces the NODE boot-requirement (arm 7, SPEC §6/§11 Arm A-pre): SDS
+// configured while bootstrap node.id/node.cluster are empty ⇒ boot-fail. The
+// cluster/secret/timeout are extracted via xds.ParseSDSConfig (arms 1-4,8,9);
+// the *grpcclient.SDSClient edge is carried by xdsgrpc.NewOpener so internal/xds
+// stays grpcclient-free (the ADR-0278 cycle guard).
+func NewSDSProvider(dialer *grpcclient.Dialer, bs *bootstrap.Bootstrap, baseDir string, registry *stats.Registry) (xds.SecretProvider, error) {
+	dtcTypeURL := "type.googleapis.com/" + string(proto.MessageName(&tlsv3.DownstreamTlsContext{}))
+	var found []*tlsv3.SdsSecretConfig
+	seen := 0
+	for _, l := range bs.Proto.GetStaticResources().GetListeners() {
+		chains := append([]*listenerv3.FilterChain{}, l.GetFilterChains()...)
+		if dfc := l.GetDefaultFilterChain(); dfc != nil {
+			chains = append(chains, dfc)
+		}
+		for _, fc := range chains {
+			ts := fc.GetTransportSocket()
+			if ts == nil || ts.GetTypedConfig().GetTypeUrl() != dtcTypeURL {
+				continue
+			}
+			var dtc tlsv3.DownstreamTlsContext
+			if err := ts.GetTypedConfig().UnmarshalTo(&dtc); err != nil {
+				continue // a malformed transport_socket surfaces at the listener build, not here
+			}
+			if sc := dtc.GetCommonTlsContext().GetTlsCertificateSdsSecretConfigs(); len(sc) > 0 {
+				seen++
+				found = sc
+			}
+		}
+	}
+	if seen == 0 {
+		return nil, nil
+	}
+	if seen > 1 {
+		return nil, fmt.Errorf("xds: sds: multiple SDS-bound downstream TLS contexts unsupported (MVP takes one)")
+	}
+	node := bs.Proto.GetNode()
+	if node.GetId() == "" || node.GetCluster() == "" {
+		return nil, fmt.Errorf("xds: sds: node.id and node.cluster are required for SDS")
+	}
+	secretName, clusterName, timeout, err := xds.ParseSDSConfig(found)
+	if err != nil {
+		return nil, err
+	}
+	client, err := grpcclient.NewSDSClient(dialer, clusterName)
+	if err != nil {
+		return nil, fmt.Errorf("xds: sds: dial cluster %q: %w", clusterName, err)
+	}
+	opener := xdsgrpc.NewOpener(client)
+	sdsStats := xds.RegisterSDSStats(registry, secretName)
+	return xds.NewProvider(opener, xds.Node{ID: node.GetId(), Cluster: node.GetCluster()}, baseDir, timeout, sdsStats), nil
 }
 
 // luaCompileErrorSubstring is the byte-stable arm-16 wrap prefix emitted by

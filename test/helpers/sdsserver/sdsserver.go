@@ -61,6 +61,14 @@ func New(t testing.TB, opts ...Option) *Server {
 	return s
 }
 
+// NewAtAddr binds the caller-supplied host:port (e.g. "0.0.0.0:<preAllocatedPort>"
+// so a Docker reference-Envoy can dial the host) and starts the server. No
+// t.Cleanup — the CALLER (a fixture driver) owns the lifecycle via Server.Stop.
+// Mirrors metricsservice.NewAtAddr.
+func NewAtAddr(addr string, opts ...Option) (*Server, error) {
+	return newServer(addr, opts...)
+}
+
 func newServer(addr string, opts ...Option) (*Server, error) {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -138,3 +146,13 @@ func (s *Server) Requests() []*discoveryv3.DiscoveryRequest {
 
 // Stop GracefulStops the server; idempotent via sync.Once.
 func (s *Server) Stop() { s.stopOnce.Do(s.grpcSrv.GracefulStop) }
+
+// Close is the immediate hard-stop variant of Stop (GracefulStop) for callers
+// (e.g. a differential fixture driver) that want deterministic teardown
+// without waiting on a still-open proxy StreamSecrets stream. Like
+// metricsservice's StreamMetrics, SDS's StreamSecrets is long-lived — the
+// proxy keeps the stream open indefinitely awaiting future secret rotations —
+// so GracefulStop would block until the test timeout. Close calls
+// grpc.Server.Stop (cancels in-flight calls, returns at once) and shares the
+// same sync.Once as Stop so the two are idempotent and mutually exclusive.
+func (s *Server) Close() { s.stopOnce.Do(s.grpcSrv.Stop) }

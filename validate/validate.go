@@ -45,7 +45,8 @@ func Bootstrap(r io.Reader, baseDir string, allowH2C bool) error {
 	dialer := grpcclient.New(cm)
 	tracingProvider := boot.NewTracingProvider(dialer, httpClient, cm, bs.Stats)
 	defer func() { _ = tracingProvider.CloseAll() }()
-	_, err = boot.Construct(bs, cm, baseDir, allowH2C, nil, dm, httpClient, tracingProvider)
+	// nil sdsProvider: validate does not dial/fetch SDS (phase 60.2 Task 5).
+	_, err = boot.Construct(bs, cm, baseDir, allowH2C, nil, dm, httpClient, tracingProvider, nil)
 	return err
 }
 

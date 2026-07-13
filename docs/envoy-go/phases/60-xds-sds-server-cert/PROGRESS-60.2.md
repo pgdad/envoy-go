@@ -30,35 +30,89 @@
 
 ## Task checklist (mirrors PLAN-60.2)
 
-- [ ] **Task 1** — PROGRESS scaffold + baselines + the 60.2 design pins. (folded into the PLAN commit)
-- [ ] **Task 2** — `xds.ParseSDSConfig` (arms 1–4, 8, 9 + V3 + one-config MVP cap). [TDD]
-- [ ] **Task 3** — `tls/config.go` one-arm downstream-gated lift + `provider` param; arms 1–6 + timeout-propagation + nil-provider reject. [TDD]
-- [ ] **Task 4** — thread `sdsProvider` through the listener manager; `nil` at all existing callers. [mechanical + regression]
-- [ ] **Task 5** — `boot.NewSDSProvider` (pre-scan + node arm 7 + provider build) + `Construct` param + main/validate wiring. [TDD]
-- [ ] **Task 6** — `sdsserver.NewAtAddr` (0.0.0.0 bind) + `helpers.TLSServedLeaf`. [TDD]
-- [ ] **Task 7** — `0103-xds-sds-server-cert` differential (driver-owned SDS server per side; served-leaf cross-side via `CompareBytes`); assertion proven live. [fixture]
-- [ ] **Task 8** — BEHAVIOR_CONTRACT xDS/SDS section. [docs]
-- [ ] **Task 9** — ADR-0280 + STATE + ROADMAP row 60 `done` + xDS deferred sentence + sentinel re-check + six-gate verify. [docs + verify]
+- [x] **Task 1** — PROGRESS scaffold + baselines + the 60.2 design pins. (folded into the PLAN commit)
+- [x] **Task 2** — `xds.ParseSDSConfig` (arms 1–4, 8, 9 + V3 + one-config MVP cap). [TDD] — commit `2ea201eb`
+- [x] **Task 3** — `tls/config.go` one-arm downstream-gated lift + `provider` param; arms 1–6 + timeout-propagation + nil-provider reject. [TDD] — commit `de2f1294` + fix `e8429092` (error-prefix invariant)
+- [x] **Task 4** — thread `sdsProvider` through the listener manager; `nil` at all existing callers. [mechanical + regression] — commit `161f37d9`
+- [x] **Task 5** — `boot.NewSDSProvider` (pre-scan + node arm 7 + provider build) + `Construct` param + main/validate wiring. [TDD] — commit `d76e6752`
+- [x] **Task 6** — `sdsserver.NewAtAddr` (0.0.0.0 bind) + `helpers.TLSServedLeaf`. [TDD] — commit `db7c2fff`
+- [x] **Task 7** — `0103-xds-sds-server-cert` differential (driver-owned SDS server per side; served-leaf cross-side via `CompareBytes`); assertion proven live. [fixture] — commit `1a30b2b2`
+- [x] **Task 8** — BEHAVIOR_CONTRACT xDS/SDS section. [docs] — commit `a4234140`
+- [x] **Task 9** — ADR-0280 + STATE + ROADMAP row 60 `done` + xDS deferred sentence + sentinel re-check + six-gate verify. [docs + verify]
 
 ## Six-gate (recorded at Task 9 — RUN in the worktree `.worktrees/phase-60.2-impl`)
 
+**NOTE (per the brief):** the FAST six-gate below substitutes a targeted non-differential unit run (`go test $(go list ./... | grep -v '/test/differential') -count=1`) for `go test ./...`, and DOES NOT run the full `go test ./test/differential/ -count=1` (105-dir Docker) suite — **the controller runs that on the frozen squash HEAD** (avoiding a double Docker run within one stage). The `0103` fixture's own liveness was already independently proven at Task 7 (below) with a real `-count=1` differential run.
+
 ```
-(to be filled at the IMPL Task 9 completion)
-gofmt -l .                                               → (expect clean)
-golangci-lint run ./...                                  → (expect exit 0)
-go vet ./...                                             → (expect exit 0)
-go build ./...                                           → (expect ok)
-go mod tidy -diff                                        → (expect EMPTY)
-go test ./... -count=1                                   → (expect PASS)
-go test ./test/differential/ -count=1                    → (expect PASS; byte-stable except 0103)
-go list -deps ./internal/tls | grep -E 'internal/(grpcclient|cluster|boot|listener)$'   → (expect empty; TLS-CLEAN)
-go list -deps ./internal/xds | grep -E 'internal/(tls|grpcclient|cluster|listener|boot)$' → (expect empty; XDS-CLEAN)
-grep -rh '^func Fuzz' --include='*.go' . | wc -l         → 55
-ls -d test/fixtures/[0-9][0-9][0-9][0-9]* | wc -l         → 105
+$ gofmt -l .
+(empty — GOFMT_CLEAN)
+
+$ golangci-lint run ./...
+(empty, exit 0)
+
+$ go vet ./...
+(clean, exit 0)
+
+$ go build ./... && echo BUILD_OK
+BUILD_OK
+
+$ go mod tidy -diff && echo MODTIDY_CLEAN
+MODTIDY_CLEAN
+
+$ go list -deps ./internal/tls | grep -E 'internal/(grpcclient|cluster|boot|listener)$' || echo TLS-CLEAN
+TLS-CLEAN
+
+$ go list -deps ./internal/xds | grep -E 'internal/(tls|grpcclient|cluster|listener|boot)$' || echo XDS-CLEAN
+XDS-CLEAN
+
+$ grep -rh '^func Fuzz' --include='*.go' . | wc -l
+55
+
+$ ls -d test/fixtures/[0-9][0-9][0-9][0-9]* | wc -l
+105
+
+$ go test $(go list ./... | grep -v '/test/differential') -count=1
+(122 "ok" packages, 0 FAIL, exit 0 — includes internal/tls, internal/xds, internal/xds/xdsgrpc,
+internal/boot, internal/listener, internal/grpcclient, test/helpers/sdsserver, validate, and
+every fixture driver package's own unit tests)
 ```
+
+**FULL 105-dir differential (`go test ./test/differential/ -count=1`, Docker):** DELEGATED to the controller on the frozen squash HEAD per the brief — not run in this task. `0103-xds-sds-server-cert`'s own PASS + deliberate-break liveness (below) was already proven independently at Task 7.
 
 ## Break evidence (recorded at Task 7 Step 6)
 
+Backfilled from `/home/esa/git/envoy-go/.superpowers/sdd/task-7-report.md`.
+
+**Setup:** temporarily added `genThrowawayLeaf()` to `driver.go` — a throwaway self-signed CA + leaf sharing the committed leaf's SAN (`sds.envoy-go.test`) but a DIFFERENT serial (`BEEF0BAD`). The throwaway CA was APPENDED to the shared `caPool` (not swapped in, so trust validation for the real leaf stays intact), and ONLY `refSrv` (the reference-side SDS server) was pointed at the throwaway leaf/key — the subject side kept serving the real committed leaf (serial `0x53445330313033`).
+
+**Command:**
 ```
-(to be filled — the two-different-certs served-leaf CompareBytes liveness break, -count=1 -run 'TestDifferential/0103-xds-sds-server-cert')
+go test ./test/differential/ -run 'TestDifferential/0103-xds-sds-server-cert' -count=1 -v
+```
+
+**Failing output (confirms `CompareBytes` fired on the `serial=` line — not a boot/handshake error; both containers reached ready, both TLS handshakes completed):**
+```
+    runner_test.go:1259: differential mismatch:
+        first divergence at offset 7
+        ref [0..23]:
+        00000000  73 65 72 69 61 6c 3d 42  45 45 46 30 42 41 44 0a  |serial=BEEF0BAD.|
+        00000010  73 61 6e 3d 73 64 73                              |san=sds|
+
+        subj[0..23]:
+        00000000  73 65 72 69 61 6c 3d 35  33 34 34 35 33 33 30 33  |serial=534453303|
+        00000010  31 33 30 33 33 0a 73                              |13033.s|
+--- FAIL: TestDifferential (2.03s)
+    --- FAIL: TestDifferential/0103-xds-sds-server-cert (2.03s)
+FAIL
+```
+
+Both sides' TLS handshakes completed (2.03s run, no dial/handshake error in the failure path) — the divergence is purely in the served-leaf `serial=` observable, isolating the break to the intended assertion (`reference_deliberate_break_wrong_assertion` avoided: the throwaway CA was appended to, not substituted for, the trust pool, so a handshake failure could not have masked this).
+
+**Revert-to-PASS:** `driver.go` reverted to the pre-break version (`diff` against the saved original confirmed byte-identical), rebuilt, and re-ran:
+```
+$ go test ./test/differential/ -run 'TestDifferential/0103-xds-sds-server-cert' -count=1 -v
+--- PASS: TestDifferential (2.05s)
+    --- PASS: TestDifferential/0103-xds-sds-server-cert (2.05s)
+PASS
 ```

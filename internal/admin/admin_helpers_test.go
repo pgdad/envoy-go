@@ -111,7 +111,7 @@ func mustMinimalLM(t *testing.T, bs *bootstrap.Bootstrap, cm *cluster.Manager) *
 	lfReg := listenerfilter.NewListenerFilterRegistry()
 	lfReg.Freeze()
 	netReg := mustBuiltinsNetReg(cm, bs.Stats, httpReg)
-	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, "", false, bs.Stats, nil, httpReg, lfReg, nil, nil, netReg)
+	lm, err := listener.NewManagerWithBaseDirAndAllowH2C(bs.Proto, cm, "", false, bs.Stats, nil, httpReg, lfReg, nil, nil, netReg, nil)
 	if err != nil {
 		t.Fatalf("listener.NewManagerWithBaseDirAndAllowH2C: %v", err)
 	}

@@ -1,0 +1,100 @@
+# Reference Envoy bootstrap for fixture 0103-xds-sds-server-cert.
+#
+# Single-listener downstream-TLS topology (phase 60.2 SPEC §8 — the SDS
+# server-cert apply differential). One TLS-terminating tcp_proxy listener
+# (l_sds_tls) whose DownstreamTlsContext carries a
+# tls_certificate_sds_secret_configs entry naming secret "server_cert",
+# fetched over a SotW SDS gRPC stream against cluster sds_cluster (h2c,
+# driver-owned in-process test/helpers/sdsserver receiver). No tls_inspector
+# is needed — a single filter chain, no SNI match. The observable this
+# fixture proves cross-side is the served leaf identity (serial + SAN), NOT
+# the echoed TCP bytes — the driver never writes application data, only
+# completes the TLS handshake and inspects the peer certificate.
+#
+# node: {id, cluster} is REQUIRED — SDS boot-fails without it (arm 7).
+#
+# Templating: rendered by the driver's mustRender() at ReferenceBootstrap
+# time. Substitution keys:
+#   {{.SDSHost}}     — driver-owned SDS receiver host (host.docker.internal
+#                       for the reference container per ADR-0010).
+#   {{.SDSPort}}     — driver-owned SDS receiver port (driver-allocated; the
+#                       in-process sdsserver.Server binds 0.0.0.0:<port>
+#                       before the container starts).
+#   {{.BackendPort}} — TCP echo backend port (runner-allocated; reached via
+#                       host.docker.internal).
+#
+# Cluster types: STRICT_DNS so the reference Envoy container resolves
+# host.docker.internal (the Docker bridge host alias per ADR-0010).
+# dns_lookup_family: V4_ONLY per the established fixture precedent.
+node:
+  id: envoygo-node
+  cluster: envoygo-cluster
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: l_sds_tls
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10443 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - name: server_cert
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc:
+                              cluster_name: sds_cluster
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_sds_tls
+                cluster: c_backend
+
+  clusters:
+    # c_backend: TCP echo backend (BackendCount=1). The observable is the
+    # served leaf, not the echoed bytes — the driver never writes application
+    # data after the handshake completes.
+    - name: c_backend
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: host.docker.internal, port_value: {{.BackendPort}} }
+    # sds_cluster: driver-owned in-process sdsserver.Server SDS receiver.
+    # MANDATORY http2_protocol_options: {} for gRPC framing. Plaintext h2c —
+    # no TLS. STRICT_DNS so the container can resolve the bridge hostname.
+    - name: sds_cluster
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: sds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{.SDSHost}}, port_value: {{.SDSPort}} }

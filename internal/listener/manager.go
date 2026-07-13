@@ -29,6 +29,7 @@ import (
 	"github.com/pgdad/envoy-go/internal/listener/listenerfilter"
 	"github.com/pgdad/envoy-go/internal/stats"
 	internaltls "github.com/pgdad/envoy-go/internal/tls"
+	xds "github.com/pgdad/envoy-go/internal/xds"
 )
 
 // Info is the after-Start description of one bound listener: the name
@@ -201,7 +202,7 @@ func NewManager(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, registry *stats.
 	netReg := network.NewRegistry()
 	builtins.RegisterBuiltins(netReg, builtins.Deps{ClusterManager: cm, StatsRegistry: registry, HTTPRegistry: httpRegistry})
 	netReg.Freeze()
-	return NewManagerWithBaseDirAndAllowH2C(bs, cm, "", false, registry, nil, httpRegistry, nil, nil, nil, netReg)
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, "", false, registry, nil, httpRegistry, nil, nil, nil, netReg, nil)
 }
 
 // NewManagerWithBaseDir is the phase-03 variant of NewManager. baseDir is
@@ -216,7 +217,7 @@ func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseD
 	netReg := network.NewRegistry()
 	builtins.RegisterBuiltins(netReg, builtins.Deps{ClusterManager: cm, StatsRegistry: registry, HTTPRegistry: httpRegistry})
 	netReg.Freeze()
-	return NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, false, registry, nil, httpRegistry, nil, nil, nil, netReg)
+	return NewManagerWithBaseDirAndAllowH2C(bs, cm, baseDir, false, registry, nil, httpRegistry, nil, nil, nil, netReg, nil)
 }
 
 // NewManagerWithBaseDirAndAllowH2C is the phase-05.1 constructor variant. It
@@ -251,7 +252,7 @@ func NewManagerWithBaseDir(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseD
 // (chainInfo.netChainFactory) instead of the terminal-filter path; mixed
 // read+terminal chains are boot-rejected. May be nil — the old terminal-filter
 // path (tcp_proxy/HCM) is then taken for every chain (R4 back-compat).
-func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager, httpClient *httpclient.Client, netReg *network.Registry) (*Manager, error) {
+func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager, httpClient *httpclient.Client, netReg *network.Registry, sdsProvider xds.SecretProvider) (*Manager, error) {
 	ls := bs.GetStaticResources().GetListeners()
 	if len(ls) == 0 {
 		return nil, fmt.Errorf("listener: zero listeners in bootstrap")
@@ -265,7 +266,7 @@ func NewManagerWithBaseDirAndAllowH2C(bs *bootstrapv3.Bootstrap, cm *cluster.Man
 	m := &Manager{runtimes: make([]*listenerRuntime, 0, len(ls)), registry: registry, dm: dm}
 	seen := make(map[string]struct{}, len(ls))
 	for i, l := range ls {
-		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C, registry, accessLogSinks, httpRegistry, lfRegistry, dm, httpClient, nodeServiceCluster, netReg)
+		rt, err := buildListenerRuntimeWithCtx(l, i, cm, baseDir, allowH2C, registry, accessLogSinks, httpRegistry, lfRegistry, dm, httpClient, nodeServiceCluster, netReg, sdsProvider)
 		if err != nil {
 			return nil, err
 		}
@@ -337,7 +338,7 @@ func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
 // per SPEC §12. The phase-03 parse-time errors on `default_filter_chain` and
 // `listener_filters[]` (ADR-0033 clauses 3 and 8) are also superseded; both
 // fields are now honored.
-func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager, httpClient *httpclient.Client, nodeServiceCluster string, netReg *network.Registry) (*listenerRuntime, error) {
+func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Manager, baseDir string, allowH2C bool, registry *stats.Registry, accessLogSinks []accesslog.Sink, httpRegistry *filter_http.HTTPRegistry, lfRegistry *listenerfilter.ListenerFilterRegistry, dm *drain.Manager, httpClient *httpclient.Client, nodeServiceCluster string, netReg *network.Registry, sdsProvider xds.SecretProvider) (*listenerRuntime, error) {
 	name := l.GetName()
 	if name == "" {
 		return nil, fmt.Errorf("listener: listeners[%d]: missing name", idx)
@@ -379,7 +380,11 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		// Decode transport_socket (nil = plaintext, non-nil = TLS).
 		var chainTLS *stdtls.Config
 		if ts := fc.GetTransportSocket(); ts != nil {
-			dc, err := internaltls.NewDownstreamConfig(ts, baseDir)
+			// sdsProvider: nil at all pre-60.2 call sites (NewManager,
+			// NewManagerWithBaseDir, and test callers), so an
+			// SDS-bound tls_certificate_sds_secret_configs here still errors
+			// ("requires a live SDS provider"), matching pre-60.2 behavior.
+			dc, err := internaltls.NewDownstreamConfig(ts, baseDir, sdsProvider)
 			if err != nil {
 				return nil, fmt.Errorf("listener: %q: filter_chains[%d]: %w", name, i, err)
 			}
@@ -454,7 +459,8 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 	if dfc := l.GetDefaultFilterChain(); dfc != nil {
 		var dfcTLS *stdtls.Config
 		if ts := dfc.GetTransportSocket(); ts != nil {
-			dc, err := internaltls.NewDownstreamConfig(ts, baseDir)
+			// sdsProvider: see the filter_chains[] call site above.
+			dc, err := internaltls.NewDownstreamConfig(ts, baseDir, sdsProvider)
 			if err != nil {
 				return nil, fmt.Errorf("listener: %q: default_filter_chain: %w", name, err)
 			}
