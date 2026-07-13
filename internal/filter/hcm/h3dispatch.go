@@ -38,6 +38,23 @@ func writeH3Reply(w http.ResponseWriter, status int, headers filter_http.Ordered
 		}
 		h.Add(hf.Name, hf.Value)
 	}
+	// Phase 61.3 (ADR-0281 §Consequences deferral, ADR-0282): synthesize the
+	// fidelity headers the reference Envoy emits for a direct_response,
+	// mirroring the H1 writeStatusReply's Server/Content-Length emission
+	// (codec.go) without double-setting an action-supplied value.
+	// http.Header.Get is case-insensitive, so this respects any casing the
+	// router action already set. Server is synthesized ALWAYS (even for an
+	// empty body — Envoy emits server on all responses); Content-Length is
+	// synthesized ONLY when the body is non-empty (an empty-body response
+	// gets no Content-Length, never Content-Length: 0). Date is intentionally
+	// NOT synthesized — it is a timestamp and the differential does not
+	// byte-compare headers.
+	if h.Get("Server") == "" {
+		h.Set("Server", serverHeader())
+	}
+	if len(body) > 0 && h.Get("Content-Length") == "" {
+		h.Set("Content-Length", strconv.Itoa(len(body)))
+	}
 	w.WriteHeader(status)
 	if len(body) > 0 {
 		if _, err := w.Write(body); err != nil {

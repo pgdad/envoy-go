@@ -98,16 +98,28 @@ type ReferenceProxy struct {
 	container testcontainers.Container
 	adminAddr string
 	tcpAddrs  map[int]string // listener port (in-container) → host:port
+	udpAddrs  map[int]string // in-container UDP/QUIC listener port → host host:port (phase 61.3)
 }
 
-// StartReferenceProxy launches the pinned Envoy image with the supplied
-// bootstrap YAML, waits for admin /ready to return 200, and returns a handle.
-// listenerPorts are container-internal TCP ports that should be exposed and
-// looked up by AdminAddr / ListenerAddr.
-func StartReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string, listenerPorts ...int) (*ReferenceProxy, error) {
+// startReferenceProxy is the shared container-start body behind
+// StartReferenceProxy and StartReferenceProxyWithMounts. It launches the
+// pinned Envoy image with the supplied bootstrap YAML, waits for admin
+// /ready to return 200, exposes tcpPorts as "<p>/tcp" (mapped into
+// tcpAddrs) and udpPorts as "<p>/udp" (mapped into udpAddrs — phase 61.3,
+// the harness's first non-TCP transport, for QUIC/HTTP-3 listeners), and
+// optionally bind-mounts hostMounts. Admin is always 9901/tcp.
+func startReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string, hostMounts []fixture.HostMount, tcpPorts, udpPorts []int) (*ReferenceProxy, error) {
 	exposed := []string{"9901/tcp"}
-	for _, p := range listenerPorts {
+	for _, p := range tcpPorts {
 		exposed = append(exposed, fmt.Sprintf("%d/tcp", p))
+	}
+	for _, p := range udpPorts {
+		exposed = append(exposed, fmt.Sprintf("%d/udp", p))
+	}
+	// Build the Binds slice in Docker bind format: "hostPath:containerPath".
+	binds := make([]string, 0, len(hostMounts))
+	for _, m := range hostMounts {
+		binds = append(binds, m.HostPath+":"+m.ContainerPath)
 	}
 	req := testcontainers.ContainerRequest{
 		Image:        pin.SHA256,
@@ -119,69 +131,6 @@ func StartReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string, l
 		// assertion. See ADR-0028.
 		Cmd:        []string{"envoy", "--config-yaml", bootstrap, "--log-level", "warn", "--concurrency", "1"},
 		WaitingFor: wait.ForHTTP("/ready").WithPort("9901/tcp").WithStartupTimeout(readyTimeout),
-		HostConfigModifier: func(hc *container.HostConfig) {
-			hc.ExtraHosts = []string{"host.docker.internal:host-gateway"}
-		},
-	}
-	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
-		Started:          true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("start reference: %w", err)
-	}
-	host, err := c.Host(ctx)
-	if err != nil {
-		_ = c.Terminate(ctx)
-		return nil, err
-	}
-	adminMapped, err := c.MappedPort(ctx, "9901/tcp")
-	if err != nil {
-		_ = c.Terminate(ctx)
-		return nil, err
-	}
-	tcp := map[int]string{}
-	for _, p := range listenerPorts {
-		mapped, err := c.MappedPort(ctx, nat.Port(fmt.Sprintf("%d/tcp", p)))
-		if err != nil {
-			_ = c.Terminate(ctx)
-			return nil, err
-		}
-		tcp[p] = fmt.Sprintf("%s:%s", host, mapped.Port())
-	}
-	return &ReferenceProxy{
-		container: c,
-		adminAddr: fmt.Sprintf("%s:%s", host, adminMapped.Port()),
-		tcpAddrs:  tcp,
-	}, nil
-}
-
-// StartReferenceProxyWithMounts is like StartReferenceProxy but also bind-mounts
-// host files into the container before start. Each mount maps a host-side file
-// path to a container-side path. The host files must already exist (Docker bind-
-// mount of a file, not a directory, requires the host file to be pre-created).
-// Introduced for fixture 0006-access-log (ADR-0068) to surface the reference
-// Envoy's container-side access log (/envoy-go-test/envoy-access.log) to a
-// host-visible path for log-comparison.
-//
-// Bind mounts are implemented via HostConfig.Binds (the "<hostPath>:<containerPath>"
-// format) because testcontainers-go v0.27.0's Mounts / ContainerMounts path
-// silently drops MountTypeBind entries in mapToDockerMounts.
-func StartReferenceProxyWithMounts(ctx context.Context, pin *EnvoyPin, bootstrap string, hostMounts []fixture.HostMount, listenerPorts ...int) (*ReferenceProxy, error) {
-	exposed := []string{"9901/tcp"}
-	for _, p := range listenerPorts {
-		exposed = append(exposed, fmt.Sprintf("%d/tcp", p))
-	}
-	// Build the Binds slice in Docker bind format: "hostPath:containerPath".
-	binds := make([]string, 0, len(hostMounts))
-	for _, m := range hostMounts {
-		binds = append(binds, m.HostPath+":"+m.ContainerPath)
-	}
-	req := testcontainers.ContainerRequest{
-		Image:        pin.SHA256,
-		ExposedPorts: exposed,
-		Cmd:          []string{"envoy", "--config-yaml", bootstrap, "--log-level", "warn", "--concurrency", "1"},
-		WaitingFor:   wait.ForHTTP("/ready").WithPort("9901/tcp").WithStartupTimeout(readyTimeout),
 		HostConfigModifier: func(hc *container.HostConfig) {
 			hc.ExtraHosts = []string{"host.docker.internal:host-gateway"}
 			hc.Binds = append(hc.Binds, binds...)
@@ -205,7 +154,7 @@ func StartReferenceProxyWithMounts(ctx context.Context, pin *EnvoyPin, bootstrap
 		return nil, err
 	}
 	tcp := map[int]string{}
-	for _, p := range listenerPorts {
+	for _, p := range tcpPorts {
 		mapped, err := c.MappedPort(ctx, nat.Port(fmt.Sprintf("%d/tcp", p)))
 		if err != nil {
 			_ = c.Terminate(ctx)
@@ -213,11 +162,44 @@ func StartReferenceProxyWithMounts(ctx context.Context, pin *EnvoyPin, bootstrap
 		}
 		tcp[p] = fmt.Sprintf("%s:%s", host, mapped.Port())
 	}
+	udp := map[int]string{}
+	for _, p := range udpPorts {
+		mapped, err := c.MappedPort(ctx, nat.Port(fmt.Sprintf("%d/udp", p)))
+		if err != nil {
+			_ = c.Terminate(ctx)
+			return nil, err
+		}
+		udp[p] = fmt.Sprintf("%s:%s", host, mapped.Port())
+	}
 	return &ReferenceProxy{
 		container: c,
 		adminAddr: fmt.Sprintf("%s:%s", host, adminMapped.Port()),
 		tcpAddrs:  tcp,
+		udpAddrs:  udp,
 	}, nil
+}
+
+// StartReferenceProxy launches the pinned Envoy image with the supplied
+// bootstrap YAML, waits for admin /ready to return 200, and returns a handle.
+// listenerPorts are container-internal TCP ports that should be exposed and
+// looked up by AdminAddr / ListenerAddr.
+func StartReferenceProxy(ctx context.Context, pin *EnvoyPin, bootstrap string, listenerPorts ...int) (*ReferenceProxy, error) {
+	return startReferenceProxy(ctx, pin, bootstrap, nil, listenerPorts, nil)
+}
+
+// StartReferenceProxyWithMounts is like StartReferenceProxy but also bind-mounts
+// host files into the container before start. Each mount maps a host-side file
+// path to a container-side path. The host files must already exist (Docker bind-
+// mount of a file, not a directory, requires the host file to be pre-created).
+// Introduced for fixture 0006-access-log (ADR-0068) to surface the reference
+// Envoy's container-side access log (/envoy-go-test/envoy-access.log) to a
+// host-visible path for log-comparison.
+//
+// Bind mounts are implemented via HostConfig.Binds (the "<hostPath>:<containerPath>"
+// format) because testcontainers-go v0.27.0's Mounts / ContainerMounts path
+// silently drops MountTypeBind entries in mapToDockerMounts.
+func StartReferenceProxyWithMounts(ctx context.Context, pin *EnvoyPin, bootstrap string, hostMounts []fixture.HostMount, listenerPorts ...int) (*ReferenceProxy, error) {
+	return startReferenceProxy(ctx, pin, bootstrap, hostMounts, listenerPorts, nil)
 }
 
 // AdminAddr returns the host:port for the container's admin listener (9901/tcp).
@@ -225,6 +207,10 @@ func (r *ReferenceProxy) AdminAddr() string { return r.adminAddr }
 
 // ListenerAddr returns the host:port for an exposed in-container listener port.
 func (r *ReferenceProxy) ListenerAddr(containerPort int) string { return r.tcpAddrs[containerPort] }
+
+// ListenerUDPAddr returns the host host:port that maps the given in-container
+// UDP/QUIC listener port (phase 61.3 — the harness's first non-TCP transport).
+func (r *ReferenceProxy) ListenerUDPAddr(containerPort int) string { return r.udpAddrs[containerPort] }
 
 // Stop terminates the container.
 func (r *ReferenceProxy) Stop(ctx context.Context) error {

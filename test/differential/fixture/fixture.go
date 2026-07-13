@@ -76,6 +76,14 @@ type StatsAsserter interface {
 	AssertStats(t TB, refAdminAddr, subjAdminAddr string)
 }
 
+// ReferenceListenerIsUDP marks a fixture whose reference listener is a UDP/QUIC
+// (HTTP/3) listener: the runner exposes its port as /udp (not /tcp) and passes
+// the UDP-mapped host addr to DriveReference. Default absent → TCP (all pre-61.3
+// fixtures). Phase 61.3.
+type ReferenceListenerIsUDP interface {
+	ReferenceListenerIsUDP() bool
+}
+
 // DriverRegistry maps fixture names to their registered drivers. Drivers register
 // themselves from init() via RegisterFixture.
 var DriverRegistry = map[string]Driver{}

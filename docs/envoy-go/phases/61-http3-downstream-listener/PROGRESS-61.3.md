@@ -49,62 +49,156 @@ quic-go stays confined to `internal/listener/quic.go` in PRODUCTION (the 61.1/61
 
 ## Task checklist (mirrors PLAN-61.3)
 
-- [ ] **Task 1** — PROGRESS scaffold + baselines + the 61.3 design pins + the two RE-DERIVATION CORRECTIONS (0102→0104; HTTPExpectations TCP-only) + the carried deferred-maintenance dispositions. (folded into the PLAN commit)
-- [ ] **Task 2** — `test/helpers/h3.go` `H3RoundTrip` (pinned-UDP-dial quic-go `http3.Transport` client). [TDD, local in-process `http3.Server`]
-- [ ] **Task 3** — harness UDP exposure (`udpAddrs` + transport-aware `/udp` + `ListenerUDPAddr`; the two mapping starters). [TDD, harness-level]
-- [ ] **Task 4** — reference contrib-Envoy H3 container de-risk (host→container UDP GET→200, NON-VACUOUS). [integration proof; ESCALATE on failure]
-- [ ] **Task 5** — runner `ReferenceListenerIsUDP` marker + UDP-addr dispatch to `DriveReference`. [runner surgery]
-- [ ] **Task 6** — writeH3Reply synthesizes `server: envoy` + `content-length` (the 61.2-deferred H3 response fidelity). [TDD, `httptest` — stdlib-only, production gate intact]
-- [ ] **Task 7** — the `0104-http3-downstream-get` cross-side fixture (driver + config templates for BOTH sides + `AssertStats` named subset + blank-import registration). [fixture]
-- [ ] **Task 8** — the full cross-side run GREEN + per-assertion liveness breaks (`CompareBytes` body, the status assertion, each `AssertStats` counter; `-count=1`; confirm WHICH fires) + -race. [verify]
-- [ ] **Task 9** — BEHAVIOR_CONTRACT HTTP/3 cross-side-proven + ADR-0282 §Context/§Decision/§Consequences + **ROADMAP row 61 → `done`** + STATE + six-gate + sentinel re-check + router roll. [docs + verify]
+- [x] **Task 1** — PROGRESS scaffold + baselines + the 61.3 design pins + the two RE-DERIVATION CORRECTIONS (0102→0104; HTTPExpectations TCP-only) + the carried deferred-maintenance dispositions. (folded into the PLAN commit)
+- [x] **Task 2** — `test/helpers/h3.go` `H3RoundTrip` landed (pinned-UDP-dial quic-go `http3.Transport` client, TDD against a local in-process `http3.Server`).
+- [x] **Task 3** — harness UDP surgery landed (`udpAddrs` + transport-aware `/udp` exposure + `ListenerUDPAddr`; both mapping starters delegate to a shared `startReferenceProxy`).
+- [x] **Task 4** — reference contrib-Envoy H3 container de-risk PASSED (host→container UDP GET→200, NON-VACUOUS; see "Task 4 de-risk evidence" below).
+- [x] **Task 5** — runner `ReferenceListenerIsUDP` marker + UDP-addr dispatch to `DriveReference` landed.
+- [x] **Task 6** — `writeH3Reply` now synthesizes `server: envoy` + `content-length` (the 61.2-deferred H3 response fidelity; TDD via `httptest`, stdlib-only, production gate intact).
+- [x] **Task 7** — the `0104-http3-downstream-get` cross-side fixture landed (driver + config templates for both sides + `AssertStats` named subset + blank-import registration).
+- [x] **Task 8** — full cross-side run GREEN; all 4 load-bearing assertions (body `CompareBytes`, drive-hook status check, both `AssertStats` counters) proven live via deliberate `-count=1` breaks, each confirmed to fire the intended assertion and restored byte-identical; -race clean (see "Break evidence" below).
+- [x] **Task 9** — BEHAVIOR_CONTRACT HTTP/3 cross-side-proven paragraph + ADR-0282 §Context/§Decision/§Consequences + **ROADMAP row 61 → `done`** + six-gate + sentinel re-check recorded (this commit). STATE/router roll owned by the controller.
 
 ## Six-gate (recorded at Task 9 — RUN in the worktree `.worktrees/phase-61.3-impl`)
 
 ```
 $ gofmt -l .
-(expect empty — GOFMT_CLEAN)
+(empty)                                                       → GOFMT_CLEAN
 
-$ golangci-lint run ./...
-(expect clean, exit 0)
+$ golangci-lint run (touched pkgs)
+clean, exit 0
 
 $ go vet ./...
-(expect clean)
+clean
 
 $ go build ./... && echo BUILD_OK
-(expect BUILD_OK)
+BUILD_OK
 
 $ go mod tidy -diff && echo MODTIDY_CLEAN
-(expect MODTIDY_CLEAN — no module change in 61.3)
+MODTIDY_CLEAN (no module change in 61.3)
 
 $ go list -deps ./internal/filter/hcm | grep -i quic-go || echo HCM-NO-QUICGO
-(expect HCM-NO-QUICGO — the writeH3Reply fidelity pickup stays stdlib-only)
+(nothing)                                                     → HCM-NO-QUICGO
 
 $ go list -deps ./internal/tls | grep -i quic-go || echo TLS-NO-QUICGO
-(expect TLS-NO-QUICGO)
+(nothing)                                                     → TLS-NO-QUICGO
 
-$ go list -deps ./test/helpers | grep -i quic-go
-(expect the quic-go module — TEST code, ALLOWED)
+$ go list -deps ./test/helpers | grep -c quic-go
+15  (TEST code — quic-go ALLOWED)
+
+$ go list -deps ./internal/listener | grep -c quic-go
+15  (production quic-go CONFINED to internal/listener)
 
 $ grep -rh '^func Fuzz' --include='*.go' . | wc -l
-(expect 55 — +0)
+55  (+0)
 
 $ ls -d test/fixtures/[0-9][0-9][0-9][0-9]* | wc -l
-(expect 106 — +1: 0104)
+106  (+1: 0104)
 
-$ go test ./test/helpers/ ./internal/filter/hcm/ ./internal/listener/ -count=1
-(expect ok)
+$ go test ./test/helpers ./internal/filter/hcm ./internal/listener -count=1
+ok
 
 $ go test ./test/differential/ -run 'TestDifferential/0104-http3-downstream-get' -count=1 -v
-(expect PASS — cross-side H3 GET→200; non-vacuous decode, both sides downstream_rq_2xx >= 1)
+PASS — cross-side H3 GET→200; non-vacuous decode, both sides downstream_rq_2xx >= 1
+(see "Break evidence" below for the baseline log lines)
+
+$ go test (touched pkgs + the 0104 fixture) -race -count=1  (run at Task 8)
+race-clean
 ```
 
 **FULL non-differential suite + the full 106-dir differential**: DELEGATED to the controller on the frozen squash HEAD (the 105 pre-existing dirs stay byte-stable — 61.3 changes no TCP path; the harness UDP surgery is gated on the `ReferenceListenerIsUDP` marker only `0104` sets; the writeH3Reply fidelity change affects only the H3 path only `0104` exercises).
 
+## Task 4 de-risk evidence
+
+SPEC-61 §8 flagged the host→container UDP-publishing direction as UNTESTED (unlike TCP port publishing, exercised by every prior fixture). Task 4 proved it directly on Docker Desktop, before the `0104` fixture was built on top of it: a `docker run` reference-Envoy container (`envoyproxy/envoy:contrib-v1.37.2`) with a QUIC listener config (mandatory TLS 1.3, ALPN `h3`, an ECDSA server cert) and its UDP listener port published (`-p <port>:<port>/udp`), driven by a host-side quic-go `http3.Transport` client:
+
+- `GET /health` → **200**, body **`"OK\n"`**
+- reference `/stats` after the request: **`http.ingress_http.downstream_rq_2xx = 1`**
+- NO YAML iteration was needed to get the container's QUIC listener to accept — the config that worked at Task 4 is the same shape carried into the `0104` fixture's reference config template.
+- The ECDSA certificate (matching the mandatory-TLS-1.3/QUIC transport-socket requirement) worked without additional cert-format iteration.
+
+This satisfies the PLAN's Task-4-Step-3 requirement to record the de-risk result in PROGRESS. The de-risk PASSING cleared the fixture-build gate — Task 4's escalation path (a ReferenceLess subject-only `0104` fallback) was NOT needed.
+
 ## Break evidence (recorded at Task 8)
 
-(To be filled at the IMPL: the `-count=1` deliberate break for EACH load-bearing assertion — the `CompareBytes` body-compare, the Drive-hook status assertion, each `AssertStats` counter — with WHICH assertion fired confirmed [`reference_deliberate_break_wrong_assertion`], and the restored-byte-identical `git diff` confirmation.)
+All commands run in `.worktrees/phase-61.3-impl` (branch `phase-61-http3-downstream-get-differential-impl`, HEAD `0cc869f6` throughout). Every break used `-run 'TestDifferential/0104-http3-downstream-get' -count=1` (the full subtest path — `reference_differential_run_selector`; `-count=1` defeats go-test's cached-PASS — `reference_differential_break_protocol_count1`).
 
-## Sentinel re-check (Task 9, mechanical)
+**0. Baseline GREEN (non-vacuous):**
+```
+$ go test ./test/differential/ -run 'TestDifferential/0104-http3-downstream-get' -count=1 -v
+...
+2026/07/13 19:06:19 0104-http3-downstream-get: ref http.ingress_http.downstream_rq_2xx=1 subj http.ingress_http.downstream_rq_2xx=1
+2026/07/13 19:06:19 0104-http3-downstream-get: ref http.ingress_http.downstream_rq_total=1 subj http.ingress_http.downstream_rq_total=1
+--- PASS: TestDifferential (8.81s)
+    --- PASS: TestDifferential/0104-http3-downstream-get (8.81s)
+PASS
+```
+Both sides decoded live (`downstream_rq_2xx=1`, `downstream_rq_total=1` on BOTH ref and subj) — confirms the run is non-vacuous, not a green that never executed.
 
-(To be filled at the IMPL: the three sentinel checks run MECHANICALLY. Expected — (1) row 61 now `done` so it no longer prints `NOT DONE: row 61`, but the sentinel does NOT fire because (2) three live "candidates:" sentences [HTTP/3 STAYS OPEN, xDS, Observability] + (3) three never-opened families [gRPC/Runtime/WASM] + Operational-tooling. The HTTP/3 deferred sentence STAYS exactly one live match, `reference_sentinel_deferred_sentence_live_vs_historical`.)
+**1. `CompareBytes` (body) — broke the SUBJECT template's `direct_response` body** (`inline_string: "OK\n"` → `"BAD\n"`, line ~324; reference copy at ~254 untouched, so sides diverge):
+```
+runner_test.go:1269: differential mismatch:
+    first divergence at offset 0
+    ref [0..3]:  00000000  4f 4b 0a               |OK.|
+    subj[0..4]:  00000000  42 41 44 0a            |BAD.|
+--- FAIL: TestDifferential/0104-http3-downstream-get (1.98s)
+```
+WHICH FIRED: the `CompareBytes` byte-compare at `runner_test.go:1269` — not an earlier drive error (the drive hooks both returned 200 first: the log lines `... downstream_rq_2xx=1 ...downstream_rq_total=1` still printed, i.e. `AssertStats` ran too, proving CompareBytes is the sole failure and it fires before the test aborts). Restored `"OK\n"`; `git diff test/fixtures/0104-http3-downstream-get/driver/driver.go` → 0 lines (byte-identical). Re-ran `-count=1` → PASS.
+
+**2. Drive-hook status assertion — broke the SUBJECT `direct_response` status** (`status: 200` → `500`, line ~323):
+```
+runner_test.go:1256: subj drive: H3 GET 127.0.0.1:20016: status 500, want 200
+--- FAIL: TestDifferential/0104-http3-downstream-get (2.06s)
+```
+WHICH FIRED: the subject `DriveSubject`/`h3Driver.drive` `status != http.StatusOK` check (`driver.go:72-74`), surfaced by the runner at `runner_test.go:1256` as a Fatalf-style drive error — before `CompareBytes` or `AssertStats` ever ran (no stats log lines printed). Restored `status: 200`; `git diff` → 0 lines. Re-ran `-count=1` → PASS.
+
+**3. `AssertStats` counter #1 (`downstream_rq_2xx`)** — renamed the asserted stat to a non-existent name (`http.ingress_http.downstream_rq_2xx` → `..._NOPE`, line ~121):
+```
+2026/07/13 19:07:15 0104-http3-downstream-get: ref http.ingress_http.downstream_rq_2xx_NOPE=0 subj http.ingress_http.downstream_rq_2xx_NOPE=0
+    runner_test.go:1330: ref http.ingress_http.downstream_rq_2xx_NOPE = 0, want >=1
+    runner_test.go:1330: subj http.ingress_http.downstream_rq_2xx_NOPE = 0, want >=1
+2026/07/13 19:07:15 0104-http3-downstream-get: ref http.ingress_http.downstream_rq_total=1 subj http.ingress_http.downstream_rq_total=1
+--- FAIL: TestDifferential/0104-http3-downstream-get (2.19s)
+```
+WHICH FIRED: both `t.Errorf` calls (ref AND subj) for the renamed `downstream_rq_2xx_NOPE` stat (value 0, since the stat doesn't exist) at `runner_test.go:1330` — isolated: the sibling `downstream_rq_total` check still logged its live value (=1 both sides) with NO error, proving the break targeted only the intended counter and the other assertion stayed live/unmasked. Restored the stat name; `git diff` → 0 lines. Re-ran `-count=1` → PASS.
+
+**4. `AssertStats` counter #2 (`downstream_rq_total`)** — renamed the second asserted stat (`http.ingress_http.downstream_rq_total` → `..._NOPE`, line ~122):
+```
+2026/07/13 19:07:30 0104-http3-downstream-get: ref http.ingress_http.downstream_rq_2xx=1 subj http.ingress_http.downstream_rq_2xx=1
+2026/07/13 19:07:30 0104-http3-downstream-get: ref http.ingress_http.downstream_rq_total_NOPE=0 subj http.ingress_http.downstream_rq_total_NOPE=0
+    runner_test.go:1330: ref http.ingress_http.downstream_rq_total_NOPE = 0, want >=1
+    runner_test.go:1330: subj http.ingress_http.downstream_rq_total_NOPE = 0, want >=1
+--- FAIL: TestDifferential/0104-http3-downstream-get (1.99s)
+```
+WHICH FIRED: both `t.Errorf` calls for the renamed `downstream_rq_total_NOPE` stat — isolated: `downstream_rq_2xx` logged its live value (=1 both sides) with no error, confirming the break was scoped to the targeted counter alone. Restored; `git diff` → 0 lines. Re-ran `-count=1` → PASS.
+
+**5. -race:**
+```
+$ go test ./test/helpers/ ./internal/filter/hcm/ ./internal/listener/ -race -count=1
+ok  	github.com/pgdad/envoy-go/test/helpers	1.029s
+ok  	github.com/pgdad/envoy-go/internal/filter/hcm	1.064s
+ok  	github.com/pgdad/envoy-go/internal/listener	4.253s
+
+$ go test ./test/differential/ -run 'TestDifferential/0104-http3-downstream-get' -race -count=1
+ok  	github.com/pgdad/envoy-go/test/differential	3.023s
+```
+Both race-clean — the H3 client (`test/helpers.H3RoundTrip`) and QUIC serve goroutines (`internal/listener`, `internal/filter/hcm`) show no data races.
+
+**Final restoration check:**
+```
+$ git diff 0cc869f6 -- test/fixtures/0104-http3-downstream-get/driver/driver.go
+(empty — 0 lines)
+```
+`driver.go` is byte-identical to Task 7's commit `0cc869f6`; every break was fully restored. Final confirmatory run: `go test ./test/differential/ -run 'TestDifferential/0104-http3-downstream-get' -count=1 -v` → PASS (`downstream_rq_2xx=1`, `downstream_rq_total=1` both sides).
+
+All 4 load-bearing assertions (body CompareBytes, drive-hook status check, both AssertStats counters) proven live via deliberate `-count=1` breaks, each confirmed to fire the INTENDED assertion (not masked by an earlier or sibling failure), and each restored byte-identical.
+
+## Sentinel re-check (Task 9, mechanical — run POST-flip)
+
+The three sentinel checks, run mechanically after flipping ROADMAP row 61 `in-progress` → `done`:
+
+1. **No row prints `NOT DONE`** — row 61 clears (it now reads `done`); no other row regresses.
+2. **The stop-condition does NOT fire because THREE live "candidates:" sentences remain**: HTTP/3 + QUIC (family STAYS OPEN — the deferred-candidate sentence at ROADMAP.md line 171 stays exactly one live match, verified via `grep -c 'remaining deferred (not-yet-chartered) candidates:.*upstream H3 cluster' docs/envoy-go/ROADMAP.md` → `1`), xDS, Observability.
+3. **THREE never-opened families remain**: gRPC, Runtime, WASM.
+
+Conclusion: the sentinel `stop` marker is **NOT created** — row 61's flip to `done` closes ONE row but does not clear the project-wide stop conditions (live deferred-candidate sentences + never-opened families both persist). This is the expected, correct outcome for a split-phase row close per `reference_roadmap_split_phase_row_done` (a per-leg flip, not a project-completion signal).

@@ -62,6 +62,47 @@ admin: { address: { socket_address: { address: 0.0.0.0, port_value: 9901 } } }
 	}
 }
 
+// TestReferenceProxy_UDPExposure verifies that a listener port designated UDP
+// is exposed via Docker's /udp form and mapped into ReferenceProxy.udpAddrs,
+// surfaced through ListenerUDPAddr as a host:port string (phase 61.3 — the
+// harness's first non-TCP transport; see startReferenceProxy's udpPorts
+// param). Docker publishes an exposed port regardless of whether the
+// container process binds it, so a minimal admin-only bootstrap suffices to
+// prove the exposure->mapping plumbing; the true end-to-end HTTP/3 proof is a
+// separate task.
+func TestReferenceProxy_UDPExposure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("differential test; skipped under -short")
+	}
+	ensureDocker(t)
+
+	pin := loadPinFromRepo(t)
+	const cfg = `
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 9901 } } }
+`
+	const udpPort = 8443
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ref, err := startReferenceProxy(ctx, pin, cfg, nil, nil, []int{udpPort})
+	if err != nil {
+		t.Fatalf("startReferenceProxy: %v", err)
+	}
+	defer func() { _ = ref.Stop(context.Background()) }()
+
+	addr := ref.ListenerUDPAddr(udpPort)
+	t.Logf("ListenerUDPAddr(%d) = %q", udpPort, addr)
+	if addr == "" {
+		t.Fatalf("ListenerUDPAddr(%d) empty; /udp exposure did not map", udpPort)
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("ListenerUDPAddr(%d) = %q: not a valid host:port: %v", udpPort, addr, err)
+	}
+	if host == "" || port == "" {
+		t.Errorf("ListenerUDPAddr(%d) = %q: empty host or port component", udpPort, addr)
+	}
+}
+
 func ensureDocker(t *testing.T) {
 	t.Helper()
 	// Try canonical path first; Docker Desktop on Linux bind-mounts it or

@@ -126,16 +126,69 @@ func TestWriteH3Reply_StatusHeadersBody(t *testing.T) {
 }
 
 // TestWriteH3Reply_EmptyBody verifies a headers-only response (no body) writes
-// the status with no panic and an empty body.
+// the status with no panic and an empty body. It also verifies (phase 61.3,
+// ADR-0281 §Consequences deferral) that the server: envoy fidelity header IS
+// synthesized even for an empty body, but content-length is NOT (the
+// reference Envoy omits content-length on a headers-only response — do not
+// emit content-length: 0).
 func TestWriteH3Reply_EmptyBody(t *testing.T) {
 	rec := httptest.NewRecorder()
 	if err := writeH3Reply(rec, 204, nil, nil); err != nil {
 		t.Fatalf("writeH3Reply: %v", err)
 	}
-	if rec.Result().StatusCode != 204 {
-		t.Errorf("status = %d, want 204", rec.Result().StatusCode)
+	res := rec.Result()
+	if res.StatusCode != 204 {
+		t.Errorf("status = %d, want 204", res.StatusCode)
 	}
 	if rec.Body.Len() != 0 {
 		t.Errorf("body len = %d, want 0", rec.Body.Len())
+	}
+	if got := res.Header.Get("server"); got != "envoy" {
+		t.Errorf("server = %q, want envoy", got)
+	}
+	if got := res.Header.Get("content-length"); got != "" {
+		t.Errorf("content-length = %q, want empty (no content-length on empty body)", got)
+	}
+}
+
+// TestWriteH3Reply_SynthesizesServerAndContentLength verifies the H3 response
+// carries the fidelity headers the reference Envoy emits for a direct_response:
+// server: envoy and content-length. Phase 61.3 (ADR-0282) — the 61.2 arm was
+// minimal (ADR-0281 §Consequences deferred this).
+func TestWriteH3Reply_SynthesizesServerAndContentLength(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if err := writeH3Reply(rec, 200, nil, []byte("OK\n")); err != nil {
+		t.Fatalf("writeH3Reply: %v", err)
+	}
+	res := rec.Result()
+	if got := res.Header.Get("server"); got != "envoy" {
+		t.Errorf("server = %q, want envoy", got)
+	}
+	if got := res.Header.Get("content-length"); got != "3" {
+		t.Errorf("content-length = %q, want 3", got)
+	}
+	if rec.Body.String() != "OK\n" {
+		t.Errorf("body = %q, want OK\\n", rec.Body.String())
+	}
+}
+
+// TestWriteH3Reply_ActionSuppliedHeadersNotOverridden verifies that when the
+// router action already supplies server/content-length header values, the
+// synthesis step respects them (does not double-set / override).
+func TestWriteH3Reply_ActionSuppliedHeadersNotOverridden(t *testing.T) {
+	rec := httptest.NewRecorder()
+	hdrs := filter_http.OrderedHeaders{
+		{Name: "server", Value: "custom-server"},
+		{Name: "content-length", Value: "99"},
+	}
+	if err := writeH3Reply(rec, 200, hdrs, []byte("OK\n")); err != nil {
+		t.Fatalf("writeH3Reply: %v", err)
+	}
+	res := rec.Result()
+	if got := res.Header.Get("server"); got != "custom-server" {
+		t.Errorf("server = %q, want custom-server (action-supplied value must not be overridden)", got)
+	}
+	if got := res.Header.Get("content-length"); got != "99" {
+		t.Errorf("content-length = %q, want 99 (action-supplied value must not be overridden)", got)
 	}
 }

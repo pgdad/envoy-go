@@ -1,0 +1,93 @@
+# Phase 61.3 fixture 0104-http3-downstream-get expectations (ADR-0019 —
+# prose; the driver is the enforcer via CompareBytes/AssertStats; this file
+# is documentation, not machine-evaluated).
+#
+# Topology (single QUIC/UDP listener; no cluster dial on the reference side;
+# a throwaway cluster on the subject side — see README.md "The subject-side
+# cluster surprise"):
+#
+#   l_h3 — one QUIC/UDP listener (udp_listener_config.quic_options{}),
+#          filter_chain transport_socket envoy.transport_sockets.quic
+#          (QuicDownstreamTransport, DownstreamTlsContext, ALPN "h3",
+#          inlined ECDSA P-256 cert/key — the SAME testAlphaCertPEM/
+#          testAlphaKeyPEM pair proven in internal/listener/manager_test.go
+#          and Task 4's referenceQUICBootstrap), HCM codec_type HTTP3
+#          stat_prefix ingress_http http3_protocol_options{}, route
+#          GET /health -> direct_response 200 "OK\n", router filter.
+#   c_backend — STATIC cluster, subject-side ONLY (BackendCount=1, driver-
+#          allocated port, NEVER dialed by the route). Reference-side
+#          bootstrap carries NO clusters section (contrib-Envoy boots fine
+#          with zero clusters); envoy-go's cluster manager
+#          (internal/cluster.NewManagerWithBaseDir) hard-rejects a bootstrap
+#          with zero clusters, so the subject template MUST carry this
+#          throwaway cluster even though the route is a pure direct_response.
+#
+# Reference Envoy contrib-v1.37.2 (Docker, admin 0.0.0.0:9901, listener
+# 0.0.0.0:15104/UDP) vs envoy-go (in-process, admin 127.0.0.1:<subjAdminPort>,
+# listener 127.0.0.1:<subjListenerPort>/UDP).
+#
+# ## Workload
+#
+# One HTTP/3 GET /health per side via helpers.H3RoundTrip (fresh
+# http3.Transport per call, pinned dial to the resolved UDP addr,
+# InsecureSkipVerify client TLS, NextProtos=["h3"]). A non-200 status is a
+# hard driver error (fails the fixture before CompareBytes runs).
+#
+# This fixture does NOT implement fixture.HTTPExpectations — the runner's
+# HTTPExpectations re-drive is HTTP/1-over-TCP only and cannot reach a
+# QUIC/UDP listener (reference_http_expectations_tcp_only). Status is
+# asserted in-band by the drive helper; body via CompareBytes; stats via
+# AssertStats.
+#
+# ## Asserted (cross-side EXACT via CompareBytes)
+#
+#   Response body: "OK\n" on both sides.
+#
+# ## Asserted (AssertStats — named subset, NOT whole-map equality)
+#
+#   http.ingress_http.downstream_rq_2xx   >= 1   (both sides)
+#   http.ingress_http.downstream_rq_total >= 1   (both sides)
+#
+#   Per-property Errorf (not Fatalf) so all four checks run even if one
+#   already failed (reference_fatalf_makes_assertions_unreachable). Fatalf
+#   is reserved for a broken precondition (the /stats scrape itself
+#   failing).
+#
+# ## UNasserted
+#
+#   HTTP/3-specific counters (downstream_cx_http3_total, listener.<addr>.*,
+#   etc.) — envoy-go emits only stats it actually increments; a whole-map
+#   or codec-specific comparison is not meaningful here
+#   (reference_stats_sink_emits_used_only).
+#   Response header set equality (server/content-length exact wire fidelity
+#   is covered by Task 6's subject-side unit test on writeH3Reply, not
+#   re-driven here).
+#   QUIC/H3 transport-level framing (ALPN negotiation cadence, QUIC version
+#   negotiation, 0-RTT) — only decoded HTTP semantics are in scope.
+#
+# ## Admin probe
+#
+#   ProbeAdmin issues GET /ready against BOTH admin endpoints over
+#   HTTP-over-TCP (admin stays TCP even for a QUIC data listener) —
+#   mirrors the 0003-http11-routing precedent.
+#
+# ## Non-vacuous decode proof
+#
+#   AssertStats log.Printf's the live scraped values on both sides
+#   (fixture.TB has no Logf — reference_fixture_tb_has_no_logf); the
+#   task-7 smoke run observed:
+#     ref http.ingress_http.downstream_rq_2xx=1   subj ...=1
+#     ref http.ingress_http.downstream_rq_total=1 subj ...=1
+#
+# Cross-refs: SPEC-61 + phase 61.1 (QUIC/UDP substrate, ADR-0279) +
+#             phase 61.2 (H3 codec/HCM adapter, ADR-0281) +
+#             reference_differential_backendcount_min_one +
+#             reference_differential_asserter_dispatch +
+#             reference_http_expectations_tcp_only +
+#             reference_fixture_tb_has_no_logf +
+#             reference_fatalf_makes_assertions_unreachable +
+#             reference_stats_sink_emits_used_only +
+#             reference_docker_probe_bridge_network.
+#
+# The full break protocol (deliberately breaking each assertion to prove it
+# is live) is Task 8, not this task.

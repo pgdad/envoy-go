@@ -128,6 +128,7 @@ import (
 	_ "github.com/pgdad/envoy-go/test/fixtures/0101-stats-sink-graphite/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0102-tracing-custom-tags-literal/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0103-xds-sds-server-cert/driver"
+	_ "github.com/pgdad/envoy-go/test/fixtures/0104-http3-downstream-get/driver"
 	"github.com/pgdad/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
@@ -1145,6 +1146,10 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	} else {
 		refPorts = []int{d.ReferenceListenerPort()}
 	}
+	refIsUDP := false
+	if u, ok := d.(fixture.ReferenceListenerIsUDP); ok {
+		refIsUDP = u.ReferenceListenerIsUDP()
+	}
 	var ref *ReferenceProxy
 	var err error
 	if rlm, ok := d.(fixture.ReferenceLogMounter); ok {
@@ -1171,6 +1176,13 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 			}
 		}
 		ref, err = StartReferenceProxyWithMounts(ctx, pin, bootstrap, hostMounts, refPorts...)
+	} else if refIsUDP {
+		// NOTE (phase 61.3): the mount branch above wins over refIsUDP, so a
+		// fixture that is BOTH a ReferenceLogMounter AND ReferenceListenerIsUDP
+		// would expose its listener as /tcp and silently break the UDP dial. No
+		// current fixture overlaps (0104 is the only UDP fixture, not a mounter);
+		// a future UDP+mount fixture must thread udpPorts through the mount path.
+		ref, err = startReferenceProxy(ctx, pin, bootstrap, nil, nil, refPorts)
 	} else {
 		ref, err = StartReferenceProxy(ctx, pin, bootstrap, refPorts...)
 	}
@@ -1179,6 +1191,9 @@ func runFixture(t *testing.T, root string, pin *EnvoyPin, _ string, d FixtureDri
 	}
 	defer func() { _ = ref.Stop(context.Background()) }()
 	refAddr := ref.ListenerAddr(d.ReferenceListenerPort())
+	if refIsUDP {
+		refAddr = ref.ListenerUDPAddr(d.ReferenceListenerPort())
+	}
 
 	// 3. Subject proxy (allocate→render→start with retry; see
 	// startSubjectWithRetry for the bind-collision rationale).
