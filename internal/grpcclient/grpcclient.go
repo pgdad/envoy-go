@@ -59,6 +59,7 @@ import (
 	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/service/accesslog/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	metricsv3 "github.com/envoyproxy/go-control-plane/envoy/service/metrics/v3"
+	secretv3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/grpc"
@@ -342,6 +343,59 @@ func (a *ALSClient) Close() error {
 		return nil
 	}
 	return a.connHolder.close()
+}
+
+// ----------------------------------------------------------------------------
+// SDSClient — the typed SecretDiscoveryService/StreamSecrets BIDI wrapper (ADR-0278).
+// ----------------------------------------------------------------------------
+
+// SDSClient wraps a *grpc.ClientConn with the typed
+// secretv3.SecretDiscoveryServiceClient stub. One *SDSClient per SDS secret
+// config (cluster_name), owned by the internal/xds SecretProvider and Close()d at
+// shutdown. The ALSClient precedent (ADR-0158) but BIDI — StreamSecrets is a
+// bidirectional stream (Send *DiscoveryRequest / Recv *DiscoveryResponse), unlike
+// ALS's client-streaming.
+//
+// Concurrency: a *SDSClient is safe for concurrent use — the underlying
+// *grpc.ClientConn is goroutine-safe. Each StreamSecrets call opens a distinct
+// bidi stream; an individual stream is NOT itself concurrency-safe and is driven
+// by a single caller.
+type SDSClient struct {
+	connHolder
+	stub secretv3.SecretDiscoveryServiceClient
+}
+
+// NewSDSClient dials the named cluster via d.DialContext and wraps the resulting
+// *grpc.ClientConn in a typed SDSClient. On dial error returns (nil, err) verbatim
+// (already cluster-named via DialContext's wrapping). The NewALSClient shape.
+func NewSDSClient(d *Dialer, clusterName string) (*SDSClient, error) {
+	conn, err := dialConn(d, "SDS client", clusterName)
+	if err != nil {
+		return nil, err
+	}
+	return &SDSClient{
+		connHolder: connHolder{conn: conn},
+		stub:       secretv3.NewSecretDiscoveryServiceClient(conn),
+	}, nil
+}
+
+// StreamSecrets opens the bidirectional StreamSecrets RPC. The caller (the SDS
+// provider) drives Send(*DiscoveryRequest) + Recv(*DiscoveryResponse); ctx bounds
+// the stream lifetime (the provider applies initial_fetch_timeout via ctx).
+func (c *SDSClient) StreamSecrets(ctx context.Context) (secretv3.SecretDiscoveryService_StreamSecretsClient, error) {
+	if c == nil || c.stub == nil {
+		return nil, errors.New("grpcclient: StreamSecrets: nil SDSClient / stub")
+	}
+	return c.stub.StreamSecrets(ctx)
+}
+
+// Close releases the underlying *grpc.ClientConn. Idempotent (shared connHolder
+// sync.Once), the ALSClient.Close shape. A nil receiver is tolerated (returns nil).
+func (c *SDSClient) Close() error {
+	if c == nil {
+		return nil
+	}
+	return c.connHolder.close()
 }
 
 // ----------------------------------------------------------------------------

@@ -63,7 +63,9 @@ import (
 	upstreamshttpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	accesslogv3 "github.com/envoyproxy/go-control-plane/envoy/service/accesslog/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
+	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	metricsv3 "github.com/envoyproxy/go-control-plane/envoy/service/metrics/v3"
+	secretv3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/grpc"
@@ -1619,5 +1621,239 @@ func TestMetricsServiceClient_Close_NilSafe(t *testing.T) {
 	var c *MetricsServiceClient
 	if err := c.Close(); err != nil {
 		t.Errorf("nil MetricsServiceClient Close: err = %v; want nil", err)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// In-process gRPC SDS (SecretDiscoveryService) server — Task 6 (SDSClient).
+//
+// StreamSecrets is a BIDIRECTIONAL stream (unlike ALS/StreamMetrics's client-
+// streaming), so the smoke test stands up a BARE in-test SDS server here: a
+// no-op stub that echoes one DiscoveryResponse per DiscoveryRequest received,
+// then drains until EOF. Mirrors `startTestALSServer` (TLS-fronted, ALPN h2)
+// so the same `mkH2ClusterMgr` builder wires a cluster to it.
+// ----------------------------------------------------------------------------
+
+// fakeSDSServer implements `secretv3.SecretDiscoveryServiceServer`. StreamSecrets
+// echoes one DiscoveryResponse per DiscoveryRequest received, until EOF.
+type fakeSDSServer struct {
+	secretv3.UnimplementedSecretDiscoveryServiceServer
+}
+
+func (f *fakeSDSServer) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSecretsServer) error {
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := stream.Send(&discoveryv3.DiscoveryResponse{VersionInfo: req.GetVersionInfo()}); err != nil {
+			return err
+		}
+	}
+}
+
+// startTestSDSServer starts a TLS-fronted `*grpc.Server` on a loopback port
+// with ALPN h2; registers a `fakeSDSServer`. Returns the bound port and a
+// `stop` func (calls `GracefulStop`). Mirrors `startTestALSServer`.
+func startTestSDSServer(t testing.TB, pki *authTestPKI) (uint32, func()) {
+	t.Helper()
+	pair, err := stdtls.X509KeyPair(pki.leafCertPEM, pki.leafKeyPEM)
+	if err != nil {
+		t.Fatalf("server keypair: %v", err)
+	}
+	cfg := &stdtls.Config{
+		Certificates: []stdtls.Certificate{pair},
+		NextProtos:   []string{"h2"},
+		MinVersion:   stdtls.VersionTLS12,
+		MaxVersion:   stdtls.VersionTLS13,
+	}
+	ln, err := stdtls.Listen("tcp", "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatalf("listen tls: %v", err)
+	}
+	s := grpc.NewServer()
+	secretv3.RegisterSecretDiscoveryServiceServer(s, &fakeSDSServer{})
+	go func() {
+		_ = s.Serve(ln)
+	}()
+	port := uint32(ln.Addr().(*net.TCPAddr).Port)
+	stop := func() {
+		s.GracefulStop()
+		_ = ln.Close()
+	}
+	return port, stop
+}
+
+// ----------------------------------------------------------------------------
+// Group 6 — SDSClient surface (Task 6) — the EXACT ALSClient analog for the
+// Secret Discovery Service, but BIDI (StreamSecrets: Send *DiscoveryRequest /
+// Recv *DiscoveryResponse) rather than ALS's client-streaming (ADR-0278 /
+// ADR-0158 precedent).
+// ----------------------------------------------------------------------------
+
+// TestSDSClient_NewSDSClient_NilDialer verifies a nil `*Dialer` errors with the
+// cluster name named (mirrors NewALSClient's nil-dialer guard).
+func TestSDSClient_NewSDSClient_NilDialer(t *testing.T) {
+	t.Parallel()
+	c, err := NewSDSClient(nil, "c_sds")
+	if err == nil {
+		_ = c.Close()
+		t.Fatalf("NewSDSClient(nil): err = nil; want non-nil")
+	}
+	if c != nil {
+		t.Errorf("NewSDSClient(nil): c = %v; want nil on error", c)
+	}
+	if !strings.Contains(err.Error(), "c_sds") {
+		t.Errorf("NewSDSClient(nil) err = %q; want substring %q", err.Error(), "c_sds")
+	}
+	if !strings.Contains(err.Error(), "dialer is nil") {
+		t.Errorf("NewSDSClient(nil) err = %q; want substring %q", err.Error(), "dialer is nil")
+	}
+}
+
+// TestSDSClient_NewSDSClient_UnknownCluster verifies the DialContext
+// unknown-cluster PARSE-REJECT propagates through NewSDSClient, naming the
+// cluster.
+func TestSDSClient_NewSDSClient_UnknownCluster(t *testing.T) {
+	t.Parallel()
+	mgr := mkPlainClusterMgr(t, "c_other", 9999) // wrong name → unknown-cluster
+	d := New(mgr)
+
+	c, err := NewSDSClient(d, "c_missing")
+	if err == nil {
+		_ = c.Close()
+		t.Fatalf("NewSDSClient: err = nil; want unknown-cluster PARSE-REJECT")
+	}
+	if c != nil {
+		t.Errorf("NewSDSClient: c = %v; want nil on error", c)
+	}
+	if !strings.Contains(err.Error(), "c_missing") {
+		t.Errorf("NewSDSClient err = %q; want substring %q", err.Error(), "c_missing")
+	}
+	if !strings.Contains(err.Error(), "unknown cluster") {
+		t.Errorf("NewSDSClient err = %q; want substring %q", err.Error(), "unknown cluster")
+	}
+}
+
+// TestSDSClient_NewSDSClient_NonH2Cluster verifies a cluster WITHOUT
+// http2_protocol_options{} errors via the DialContext UseH2() gate.
+func TestSDSClient_NewSDSClient_NonH2Cluster(t *testing.T) {
+	t.Parallel()
+	mgr := mkPlainClusterMgr(t, "c_plain", 9999) // UseH2() == false
+	d := New(mgr)
+
+	c, err := NewSDSClient(d, "c_plain")
+	if err == nil {
+		_ = c.Close()
+		t.Fatalf("NewSDSClient: err = nil; want non-H2 PARSE-REJECT")
+	}
+	if c != nil {
+		t.Errorf("NewSDSClient: c = %v; want nil on error", c)
+	}
+	if !strings.Contains(err.Error(), "c_plain") {
+		t.Errorf("NewSDSClient err = %q; want substring %q", err.Error(), "c_plain")
+	}
+	if !strings.Contains(err.Error(), "HTTP/2 framing") {
+		t.Errorf("NewSDSClient err = %q; want substring %q", err.Error(), "HTTP/2 framing")
+	}
+}
+
+// TestSDSClient_Close_Idempotent verifies the sync.Once-guarded Close against a
+// valid H2 cluster: repeated Close() returns the same (nil) error, no panic.
+func TestSDSClient_Close_Idempotent(t *testing.T) {
+	t.Parallel()
+	pki := mkAuthPKI(t)
+	port, stop := startTestSDSServer(t, pki)
+	t.Cleanup(stop)
+	mgr := mkH2ClusterMgr(t, pki, "c_sds", port)
+	d := New(mgr)
+
+	c, err := NewSDSClient(d, "c_sds")
+	if err != nil {
+		t.Fatalf("NewSDSClient: %v", err)
+	}
+
+	err1 := c.Close()
+	err2 := c.Close()
+	err3 := c.Close()
+	if (err1 == nil) != (err2 == nil) || (err2 == nil) != (err3 == nil) {
+		t.Errorf("Close idempotency: err1=%v, err2=%v, err3=%v; want all equal", err1, err2, err3)
+	}
+	if err1 != nil && (err1.Error() != err2.Error() || err2.Error() != err3.Error()) {
+		t.Errorf("Close idempotency: err1=%q, err2=%q, err3=%q; want all equal", err1, err2, err3)
+	}
+}
+
+// TestSDSClient_StreamSecrets_ReturnsStream verifies that against a valid H2
+// cluster wired to the in-test SDS server, StreamSecrets opens a non-nil BIDI
+// RPC whose Send + Recv round-trip a DiscoveryRequest/DiscoveryResponse pair.
+func TestSDSClient_StreamSecrets_ReturnsStream(t *testing.T) {
+	t.Parallel()
+	pki := mkAuthPKI(t)
+	port, stop := startTestSDSServer(t, pki)
+	t.Cleanup(stop)
+	mgr := mkH2ClusterMgr(t, pki, "c_sds", port)
+	d := New(mgr)
+
+	c, err := NewSDSClient(d, "c_sds")
+	if err != nil {
+		t.Fatalf("NewSDSClient: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	stream, err := c.StreamSecrets(ctx)
+	if err != nil {
+		t.Fatalf("StreamSecrets: %v", err)
+	}
+	if stream == nil {
+		t.Fatalf("StreamSecrets: nil stream")
+	}
+	if err := stream.Send(&discoveryv3.DiscoveryRequest{VersionInfo: "v1"}); err != nil {
+		t.Fatalf("stream.Send: %v", err)
+	}
+	resp, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("stream.Recv: %v", err)
+	}
+	if resp == nil {
+		t.Fatalf("stream.Recv: nil response")
+	}
+	if resp.GetVersionInfo() != "v1" {
+		t.Errorf("stream.Recv: VersionInfo = %q; want %q (echoed)", resp.GetVersionInfo(), "v1")
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Errorf("stream.CloseSend: %v", err)
+	}
+}
+
+// TestSDSClient_Close_NilSafe verifies Close() on a nil *SDSClient is a no-op
+// returning nil (mirrors ALSClient.Close nil-tolerance).
+func TestSDSClient_Close_NilSafe(t *testing.T) {
+	t.Parallel()
+	var c *SDSClient
+	if err := c.Close(); err != nil {
+		t.Errorf("nil SDSClient Close: err = %v; want nil", err)
+	}
+}
+
+// TestSDSClient_StreamSecrets_NilClientErrors verifies StreamSecrets on a nil
+// *SDSClient returns a non-nil error cleanly (no panic) — mirrors
+// OTLPTracesClient_Export_NilClientErrors's nil-receiver-tolerance shape.
+func TestSDSClient_StreamSecrets_NilClientErrors(t *testing.T) {
+	t.Parallel()
+	var c *SDSClient
+	ctx := context.Background()
+	stream, err := c.StreamSecrets(ctx)
+	if err == nil {
+		t.Errorf("nil SDSClient StreamSecrets: err = nil; want non-nil")
+	}
+	if stream != nil {
+		t.Errorf("nil SDSClient StreamSecrets: stream = %v; want nil", stream)
 	}
 }
