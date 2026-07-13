@@ -28,23 +28,27 @@ If ANY check prints output, the sentinel does NOT fire: proceed with the stage b
 
 Check (3) fails SAFE by construction: a future family whose rows use a slug not listed above reads as "never opened", which BLOCKS `stop` rather than falsely triggering it. A false "not done" costs one wasted session; a false "done" ends the project early. When you open a new family, add its row-summary slug here.
 
-**SENTINEL RE-CHECKED 2026-07-12 (at the phase-59 PLAN, run MECHANICALLY) — it does NOT fire. Do NOT create `stop`.** The phase-59 PLAN landed (docs-only; row 59 STAYS `in-progress`); the state after it:
-- (1) prints `NOT DONE: row 59` — row 59 (`tracing-custom-tags-literal`) STAYS `in-progress` (a row flips `done` only at its IMPL six-gate per ADR-0106). This ALONE blocks `stop`. (UNCHANGED from the phase-59 SPEC/BRAINSTORM state — a PLAN is docs-only and does not flip the row.)
-- (2) prints EXACTLY ONE live "candidates:" sentence — the Observability family's `remaining deferred (not-yet-chartered) candidates: OTLP-metrics stats sink + tracing custom_tags/spawn_upstream_span/http_service/force-trace.` (UNCHANGED at the PLAN; `custom_tags` NARROWS to its non-literal types only at the phase-59 IMPL). ⇒ Observability STAYS OPEN. (One live match, `reference_sentinel_deferred_sentence_live_vs_historical`.)
-- (3) prints `NEVER OPENED: HTTP/3`, `gRPC`, `xDS`, `Runtime`, `WASM` ⇒ FIVE families never opened; Operational-tooling also STAYS OPEN.
+**SENTINEL RE-CHECKED 2026-07-12 (after the phase-60/61 parallel design fan-out, run MECHANICALLY) — it does NOT fire. Do NOT create `stop`.** State:
+- (1) prints `NOT DONE: row 59`, `NOT DONE: row 60`, `NOT DONE: row 61` — THREE `in-progress` rows (row 59 `tracing-custom-tags-literal` PLAN'd; rows 60 `xds-sds-server-cert` + 61 `http3-downstream-listener` SPEC'd via the fan-out). A row flips `done` only at its IMPL six-gate (ADR-0106). This ALONE blocks `stop`.
+- (2) prints THREE live "candidates:" sentences — Observability (`OTLP-metrics stats sink + tracing custom_tags/spawn_upstream_span/http_service/force-trace`), xDS (`SDS rotation + validation_context/upstream SDS + CDS/EDS + LDS/RDS + ADS + Delta + RTDS/Runtime + reconnection/initial_fetch_timeout + google_grpc`), and HTTP/3 (`upstream H3 + alt-svc + 0-RTT + h3spec + QuicProtocolOptions + full transport-socket options + QUIC robustness`). ⇒ three families STAY OPEN. (`reference_sentinel_deferred_sentence_live_vs_historical`.)
+- (3) prints `NEVER OPENED: gRPC`, `Runtime`, `WASM` ⇒ THREE families never opened (DOWN from five — xDS + HTTP/3 were OPENED by the fan-out). Operational-tooling also STAYS OPEN.
 
 All three checks print ⇒ the sentinel does NOT fire.
 
-**STATUS AS OF 2026-07-12: phase 59 (`tracing-custom-tags-literal`) is CHARTERED, BRAINSTORMED, SPEC'd, and PLANNED — the PLAN landed (docs-only; row 59 STAYS `in-progress`, lifecycle-state 2 → 3). The next stage is the phase-59 IMPL.** The PLAN is a MECHANICAL 8-task TDD spine over SPEC §10 (no empirical question remains — all ten D-CT-* were disposed at the SPEC). Every `file:line` was RE-DERIVED against master tip `36f012cf` this PLAN session (`feedback_brief_citations_not_evidence` — the SPEC's citations were a starting point, verified; incl. the `CustomTag_Literal_`/`CustomTag_RequestHeader` oneof-wrapper naming asymmetry in `custom_tag.pb.go`, and the existing `config_test.go:319-324` typeless `custom_tags` row that STAYS green under the new code). `PROGRESS.md` is scaffolded. ADR-0045: a SINGLE FLAT ROW (8 tasks, escape-valve UNCONSUMED).
+**STATUS AS OF 2026-07-12: the NEXT IMPLEMENTABLE PHASE is the phase-59 IMPL** (row 59 `tracing-custom-tags-literal`, lifecycle-state 3 → done). It is the ONLY phase with a landed PLAN — its 8-task TDD spine is ready to execute. Rows 60 (`xds-sds-server-cert`) and 61 (`http3-downstream-listener`) are BANKED at SPEC by the parallel design fan-out — each a CONFIRMED SPLIT (60.1/60.2 and 61.1/61.2/61.3), so each leg needs its OWN PLAN then IMPL; they are NOT yet IMPL-ready. So this session's IMPL target is phase 59.
 
-**Current counts (verified at the phase-59 PLAN, on the frozen HEAD; UNCHANGED — a PLAN is docs-only):** fixtures **103** (tail `0101-stats-sink-graphite`) · fuzzers **54** · DECISIONS tail **ADR-0276** (next-free **ADR-0277**) · BackendKind tail **38** (`H2GoawayResponder`) · stat surface **1201** · new Go packages **0** · new go.mod modules **0**. RE-VERIFY against the actual master tip at session start (`git fetch` first).
+The phase-59 PLAN is a MECHANICAL 8-task TDD spine over SPEC §10 (no empirical question remains — all ten D-CT-* disposed at the SPEC). Every `file:line` was RE-DERIVED against master tip `36f012cf` at the PLAN (`feedback_brief_citations_not_evidence`; incl. the `CustomTag_Literal_`/`CustomTag_RequestHeader` oneof-wrapper naming asymmetry in `custom_tag.pb.go`, and the existing `config_test.go:319-324` typeless `custom_tags` row that STAYS green under the new code). `PROGRESS.md` is scaffolded. ADR-0045: a SINGLE FLAT ROW (8 tasks, escape-valve UNCONSUMED).
+
+**ADR reservation ledger (provisional; each finalized at its IMPL in landing order):** ADR-0277 = phase-59 · ADR-0278 = xDS 60.1 · ADR-0279 = HTTP/3 (61) · ADR-0280 = xDS 60.2 · next-free **ADR-0281**. **Fixture caveat:** phase-59, xDS-60.2, and HTTP/3-61.3 EACH anticipate a `0102-*` dir — RE-DERIVE the actual fixture-dir number against the master tip at IMPL time (landing order assigns 0102/0103/0104…).
+
+**Current counts (verified after the fan-out, on master tip `6ffbba5d`; UNCHANGED — the fan-out was docs-only):** fixtures **103** (tail `0101-stats-sink-graphite`) · fuzzers **54** · DECISIONS tail **ADR-0276** (the ADR §Context drafts live in the phase 59/60/61 SPECs; the real DECISIONS.md entries land at each IMPL per ADR-0044) · BackendKind tail **38** (`H2GoawayResponder`) · stat surface **1201** · new Go packages **0** · new go.mod modules **0**. RE-VERIFY against the actual master tip at session start (`git fetch` first).
 
 **Locating the phase-59 PLAN stage squash** (a router cannot name its own sha — identify by SUBJECT, never by position):
 ```sh
 git log --oneline --grep='^phase 59 (tracing-custom-tags-literal) PLAN' -1
 ```
 
-**THE NEXT ACTION: the phase-59 IMPL (lifecycle-state 3 → done; row 59 flips `done` at the IMPL six-gate per ADR-0106).**
+**THE NEXT ACTION: the phase-59 IMPL (lifecycle-state 3 → done; row 59 flips `done` at the IMPL six-gate per ADR-0106).** After it lands, the roller's next choices (per the standing directive) are to PLAN one of the banked SPLIT legs (xDS 60.1 or HTTP/3 61.1) OR self-pick a new smallest-defensible subject — the sentinel governs termination, not this list.
 
 ==============================================
 
@@ -63,7 +67,7 @@ Perform the IMPL for phase 59 — SUBAGENT-DRIVEN (`feedback_execution_style`, `
 8. **ADR-0277 body** (§Decision/§Consequences on the SPEC §13 §Context per ADR-0044) + **STATE** + **ROADMAP** (row 59 → `done` per ADR-0106; the LIVE deferred sentence NARROWS `custom_tags` → the non-literal types — re-run the check-(2) grep, EXACTLY ONE live "candidates:" match, `reference_sentinel_deferred_sentence_live_vs_historical`) + **PROGRESS close** + **router roll** (to the NEXT router decision — a new BRAINSTORM; the roller self-picks the smallest defensible candidate per the 2026-07-12 standing directive; the sentinel does NOT fire).
 
 ## Honor throughout (the discipline, unchanged)
-- **Lifecycle = one stage per session.** This session: the phase-59 IMPL ONLY. After it lands: the next BRAINSTORM (roller self-picks the subject).
+- **Lifecycle = one stage per session.** This session: the phase-59 IMPL ONLY. After it lands: the roller PLANs a banked SPLIT leg (xDS 60.1 or HTTP/3 61.1 — both already BRAINSTORMED + SPEC'd) or self-picks a new smallest-defensible subject (per the standing directive).
 - **Process anchors:** ADR-0044 (ADR §Decision/§Consequences land at the IMPL) · ADR-0045 (split gate ~15 tasks; UNCONSUMED here) · ADR-0080 (distinct per-arm substrings — all six here) · ADR-0106 (a row flips `done` at its IMPL six-gate). Next-free ADR is **ADR-0277**.
 - **Subagent-driven execution** (`feedback_execution_style`, `feedback_subagent_autocommit_claudemd`, `feedback_subagents_no_push`): subagents commit LOCALLY only; the controller squashes at stage-close and pushes. Watch for HEAD-detach on deliberate breaks (`feedback_subagent_worktree_detach`) and stale-path targeting (`feedback_subagent_worktree_path_targeting`).
 - **`next-prompt.txt` IS TRACKED** — edit it inside the stage worktree, fold into the stage commit; locate commits by SUBJECT (`git log --grep`), never by position (`reference_next_prompt_tracked_despite_gitignore`).
