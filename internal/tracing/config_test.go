@@ -413,8 +413,8 @@ func TestNewConfigAcceptCustomTagLiteral(t *testing.T) {
 	if len(cfg.CustomTags) != 1 {
 		t.Fatalf("CustomTags len = %d, want 1", len(cfg.CustomTags))
 	}
-	if got := cfg.CustomTags[0]; got.Key != "env" || got.Str != "prod" || got.IsInt {
-		t.Errorf("CustomTags[0] = %+v, want {Key:env Str:prod IsInt:false}", got)
+	if got := cfg.CustomTags[0]; got.Key != "env" || got.Kind != kindLiteral || got.LiteralValue != "prod" {
+		t.Errorf("CustomTags[0] = %+v, want {Key:env Kind:literal LiteralValue:prod}", got)
 	}
 }
 
@@ -430,8 +430,9 @@ func TestNewConfigAcceptCustomTagLiteralZipkin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConfig accept literal (zipkin): unexpected err %v", err)
 	}
-	if len(cfg.CustomTags) != 1 || cfg.CustomTags[0].Key != "env" || cfg.CustomTags[0].Str != "prod" {
-		t.Fatalf("CustomTags = %+v, want one {env,prod}", cfg.CustomTags)
+	if len(cfg.CustomTags) != 1 || cfg.CustomTags[0].Key != "env" ||
+		cfg.CustomTags[0].Kind != kindLiteral || cfg.CustomTags[0].LiteralValue != "prod" {
+		t.Fatalf("CustomTags = %+v, want one literal {env,prod}", cfg.CustomTags)
 	}
 }
 
@@ -454,9 +455,9 @@ func TestNewConfigRejectCustomTagArms(t *testing.T) {
 			wantSub: "empty value",
 		},
 		{
-			name:    "request_header",
-			tag:     &typetracingv3.CustomTag{Tag: "h", Type: &typetracingv3.CustomTag_RequestHeader{RequestHeader: &typetracingv3.CustomTag_Header{Name: "x-h"}}},
-			wantSub: "request_header type unsupported",
+			name:    "request_header-empty-name",
+			tag:     &typetracingv3.CustomTag{Tag: "h", Type: &typetracingv3.CustomTag_RequestHeader{RequestHeader: &typetracingv3.CustomTag_Header{Name: ""}}},
+			wantSub: "request_header tag \"h\" empty name",
 		},
 		{
 			name:    "environment",
@@ -489,5 +490,52 @@ func TestNewConfigRejectCustomTagArms(t *testing.T) {
 				t.Errorf("NewConfig(%s) err = %q, want substring %q", tc.name, err.Error(), tc.wantSub)
 			}
 		})
+	}
+}
+
+// TestNewConfigAcceptCustomTagRequestHeader: a request_header custom tag parses
+// into a CustomTagSpec carrying the header name + default (HasDefault derived from
+// a non-empty default_value).
+func TestNewConfigAcceptCustomTagRequestHeader(t *testing.T) {
+	tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+	tr.CustomTags = []*typetracingv3.CustomTag{
+		{Tag: "user", Type: &typetracingv3.CustomTag_RequestHeader{RequestHeader: &typetracingv3.CustomTag_Header{Name: "x-user", DefaultValue: "anon"}}},
+		{Tag: "bare", Type: &typetracingv3.CustomTag_RequestHeader{RequestHeader: &typetracingv3.CustomTag_Header{Name: "x-bare"}}}, // no default
+	}
+	cfg, err := NewConfig(tr)
+	if err != nil {
+		t.Fatalf("NewConfig accept request_header: unexpected err %v", err)
+	}
+	if len(cfg.CustomTags) != 2 {
+		t.Fatalf("CustomTags len = %d, want 2", len(cfg.CustomTags))
+	}
+	if got := cfg.CustomTags[0]; got.Key != "user" || got.Kind != kindRequestHeader ||
+		got.HeaderName != "x-user" || got.DefaultValue != "anon" || !got.HasDefault {
+		t.Errorf("CustomTags[0] = %+v, want request_header {user,x-user,anon,HasDefault}", got)
+	}
+	if got := cfg.CustomTags[1]; got.Key != "bare" || got.Kind != kindRequestHeader ||
+		got.HeaderName != "x-bare" || got.HasDefault {
+		t.Errorf("CustomTags[1] = %+v, want request_header {bare,x-bare,no-default}", got)
+	}
+}
+
+// TestNewConfigCustomTagFirstWinsDedup: two custom tags with the SAME key keep the
+// FIRST in config order (Envoy's config-time map insert-if-absent, SPEC-62 §11
+// arms C/D), regardless of source type.
+func TestNewConfigCustomTagFirstWinsDedup(t *testing.T) {
+	tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+	tr.CustomTags = []*typetracingv3.CustomTag{
+		customTagLiteral("dup", "LIT-VAL"),
+		{Tag: "dup", Type: &typetracingv3.CustomTag_RequestHeader{RequestHeader: &typetracingv3.CustomTag_Header{Name: "x-dup"}}},
+	}
+	cfg, err := NewConfig(tr)
+	if err != nil {
+		t.Fatalf("NewConfig dedup: unexpected err %v", err)
+	}
+	if len(cfg.CustomTags) != 1 {
+		t.Fatalf("CustomTags len = %d, want 1 (first-wins dedup)", len(cfg.CustomTags))
+	}
+	if got := cfg.CustomTags[0]; got.Key != "dup" || got.Kind != kindLiteral || got.LiteralValue != "LIT-VAL" {
+		t.Errorf("CustomTags[0] = %+v, want the FIRST (literal LIT-VAL)", got)
 	}
 }

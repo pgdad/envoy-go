@@ -361,3 +361,29 @@ func TestSpanCustomTagsUpsertOverridesBuiltin(t *testing.T) {
 		t.Errorf("http.method = %q, want COLLIDE-VALUE (override)", v)
 	}
 }
+
+// TestSpanResolvedRequestHeaderUpsertsOverBuiltin: a resolved request_header custom
+// tag whose key collides with a built-in OVERRIDES it (exactly ONE attribute with
+// that key, carrying the resolved header value) — arm B (SPEC-62 §11). The resolver
+// hands BuildServerSpan a unique-keyed []KV; upsertAttr overrides the built-in.
+func TestSpanResolvedRequestHeaderUpsertsOverBuiltin(t *testing.T) {
+	d := freshDecision()
+	in := freshInputs() // built-in http.method == "GET"
+	start := time.Now()
+	end := start.Add(time.Millisecond)
+	// A resolved request_header tag: key collides with the built-in http.method.
+	s := BuildServerSpan(d, in, []KV{{Key: "http.method", Str: "OVERRIDE-METHOD"}}, start, end)
+
+	n := 0
+	for _, kv := range s.Attrs {
+		if kv.Key == "http.method" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("http.method attribute count = %d, want 1 (upsert, not append-duplicate)", n)
+	}
+	if v := attrStr(s.Attrs, "http.method"); v != "OVERRIDE-METHOD" {
+		t.Errorf("http.method = %q, want OVERRIDE-METHOD (resolved request_header overrides built-in)", v)
+	}
+}

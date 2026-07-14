@@ -43,6 +43,21 @@ func FuzzHCMConfigParse(f *testing.F) {
 	})
 	f.Add(withCustomTags.GetTypeUrl(), withCustomTags.GetValue())
 
+	// Phase 62: a request_header custom_tags seed — one accepted `request_header`
+	// (name + default) + a mixed literal+request_header config with a duplicate key
+	// (exercises the accept arm, the empty-name reject boundary is a unit test, and
+	// the first-wins dedup path).
+	withReqHeaderTags := mkHCM(func(h *hcmv3.HttpConnectionManager) {
+		h.Tracing = &hcmv3.HttpConnectionManager_Tracing{
+			CustomTags: []*tracingv3.CustomTag{
+				{Tag: "user", Type: &tracingv3.CustomTag_RequestHeader{RequestHeader: &tracingv3.CustomTag_Header{Name: "x-user", DefaultValue: "anon"}}},
+				{Tag: "dup", Type: &tracingv3.CustomTag_Literal_{Literal: &tracingv3.CustomTag_Literal{Value: "L"}}},
+				{Tag: "dup", Type: &tracingv3.CustomTag_RequestHeader{RequestHeader: &tracingv3.CustomTag_Header{Name: "x-dup"}}},
+			},
+		}
+	})
+	f.Add(withReqHeaderTags.GetTypeUrl(), withReqHeaderTags.GetValue())
+
 	cm := mkOneClusterManagerTB(f)
 	httpReg := testHTTPRegistry()
 

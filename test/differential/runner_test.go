@@ -129,6 +129,7 @@ import (
 	_ "github.com/pgdad/envoy-go/test/fixtures/0102-tracing-custom-tags-literal/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0103-xds-sds-server-cert/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0104-http3-downstream-get/driver"
+	_ "github.com/pgdad/envoy-go/test/fixtures/0105-tracing-custom-tags-request-header/driver"
 	"github.com/pgdad/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for
