@@ -58,6 +58,21 @@ func FuzzHCMConfigParse(f *testing.F) {
 	})
 	f.Add(withReqHeaderTags.GetTypeUrl(), withReqHeaderTags.GetValue())
 
+	// Phase 63: an environment custom_tags seed — one accepted `environment`
+	// (name + default) + a mixed literal+environment config with a duplicate key
+	// (exercises the environment accept arm + the first-wins dedup; the empty-name
+	// reject boundary is a config_test unit test).
+	withEnvTags := mkHCM(func(h *hcmv3.HttpConnectionManager) {
+		h.Tracing = &hcmv3.HttpConnectionManager_Tracing{
+			CustomTags: []*tracingv3.CustomTag{
+				{Tag: "region", Type: &tracingv3.CustomTag_Environment_{Environment: &tracingv3.CustomTag_Environment{Name: "ENVOY_REGION", DefaultValue: "unknown"}}},
+				{Tag: "dup", Type: &tracingv3.CustomTag_Literal_{Literal: &tracingv3.CustomTag_Literal{Value: "L"}}},
+				{Tag: "dup", Type: &tracingv3.CustomTag_Environment_{Environment: &tracingv3.CustomTag_Environment{Name: "ENVOY_DUP"}}},
+			},
+		}
+	})
+	f.Add(withEnvTags.GetTypeUrl(), withEnvTags.GetValue())
+
 	cm := mkOneClusterManagerTB(f)
 	httpReg := testHTTPRegistry()
 

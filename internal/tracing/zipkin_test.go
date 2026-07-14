@@ -601,3 +601,38 @@ func TestZipkinEncodeResolvedRequestHeaderTag(t *testing.T) {
 		t.Errorf("tags[zone] present, want dropped by the Zipkin encoder")
 	}
 }
+
+// TestZipkinEncodeResolvedEnvironmentTag: a resolved environment custom tag surfaces
+// in the Zipkin v2 `tags` map (the shared Attrs seam feeds both exporters);
+// node_id/zone stay dropped by the encoder.
+func TestZipkinEncodeResolvedEnvironmentTag(t *testing.T) {
+	d := freshDecision()
+	in := freshInputs()
+	in.Authority = "127.0.0.1:10000"
+	in.NodeID = "node-x"
+	in.Zone = "zone-y"
+	start := time.Unix(0, 1_000_000_000)
+	end := start.Add(10 * time.Millisecond)
+	// The resolver would have produced this KV from {tag: region, environment:{name: ENVOY_REGION}}.
+	span := BuildServerSpan(d, in, []KV{{Key: "region", Str: "us-east-2"}}, start, end)
+
+	b, err := encodeZipkinSpans([]*Span{span}, false, true)
+	if err != nil {
+		t.Fatalf("encodeZipkinSpans err = %v", err)
+	}
+	var got struct {
+		Tags map[string]string `json:"tags"`
+	}
+	if err := json.Unmarshal(b[1:len(b)-1], &got); err != nil {
+		t.Fatalf("decode span: %v (%s)", err, b)
+	}
+	if got.Tags["region"] != "us-east-2" {
+		t.Errorf("tags[region] = %q, want us-east-2", got.Tags["region"])
+	}
+	if _, ok := got.Tags["node_id"]; ok {
+		t.Errorf("tags[node_id] present, want dropped by the Zipkin encoder")
+	}
+	if _, ok := got.Tags["zone"]; ok {
+		t.Errorf("tags[zone] present, want dropped by the Zipkin encoder")
+	}
+}

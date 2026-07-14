@@ -102,3 +102,46 @@ func TestResolveCustomTagsEmpty(t *testing.T) {
 		t.Errorf("ResolveCustomTags(nil, ...) = %+v, want nil", got)
 	}
 }
+
+// TestResolveCustomTagsEnvironment drives the kindEnvironment source arm: env
+// present → the env value (the default is IGNORED); env absent + default → the
+// default; env absent + no default → OMIT; env PRESENT-but-EMPTY → OMIT (SPEC-63 §11
+// arm G — present-ness is honored via os.LookupEnv, the default is NOT used, and an
+// empty resolved value is omitted). Together: OMIT iff the resolved value is empty.
+// headerLookup is IGNORED by this arm (passed nil). t.Setenv gives hermetic env
+// control. Errorf per subtest so one failing case does not mask the rest.
+func TestResolveCustomTagsEnvironment(t *testing.T) {
+	// A name that is not set in the test environment (absent cases).
+	const absent = "ENVOY_GO_TEST_ABSENT_XYZ"
+
+	t.Run("present-uses-env-value", func(t *testing.T) {
+		t.Setenv("ENVOY_GO_TEST_PRESENT", "PRESENT-VAL")
+		specs := []CustomTagSpec{{Key: "e", Kind: kindEnvironment, EnvName: "ENVOY_GO_TEST_PRESENT", DefaultValue: "def"}}
+		got := ResolveCustomTags(specs, nil)
+		if len(got) != 1 || got[0].Key != "e" || got[0].Str != "PRESENT-VAL" {
+			t.Errorf("present: got %+v, want one {e, PRESENT-VAL} (env value, default ignored)", got)
+		}
+	})
+	t.Run("absent-with-default", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "e", Kind: kindEnvironment, EnvName: absent, DefaultValue: "def-m"}}
+		got := ResolveCustomTags(specs, nil)
+		if len(got) != 1 || got[0].Str != "def-m" {
+			t.Errorf("absent+default: got %+v, want one {e, def-m}", got)
+		}
+	})
+	t.Run("absent-no-default-omits", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "e", Kind: kindEnvironment, EnvName: absent}}
+		got := ResolveCustomTags(specs, nil)
+		if len(got) != 0 {
+			t.Errorf("absent+no-default: got %+v, want OMITTED (empty resolved value)", got)
+		}
+	})
+	t.Run("present-empty-omits", func(t *testing.T) {
+		t.Setenv("ENVOY_GO_TEST_EMPTY", "") // present, empty string
+		specs := []CustomTagSpec{{Key: "e", Kind: kindEnvironment, EnvName: "ENVOY_GO_TEST_EMPTY", DefaultValue: "def-empty"}}
+		got := ResolveCustomTags(specs, nil)
+		if len(got) != 0 {
+			t.Errorf("present-empty: got %+v, want OMITTED (present-empty ignores the default, arm G)", got)
+		}
+	})
+}

@@ -1,5 +1,7 @@
 package tracing
 
+import "os"
+
 // ResolveCustomTags resolves the ordered (already first-wins-deduped) specs
 // against a per-request header lookup into span attributes. A literal spec yields
 // its static value; a request_header spec yields the FIRST value of the named
@@ -31,6 +33,23 @@ func ResolveCustomTags(specs []CustomTagSpec, headerLookup func(string) ([]strin
 			if s.HasDefault {
 				out = append(out, KV{Key: s.Key, Str: s.DefaultValue})
 			} // else omit (append nothing)
+		case kindEnvironment:
+			// The env is process-STATIC; os.LookupEnv reports present-ness so a
+			// PRESENT-but-EMPTY var ("") is distinguished from an ABSENT one
+			// (D-ENV-EMPTYVAL, SPEC §11 arm G). Resolved value = the env value if
+			// present, else the DefaultValue. The tag is OMITTED iff the resolved
+			// value is empty — a present-empty var, an absent var with no default,
+			// and an absent var with an empty default all omit; only a NON-EMPTY
+			// resolved value emits. headerLookup is IGNORED (an env tag needs no
+			// request header). This DIVERGES from kindRequestHeader's present-empty
+			// edge (which emits ""), a probe-justified difference (SPEC §3.3).
+			v, present := os.LookupEnv(s.EnvName)
+			if !present {
+				v = s.DefaultValue
+			}
+			if v != "" {
+				out = append(out, KV{Key: s.Key, Str: v})
+			}
 		}
 	}
 	return out

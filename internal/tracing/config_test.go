@@ -460,9 +460,9 @@ func TestNewConfigRejectCustomTagArms(t *testing.T) {
 			wantSub: "request_header tag \"h\" empty name",
 		},
 		{
-			name:    "environment",
-			tag:     &typetracingv3.CustomTag{Tag: "e", Type: &typetracingv3.CustomTag_Environment_{Environment: &typetracingv3.CustomTag_Environment{Name: "E"}}},
-			wantSub: "environment type unsupported",
+			name:    "environment-empty-name",
+			tag:     &typetracingv3.CustomTag{Tag: "e", Type: &typetracingv3.CustomTag_Environment_{Environment: &typetracingv3.CustomTag_Environment{Name: ""}}},
+			wantSub: "environment tag \"e\" empty name",
 		},
 		{
 			name:    "metadata",
@@ -537,5 +537,53 @@ func TestNewConfigCustomTagFirstWinsDedup(t *testing.T) {
 	}
 	if got := cfg.CustomTags[0]; got.Key != "dup" || got.Kind != kindLiteral || got.LiteralValue != "LIT-VAL" {
 		t.Errorf("CustomTags[0] = %+v, want the FIRST (literal LIT-VAL)", got)
+	}
+}
+
+// TestNewConfigAcceptCustomTagEnvironment: an environment custom tag parses into a
+// CustomTagSpec carrying the env-var name + default. kindEnvironment does NOT set
+// HasDefault (it uses the omit-iff-resolved-empty rule).
+func TestNewConfigAcceptCustomTagEnvironment(t *testing.T) {
+	tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+	tr.CustomTags = []*typetracingv3.CustomTag{
+		{Tag: "region", Type: &typetracingv3.CustomTag_Environment_{Environment: &typetracingv3.CustomTag_Environment{Name: "ENVOY_REGION", DefaultValue: "unknown"}}},
+		{Tag: "bare", Type: &typetracingv3.CustomTag_Environment_{Environment: &typetracingv3.CustomTag_Environment{Name: "ENVOY_BARE"}}}, // no default
+	}
+	cfg, err := NewConfig(tr)
+	if err != nil {
+		t.Fatalf("NewConfig accept environment: unexpected err %v", err)
+	}
+	if len(cfg.CustomTags) != 2 {
+		t.Fatalf("CustomTags len = %d, want 2", len(cfg.CustomTags))
+	}
+	if got := cfg.CustomTags[0]; got.Key != "region" || got.Kind != kindEnvironment ||
+		got.EnvName != "ENVOY_REGION" || got.DefaultValue != "unknown" {
+		t.Errorf("CustomTags[0] = %+v, want environment {region,ENVOY_REGION,unknown}", got)
+	}
+	if got := cfg.CustomTags[1]; got.Key != "bare" || got.Kind != kindEnvironment ||
+		got.EnvName != "ENVOY_BARE" || got.DefaultValue != "" {
+		t.Errorf("CustomTags[1] = %+v, want environment {bare,ENVOY_BARE,no-default}", got)
+	}
+}
+
+// TestNewConfigCustomTagEnvironmentFirstWinsDedup: an environment tag placed FIRST in
+// config order reserves its key slot at parse — a later same-key tag of ANY source
+// type is dropped (SPEC-63 §11 arm F, parse half; the resolve-time omit of an unset
+// env tag is TestResolveCustomTagsEnvironment). The stored spec is the FIRST (env).
+func TestNewConfigCustomTagEnvironmentFirstWinsDedup(t *testing.T) {
+	tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+	tr.CustomTags = []*typetracingv3.CustomTag{
+		{Tag: "dup", Type: &typetracingv3.CustomTag_Environment_{Environment: &typetracingv3.CustomTag_Environment{Name: "ENVOY_UNSET_XYZ"}}},
+		customTagLiteral("dup", "LIT-VAL"),
+	}
+	cfg, err := NewConfig(tr)
+	if err != nil {
+		t.Fatalf("NewConfig env-dedup: unexpected err %v", err)
+	}
+	if len(cfg.CustomTags) != 1 {
+		t.Fatalf("CustomTags len = %d, want 1 (first-wins dedup)", len(cfg.CustomTags))
+	}
+	if got := cfg.CustomTags[0]; got.Key != "dup" || got.Kind != kindEnvironment || got.EnvName != "ENVOY_UNSET_XYZ" {
+		t.Errorf("CustomTags[0] = %+v, want the FIRST (environment ENVOY_UNSET_XYZ)", got)
 	}
 }

@@ -1,0 +1,112 @@
+# Reference Envoy bootstrap for fixture 0106-tracing-custom-tags-environment.
+#
+# Single-listener plaintext H1 topology, cloned from 0087-tracing-otlp (phase
+# 46.1b SPEC — the OTLP span export differential). One downstream HTTP/1.1
+# listener routes every request to the HTTPFixedBody backend (cluster
+# c_backend). The HCM carries a `tracing` block (OpenTelemetry provider,
+# random_sampling 100%, service_name "0106") naming the c_otlp_collector
+# cluster, which points at the driver-owned in-process otlptrace.Server
+# receiver. The reference Envoy exports one OTLP Span per completed request.
+#
+# phase 63: the tracing block carries a custom_tags environment entry (tag
+# "env_path", read from the PATH process env var) exercising the environment
+# custom_tags source arm. PATH is naturally present + non-empty in both the
+# reference container and the subject subprocess (which inherits
+# os.Environ()), but the VALUE differs per side — so the driver asserts
+# key-presence + value-non-empty, NOT value-equality (SPEC §8). The driver
+# drives a PLAIN GET (no request-header manipulation); the present/default/
+# omit/present-empty/dedup edges are covered by resolve_test.go/config_test.go,
+# not this fixture.
+#
+# Templating: rendered by the driver's mustRender() at ReferenceBootstrap time.
+# Substitution keys:
+#   {{.AdminPort}}    — admin endpoint port (hard-coded 9901 by driver).
+#   {{.ListenerPort}} — l_test in-container port (10105 per fixture convention).
+#   {{.BackendHost}}  — HTTPFixedBody backend host (host.docker.internal per ADR-0010).
+#   {{.BackendPort}}  — HTTPFixedBody backend port (runner-allocated).
+#   {{.OTLPHost}}     — driver-owned OTLP receiver host (host.docker.internal for ref).
+#   {{.OTLPPort}}     — driver-owned OTLP receiver port (driver-allocated; the
+#                       in-process otlptrace.Server binds 0.0.0.0:<port> before the
+#                       container starts).
+#
+# Cluster type: STRICT_DNS so the reference Envoy container resolves
+# host.docker.internal (the Docker bridge host alias per ADR-0010).
+# dns_lookup_family: V4_ONLY per the established fixture precedent.
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+static_resources:
+  listeners:
+    - name: l_test
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.ListenerPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_local
+                tracing:
+                  provider:
+                    name: envoy.tracers.opentelemetry
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.config.trace.v3.OpenTelemetryConfig
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: c_otlp_collector
+                      service_name: "0106"
+                  random_sampling:
+                    value: 100
+                  custom_tags:
+                  - tag: env_path
+                    environment:
+                      name: PATH
+                route_config:
+                  name: rc_test
+                  virtual_hosts:
+                    - name: vh_test
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # c_backend: HTTPFixedBody subprocess (17-byte fixed body) reached via
+    # host.docker.internal from the reference Envoy container per ADR-0010.
+    - name: c_backend
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{.BackendHost}}, port_value: {{.BackendPort}} }
+    # c_otlp_collector: driver-owned in-process OTLP TraceService gRPC receiver.
+    # MANDATORY http2_protocol_options: {} for gRPC framing. Plaintext h2c — no TLS
+    # (D-OTLP-RECEIVER). STRICT_DNS so the container can resolve the bridge hostname.
+    - name: c_otlp_collector
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: c_otlp_collector
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{.OTLPHost}}, port_value: {{.OTLPPort}} }
