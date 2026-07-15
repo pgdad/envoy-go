@@ -636,3 +636,38 @@ func TestZipkinEncodeResolvedEnvironmentTag(t *testing.T) {
 		t.Errorf("tags[zone] present, want dropped by the Zipkin encoder")
 	}
 }
+
+// TestZipkinEncodeTruncatedHTTPURL: a truncated http.url (built via BuildHTTPURL, the
+// provider-neutral truncation) surfaces VERBATIM in the Zipkin v2 `tags` map — the
+// Zipkin encoder carries the already-truncated URL (SPEC-64 §3.5/§8; truncation is at
+// the call site, NOT in the encoder). node_id/zone stay dropped by the encoder.
+func TestZipkinEncodeTruncatedHTTPURL(t *testing.T) {
+	d := freshDecision()
+	in := freshInputs()
+	in.URL = BuildHTTPURL("http", "h.io", "/abcdefghijKLMNOPqrstuvwxyz", 16) // :path truncated to 16 bytes
+	in.NodeID = "node-x"
+	in.Zone = "zone-y"
+	start := time.Unix(0, 1_000_000_000)
+	end := start.Add(10 * time.Millisecond)
+	span := BuildServerSpan(d, in, nil, start, end)
+
+	b, err := encodeZipkinSpans([]*Span{span}, false, true)
+	if err != nil {
+		t.Fatalf("encodeZipkinSpans err = %v", err)
+	}
+	var got struct {
+		Tags map[string]string `json:"tags"`
+	}
+	if err := json.Unmarshal(b[1:len(b)-1], &got); err != nil {
+		t.Fatalf("decode span: %v (%s)", err, b)
+	}
+	if got.Tags["http.url"] != "http://h.io/abcdefghijKLMNO" {
+		t.Errorf("tags[http.url] = %q, want http://h.io/abcdefghijKLMNO (truncated)", got.Tags["http.url"])
+	}
+	if _, ok := got.Tags["node_id"]; ok {
+		t.Errorf("tags[node_id] present, want dropped by the Zipkin encoder")
+	}
+	if _, ok := got.Tags["zone"]; ok {
+		t.Errorf("tags[zone] present, want dropped by the Zipkin encoder")
+	}
+}

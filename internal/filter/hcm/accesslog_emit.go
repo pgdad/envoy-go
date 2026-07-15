@@ -37,7 +37,7 @@ func (f *Filter) emitAccessLog(r *http.Request, statusCode int, bytesSent int64,
 		if r.TLS != nil {
 			scheme = "https"
 		}
-		url := scheme + "://" + r.Host + r.URL.RequestURI()
+		url := tracing.BuildHTTPURL(scheme, r.Host, r.URL.RequestURI(), f.tracingConfig.MaxPathTagLength)
 		in := tracing.SpanInputs{
 			Method:            r.Method,
 			URL:               url,
@@ -90,7 +90,7 @@ func (f *Filter) emitAccessLogH2(req h2.H2Request, statusCode int, bytesSent int
 		if scheme == "" {
 			scheme = "https" // H2 defaults to https per RFC 9113 §8.3.1
 		}
-		url := scheme + "://" + req.Authority + req.Path
+		url := tracing.BuildHTTPURL(scheme, req.Authority, req.Path, f.tracingConfig.MaxPathTagLength)
 		// x-client-trace-id from the H2 regular headers (case-insensitive scan).
 		var clientTraceID string
 		for _, hf := range req.Headers {
@@ -159,7 +159,7 @@ func (f *Filter) emitAccessLogH3(r *http.Request, statusCode int, bytesSent int6
 		if r.TLS != nil {
 			scheme = "https"
 		}
-		url := scheme + "://" + r.Host + r.URL.RequestURI()
+		url := tracing.BuildHTTPURL(scheme, r.Host, r.URL.RequestURI(), f.tracingConfig.MaxPathTagLength)
 		in := tracing.SpanInputs{
 			Method:            r.Method,
 			URL:               url,

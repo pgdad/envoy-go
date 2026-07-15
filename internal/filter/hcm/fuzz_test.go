@@ -13,6 +13,7 @@ import (
 	tracingv3 "github.com/envoyproxy/go-control-plane/envoy/type/tracing/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/pgdad/envoy-go/internal/cluster"
 	"github.com/pgdad/envoy-go/internal/stats"
@@ -72,6 +73,17 @@ func FuzzHCMConfigParse(f *testing.F) {
 		}
 	})
 	f.Add(withEnvTags.GetTypeUrl(), withEnvTags.GetValue())
+
+	// Phase 64: a max_path_tag_length seed (incl. an explicit 0) exercises the tracing
+	// numeric-knob resolve arm (the GetMaxPathTagLength resolve REPLACED the former
+	// reject). The block sets no provider, so it errors at "provider required" AFTER
+	// the resolve — the fuzz asserts no-panic + hcm:-prefixed.
+	withMaxPathTag := mkHCM(func(h *hcmv3.HttpConnectionManager) {
+		h.Tracing = &hcmv3.HttpConnectionManager_Tracing{
+			MaxPathTagLength: wrapperspb.UInt32(0),
+		}
+	})
+	f.Add(withMaxPathTag.GetTypeUrl(), withMaxPathTag.GetValue())
 
 	cm := mkOneClusterManagerTB(f)
 	httpReg := testHTTPRegistry()

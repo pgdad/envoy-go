@@ -1,0 +1,123 @@
+# Phase 64 fixture 0107-tracing-max-path-tag-length expectations
+# (ADR-0019 — prose; the driver is the enforcer via AssertStats; this file is
+# documentation). Cloned from 0106-tracing-custom-tags-environment (itself
+# cloned from 0105-tracing-custom-tags-request-header / 0102-tracing-custom-tags-literal
+# / 0087-tracing-otlp, phase 46.1b); swaps the phase-63 environment custom_tags
+# source for the phase-64 max_path_tag_length numeric knob — the HCM `tracing`
+# block's `max_path_tag_length: 16` byte-truncates the OTLP span
+# attribute `http.url`'s :path (path+query) portion to 16 bytes, cross-side.
+#
+# Topology (single-listener plaintext H1; HTTPFixedBody backend; driver-owned
+# in-process OTLP TraceService gRPC receiver):
+#   l_test (hcm_local) — one downstream HTTP/1.1 listener; route prefix "/" →
+#                        cluster c_backend (HTTPFixedBody, 17-byte body). HCM
+#                        carries a `tracing` block (OpenTelemetry provider,
+#                        service_name "0107", random_sampling 100%) naming
+#                        c_otlp_collector — exporting one OTLP Span per completed
+#                        request to the driver-owned receiver. The `tracing`
+#                        block ALSO carries `max_path_tag_length: 16`,
+#                        sibling of `provider`/`random_sampling` (dropping the
+#                        0106 `custom_tags` block). The driver drives a PLAIN
+#                        GET against a LONG ASCII query-less path (37 bytes,
+#                        > 16), so the truncated http.url is deterministic AND
+#                        identical cross-side (the scheme://host prefix is
+#                        echoed verbatim by both proxies), making http.url a
+#                        VALUE-equality assertion (unlike 0106's key-presence
+#                        assertion). The default-256 / explicit-0 / query-cut
+#                        truncation edges are the deterministic
+#                        internal/tracing/url_test.go unit tests, not this
+#                        fixture.
+#   c_backend          — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
+#   c_otlp_collector   — driver-owned in-process TraceService receiver
+#                        (test/helpers/otlptrace/; new in phase 46.1b) on a
+#                        driver-allocated stable port, bound 0.0.0.0:<port> so the
+#                        reference container (host.docker.internal) AND the subject
+#                        (127.0.0.1) both reach it. The cluster carries the
+#                        mandatory http2_protocol_options:{} for gRPC framing +
+#                        plaintext h2c (D-OTLP-RECEIVER — no TLS).
+#
+# Reference Envoy contrib-v1.37.2 (STRICT_DNS via host.docker.internal) vs
+# envoy-go (STATIC, in-process).
+#
+# ## Workload
+#
+# Each side fires N+M = 12 requests:
+#   N = 8 PLAIN: GET /abcdefghijklmnopqrstuvwxyz0123456789 (37 bytes), Host:
+#       trace.example, UA: trace-probe/1. No inbound trace context.
+#       random_sampling 100% => each is a fresh locally-sampled span.
+#   M = 4 CONTINUATION: + Traceparent: 00-aaa...aaa-bbb...bbb-01. The proxy
+#       CONTINUES the inbound trace (keeps the inbound trace-id; sets parent_span_id
+#       to the inbound parent span id).
+# The driver POLLS the receiver's Count() to >= 12 (poll-to-converge; the reference
+# buffers spans and flushes on a timer / buffer-fill — never a fixed sleep).
+# Per-side separation: the receiver is Reset() at the start of each side's drive.
+#
+# ## Framing NOT asserted
+#
+# The cross-side assertion is on the per-span PAYLOAD aggregated across all
+# received spans — NOT the Export-call count, per-call batch sizes, connection
+# count, or flush cadence, which legitimately vary side-to-side
+# (reference_streaming_sink_differential_framing).
+#
+# ## Asserted (cross-side EXACT on the STABLE per-span subset, both sides)
+#
+#   len(spans) == 12   (zero-span pass is vacuous — proves decode ran on BOTH sides)
+#   Every span:
+#     name                        == "ingress"
+#     kind                        == SPAN_KIND_SERVER (= 2)
+#     StartTimeUnixNano           != 0  (non-zero; PRESENCE + ordering, not value)
+#     EndTimeUnixNano             != 0
+#     StartTimeUnixNano           < EndTimeUnixNano
+#     attrs["http.method"]        == "GET"
+#     attrs["http.url"]           == "http://trace.example/abcdefghijklmno"
+#                                             (:path truncated to 16 bytes by
+#                                             max_path_tag_length: 16 — cross-side
+#                                             VALUE-equality, SPEC §8)
+#     attrs["component"]          == "proxy"
+#     attrs["downstream_cluster"] == "-"
+#     attrs["response_flags"]     == "-"
+#     attrs["http.status_code"]   == "200" (normalized: int or string form accepted)
+#     attrs["request_size"]       == "0"   (normalized: GET, no body)
+#     attrs["response_size"]      == "17"  (normalized: HTTPFixedBody 17-byte body)
+#     attrs["http.protocol"]      PRESENT
+#     attrs["user_agent"]         PRESENT
+#     attrs["guid:x-request-id"]  KEY PRESENT (value varies — UNasserted)
+#     attrs["upstream_cluster"]   KEY PRESENT (value UNasserted — framework gap; see below)
+#     attrs["upstream_cluster.name"] KEY PRESENT (value UNasserted — framework gap)
+#   Continuation prong (M = 4 spans where trace_id == contTraceID):
+#     trace_id     == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (the fixed inbound trace-id)
+#     parent_span_id == bbbbbbbbbbbbbbbb               (the fixed inbound parent id)
+#   Resource.attributes:
+#     service.name == "0107"   (cross-side EXACT on VALUE)
+#
+# PLUS the subject-side flat /stats counters:
+#   tracing.opentelemetry.spans_sent    == 12
+#   tracing.opentelemetry.spans_dropped == 0
+#
+# ## UNasserted (vary side-to-side / impl-specific)
+#
+#   trace_id / span_id VALUES (except the continuation prong trace_id).
+#   start/end time VALUES — non-deterministic.
+#   x-request-id / peer.address / node_id / zone VALUES.
+#   upstream_cluster / upstream_cluster.name VALUES — framework gap (see below).
+#   Export-call count / per-call batch sizes / connection count — framing.
+#   telemetry.sdk.* resource attrs / ScopeSpans.scope.name+version — impl-specific
+#       (envoy-go is not cpp; SDK attrs not emitted).
+#
+# ## upstream_cluster framework-gap deviation
+#
+# The upstream cluster name is NOT plumbed to envoy-go's request-completion seam
+# (same gap as the Lua bridge's UpstreamCluster() which returns ""). envoy-go
+# emits upstream_cluster = "" and upstream_cluster.name = ""; the reference Envoy
+# emits the real cluster name "c_backend". KEYS are present on both sides; VALUES
+# are explicitly UNasserted cross-side. Documented in README.md.
+#
+# Cross-refs: phase 64 SPEC §8 + §10 D-MPTL-* + ADR-0285 (max_path_tag_length
+#             config model + BuildHTTPURL byte-truncation helper) +
+#             phase 63 SPEC §11 D-ENV-* + ADR-0284 (environment custom_tags
+#             precedent) + phase 62 SPEC §10 D-RH-* + ADR-0283 (request_header
+#             custom_tags precedent) + phase 59 ADR-0277 (literal custom_tags
+#             precedent) + phase 46.1b SPEC §12 D-TRACE-* + ADR-0260 +
+#             reference_streaming_sink_differential_framing +
+#             reference_differential_grpc_receiver_driver_owned +
+#             reference_phase_46_tracing_split.

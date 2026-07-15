@@ -103,7 +103,7 @@ func TestNewConfigAcceptMinimal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConfig err = %v, want nil", err)
 	}
-	want := &TracingConfig{ClientSampling: 100, RandomSampling: 100, OverallSampling: 100, ServiceName: "svc", ClusterName: "c"}
+	want := &TracingConfig{ClientSampling: 100, RandomSampling: 100, OverallSampling: 100, MaxPathTagLength: 256, ServiceName: "svc", ClusterName: "c"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("NewConfig = %+v, want %+v", got, want)
 	}
@@ -330,14 +330,6 @@ func TestNewConfigRejectArms(t *testing.T) {
 			mut: func(t *testing.T) *hcmv3.HttpConnectionManager_Tracing {
 				tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
 				tr.Verbose = true
-				return tr
-			},
-		},
-		{
-			name: "max_path_tag_length",
-			mut: func(t *testing.T) *hcmv3.HttpConnectionManager_Tracing {
-				tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
-				tr.MaxPathTagLength = wrapperspb.UInt32(128)
 				return tr
 			},
 		},
@@ -586,4 +578,43 @@ func TestNewConfigCustomTagEnvironmentFirstWinsDedup(t *testing.T) {
 	if got := cfg.CustomTags[0]; got.Key != "dup" || got.Kind != kindEnvironment || got.EnvName != "ENVOY_UNSET_XYZ" {
 		t.Errorf("CustomTags[0] = %+v, want the FIRST (environment ENVOY_UNSET_XYZ)", got)
 	}
+}
+
+// TestNewConfigMaxPathTagLength: max_path_tag_length resolves to a uint32 cap on
+// TracingConfig — an explicit value is preserved, an ABSENT field defaults to 256
+// (the reference default, SPEC-64 §11 arm 1), and an explicit 0 is preserved (arm 2,
+// NOT treated as "unlimited"). Errorf per case so one failure does not mask the rest.
+func TestNewConfigMaxPathTagLength(t *testing.T) {
+	t.Run("explicit", func(t *testing.T) {
+		tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+		tr.MaxPathTagLength = wrapperspb.UInt32(128)
+		cfg, err := NewConfig(tr)
+		if err != nil {
+			t.Fatalf("NewConfig explicit: unexpected err %v", err)
+		}
+		if cfg.MaxPathTagLength != 128 {
+			t.Errorf("MaxPathTagLength = %d, want 128 (explicit value)", cfg.MaxPathTagLength)
+		}
+	})
+	t.Run("absent-defaults-256", func(t *testing.T) {
+		tr := otelProvider(t, envoyGrpcOTel("c", "svc")) // no MaxPathTagLength set
+		cfg, err := NewConfig(tr)
+		if err != nil {
+			t.Fatalf("NewConfig absent: unexpected err %v", err)
+		}
+		if cfg.MaxPathTagLength != 256 {
+			t.Errorf("MaxPathTagLength = %d, want 256 (absent default)", cfg.MaxPathTagLength)
+		}
+	})
+	t.Run("explicit-zero-preserved", func(t *testing.T) {
+		tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+		tr.MaxPathTagLength = wrapperspb.UInt32(0)
+		cfg, err := NewConfig(tr)
+		if err != nil {
+			t.Fatalf("NewConfig explicit-0: unexpected err %v", err)
+		}
+		if cfg.MaxPathTagLength != 0 {
+			t.Errorf("MaxPathTagLength = %d, want 0 (explicit 0 preserved, NOT 256)", cfg.MaxPathTagLength)
+		}
+	})
 }

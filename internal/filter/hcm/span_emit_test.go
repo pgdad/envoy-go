@@ -356,3 +356,55 @@ func TestSpanEmit_H2_ByteStableNoTracing(t *testing.T) {
 	// Must not panic.
 	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, nil)
 }
+
+// spanAttr returns the string value of the named span attribute (or "" if absent).
+func spanAttr(s *tracing.Span, key string) string {
+	for _, kv := range s.Attrs {
+		if kv.Key == key {
+			return kv.Str
+		}
+	}
+	return ""
+}
+
+// TestSpanEmit_H1_MaxPathTagLengthTruncates: the H1 call site (accesslog_emit.go:40)
+// byte-truncates the :path portion of http.url to TracingConfig.MaxPathTagLength (16),
+// preserving the scheme://host prefix (SPEC-64 §3.4, mirrors §11 arm 0).
+func TestSpanEmit_H1_MaxPathTagLengthTruncates(t *testing.T) {
+	fe := &fakeExporter{}
+	cfg := &tracing.TracingConfig{RandomSampling: 100, MaxPathTagLength: 16}
+	f := newTracingFilter(t, fe, cfg)
+
+	req, _ := http.NewRequest("GET", "http://example.com/abcdefghijKLMNOPqrstuvwxyz", nil)
+	req.Proto = "HTTP/1.1"
+	req.Host = "h.io"
+
+	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, knownDecision())
+
+	spans := fe.captured()
+	if len(spans) != 1 {
+		t.Fatalf("expected 1 span, got %d", len(spans))
+	}
+	if got := spanAttr(spans[0], "http.url"); got != "http://h.io/abcdefghijKLMNO" {
+		t.Errorf("http.url = %q, want http://h.io/abcdefghijKLMNO (:path truncated to 16 bytes)", got)
+	}
+}
+
+// TestSpanEmit_H2_MaxPathTagLengthTruncates: the H2 call site (accesslog_emit.go:93)
+// mirror — truncates req.Path to MaxPathTagLength, scheme://authority preserved.
+func TestSpanEmit_H2_MaxPathTagLengthTruncates(t *testing.T) {
+	fe := &fakeExporter{}
+	cfg := &tracing.TracingConfig{RandomSampling: 100, MaxPathTagLength: 16}
+	f := newTracingFilter(t, fe, cfg)
+
+	req := h2.H2Request{Method: "GET", Path: "/abcdefghijKLMNOPqrstuvwxyz", Scheme: "http", Authority: "h.io"}
+	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, knownDecision())
+
+	spans := fe.captured()
+	if len(spans) != 1 {
+		t.Fatalf("expected 1 span, got %d", len(spans))
+	}
+	if got := spanAttr(spans[0], "http.url"); got != "http://h.io/abcdefghijKLMNO" {
+		t.Errorf("http.url = %q, want http://h.io/abcdefghijKLMNO", got)
+	}
+}

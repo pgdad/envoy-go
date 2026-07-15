@@ -26,10 +26,16 @@ type TracingConfig struct {
 	ClientSampling  float64
 	RandomSampling  float64
 	OverallSampling float64
-	ServiceName     string
-	ClusterName     string
-	Provider        ProviderKind
-	Zipkin          *ZipkinSettings // non-nil iff Provider == ProviderZipkin
+	// MaxPathTagLength is the resolved byte-cap on the http.url span attribute's
+	// :path (path+query) portion: the reference default 256 when ABSENT, the explicit
+	// value otherwise (an explicit 0 = empty path is PRESERVED). ALWAYS set by
+	// NewConfig, so a configured-tracing Filter never sees the zero value as a
+	// spurious 0-cap (D-MPTL-DEFAULT / D-MPTL-ZERO, SPEC-64 §11).
+	MaxPathTagLength uint32
+	ServiceName      string
+	ClusterName      string
+	Provider         ProviderKind
+	Zipkin           *ZipkinSettings // non-nil iff Provider == ProviderZipkin
 	// CustomTags are the parsed custom tags (provider-neutral), ORDERED and
 	// first-wins-deduplicated by tag key at parse (matching the reference's
 	// config-time map). ResolveCustomTags resolves them per-request into span
@@ -109,8 +115,9 @@ func NewConfig(t *hcmv3.HttpConnectionManager_Tracing) (*TracingConfig, error) {
 	if t.GetVerbose() {
 		return nil, fmt.Errorf("tracing: verbose is unsupported")
 	}
-	if t.GetMaxPathTagLength() != nil {
-		return nil, fmt.Errorf("tracing: max_path_tag_length is unsupported")
+	maxPathTagLen := uint32(256) // the reference default when ABSENT (D-MPTL-DEFAULT, SPEC-64 §11 arm 1)
+	if m := t.GetMaxPathTagLength(); m != nil {
+		maxPathTagLen = m.GetValue() // explicit value; an explicit 0 is PRESERVED (D-MPTL-ZERO, arm 2)
 	}
 	customTags, err := parseCustomTags(t.GetCustomTags())
 	if err != nil {
@@ -152,6 +159,7 @@ func NewConfig(t *hcmv3.HttpConnectionManager_Tracing) (*TracingConfig, error) {
 		return nil, err
 	}
 	cfg.CustomTags = customTags
+	cfg.MaxPathTagLength = maxPathTagLen
 	return cfg, nil
 }
 
