@@ -16944,3 +16944,42 @@ Two further obligations the envelope-lift creates, **neither anticipated by the 
 Only **ONE of the proto's three documented merge rules is reachable** (the singular-`trusted_ca` case), and envoy-go reaches it by construction rather than by `MergeFrom`: repeated-concatenate and bool-OR are structurally unreachable, because a mechanical reflection enumeration of `CertificateValidationContext`'s **15** fields shows envoy-go rejects or silently ignores every repeated and bool field. `crl`, `trust_chain_verification` (incl. `ACCEPT_UNTRUSTED`), `system_root_certs`, `max_verify_depth`, `ca_certificate_provider_instance` and `match_subject_alt_names` remain **SHARED** silent-ignore gaps on both paths — this row closes none of them, and rejecting them on the CVC path alone would introduce a NEW asymmetry. `require_client_certificate: false` (verify-if-presented) is **scoped out as a named boundary** with the reference behavior PROBED and PINNED: the reference honors the anchor; envoy-go silently ignores it, on **all three** paths (CVC, plain SDS-VC, fully-inline), so lifting it belongs in a row that fixes all three.
 
 *(§Decision + §Consequences land at the phase-66 IMPL.)*
+
+---
+
+## ADR-0288 — Restore `STATE.md` to the POINTER its charter defines, archiving the accumulated stage history to `STATE_HISTORY.md` (a navigation/correctness move, NOT a phase; row 66 is untouched)
+
+### Context
+
+`BOOTSTRAP_PROMPT.md` §4 defines `STATE.md` as *"pointer: active phase, last commit, next action"*, and §4.1 invariant 1 scopes its job to *"the single source of truth for 'what next'… It names the active phase directory and the next expected skill invocation."*
+
+It had grown to **750,794 bytes / 384 lines**, of which **~93% (696 KB) was 152 accumulated `prior active-phase:` bullets**. Each stage prepended a new bullet above the last; none was ever retired. The current stage's bullet alone was ~6 KB.
+
+**This was not merely bloat — it had become a CORRECTNESS defect against invariant 1.** Prepending had buried TWO fossilised "current state" blocks far below the fold, and they still advertised live-looking routing fields:
+
+| Field | `STATE.md` said | Truth at `a1fe295a` |
+|---|---|---|
+| `next-skill:` | *"the 42.2 hedging BRAINSTORM"* (line 341) and *"the 46.2 SPEC"* (line 362) | the **phase-66 PLAN** |
+| `lifecycle-state:` | phase 42.1 IMPL done / phase 46.1b IMPL done | phase **66** SPEC done |
+| `next-free ADR:` | `ADR-0250` / `ADR-0261` | **ADR-0288** |
+| `fuzzers:` | **48** / **42** | **55** |
+| `active differential fixtures:` | **89** / **77** | **110** |
+| `last-updated:` | 2026-06-20 / 2026-06-28 | 2026-07-16 |
+
+So the file whose ONE invariant is to be the single source of truth for "what next" contained **three mutually contradictory "next" pointers**. Worse, the *live* bullet stated its next action in PROSE rather than in the `next-skill:` field — so **`grep '^- \*\*next-skill:\*\*' STATE.md` returned exactly two hits, BOTH stale (42.2 and 46.2), and ZERO live ones.** A session that grepped for its next action — a reasonable act on a 750 KB file no one can read in full — routed to a phase that had completed roughly twenty-four rows earlier. Same for every count.
+
+**Why archiving is licensed rather than a violation.** Invariant 2 declares `ROADMAP.md` append-only; invariant 4 declares `DECISIONS.md` append-only. **`STATE.md` is conspicuously NOT declared append-only** — the discipline was applied where completeness is the point and withheld here, and the file's charter ("pointer") says why. Nothing consumes `STATE.md` mechanically (zero `.go`/`.sh`/CI references — verified repo-wide). And the archived content is triply redundant: every retired bullet's substance also lives in its stage's commit message, in that phase's own `BRAINSTORM`/`SPEC`/`PLAN`/`PROGRESS` docs, and in the append-only `ROADMAP` row. Invariant 7 sets the precedent that a navigation-driven archival move is legitimate *"with an ADR documenting the move"* — this is that ADR.
+
+### Decision
+
+1. **`STATE.md` is rebuilt as a POINTER** (750,794 → **35,407 bytes, 95.3% smaller**): a `§Current pointer` block (active-phase, phase-directory, lifecycle-state, next-skill, last-commit, last-updated, next-free ADR), a LIVE `§Project counts` block with canonical commands inline, and a `§Recent lineage` of the **last FIVE stages only** (phase-66 SPEC/BRAINSTORM + phase-65 IMPL/PLAN/SPEC) — enough for the router's "prior-phase lineage" read. Lifecycle cross-reference and exit contract are unchanged.
+2. **`STATE_HISTORY.md` is created** carrying the **entire pre-move `STATE.md` VERBATIM, byte-for-byte** (all 384 lines / 750,794 bytes, all 152 prior bullets, both fossil blocks retained as the evidence). **Nothing is deleted.** This honors `BOOTSTRAP_PROMPT.md` Step B's *Never*: *"if it's not on disk, it does not exist for you"* — disk is the only memory, so the memory stays on disk. The archive opens with a banner declaring it carries NO live pointer and that every count in it is stale by construction.
+3. **The invariant this move installs, stated in `STATE.md`'s own header:** there is **EXACTLY ONE** live `next-skill:` / `lifecycle-state:` / `next-free ADR:` / count block in the file, in `§Current pointer`. **A stage close EDITS `§Current pointer` IN PLACE and never prepends a block above it** — prepending is precisely what buried the fossils. The recent-lineage list is capped at five; the sixth is moved to `STATE_HISTORY.md`.
+4. **Scope:** `ROADMAP.md` (819 KB) and `DECISIONS.md` (3.4 MB) are **deliberately NOT touched.** They are append-only by invariants 2 and 4, and being complete IS their job. This ADR is about a file that had drifted from its own definition, not about size as such.
+
+### Consequences
+
+- **A grep of `STATE.md` is trustworthy again.** Post-move: exactly one `next-skill:` (→ the phase-66 PLAN), one `lifecycle-state:`, `fuzzers: 55`, `fixtures: 110`, `DECISIONS tail ADR-0288`. Verified mechanically at the landing commit.
+- **Cold-start cost drops for the file that most needed it, but this does NOT fix cold start.** `BOOTSTRAP_PROMPT.md` Step B tells a cold session to read six files totalling **~6.2 MB ≈ 1.58M tokens** — which exceeds even a 1M-token context window, so **Step B is already physically unfollowable** and sessions necessarily grep/slice instead. `STATE.md` was only ~12% of that total. **This ADR does not claim to have solved cold start; it claims one file now tells the truth when grepped.** The Step B instruction remains a known, unaddressed defect — a candidate for its own future ADR, and deliberately out of scope here.
+- **No phase state changes.** Row 66 stays `in-progress`; the lifecycle is untouched; ADR-0287's §Context remains awaiting its §Decision at the phase-66 IMPL (ADR-0044). This move is orthogonal housekeeping landed between stages, not a stage.
+- **A new discipline a session can get wrong.** The five-entry lineage cap and the edit-in-place rule are conventions, not enforced by tooling. If a future session prepends, the fossil defect regenerates. The header states the rule at the point of use; that is the only enforcement.
