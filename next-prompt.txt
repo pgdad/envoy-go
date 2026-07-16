@@ -28,7 +28,7 @@ If ANY check prints output, the sentinel does NOT fire: proceed with the stage b
 
 Check (3) fails SAFE by construction: a future family whose rows use a slug not listed above reads as "never opened", which BLOCKS `stop` rather than falsely triggering it. A false "not done" costs one wasted session; a false "done" ends the project early. When you open a new family, add its row-summary slug here.
 
-**SENTINEL RE-CHECKED 2026-07-15 (after the phase-65 SPEC landed + ROADMAP row 65 STAYS `in-progress`, run MECHANICALLY) — it does NOT fire. Do NOT create `stop`.** State:
+**SENTINEL RE-VERIFIED 2026-07-16 (re-run MECHANICALLY against master `da766140` — UNCHANGED from the 2026-07-15 phase-65-SPEC-close check; all three checks still print) — it does NOT fire. Do NOT create `stop`.** State:
 - (1) prints `NOT DONE: row 65` — row 65 `xds-sds-validation-context` STAYS `in-progress` (it flips `done` only at its IMPL six-gate, ADR-0106). Check (1) BLOCKS `stop`.
 - (2) prints THREE live "candidates:" sentences — HTTP/3, xDS, and Observability ⇒ three families STAY OPEN. The xDS sentence is UNCHANGED by this SPEC (`SDS validation_context/upstream SDS` still listed; it narrows to `upstream SDS` only at the phase-65 IMPL per the observed convention).
 - (3) prints `NEVER OPENED: gRPC`, `Runtime`, `WASM` ⇒ THREE families never opened. Operational-tooling also STAYS OPEN.
