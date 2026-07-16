@@ -135,9 +135,23 @@ func NewSDSProvider(dialer *grpcclient.Dialer, bs *bootstrap.Bootstrap, baseDir 
 			if err := ts.GetTypedConfig().UnmarshalTo(&dtc); err != nil {
 				continue // a malformed transport_socket surfaces at the listener build, not here
 			}
-			if sc := dtc.GetCommonTlsContext().GetTlsCertificateSdsSecretConfigs(); len(sc) > 0 {
+			ctc := dtc.GetCommonTlsContext()
+			if sc := ctc.GetTlsCertificateSdsSecretConfigs(); len(sc) > 0 {
 				seen++
 				found = sc
+			}
+			// Phase 65 (ADR-0286): also detect an SDS-bound validation_context, so a
+			// listener using SDS ONLY for the downstream mTLS trusted-CA (with a
+			// static server cert) builds a provider. Without this the pre-scan
+			// returns (nil, nil) and the tls apply-point's nil-provider reject fires.
+			//
+			// seen++ on BOTH arms is deliberate: a context using SDS for the server
+			// cert AND the validation_context trips the seen>1 guard below — the
+			// DEFERRED compose-two edge (the single-slot provider model holds ONE
+			// secretName and ONE *SDSStats; SPEC-65 §2/§3.4).
+			if vsc, ok := ctc.GetValidationContextType().(*tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig); ok {
+				seen++
+				found = []*tlsv3.SdsSecretConfig{vsc.ValidationContextSdsSecretConfig}
 			}
 		}
 	}

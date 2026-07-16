@@ -29,7 +29,16 @@ type Server struct {
 	secretName string
 	certPEM    []byte
 	keyPEM     []byte
-	silent     bool // when true, never Send a response (drives the client's initial-fetch timeout)
+
+	// vcSecretName / trustedCAPEM configure the validation_context arm (phase 65).
+	// A Server serves EITHER a tls_certificate OR a validation_context — the
+	// single-secret shape every current fixture needs. Serving BOTH on one server
+	// is the deferred compose-two edge (rejected by boot's seen>1 guard), so the
+	// flat state deliberately stays flat rather than becoming a map.
+	vcSecretName string
+	trustedCAPEM []byte
+
+	silent bool // when true, never Send a response (drives the client's initial-fetch timeout)
 
 	mu       sync.RWMutex
 	requests []*discoveryv3.DiscoveryRequest
@@ -43,6 +52,15 @@ type Option func(*Server)
 // WithSecret configures the delivered Secret{name, tls_certificate{inline PEM}}.
 func WithSecret(name string, certPEM, keyPEM []byte) Option {
 	return func(s *Server) { s.secretName = name; s.certPEM = certPEM; s.keyPEM = keyPEM }
+}
+
+// WithValidationContext configures the delivered
+// Secret{name, validation_context{trusted_ca: inline PEM}} — the SDS-delivered
+// downstream mTLS trusted-CA (phase 65). Mutually exclusive with WithSecret: a
+// Server serves ONE secret, and buildResponse takes the validation_context
+// branch whenever a validation-context name is set.
+func WithValidationContext(name string, trustedCAPEM []byte) Option {
+	return func(s *Server) { s.vcSecretName = name; s.trustedCAPEM = trustedCAPEM }
 }
 
 // Silent makes the server accept the stream but never Send a response — used to
@@ -116,12 +134,26 @@ func (s *Server) StreamSecrets(stream secretv3.SecretDiscoveryService_StreamSecr
 }
 
 func (s *Server) buildResponse(names []string) (*discoveryv3.DiscoveryResponse, error) {
-	sec := &tlsv3.Secret{
-		Name: s.secretName,
-		Type: &tlsv3.Secret_TlsCertificate{TlsCertificate: &tlsv3.TlsCertificate{
-			CertificateChain: &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: s.certPEM}},
-			PrivateKey:       &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: s.keyPEM}},
-		}},
+	var sec *tlsv3.Secret
+	switch {
+	case s.vcSecretName != "":
+		// Phase 65: the validation_context arm — the SAME tls.v3.Secret message,
+		// a different oneof arm, so the generic TypeUrl derivation below is
+		// unchanged.
+		sec = &tlsv3.Secret{
+			Name: s.vcSecretName,
+			Type: &tlsv3.Secret_ValidationContext{ValidationContext: &tlsv3.CertificateValidationContext{
+				TrustedCa: &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: s.trustedCAPEM}},
+			}},
+		}
+	default:
+		sec = &tlsv3.Secret{
+			Name: s.secretName,
+			Type: &tlsv3.Secret_TlsCertificate{TlsCertificate: &tlsv3.TlsCertificate{
+				CertificateChain: &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: s.certPEM}},
+				PrivateKey:       &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: s.keyPEM}},
+			}},
+		}
 	}
 	any, err := anypb.New(sec)
 	if err != nil {

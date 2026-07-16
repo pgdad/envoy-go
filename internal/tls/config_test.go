@@ -5,6 +5,7 @@ import (
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -793,16 +794,23 @@ func TestPKISanity(t *testing.T) {
 	_ = strings.TrimSpace
 }
 
-// fakeProvider is a test-only xds.SecretProvider whose FetchInitialCertificate
-// returns a canned (cert, err) pair. It mirrors the shape of internal/xds's
-// real Provider without any of the stream-opening machinery.
+// fakeProvider is a test-only xds.SecretProvider whose fetches return canned
+// values. It mirrors the shape of internal/xds's real Provider without any of
+// the stream-opening machinery.
 type fakeProvider struct {
 	cert *stdtls.Certificate
 	err  error
+
+	pool  *x509.CertPool // returned by FetchInitialValidationContext
+	vcErr error          // returned by FetchInitialValidationContext
 }
 
 func (f *fakeProvider) FetchInitialCertificate(ctx context.Context, secretName string) (*stdtls.Certificate, error) {
 	return f.cert, f.err
+}
+
+func (f *fakeProvider) FetchInitialValidationContext(ctx context.Context, secretName string) (*x509.CertPool, error) {
+	return f.pool, f.vcErr
 }
 
 // sdsSecretConfig builds a valid *tlsv3.SdsSecretConfig (api_config_source,
@@ -933,8 +941,19 @@ func TestNewDownstreamConfig_SDS(t *testing.T) {
 		}
 	})
 
-	t.Run("validation_context_sds_secret_config unchanged (arm 5)", func(t *testing.T) {
+	t.Run("validation_context_sds_secret_config fetches and installs ClientCAs (arm 5, phase 65)", func(t *testing.T) {
+		// NOTE (phase 65): the pre-65 version of this subtest passed an
+		// SdsSecretConfig with NO sds_config, which — now that the path routes
+		// through xds.ParseSDSConfig — would fire the `sds_config is required`
+		// envelope reject and never reach the provider, making the ACCEPT
+		// assertion VACUOUS. A FULL sds_config is required here.
+		caPool := x509.NewCertPool()
+		if !caPool.AppendCertsFromPEM(pki.caPEM) {
+			t.Fatal("pki.caPEM: no certificates parsed")
+		}
+		fp := &fakeProvider{pool: caPool}
 		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+			RequireClientCertificate: &wrapperspb.BoolValue{Value: true},
 			CommonTlsContext: &tlsv3.CommonTlsContext{
 				TlsCertificates: []*tlsv3.TlsCertificate{
 					{
@@ -943,16 +962,80 @@ func TestNewDownstreamConfig_SDS(t *testing.T) {
 					},
 				},
 				ValidationContextType: &tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
-					ValidationContextSdsSecretConfig: &tlsv3.SdsSecretConfig{Name: "validation-secret"},
+					ValidationContextSdsSecretConfig: sdsSecretConfig("validation-secret", "sds_cluster"),
 				},
 			},
 		})
-		_, err := NewDownstreamConfig(ts, "", nil)
-		if err == nil {
-			t.Fatal("expected error, got nil")
+		cfg, err := NewDownstreamConfig(ts, "", fp)
+		if err != nil {
+			t.Fatalf("NewDownstreamConfig: unexpected err %v", err)
 		}
-		if !strings.Contains(err.Error(), "validation_context_sds_secret_config is not supported") {
-			t.Errorf("error should contain 'validation_context_sds_secret_config is not supported', got: %v", err)
+		if cfg.TLSConfig.ClientCAs == nil {
+			t.Error("ClientCAs is nil — the SDS-delivered validation_context was not installed")
+		}
+		if cfg.TLSConfig.ClientAuth != stdtls.RequireAndVerifyClientCert {
+			t.Errorf("ClientAuth = %v, want RequireAndVerifyClientCert (mandatory mTLS)", cfg.TLSConfig.ClientAuth)
+		}
+	})
+
+	t.Run("validation_context_sds fetch failure boot-FAILS (the ADR-0280 departure, extended)", func(t *testing.T) {
+		fp := &fakeProvider{vcErr: errors.New("xds: sds: secret \"validation-secret\": initial fetch timed out after 15s: context deadline exceeded")}
+		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+			RequireClientCertificate: &wrapperspb.BoolValue{Value: true},
+			CommonTlsContext: &tlsv3.CommonTlsContext{
+				TlsCertificates: []*tlsv3.TlsCertificate{
+					{
+						CertificateChain: inlineBytes(pki.leafCertPEM),
+						PrivateKey:       inlineBytes(pki.leafKeyPEM),
+					},
+				},
+				ValidationContextType: &tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
+					ValidationContextSdsSecretConfig: sdsSecretConfig("validation-secret", "sds_cluster"),
+				},
+			},
+		})
+		_, err := NewDownstreamConfig(ts, "", fp)
+		if err == nil {
+			t.Fatal("expected a boot failure, got nil (envoy-go boot-FAILS where the reference serves anyway — ADR-0280)")
+		}
+		if !strings.HasPrefix(err.Error(), "tls: ") {
+			t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", err.Error())
+		}
+		if !strings.Contains(err.Error(), "initial fetch timed out") {
+			t.Errorf("error = %q, want the provider's classified cause preserved", err.Error())
+		}
+	})
+
+	t.Run("require_client_certificate=false leaves the SDS validation_context INERT", func(t *testing.T) {
+		// Mirrors the landed inline behavior: an inline validation_context with
+		// require_client_certificate=false is ALSO inert (only the require==true
+		// block loads ClientCAs). Phase 65 introduces no NEW inconsistency, and
+		// crucially performs NO boot-time SDS fetch for this shape (SPEC-65 §3.5) —
+		// the vcErr below would surface as a boot failure if a fetch happened.
+		fp := &fakeProvider{vcErr: errors.New("FETCH MUST NOT HAPPEN")}
+		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+			// RequireClientCertificate deliberately absent (false).
+			CommonTlsContext: &tlsv3.CommonTlsContext{
+				TlsCertificates: []*tlsv3.TlsCertificate{
+					{
+						CertificateChain: inlineBytes(pki.leafCertPEM),
+						PrivateKey:       inlineBytes(pki.leafKeyPEM),
+					},
+				},
+				ValidationContextType: &tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
+					ValidationContextSdsSecretConfig: sdsSecretConfig("validation-secret", "sds_cluster"),
+				},
+			},
+		})
+		cfg, err := NewDownstreamConfig(ts, "", fp)
+		if err != nil {
+			t.Fatalf("NewDownstreamConfig: unexpected err %v (the fetch must be SKIPPED, not attempted)", err)
+		}
+		if cfg.TLSConfig.ClientCAs != nil {
+			t.Error("ClientCAs is non-nil — require_client_certificate=false must leave the SDS validation_context inert")
+		}
+		if cfg.TLSConfig.ClientAuth != stdtls.NoClientCert {
+			t.Errorf("ClientAuth = %v, want NoClientCert (inert)", cfg.TLSConfig.ClientAuth)
 		}
 	})
 }
@@ -1091,4 +1174,83 @@ func TestNewQUICDownstreamConfig_WrongTypeURL(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unexpected quic transport_socket type_url") {
 		t.Fatalf("expected wrong-type-URL error, got %v", err)
 	}
+}
+
+// TestValidationContextSDS_SiblingRejectsStay is a REGRESSION FENCE for phase 65
+// (ADR-0286), which lifts the downstream validation_context_sds_secret_config
+// reject (config.go:227) to a no-op ONLY for the live-provider path. Every OTHER
+// arm must keep refusing, and the reject substring stays BYTE-IDENTICAL (ADR-0080
+// distinct-substring rule). Errorf per arm so one failure does not mask the rest.
+//
+// The oneof matters here: CommonTlsContext.ValidationContextType holds EXACTLY
+// one of validation_context / validation_context_sds_secret_config /
+// combined_validation_context, so the arms below are mutually exclusive by
+// construction.
+func TestValidationContextSDS_SiblingRejectsStay(t *testing.T) {
+	const wantSub = "SDS-bound validation_context_sds_secret_config is not supported in phase 03"
+
+	vcSDS := func() *tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig {
+		return &tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
+			ValidationContextSdsSecretConfig: sdsSecretConfig("validation_ca", "sds_cluster"),
+		}
+	}
+
+	// Upstream: NewUpstreamConfig's trusted_ca gate (config.go:141) reads
+	// common.GetValidationContext(), which returns nil when the oneof holds the SDS
+	// arm — so upstream refuses BEFORE commonTLSContextToConfig is ever reached and
+	// the config.go:227 upstream arm is UNREACHABLE from this entry point. The fence
+	// pins the REFUSAL (what callers depend on), not a substring that never fires.
+	t.Run("upstream still rejects", func(t *testing.T) {
+		ts := makeTransportSocket(t, &tlsv3.UpstreamTlsContext{
+			CommonTlsContext: &tlsv3.CommonTlsContext{ValidationContextType: vcSDS()},
+		})
+		_, err := NewUpstreamConfig(ts, "")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "validation_context.trusted_ca is required") {
+			t.Errorf("upstream error = %q, want it to contain %q", err.Error(), "validation_context.trusted_ca is required")
+		}
+	})
+
+	// QUIC: NewQUICDownstreamConfig (config.go:90-113) calls
+	// commonTLSContextToConfig(..., "downstream", nil) at config.go:108 — side ==
+	// "downstream" WITH a nil provider. This is the arm that proves the guard needs
+	// its `|| provider == nil` clause: without it, a QUIC listener carrying an SDS
+	// validation_context would fall through and skip validation entirely. QUIC
+	// carries no SDS.
+	t.Run("quic downstream (nil provider) still rejects", func(t *testing.T) {
+		ts := makeTransportSocket(t, &quicv3.QuicDownstreamTransport{
+			DownstreamTlsContext: &tlsv3.DownstreamTlsContext{
+				CommonTlsContext: &tlsv3.CommonTlsContext{ValidationContextType: vcSDS()},
+			},
+		})
+		_, err := NewQUICDownstreamConfig(ts, "")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), wantSub) {
+			t.Errorf("quic error = %q, want it to contain %q", err.Error(), wantSub)
+		}
+	})
+
+	// Downstream with a nil provider (the non-QUIC no-SDS-provider mode): must still
+	// refuse. Either this reject or T5's nil-provider reject is acceptable; both are
+	// `tls: `-prefixed and both refuse. Pin the REFUSAL + the prefix invariant that
+	// FuzzTLSContextParse depends on.
+	t.Run("downstream with NIL provider still rejects", func(t *testing.T) {
+		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+			CommonTlsContext: &tlsv3.CommonTlsContext{ValidationContextType: vcSDS()},
+		})
+		_, err := NewDownstreamConfig(ts, "", nil)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.HasPrefix(err.Error(), "tls: ") {
+			t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", err.Error())
+		}
+		if !strings.Contains(err.Error(), wantSub) {
+			t.Errorf("downstream/nil-provider error = %q, want it to contain %q", err.Error(), wantSub)
+		}
+	})
 }

@@ -3,6 +3,7 @@ package xds
 import (
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
@@ -175,5 +176,127 @@ func TestFetchSecret_TransportError(t *testing.T) {
 	}
 	if !errors.Is(err, io.EOF) {
 		t.Errorf("fetchSecret() error = %v, want it to wrap io.EOF", err)
+	}
+}
+
+// validVCSecretAny builds an Any-wrapped Secret{name, validation_context{trusted_ca}}
+// for the stream-arm tests — the validation_context sibling of validSecretAny
+// (:42). It delegates to vcSecret (secret_test.go:218), which builds the exact
+// same shape (inline_bytes trusted_ca) for the applier tests.
+func validVCSecretAny(t *testing.T, name string) *anypb.Any {
+	t.Helper()
+	caPEM, _ := selfSignedPEM(t)
+	return vcSecret(t, name, caPEM)
+}
+
+func TestFetchValidationSecret_InitialRequestShape(t *testing.T) {
+	fs := &fakeStream{resps: []*discoveryv3.DiscoveryResponse{{
+		VersionInfo: "v1", Nonce: "n1",
+		Resources: []*anypb.Any{validVCSecretAny(t, "validation_ca")},
+	}}}
+	if _, err := fetchValidationSecret(fs, Node{ID: "id", Cluster: "cl"}, "validation_ca", ""); err != nil {
+		t.Fatalf("fetchValidationSecret: %v", err)
+	}
+	if len(fs.sent) < 1 {
+		t.Fatal("no request sent")
+	}
+	init := fs.sent[0]
+	if got := init.GetTypeUrl(); got != secretTypeURL() {
+		t.Errorf("initial TypeUrl = %q, want %q (the Secret type URL is SHARED by both oneof arms)", got, secretTypeURL())
+	}
+	if got := init.GetResourceNames(); len(got) != 1 || got[0] != "validation_ca" {
+		t.Errorf("initial ResourceNames = %v, want [validation_ca]", got)
+	}
+	if init.GetVersionInfo() != "" {
+		t.Errorf("initial VersionInfo = %q, want empty", init.GetVersionInfo())
+	}
+	if init.GetResponseNonce() != "" {
+		t.Errorf("initial ResponseNonce = %q, want empty", init.GetResponseNonce())
+	}
+	if init.GetNode().GetId() != "id" || init.GetNode().GetCluster() != "cl" {
+		t.Errorf("initial Node = %v, want {id, cl}", init.GetNode())
+	}
+}
+
+func TestFetchValidationSecret_AckOnSuccess(t *testing.T) {
+	fs := &fakeStream{resps: []*discoveryv3.DiscoveryResponse{{
+		VersionInfo: "v7", Nonce: "n7",
+		Resources: []*anypb.Any{validVCSecretAny(t, "validation_ca")},
+	}}}
+	pool, err := fetchValidationSecret(fs, Node{ID: "id", Cluster: "cl"}, "validation_ca", "")
+	if err != nil {
+		t.Fatalf("fetchValidationSecret: %v", err)
+	}
+	if pool == nil {
+		t.Error("pool is nil on success")
+	}
+	if len(fs.sent) != 2 {
+		t.Fatalf("sent %d requests, want 2 (initial + ACK)", len(fs.sent))
+	}
+	ack := fs.sent[1]
+	if ack.GetVersionInfo() != "v7" {
+		t.Errorf("ACK VersionInfo = %q, want v7 (echo the accepted version)", ack.GetVersionInfo())
+	}
+	if ack.GetResponseNonce() != "n7" {
+		t.Errorf("ACK ResponseNonce = %q, want n7", ack.GetResponseNonce())
+	}
+	if ack.GetErrorDetail() != nil {
+		t.Errorf("ACK carries ErrorDetail %v, want nil", ack.GetErrorDetail())
+	}
+}
+
+func TestFetchValidationSecret_NackOnValidationFailure(t *testing.T) {
+	// A tls_certificate secret served where a validation_context was requested:
+	// parseValidationSecret rejects it -> errValidation -> NACK.
+	fs := &fakeStream{resps: []*discoveryv3.DiscoveryResponse{{
+		VersionInfo: "v2", Nonce: "n2",
+		Resources: []*anypb.Any{validSecretAny(t, "validation_ca")},
+	}}}
+	_, err := fetchValidationSecret(fs, Node{ID: "id", Cluster: "cl"}, "validation_ca", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, errValidation) {
+		t.Errorf("error = %v, want it to wrap errValidation", err)
+	}
+	if len(fs.sent) != 2 {
+		t.Fatalf("sent %d requests, want 2 (initial + NACK)", len(fs.sent))
+	}
+	nack := fs.sent[1]
+	if nack.GetVersionInfo() != "" {
+		t.Errorf("NACK VersionInfo = %q, want empty (keep the PRIOR version on reject)", nack.GetVersionInfo())
+	}
+	if nack.GetResponseNonce() != "n2" {
+		t.Errorf("NACK ResponseNonce = %q, want n2", nack.GetResponseNonce())
+	}
+	if nack.GetErrorDetail() == nil {
+		t.Error("NACK ErrorDetail is nil, want the validation failure detail")
+	}
+}
+
+func TestFetchValidationSecret_TransportError(t *testing.T) {
+	fs := &fakeStream{recvErr: errors.New("boom")}
+	_, err := fetchValidationSecret(fs, Node{ID: "id", Cluster: "cl"}, "validation_ca", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if errors.Is(err, errValidation) {
+		t.Errorf("error = %v, want a TRANSPORT error, not errValidation (a transport failure must not classify as rejected)", err)
+	}
+	if !strings.Contains(err.Error(), "recv response") {
+		t.Errorf("error = %q, want it to mention recv response", err.Error())
+	}
+}
+
+func TestApplyValidationResponse_EmptyResources(t *testing.T) {
+	_, err := applyValidationResponse(&discoveryv3.DiscoveryResponse{VersionInfo: "v1", Nonce: "n1"}, "validation_ca", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, errValidation) {
+		t.Errorf("error = %v, want it to wrap errValidation", err)
+	}
+	if !strings.Contains(err.Error(), "empty resources") {
+		t.Errorf("error = %q, want it to mention empty resources", err.Error())
 	}
 }

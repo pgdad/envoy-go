@@ -8,6 +8,7 @@ import (
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 // FuzzTLSContextParse exercises NewDownstreamConfig and NewUpstreamConfig
@@ -73,6 +74,35 @@ func FuzzTLSContextParse(f *testing.F) {
 	// Seed (d): wrong type_url
 	{
 		f.Add("downstream", "type.googleapis.com/google.protobuf.StringValue", []byte{0x0a, 0x03, 'x', 'y', 'z'})
+	}
+
+	// Seed (e), phase 65: a downstream require_client_certificate=true + an SDS
+	// validation_context. The fuzz body dispatches NewDownstreamConfig(ts, "",
+	// nil) — a NIL provider — so this seed lands on commonTLSContextToConfig's
+	// nil-provider reject (config.go:272), which fires from config.go:52, i.e.
+	// BEFORE the require_client_certificate block at config.go:67. It therefore
+	// does NOT reach that block's own nil guard (config.go:77, documented there
+	// as unreachable) nor the xds.ParseSDSConfig wrap at config.go:90 — those
+	// need a live provider and are covered by the unit tests, not by this seed.
+	// What this seed pins is the "tls: "-prefix invariant across the reject.
+	{
+		inner := &tlsv3.DownstreamTlsContext{
+			RequireClientCertificate: &wrapperspb.BoolValue{Value: true},
+			CommonTlsContext: &tlsv3.CommonTlsContext{
+				TlsCertificates: []*tlsv3.TlsCertificate{{
+					CertificateChain: &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: pki.leafCertPEM}},
+					PrivateKey:       &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: pki.leafKeyPEM}},
+				}},
+				ValidationContextType: &tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
+					ValidationContextSdsSecretConfig: &tlsv3.SdsSecretConfig{Name: "validation_ca"},
+				},
+			},
+		}
+		anyTC, err := anypb.New(inner)
+		if err != nil {
+			f.Fatalf("anypb.New: %v", err)
+		}
+		f.Add("downstream", anyTC.GetTypeUrl(), anyTC.GetValue())
 	}
 
 	f.Fuzz(func(t *testing.T, side, typeURL string, value []byte) {

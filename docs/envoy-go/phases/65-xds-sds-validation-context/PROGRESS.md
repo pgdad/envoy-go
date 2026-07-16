@@ -4,17 +4,17 @@
 
 ## Task checklist (mirrors PLAN.md — 11 tasks, SINGLE FLAT ROW, ADR-0045 escape-valve UNCONSUMED)
 
-- [ ] Task 1 — `internal/xds/secret.go`: ADD `parseValidationSecret(resource, wantName, baseDir) (*x509.CertPool, error)` + the CVC-reject roster (`custom_validator_config` / `match_typed_subject_alt_names` / `verify_certificate_hash` / `verify_certificate_spki`, each `xds: sds: validation secret %q:`-prefixed, ADR-0080) + the FIRST production `crypto/x509` import in `internal/xds`; `secret_test.go` — `_Valid` (pool holds 1 subject) / `_WrongName` / `_WrongOneof` / `_CVCRejects` (4 rows) / `_NoTrustedCa` / `_BadPEM`; `TestParseSecret_WrongOneof` (`:175-187`) STAYS green (the two appliers stay DISJOINT); `-count=1` breaks on a dropped CVC arm + the PEM guard + the oneof check [TDD]
-- [ ] Task 2 — `internal/xds/stream.go`: ADD `fetchValidationSecret` + `applyValidationResponse` (byte-parallel to `:38-95`, SHARING `errValidation` `:32` and `secretTypeURL()` — the Secret type URL is the SAME for both oneof arms, D1); `stream_test.go` (append after **`:179`**, not `:166`) — initial-request shape / ACK / NACK (prior-version + ErrorDetail) / transport-error-is-not-errValidation / empty-resources; `-count=1` breaks on the NACK version + ErrorDetail + the `%w` classification [TDD]
-- [ ] Task 3 — `internal/xds/provider.go`: ADD `FetchInitialValidationContext` (parallel to `:47-75`, classification switch VERBATIM incl. `errValidation`-before-`ctx.Err()`) + the `SecretProvider` interface method (`:14-16`) **AND** `internal/tls`'s `fakeProvider` (`config_test.go:796-806`) gains it — **ONE COMMIT** (the interface change breaks `internal/tls`'s build otherwise; exactly TWO implementers repo-wide); `provider_test.go` (append after **`:160`**) — success / timeout / mgmt-down / rejected (+ `update_failure == 0` on reject); `-count=1` breaks on the attempt-counter position + the rejected→failure swap [TDD]
-- [ ] Task 4 — `internal/tls/config.go`: lift the `:227-228` reject to a NO-OP gated `side != "downstream" || provider == nil` (**the `|| provider == nil` clause is CORRECTNESS, not defensiveness — QUIC reaches this arm with `side=="downstream"` AND a nil provider via `config.go:108`**); `config_test.go` — a regression FENCE: upstream STILL rejects / QUIC STILL rejects / downstream+nil-provider STILL refuses (byte-identical substring, ADR-0080); `-count=1` break on dropping the nil-provider clause → the QUIC arm must fire [TDD]
-- [ ] Task 5 — `internal/tls/config.go`: `NewDownstreamConfig`'s `require_client_certificate` block (`:67-79`) gains the SDS branch (nil-provider reject → `xds.ParseSDSConfig` wrapped `tls: downstream: %w` → `FetchInitialValidationContext` → `cfg.ClientCAs`); the inline `else` stays BYTE-IDENTICAL; `config_test.go` — **the arm-5 subtest (`:936-957`) is REBUILT with a FULL `sds_config` (⚠️ C2 — the pre-65 input has NO `sds_config`; without the rebuild the ACCEPT flip is VACUOUS)** + a boot-FAIL test (ADR-0280 departure) + a `require==false`-INERT test (proving NO fetch is attempted); the rcc tests (`:286-316`/`:318-349`) STAY green; `-count=1` breaks incl. **the C2 vacuity proof** (revert the input → must fail `sds_config is required`) [TDD]
-- [ ] Task 6 — `internal/boot/boot.go`: the `NewSDSProvider` pre-scan (`:138`) also detects `validation_context_sds_secret_config` via a NEW local `ctc` (**⚠️ without this T5's fetch path is UNREACHABLE in a real boot — `seen==0` → nil provider → the nil-provider reject; T8 depends on T5 AND T6**); `seen++` on BOTH arms so compose-two trips `seen>1` (`:147-148`, the DEFERRED edge); `boot_test.go` — validation-only-SDS builds a provider / both-via-SDS rejects / cert-only (`0103`) unchanged; `-count=1` breaks on the `seen++` + the whole arm [TDD]
-- [ ] Task 7 — `test/helpers/sdsserver`: `WithValidationContext(name, trustedCAPEM)` + two fields + a `buildResponse` branch (`:118-136`); the generic TypeUrl derivation (`:133`) UNCHANGED (D1); the flat single-secret state STAYS flat (D3 — `0108` serves ONE secret per side; multi-secret is the deferred compose-two edge, do NOT refactor); helper unit test (right oneof + right trusted_ca + shared TypeUrl); `internal/xds/provider_test.go` (uses `WithSecret`) STAYS green; `-count=1` break on swapping the arms [TDD]
-- [ ] Task 8 — NEW fixture `0108-xds-sds-validation-context` (`driver/`, the `0103` convention): in-memory PKI, **NO `pki/` dir** (D2 — 5 artifacts generated in `ensure()`; server cert injected `inline_string` into both yamls; no `HostMount`); two SDS receivers, one per side; static server cert + `validation_context_sds_secret_config` → `sds_cluster`; `node{id,cluster}` REQUIRED; the observable is a NORMALIZED two-arm verdict (D4 — `good=ok echo=…` + `bad=rejected`; **the handshake-failure TEXT is NEVER asserted — reference sends `unknown ca`, envoy-go sends `bad certificate`**); **NO `StatsAsserter` (⚠️ C3 — `ssl.fail_verify_error` DOES NOT EXIST in envoy-go)**; register at `runner_test.go` after `:134`; FULL `-run` selector; `-count=1` breaks (⚠️ two are SYMMETRIC and will NOT fire `CompareBytes` — see the residual risk below)
-- [ ] Task 9 — fuzz SEEDS: `FuzzDiscoveryResponseParse` (`xds/fuzz_test.go:71`) gains a `validation_context` seed + the body drives `applyValidationResponse`; `FuzzTLSContextParse` (`tls/fuzz_test.go:24`, THREE-arg `f.Add`) gains a `require_client_certificate`+SDS-validation seed (nil-provider → the `tls: ` prefix invariant); prefer refactoring `selfSignedPEM` to `testing.TB` over a THIRD inline duplication; fuzzers **55 → 55** (reconcile before AND after, `reference_fuzzer_count_docs_drift`); delete any `testdata/fuzz/` corpus artifacts before commit
-- [ ] Task 10 — `BEHAVIOR_CONTRACT.md` (**`:881`**, RE-DERIVED — item 5 of the phase-60 reject list; docs drift, re-confirm): downstream SDS `validation_context` REJECT → CONSUMED (fetch → `ClientCAs` + `RequireAndVerifyClientCert`; the ADR-0280 boot-FAIL departure extended; `require==false` inert; the CVC surface held; siblings STAY) + the `ssl.*` coverage boundary (C3)
-- [ ] Task 11 — Verify: six-gate + **the cycle guard (`go list -deps ./internal/xds`, NO `...` — `internal/tls` MUST NOT appear)** + the full **110**-dir differential + ADR-0286 §Decision/§Consequences (recording the THREE PLAN-time corrections) + STATE + ROADMAP row 65 `done` + **the sentinel narrow at `:185`** + the sentinel re-run (does NOT fire — do NOT create `stop`) + PROGRESS close + router roll
+- [x] Task 1 — `internal/xds/secret.go`: ADD `parseValidationSecret(resource, wantName, baseDir) (*x509.CertPool, error)` + the CVC-reject roster (`custom_validator_config` / `match_typed_subject_alt_names` / `verify_certificate_hash` / `verify_certificate_spki`, each `xds: sds: validation secret %q:`-prefixed, ADR-0080) + the FIRST production `crypto/x509` import in `internal/xds`; `secret_test.go` — `_Valid` (pool holds 1 subject) / `_WrongName` / `_WrongOneof` / `_CVCRejects` (4 rows) / `_NoTrustedCa` / `_BadPEM`; `TestParseSecret_WrongOneof` (`:175-187`) STAYS green (the two appliers stay DISJOINT); `-count=1` breaks on a dropped CVC arm + the PEM guard + the oneof check [TDD]
+- [x] Task 2 — `internal/xds/stream.go`: ADD `fetchValidationSecret` + `applyValidationResponse` (byte-parallel to `:38-95`, SHARING `errValidation` `:32` and `secretTypeURL()` — the Secret type URL is the SAME for both oneof arms, D1); `stream_test.go` (append after **`:179`**, not `:166`) — initial-request shape / ACK / NACK (prior-version + ErrorDetail) / transport-error-is-not-errValidation / empty-resources; `-count=1` breaks on the NACK version + ErrorDetail + the `%w` classification [TDD]
+- [x] Task 3 — `internal/xds/provider.go`: ADD `FetchInitialValidationContext` (parallel to `:47-75`, classification switch VERBATIM incl. `errValidation`-before-`ctx.Err()`) + the `SecretProvider` interface method (`:14-16`) **AND** `internal/tls`'s `fakeProvider` (`config_test.go:796-806`) gains it — **ONE COMMIT** (the interface change breaks `internal/tls`'s build otherwise; exactly TWO implementers repo-wide); `provider_test.go` (append after **`:160`**) — success / timeout / mgmt-down / rejected (+ `update_failure == 0` on reject); `-count=1` breaks on the attempt-counter position + the rejected→failure swap [TDD]
+- [x] Task 4 — `internal/tls/config.go`: lift the `:227-228` reject to a NO-OP gated `side != "downstream" || provider == nil` (**the `|| provider == nil` clause is CORRECTNESS, not defensiveness — QUIC reaches this arm with `side=="downstream"` AND a nil provider via `config.go:108`**); `config_test.go` — a regression FENCE: upstream STILL rejects / QUIC STILL rejects / downstream+nil-provider STILL refuses (byte-identical substring, ADR-0080); `-count=1` break on dropping the nil-provider clause → the QUIC arm must fire [TDD]
+- [x] Task 5 — `internal/tls/config.go`: `NewDownstreamConfig`'s `require_client_certificate` block (`:67-79`) gains the SDS branch (nil-provider reject → `xds.ParseSDSConfig` wrapped `tls: downstream: %w` → `FetchInitialValidationContext` → `cfg.ClientCAs`); the inline `else` stays BYTE-IDENTICAL; `config_test.go` — **the arm-5 subtest (`:936-957`) is REBUILT with a FULL `sds_config` (⚠️ C2 — the pre-65 input has NO `sds_config`; without the rebuild the ACCEPT flip is VACUOUS)** + a boot-FAIL test (ADR-0280 departure) + a `require==false`-INERT test (proving NO fetch is attempted); the rcc tests (`:286-316`/`:318-349`) STAY green; `-count=1` breaks incl. **the C2 vacuity proof** (revert the input → must fail `sds_config is required`) [TDD]
+- [x] Task 6 — `internal/boot/boot.go`: the `NewSDSProvider` pre-scan (`:138`) also detects `validation_context_sds_secret_config` via a NEW local `ctc` (**⚠️ without this T5's fetch path is UNREACHABLE in a real boot — `seen==0` → nil provider → the nil-provider reject; T8 depends on T5 AND T6**); `seen++` on BOTH arms so compose-two trips `seen>1` (`:147-148`, the DEFERRED edge); `boot_test.go` — validation-only-SDS builds a provider / both-via-SDS rejects / cert-only (`0103`) unchanged; `-count=1` breaks on the `seen++` + the whole arm [TDD]
+- [x] Task 7 — `test/helpers/sdsserver`: `WithValidationContext(name, trustedCAPEM)` + two fields + a `buildResponse` branch (`:118-136`); the generic TypeUrl derivation (`:133`) UNCHANGED (D1); the flat single-secret state STAYS flat (D3 — `0108` serves ONE secret per side; multi-secret is the deferred compose-two edge, do NOT refactor); helper unit test (right oneof + right trusted_ca + shared TypeUrl); `internal/xds/provider_test.go` (uses `WithSecret`) STAYS green; `-count=1` break on swapping the arms [TDD]
+- [x] Task 8 — NEW fixture `0108-xds-sds-validation-context` (`driver/`, the `0103` convention): in-memory PKI, **NO `pki/` dir** (D2 — 5 artifacts generated in `ensure()`; server cert injected `inline_string` into both yamls; no `HostMount`); two SDS receivers, one per side; static server cert + `validation_context_sds_secret_config` → `sds_cluster`; `node{id,cluster}` REQUIRED; the observable is a NORMALIZED two-arm verdict (D4 — `good=ok echo=…` + `bad=rejected`; **the handshake-failure TEXT is NEVER asserted — reference sends `unknown ca`, envoy-go sends `bad certificate`**); **NO `StatsAsserter` (⚠️ C3 — `ssl.fail_verify_error` DOES NOT EXIST in envoy-go)**; register at `runner_test.go` after `:134`; FULL `-run` selector; `-count=1` breaks (⚠️ two are SYMMETRIC and will NOT fire `CompareBytes` — see the residual risk below)
+- [x] Task 9 — fuzz SEEDS: `FuzzDiscoveryResponseParse` (`xds/fuzz_test.go:71`) gains a `validation_context` seed + the body drives `applyValidationResponse`; `FuzzTLSContextParse` (`tls/fuzz_test.go:24`, THREE-arg `f.Add`) gains a `require_client_certificate`+SDS-validation seed (nil-provider → the `tls: ` prefix invariant); prefer refactoring `selfSignedPEM` to `testing.TB` over a THIRD inline duplication; fuzzers **55 → 55** (reconcile before AND after, `reference_fuzzer_count_docs_drift`); delete any `testdata/fuzz/` corpus artifacts before commit
+- [x] Task 10 — `BEHAVIOR_CONTRACT.md` (**`:881`**, RE-DERIVED — item 5 of the phase-60 reject list; docs drift, re-confirm): downstream SDS `validation_context` REJECT → CONSUMED (fetch → `ClientCAs` + `RequireAndVerifyClientCert`; the ADR-0280 boot-FAIL departure extended; `require==false` inert; the CVC surface held; siblings STAY) + the `ssl.*` coverage boundary (C3)
+- [x] Task 11 — Verify: six-gate + **the cycle guard (`go list -deps ./internal/xds`, NO `...` — `internal/tls` MUST NOT appear)** + the full **110**-dir differential + ADR-0286 §Decision/§Consequences (recording the THREE PLAN-time corrections) + STATE + ROADMAP row 65 `done` + **the sentinel narrow at `:185`** + the sentinel re-run (does NOT fire — do NOT create `stop`) + PROGRESS close + router roll
 
 **PHASE 65 CLOSES AT IMPL.** Row 65 flips `in-progress` → `done` at this IMPL six-gate (ADR-0106, the SOLE leg — `reference_roadmap_split_phase_row_done`). ANCHORS ADR-0286 (§Decision/§Consequences land in `DECISIONS.md`; §Context drafted at the SPEC, SPEC §13).
 
@@ -58,41 +58,172 @@ The SPEC's line numbers are mostly EXACT. Five substantive defects were found. F
 - **D5** — extend `SecretProvider` (cost: exactly TWO implementations) rather than forking a second interface.
 - **D6** — the `sds.<secretName>.*` stat scope keys on NAME only, not resource type; same-name secrets would share counters (idempotent, no panic). `0108` uses a distinct name; compose-two already rejects. No action; noted for a future row.
 
-## Baselines (fill at IMPL Task 1 — verbatim, against the phase-65 PLAN squash = master tip at IMPL start)
+## Baselines (filled at IMPL — verbatim, against the phase-65 PLAN squash `a71ced0d` = master tip at IMPL start)
 
-- `go build ./...`: [fill]
+- `go build ./...`: clean (against master tip `a71ced0d`, the phase-65 PLAN squash).
 - fixtures (`ls -d test/fixtures/[0-9]*/ | wc -l`): **109** at start, tail `0107-tracing-max-path-tag-length` (→ **110** after T8).
 - fuzzers (`grep -rn '^func Fuzz' --include='*.go' internal/ | wc -l`): **55** (55 after T9 — seeds only).
 - BackendKind tail: **38** (`H2GoawayResponder`) — UNCHANGED (`sdsserver` is driver-owned, NOT a BackendKind — `reference_differential_grpc_receiver_driver_owned`).
 - `go mod tidy -diff`: anticipated EMPTY (`crypto/x509` is stdlib; the tls protos are already resolved); modules stay **2**.
 - stat surface: **1201** (+0 — the `sds.*` scope is DYNAMIC, keyed on the configured secret name; a new name yields new dynamic counters, not a new static-surface TYPE).
-- DECISIONS tail: `## ADR-0285` at start (ADR-0286 body lands at T11; next-free ADR-0287).
-- Cycle guard: `go list -deps ./internal/xds` → `internal/stats` + `internal/xds` ONLY. [re-confirm at T11]
-- Anchors CONFIRMED vs the PLAN roster (RE-DERIVED against `be419023` — see the corrections above for the five that did NOT hold).
+- DECISIONS tail: `## ADR-0285` at start (ADR-0286 body landed at T11; next-free ADR-0287).
+- Cycle guard: `go list -deps ./internal/xds` → `internal/stats` + `internal/xds` ONLY. **RE-CONFIRMED at T11 on the frozen HEAD — HOLDS** (see the verify block).
+- Anchors CONFIRMED vs the PLAN roster (RE-DERIVED against `be419023` — see the corrections above for the five that did NOT hold). **⚠️ NINE FURTHER defects were found in the PLAN ITSELF at IMPL — see the log below.**
 
-## Liveness-break log (every break `-count=1`, confirmed WHICH fired, then restored byte-identical) — fill at IMPL
+## Liveness-break log (every break `-count=1`, confirmed WHICH fired, then restored byte-identical) — filled at IMPL
 
-- **T1 (applier, `secret_test.go`):** [fill]
-- **T2 (stream arm, `stream_test.go`):** [fill]
-- **T3 (provider, `provider_test.go`):** [fill]
-- **T4 (reject-lift fence, `config_test.go`):** [fill — the `|| provider == nil` drop MUST fire the QUIC arm]
-- **T5 (apply-point, `config_test.go`):** [fill — MUST include the C2 vacuity proof: reverting the arm-5 input fires `sds_config is required`]
-- **T6 (boot pre-scan, `boot_test.go`):** [fill]
-- **T7 (`sdsserver`):** [fill]
-- **T8 (`0108` differential):** [fill — ⚠️ record which breaks were SYMMETRIC and how the structural check caught them; see the residual risk]
-- **T9 (fuzz seeds):** [fill — count 55 before AND after]
+> **⚠️ HONESTY NOTE on this block's provenance.** Each task ran as a fresh subagent that committed locally; the per-break transcripts were NOT preserved in-tree (no commit message or test comment carries them). Entries here draw on three DISTINCT provenance classes, and each is labelled:
+>
+> 1. **CONTROLLER-RELAYED** — the T1/T2/T4/T7 transcripts below are quoted **verbatim from the task subagents' own reports**, held by the controller and transcribed here at a later pass. They were **NOT re-run** when this record was written, and **neither the T11 agent nor the transcribing agent observed them directly.** They are the subagents' claims, faithfully relayed — one link stronger than anticipation, one link weaker than a transcript this session re-derived. A relayed report is not a re-derivation (`feedback_brief_citations_not_evidence`).
+> 2. **IN-TREE / STRUCTURAL** — verifiable today from the landed tree, the commit ledger, or the `0108` README's in-tree break record.
+> 3. **CONTROLLER'S OWN FINDINGS** — observed by the controller directly (e.g. the T11 verify block).
+>
+> Where a detail was NOT preserved in ANY class it still says so — it is never reconstructed from anticipation. An unverifiable PROGRESS entry is worth less than an honest gap.
 
-## Task-11 verify evidence (fill at IMPL — verbatim, controller-run on the frozen HEAD)
+- **T1 (applier, `secret_test.go`, `fc68ef07`) — 3 breaks, all `-count=1`.** [provenance: CONTROLLER-RELAYED from the T1 subagent's report; not re-run here.] The applier tests landed (`_Valid` / `_WrongName` / `_WrongOneof` / the 4-row `_CVCRejects` / `_NoTrustedCa` / `_BadPEM`) and `TestParseSecret_WrongOneof` (`:175-187`) STAYS green unchanged — the two appliers are DISJOINT (each rejects the other's oneof arm), which is a STRUCTURAL property of the landed code, not a test result.
+  - **Break 1** — deleted the `verify_certificate_hash` reject. Exactly ONE test fired:
+    ```
+    --- FAIL: TestParseValidationSecret_CVCRejects/verify_certificate_hash
+        secret_test.go:311: expected error, got nil
+    ```
+    The three sibling subtests (`custom_validator_config`, `match_typed_subject_alt_names`, `verify_certificate_spki`) all still PASSed — **the 4-row roster is not vacuously passing on a shared earlier arm.**
+  - **Break 2** — `if !pool.AppendCertsFromPEM(caPEM)` → `_ = pool.AppendCertsFromPEM(caPEM)`. Exactly ONE test fired:
+    ```
+    --- FAIL: TestParseValidationSecret_BadPEM
+        secret_test.go:340: expected error, got nil
+    ```
+    **`_Valid` explicitly PASSed — its `len(pool.Subjects()) != 1` check did NOT fire**, so the pool is genuinely populated and `_Valid` was not vacuous.
+  - **Break 3** — accept the wrong oneof arm. Exactly ONE test fired:
+    ```
+    --- FAIL: TestParseValidationSecret_WrongOneof
+        secret_test.go:272: error = "xds: sds: validation secret \"validation_ca\": trusted_ca: xds: sds: data source: none of inline_bytes, inline_string, filename set", want it to contain "is not a validation_context"
+    ```
+  - **⚠️ PLAN defect (break instruction):** the PLAN's LITERAL break (`GetValidationContext()` → `GetTlsCertificate()`) **does not compile** — `*tlsv3.TlsCertificate` has no `GetCustomValidatorConfig`/`GetTrustedCa`/etc., so it is a BUILD failure, which proves nothing about WHICH assertion fires. **DEVIATION:** a compiling equivalent of identical intent was substituted — `if vc == nil && sec.GetTlsCertificate() == nil`.
+  - **⚠️ Incidental:** `golangci-lint`'s `misspell` rejected the PLAN's British "licence" in two comments → "license" (prose only).
+- **T2 (stream arm, `stream_test.go`, `e56cf154`) — 3 breaks, all `-count=1`, FULL-package runs so a wrong-test fire would be visible.** [provenance: CONTROLLER-RELAYED from the T2 subagent's report; not re-run here.] The stream-arm tests landed (initial-request shape / ACK / NACK / transport-error-is-not-`errValidation` / empty-resources), appended after `:179`. Each break fired exactly ONE assertion, in the ANTICIPATED test, with NO collateral failures.
+  - **Break 1** — NACK `VersionInfo` → `resp.GetVersionInfo()`:
+    ```
+    --- FAIL: TestFetchValidationSecret_NackOnValidationFailure (0.00s)
+        stream_test.go:267: NACK VersionInfo = "v2", want empty (keep the PRIOR version on reject)
+    ```
+  - **Break 2** — dropped the NACK `ErrorDetail`:
+    ```
+    --- FAIL: TestFetchValidationSecret_NackOnValidationFailure (0.00s)
+        stream_test.go:273: NACK ErrorDetail is nil, want the validation failure detail
+    ```
+  - **Break 3** — dropped the `errValidation` wrap in `applyValidationResponse`:
+    ```
+    --- FAIL: TestFetchValidationSecret_NackOnValidationFailure (0.00s)
+        stream_test.go:260: error = xds: sds: secret "validation_ca" is not a validation_context (unsupported oneof arm), want it to wrap errValidation
+    ```
+    Break 3 confirms **the NACK classification is LIVE** ⇒ T3's `update_rejected` accounting keys off a REAL signal, not a constant.
+  - **⚠️ PLAN defect (break instruction):** the PLAN's LITERAL break 3 ("drop the `%w: `") leaves `fmt.Errorf("%v", errValidation, err)` — two args, one verb — which **`go vet` rejects**. **DEVIATION:** substituted `fmt.Errorf("%v", err)` — identical intent, compiles, and fired the anticipated assertion.
+  - **Landed chain byte-untouched (verified in-tree by the subagent):** `git diff fc68ef07 -- internal/xds/stream.go` → **72 insertions, 0 deletions**; `grep -c '^-[^-]'` over the diff → **0**. `0103` untouched.
+- **T3 (provider, `provider_test.go`):** **⚠️ break 2 did NOT fire — a REAL, RECORDED coverage gap.** Swapping the `errValidation`-before-`ctx.Err()` classification ordering changed NO test outcome: **no test creates the discriminating condition** (a validation failure racing a live deadline). The ordering is copied VERBATIM from the landed `FetchInitialCertificate` (`provider.go:47-75`) and inherits that arm's semantics, but **phase 65 adds NO coverage for it and none is claimed.** The break not firing IS the finding, not a nuisance to route around. **⚠️ PLAN defect found here:** the PLAN's test snippet used `counterValue`, which **does not exist**.
+- **T4 (reject-lift fence, `config_test.go`):** **⚠️ the PLAN's premise was WRONG.** The PLAN specified an upstream-STILL-rejects subtest as part of the fence; it is **unreachable and vacuous** — `validation_context_type` is a **oneof**, so selecting the SDS arm makes `GetValidationContext()` return nil and `NewUpstreamConfig` refuses EARLIER with `tls: upstream: validation_context.trusted_ca is required (...)`, **NOT** the phase-03 SDS substring. **QUIC is the guard's ONLY live consumer** — via the `provider == nil` half (`config.go:108` passes `side == "downstream"` with a nil provider, C5's correction, which is why that clause is CORRECTNESS and not belt-and-braces). The `side != "downstream"` half is therefore DEAD from today's entry points; it is RETAINED so a future upstream caller cannot silently skip validation. **This false claim reached a SHIPPED code comment and was corrected in T5-fix `af55ac9e`** (`feedback_brief_citations_not_evidence`: the controller's uncited PROSE asserted the opposite of the control flow).
+  - **1 break, `-count=1`** (`d37f084a`) [provenance: CONTROLLER-RELAYED from the T4 subagent's report; not re-run here] — dropped the `|| provider == nil` clause:
+    ```
+    --- FAIL: TestValidationContextSDS_SiblingRejectsStay/quic_downstream_(nil_provider)_still_rejects
+        config_test.go:1157: quic error = "tls: downstream: no tls_certificates configured", want it to contain "SDS-bound validation_context_sds_secret_config is not supported in phase 03"
+    --- FAIL: TestValidationContextSDS_SiblingRejectsStay/downstream_with_NIL_provider_still_rejects
+        config_test.go:1177: downstream/nil-provider error = "tls: downstream: no tls_certificates configured", ...
+    --- PASS: TestValidationContextSDS_SiblingRejectsStay/upstream_still_rejects
+    ```
+    The intended `quic downstream (nil provider)` subtest fired on the intended `wantSub` assertion (`:1157`) — **NOT an earlier Fatal** (`reference_deliberate_break_wrong_assertion`). **C5 is thereby proven FROM BEHAVIOR, not from prose:** QUIC DOES reach the arm with `side=="downstream"` + a nil provider, and without the clause it falls straight through — the error degrades to "no tls_certificates configured", i.e. **validation is silently SKIPPED.**
+  - **Regression fence (as designed):** pre-change all 3 subtests PASS — correct for a fence, which pins existing behavior rather than driving new behavior — and post-change all 3 still PASS. The break above is what makes the fence non-vacuous.
+- **T5 (apply-point, `config_test.go`):** **⚠️ the C2 vacuity proof FIRED as predicted** — reverting the arm-5 input to the pre-65 `&tlsv3.SdsSecretConfig{Name: "validation-secret"}` (no `sds_config`) fails with **`tls: downstream: xds: sds: SdsSecretConfig sds_config is required`**: it dies at `ParseSDSConfig` (`internal/xds/config.go:33`) and **never reaches the provider**, so the reject→ACCEPT flip against that input would have proven NOTHING. The input was REBUILT with a full `sds_config` (via `sdsSecretConfig`, `config_test.go:813`). **Break 3 proved the `provider == nil` guard is UNREACHABLE dead code** — `commonTLSContextToConfig` refuses first; retained as documented defense-in-depth, NOT the live gate. **⚠️ TWO further PLAN defects:** the PLAN's snippet did not compile (`cfg.ClientCAs` vs the real `cfg.TLSConfig.ClientCAs`), and the boot-FAIL subtest **PASSED pre-implementation** (vacuous) until an `initial fetch timed out` assertion was added to make it bite.
+- **T6 (boot pre-scan, `boot_test.go`):** validation-only-SDS builds a provider / both-via-SDS rejects (`seen>1`) / cert-only (`0103`) unchanged. **⚠️ TWO PLAN defects:** every helper name in the PLAN's snippet was WRONG (the real idiom is YAML-template based), and **the PLAN's break-2 expectation was logically impossible** — it reproduces RED rather than discriminating.
+- **T7 (`sdsserver`):** `WithValidationContext` + two fields + the `buildResponse` branch; the generic TypeUrl derivation (`:133`) UNCHANGED (D1); the flat single-secret state STAYS flat (D3); `internal/xds/provider_test.go` (uses `WithSecret`) STAYS green. **⚠️ FINDING: mutual exclusion is last-branch-wins, NOT enforced** — passing both `WithSecret` and `WithValidationContext` silently serves the validation_context regardless of option order. Per D3 no guard was added; noted for a future compose-two row. **⚠️ PLAN defect:** the snippet did not compile (`New(t, ...)` takes `t` and returns no error).
+  - **1 break, `-count=1`** (`695d7765`) [provenance: CONTROLLER-RELAYED from the T7 subagent's report; not re-run here] — swapped the `buildResponse` switch arms (the cert secret served when `vcSecretName != ""`):
+    ```
+    === RUN   TestWithValidationContext_ServesValidationSecret
+        sdsserver_test.go:195: Secret is not a validation_context — wrong oneof arm served
+    --- FAIL: TestWithValidationContext_ServesValidationSecret (0.00s)
+    ```
+    The intended assertion fired and was the **ONLY** failure line: the break deliberately PRESERVED `Name: s.vcSecretName`, so the `Secret.Name` check stayed green and the failure **isolated cleanly on the oneof arm** — no wrong-assertion masking (`reference_deliberate_break_wrong_assertion`).
+  - **The RED step was GENUINE:** `undefined: WithValidationContext` — a real compile failure, not a pre-passing test.
+  - **Cert-arm guard GREEN:** `go test ./internal/xds/ -count=1` → `ok  0.261s` (the `0103` path did not regress).
+- **T8 (`0108` differential):** ⚠️ **see the residual-risk resolution below — this is the phase's load-bearing break log.** In-tree record: `test/fixtures/0108-xds-sds-validation-context/README.md` §"Why the driver carries a structural check". Breaks (1) and (2) are **SYMMETRIC** and were caught by `structuralCheck`, NOT by `CompareBytes`; **the trap was DEMONSTRATED** (with the check disabled, break (1) ships PASS). **⚠️ PLAN defect: break (3) was itself VACUOUS** (both receivers serve the same CA ⇒ a no-op); T8 substituted a genuinely ASYMMETRIC break (the subject's receiver serves the UNSERVED CA), which fires `CompareBytes` with **a mismatch at byte offset 5** when the structural check is disabled — that is how `CompareBytes` was proven live. FULL selector throughout (`reference_differential_run_selector`). **⚠️ TLS-1.3 hazard handled:** under TLS 1.3 the client's `Handshake()` returns BEFORE the server's verdict on the client cert, so a handshake-only probe would report a REJECTION as SUCCESS — silently inverting the negative arm; `mtlsEcho` drives the FULL round trip (handshake → write → read), which is version-independent.
+- **T9 (fuzz seeds):** fuzzers **55 before AND 55 after** (`grep -rn '^func Fuzz' --include='*.go' internal/ | wc -l`; reconciled both ways per `reference_fuzzer_count_docs_drift`) — SEEDS only, no new `Fuzz*` func. `FuzzDiscoveryResponseParse` gains a `validation_context` seed and its body now also drives `applyValidationResponse`; `FuzzTLSContextParse` gains seed (e) — `require_client_certificate=true` + SDS validation_context, pinning the `"tls: "` prefix invariant across the nil-provider reject. **Duplication RETIRED, not added:** `selfSignedPEM` took `testing.TB` cleanly (12 call sites, ZERO ripple), so `mustValidSecretAnyBytes` now calls it instead of inlining a THIRD copy of cert generation. **⚠️ PLAN defect: the seed rationale was false.** No `testdata/fuzz/` corpus artifacts were committed. **⚠️ COVERAGE GAP (honest):** the `tls: downstream: %w` wrap of `ParseSDSConfig` is **NOT** fuzz-covered — seed (e) reaches the `commonTLSContextToConfig` reject FIRST (a LIVE provider is needed to reach the wrap, and the fuzzer passes none). Its coverage rests on the unit tests, which do supply a `fakeProvider`.
 
-- six-gate: [fill]
-- cycle guard (`go list -deps ./internal/xds`, no `...`): [fill — `internal/tls` MUST NOT appear]
-- 110-dir differential (`go test ./test/differential/ -count=1`): [fill]
-- sentinel re-run (all three checks): [fill — anticipated: still does NOT fire; do NOT create `stop`]
+**⚠️ ELEVEN PLAN defects found by RE-DERIVATION across T1–T10.** `feedback_brief_citations_not_evidence` earned its keep on a PLAN that had ITSELF corrected five SPEC defects: `counterValue` did not exist (T3) · the T5 snippet did not compile (`cfg.ClientCAs` vs `cfg.TLSConfig.ClientCAs`) · the T4 upstream subtest was unreachable/vacuous (the oneof finding) · a T5 boot-FAIL subtest passed pre-implementation · every T6 helper name was wrong · T6's break-2 expectation was logically impossible · the T7 snippet did not compile · T8's break (3) was vacuous · T9's seed rationale was false · **the T1 break-3 instruction did not compile** (`*tlsv3.TlsCertificate` lacks the accessors the arm calls) · **the T2 break-3 instruction was `go vet`-rejected** (dropping the `%w: ` leaves `fmt.Errorf("%v", errValidation, err)` — two args, one verb). **A PLAN is not evidence either.**
 
-**Landed task commits:** [fill T1…T11]. Squashed to a single master commit at stage-close by the controller.
+> **⚠️ A defect CLASS the earlier tally missed: the PLAN's BREAK instructions are as defect-prone as its test snippets — and they fail more quietly.** Two of the eleven (T1 break 3, T2 break 3) are breaks that **do not build**. That is the worst failure mode in this block: a non-compiling break yields a red screen that LOOKS like a fired assertion but proves **NOTHING about which assertion is live** — the very property the break exists to establish, and a close cousin of `reference_deliberate_break_wrong_assertion`. Both were caught only because the subagents substituted a COMPILING equivalent of identical intent and then re-derived WHICH test fired. **A break must RUN to be evidence.**
 
-**Exit counts (confirm against the landed tree):** stat surface **1201** (+0) · fixtures **109 → 110** (`0108-xds-sds-validation-context`) · fuzzers **55** (+0) · BackendKind **38** (+0) · +0 packages · +0 go.mod modules · DECISIONS tail **ADR-0285 → ADR-0286** (next-free **ADR-0287**). Row 65 → `done` at this IMPL six-gate (ADR-0106, the SOLE leg).
+## ⚠️ The `-race` finding — observed ONCE; PRE-EXISTING, NOT a phase-65 regression
 
-## ⚠️ Residual risk carried into the IMPL (the single most likely place phase 65 ships a vacuous test)
+One run of `go test -race -count=1 ./internal/xds/... ./internal/tls/... ./internal/boot/... ./test/helpers/sdsserver/...` failed:
 
-`PLAN.md` T8 Step 5's breaks (1) "serve a different CA" and (2) "sign `client_bad` with the served CA" are **SYMMETRIC** — they change BOTH sides identically, so a pure `CompareBytes` fixture still compares EQUAL and PASSES (`reference_vacuous_break_receiver_normalizes`). Without an additional **in-driver STRUCTURAL check** (the subject's own bytes match `good=ok` + `bad=rejected`), `0108` would prove only "both sides agree", NOT "the SDS-served CA is the actual trust anchor" — which is the entire point of the row. **The IMPL MUST resolve this and record the chosen mechanism here.** If breaks (1)/(2) cannot be made to fail, the fixture is vacuous and the row is not done.
+```
+--- FAIL: TestProvider_FetchInitialCertificate_Timeout (0.21s)
+    provider_test.go:116: init_fetch_timeout = 0, want 1
+```
+
+It was **INVESTIGATED, not reflex-classified** (`reference_0061_ring_hash_spread_flake` — a first occurrence still deserves a mechanism, not a shrug):
+
+- The test is **BYTE-IDENTICAL to master** — verified by diffing the function body; phase 65 only APPENDED to `provider_test.go` (`@@ -158,3 +162,133 @@`).
+- Master and branch each pass the identical 4-package `-race` command **3/3**; the branch full-package passes **3/3**; **6** further runs under full 32-core CPU saturation all passed. Could NOT be force-reproduced.
+- **Mechanism:** the test's 200ms budget covers BOTH the gRPC dial and the recv. If `StreamSecrets(ctx)` misses that budget it returns an `open stream` error → `incUpdateFailure` → `init_fetch_timeout` stays 0, while `err != nil` and `cert == nil` keep **every other assertion green** — exactly matching the single observed failure line.
+- Phase 65's new validation tests use `vcFakeOpener` (a **FAKE** — no gRPC dial), so they are **structurally immune**.
+
+**Conclusion: a PRE-EXISTING latent timing sensitivity in a LANDED MASTER test, not a phase-65 regression.** The master test was deliberately **NOT** "fixed" in this row — that is a separate concern with its own evidence bar.
+
+## Task-11 verify evidence (controller-run on the frozen HEAD `af55ac9e` — verbatim)
+
+- **six-gate — ALL GREEN:**
+```
+gofmt -l internal/ test/ cmd/        -> SILENT
+go vet ./...                         -> exit 0
+go build ./...                       -> exit 0
+go mod tidy -diff                    -> EMPTY (exit 0)
+git diff --exit-code master -- go.mod go.sum -> EMPTY (modules STAY 2)
+golangci-lint run ./...              -> exit 0 (clean)
+```
+- **cycle guard** (`go list -deps ./internal/xds | grep 'envoy-go/internal'` — **NO `...`**, `reference_xds_config_seam_transitive_cycle_guard`):
+```
+github.com/pgdad/envoy-go/internal/stats
+github.com/pgdad/envoy-go/internal/xds
+```
+  ⇒ **`internal/tls` does NOT appear. GUARD HOLDS.** (`parseValidationSecret` DUPLICATES the CertPool build rather than calling `internal/tls.loadTrustedCAPool` — `internal/tls` imports `internal/xds` at `config.go:13`, so the reverse edge would cycle.)
+- **110-dir differential** (`go test ./test/differential/ -count=1`): **`ok  375.884s`, EXIT=0** — the FULL 110-dir suite. The 109 pre-existing dirs byte-stable (phase 65 LIFTS a reject; it cannot change any passing fixture's bytes) plus the new `0108`.
+- **sentinel re-run (all three checks, MECHANICAL) — does NOT fire; `stop` NOT created:**
+  - **(1) prints NOTHING** — row 65 is now `done`, and every other ROADMAP row already was. Check (1) NO LONGER blocks `stop`.
+  - **(2) prints THREE live "candidates:" sentences** — HTTP/3 (`:175`, unchanged), xDS (`:185`, **NARROWED** `SDS validation_context/upstream SDS` → `upstream SDS (server-cert + validation_context)`), Observability (`:193`, **EXTENDED** with the `ssl` handshake-outcome family per C3). ⇒ three families STAY OPEN. **NOTE: line `:193` ALSO carries a HISTORICAL `candidates were:` recap — not the live sentence** (`reference_sentinel_deferred_sentence_live_vs_historical`).
+  - **(3) prints `NEVER OPENED: gRPC`, `NEVER OPENED: Runtime`, `NEVER OPENED: WASM`** ⇒ THREE families never opened.
+  - **Checks (2) and (3) print ⇒ the sentinel does NOT fire.** `stop` was NOT created (`ls stop` → No such file or directory).
+- **counts RE-DERIVED on the landed tree (not copied):**
+  - **stat surface 1201 (+0)** — method: there is NO mechanical counting command in this repo (phases 62/63 state so explicitly: *"docs-verified; registration guards enforce +0 — no counting command"*). Re-derivation is two-part: (i) `BEHAVIOR_CONTRACT.md`'s authoritative figure still reads **1201** (`:827`), UNCHANGED by this row; (ii) `git diff master -- '*.go' | grep -E '^\+.*(NewCounter|NewGauge|NewHistogram|RegisterSDSStats)'` returns **FOUR** hits, **all four in `internal/xds/provider_test.go`** — **ZERO production stat-registration call sites added**. ⇒ **+0**. The `sds.<secretName>.*` scope is DYNAMIC (keyed on the configured secret name): a new name yields new dynamic counters, not a new static-surface TYPE.
+  - **BackendKind 38 (+0)** — method: the kinds are EXPLICIT numeric constants in `test/differential/fixture/fixture.go`; `grep -nE '^\t[A-Za-z0-9_]+ BackendKind = [0-9]+' test/differential/fixture/fixture.go | tail -1` → **`H2GoawayResponder BackendKind = 38`** (39 constants, 0-indexed ⇒ tail 38). `git diff master --stat` shows `fixture.go` is **NOT** in the diff at all. The `sdsserver` is DRIVER-owned, not a `BackendKind` (`reference_differential_grpc_receiver_driver_owned`).
+  - fixtures **110** (`ls -d test/fixtures/[0-9]*/ | wc -l`; tail `0108-xds-sds-validation-context`) · fuzzers **55** (`grep -rn '^func Fuzz' --include='*.go' internal/ | wc -l`) · DECISIONS tail **`## ADR-0286`** (`grep -oE '^## ADR-[0-9]{4}' docs/envoy-go/DECISIONS.md | tail -1`) · modules **2**.
+
+**Landed task commits:** T1 `fc68ef07` · T2 `e56cf154` · T3 `6c6c5156` · T4 `d37f084a` · T5 `d45e6b98` (+ T5-fix `af55ac9e`) · T6 `b654bae7` · T7 `695d7765` · T8 `b233af5c` · T9 `21608151` · T10 `d337f6dc` (T11 this docs commit). All LOCAL (`feedback_subagents_no_push`); squashed to a single master commit at stage-close by the controller, located by SUBJECT (`git log --grep`), never by position.
+
+**Exit counts (CONFIRMED against the landed tree — see the re-derivation methods above):** stat surface **1201** (+0) · fixtures **109 → 110** (`0108-xds-sds-validation-context`) · fuzzers **55** (+0) · BackendKind **38** (+0) · +0 packages · +0 go.mod modules · DECISIONS tail **ADR-0285 → ADR-0286** (next-free **ADR-0287**). Row 65 → `done` at this IMPL six-gate (ADR-0106, the SOLE leg).
+
+## ⚠️ THE RESIDUAL RISK — **RESOLVED at T8**; the mechanism, and the proof that the trap was REAL
+
+**The risk as flagged at the PLAN.** `PLAN.md` T8 Step 5's breaks (1) "serve a different CA over SDS" and (2) "sign `client_bad` with the served CA" are **SYMMETRIC** — they change BOTH sides identically, so a pure `CompareBytes` fixture still compares EQUAL and PASSES (`reference_vacuous_break_receiver_normalizes`). Without an in-driver **STRUCTURAL** check, `0108` would prove only *"both sides agree"*, NOT *"the SDS-served CA is the actual trust anchor"* — which is the entire point of the row. The PLAN made resolving this a **completion condition**: *"If breaks (1)/(2) cannot be made to fail, the fixture is vacuous and the row is not done."*
+
+**The mechanism shipped (T8).** `structuralCheck(side, out)` at the end of `driveSide`, returning an `error`. The runner turns a Drive error into `t.Fatalf("ref drive: …")` / `t.Fatalf("subj drive: …")`, so a symmetric break **fails loudly AND names the side**. Both arms are checked independently and all violations report together (`reference_fatalf_makes_assertions_unreachable` — `Errorf` per independent property, not a `Fatalf` that strands the second arm). In-tree record: `test/fixtures/0108-xds-sds-validation-context/README.md` §"Why the driver carries a structural check".
+
+**⚠️ THE TRAP WAS DEMONSTRATED, NOT ASSUMED.** With `structuralCheck` DISABLED, break (1) — serve a **DIFFERENT** CA over SDS — ships **PASS**: both sides emit
+
+```
+good=REJECTED err=handshake-or-roundtrip-failed
+bad=ACCEPTED
+```
+
+…and compare **EQUAL**. **A pure-`CompareBytes` fixture would have shipped GREEN on a completely broken trust anchor.** With the check ENABLED, break (1) and break (2) (sign `client_bad` with the SERVED CA → `bad=ACCEPTED`) both **FAIL loudly**.
+
+**The passing byte stream (both sides):**
+
+```
+good=ok echo=phase65-mtls-probe
+bad=rejected
+```
+
+**⚠️ The PLAN's break (3) was ITSELF vacuous** — both receivers serve the same CA, so it is a no-op. T8 substituted a genuinely **ASYMMETRIC** break (the subject's receiver serves the UNSERVED CA), which fires `CompareBytes` with **a mismatch at byte offset 5** when the structural check is disabled. That is how `CompareBytes` was proven live rather than assumed live.
+
+**⚠️ Honest consequence — recorded, not glossed.** Since exactly ONE structurally-valid stream exists, the structural check **strictly SUBSUMES `CompareBytes` for this fixture**: any deviation trips the structural check first. `CompareBytes` is retained as the harness-standard cross-side leg, but `0108`'s cross-side value is *agreement on a shape both sides independently satisfy*, not a discriminating byte comparison. The proof obligation is nevertheless discharged — and by a **stronger** instrument than the SPEC's infeasible subject-only `ssl.fail_verify_error` `StatsAsserter` (C3), because the accept/reject **contrast** proves the anchor AND cross-side agreement, while a subject-only stat proves nothing cross-side.
+
+**Also normalized (never asserted as text).** The reference (BoringSSL) sends the TLS alert `unknown ca`; envoy-go (Go `crypto/tls`) sends `bad certificate`; and the reject can additionally surface as `client didn't provide a certificate` (Go's TLS client withholds a cert that does not match the `CertificateRequest`'s acceptable-CA hint — a hint itself derived from the SDS-served CA). Same proposition, three manifestations. The negative arm records only the stable token `rejected` (the `0045` `closeOK` idiom) — a driver asserting the error string cross-side would fail 100% of the time.

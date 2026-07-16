@@ -1,0 +1,123 @@
+# Phase 65 fixture 0108-xds-sds-validation-context expectations (ADR-0019 —
+# prose; the driver is the enforcer via its per-side structural check AND the
+# runner's CompareBytes; this file is documentation).
+#
+# Topology (single-listener downstream-mTLS tcp_proxy; driver-owned in-process
+# SDS gRPC receiver; TCP echo backend):
+#   l_sds_mtls — one TLS-terminating tcp_proxy listener. Its
+#                DownstreamTlsContext carries:
+#                  require_client_certificate: true
+#                  common_tls_context.tls_certificates = [{ inline_string
+#                    server leaf + key }]            <- STATIC, per-run in-memory
+#                  common_tls_context.validation_context_sds_secret_config = {
+#                    name: validation_ca,
+#                    sds_config: { resource_api_version: V3,
+#                                  api_config_source: { api_type: GRPC,
+#                                    transport_api_version: V3,
+#                                    grpc_services: [{envoy_grpc:
+#                                      {cluster_name: sds_cluster}}] } } }
+#                No tls_inspector — a single filter chain, no SNI match.
+#   c_backend  — TCP echo backend (BackendCount=1). UNLIKE 0103 it IS
+#                exercised: the positive arm writes a payload through the
+#                tcp_proxy and reads the echo back.
+#   sds_cluster — driver-owned in-process test/helpers/sdsserver.Server SDS
+#                receiver (SotW StreamSecrets). The driver starts TWO private
+#                receivers — one per side — on two separately-allocated ports,
+#                each bound 0.0.0.0:<port>, BOTH serving the SAME in-memory
+#                "served CA" as Secret{validation_context{trusted_ca}} under
+#                name "validation_ca". MANDATORY http2_protocol_options:{} for
+#                gRPC framing + plaintext h2c (no TLS).
+#
+# Only the validation_context arrives via SDS; the server cert is STATIC, so
+# internal/boot's SDS pre-scan sees exactly one secret (seen==1) and the
+# deferred compose-two edge is never touched (PLAN-65 D3).
+#
+# node: {id: envoygo-node, cluster: envoygo-cluster} is REQUIRED on BOTH sides
+# — SDS boot-fails without it (internal/boot.NewSDSProvider).
+#
+# Reference Envoy contrib-v1.37.2 (STRICT_DNS via host.docker.internal, listener
+# port 10444) vs envoy-go (STATIC, in-process, loopback).
+#
+# ## PKI — generated IN MEMORY, per run; there is NO pki/ dir (PLAN-65 D2)
+#
+#   CA_served    — self-signed ECDSA P-256, CN "envoy-go 0108 SERVED CA".
+#                  Delivered over SDS as the trusted_ca. THE ANCHOR UNDER TEST.
+#   server leaf  — ECDSA P-256 signed by CA_served; ServerAuth;
+#                  SAN=DNS:l_sds_mtls.fixture.test. Injected inline_string into
+#                  BOTH yamls (no file, no HostMount, no Docker mount).
+#   client_good  — ECDSA P-256 signed by CA_served; ClientAuth. MUST be ACCEPTED.
+#   CA_unserved  — self-signed ECDSA P-256, CN "envoy-go 0108 UNSERVED CA".
+#                  NEVER delivered to either proxy.
+#   client_bad   — ECDSA P-256 signed by CA_unserved; ClientAuth. MUST be REJECTED.
+#
+# Nothing touches disk, so there is no .gitignore upkeep and no committed key
+# material. Freshness is safe: the observable is an accept/reject verdict, not
+# 0103's serial=/san= identity, so per-run certs change nothing.
+#
+# ## Workload
+#
+# Each side runs TWO arms against the proxy's l_sds_mtls listener, folded into
+# ONE byte stream (CompareBytes compares a single []byte per side):
+#   1. positive — dial presenting client_good, complete the handshake, write
+#                 "phase65-mtls-probe\n", read the echo back through tcp_proxy.
+#   2. negative — dial presenting client_bad; the round trip MUST fail.
+#
+# Each arm drives the FULL round trip (handshake -> write -> read), not just the
+# handshake: under TLS 1.3 the server's verdict on the client cert arrives AFTER
+# the client's Handshake() has already returned, so a handshake-only probe would
+# mis-report a rejection as success.
+#
+# ## Asserted
+#
+#   (a) PER SIDE, structurally (the driver's structuralCheck; the runner turns a
+#       Drive error into t.Fatalf("<side> drive: ...")):
+#         the side's OWN bytes are exactly
+#           "good=ok echo=phase65-mtls-probe\nbad=rejected\n"
+#       This is LOAD-BEARING, not decoration. A break that changes the SERVED CA,
+#       or re-signs client_bad with it, changes BOTH sides identically — the two
+#       streams still compare EQUAL and a pure-CompareBytes fixture PASSES
+#       (reference_vacuous_break_receiver_normalizes). Verified empirically at
+#       Task 8: with structuralCheck disabled, the served-CA break runs GREEN.
+#       structuralCheck is what makes "the served CA is the ACTUAL trust anchor"
+#       the proposition under test, rather than "both sides agree".
+#
+#   (b) CROSS-SIDE, byte-exact (the runner's CompareBytes):
+#       the two sides emit identical streams.
+#
+#   Because exactly ONE structurally-valid stream exists, (a) strictly subsumes
+#   (b) for this fixture: any deviation on either side trips (a) first. (b) is
+#   retained as the harness-standard cross-side leg and was proven live at Task 8
+#   by isolating it (asymmetric break + structuralCheck disabled -> mismatch at
+#   byte offset 5).
+#
+# ## UNasserted (named coverage boundaries)
+#
+#   The TLS handshake-failure ALERT TEXT. The reference (BoringSSL) sends
+#   `unknown ca`; envoy-go (Go crypto/tls) sends `bad certificate`. Cross-side
+#   text equality is IMPOSSIBLE — the negative arm records only the normalized
+#   verdict token `rejected` (the 0045 closeOK idiom). Note the reject may also
+#   surface as "client didn't provide a certificate": Go's TLS client withholds a
+#   cert that does not match the CertificateRequest's acceptable-CA hint — a hint
+#   itself derived from the SDS-served CA. Both manifestations are the same
+#   proposition; normalizing is what makes the arm portable.
+#
+#   The ssl.* stat family (ssl.handshake / ssl.fail_verify_error /
+#   ssl.fail_verify_no_cert / ssl.ciphers.* / ssl.versions.*). Observed live on
+#   the reference, but envoy-go emits NO ssl.* stats whatsoever — the only
+#   listener-scope counter is downstream_cx_total. The SPEC's negative-arm
+#   StatsAsserter is therefore INFEASIBLE (PLAN-65 C3). This is a PRE-EXISTING
+#   framework gap that phase 65 neither opens nor closes; it is recorded as a
+#   deferred Observability/xDS candidate. The accept/reject CONTRAST discharges
+#   the proof obligation and is strictly STRONGER than a subject-only stat — it
+#   is cross-side.
+#
+#   SDS stream framing (VersionInfo/Nonce/request-count/ACK cadence —
+#   impl-specific; only the DELIVERED CA's EFFECT is asserted).
+#   The sds.<secret>.* stat counters (no StatsAsserter — C3).
+#
+# Cross-refs: phase 65 SPEC §8 + PLAN-65 C3/C4/D2/D3/D4 + ADR-0019 + ADR-0286 +
+#             reference_differential_grpc_receiver_driver_owned +
+#             reference_periodic_sink_differential_two_receivers +
+#             reference_vacuous_break_receiver_normalizes +
+#             reference_differential_backendcount_min_one +
+#             reference_differential_run_selector

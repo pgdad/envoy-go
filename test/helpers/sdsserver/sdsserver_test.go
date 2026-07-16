@@ -1,6 +1,7 @@
 package sdsserver
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -136,6 +137,70 @@ func TestStreamSecrets_DeliversConfiguredSecret(t *testing.T) {
 	}
 	if want := []string{"server_cert"}; len(got.GetResourceNames()) != 1 || got.GetResourceNames()[0] != want[0] {
 		t.Errorf("Requests()[0].ResourceNames: got %v, want %v", got.GetResourceNames(), want)
+	}
+}
+
+// fetchOne drives exactly one StreamSecrets exchange against a running server:
+// dial, open the stream, Send a single DiscoveryRequest naming `name`, and Recv
+// the single DiscoveryResponse. Factored out of the per-arm tests so a
+// validation_context fetch and a tls_certificate fetch exercise the SAME client
+// path — any divergence is then the SERVER's, not the driver's.
+func fetchOne(t *testing.T, addr, name string) *discoveryv3.DiscoveryResponse {
+	t.Helper()
+	client := dialTestClient(t, addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := client.StreamSecrets(ctx)
+	if err != nil {
+		t.Fatalf("StreamSecrets: %v", err)
+	}
+	req := &discoveryv3.DiscoveryRequest{
+		ResourceNames: []string{name},
+		TypeUrl:       secretTypeURL,
+		Node:          &corev3.Node{Id: "n", Cluster: "c"},
+	}
+	if err := stream.Send(req); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	resp, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	return resp
+}
+
+// TestWithValidationContext_ServesValidationSecret: the server delivers a
+// Secret{name, validation_context{trusted_ca: inline}} — the phase-65 resource
+// shape PINNED by the reference's own config_dump (SPEC-65 §11 D-SDSVC-RESOURCE).
+func TestWithValidationContext_ServesValidationSecret(t *testing.T) {
+	caPEM := []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+	srv := New(t, WithValidationContext("validation_ca", caPEM))
+
+	resp := fetchOne(t, srv.Addr(), "validation_ca")
+
+	if got := len(resp.GetResources()); got != 1 {
+		t.Fatalf("Resources = %d, want 1", got)
+	}
+	var sec tlsv3.Secret
+	if err := resp.GetResources()[0].UnmarshalTo(&sec); err != nil {
+		t.Fatalf("UnmarshalTo Secret: %v", err)
+	}
+	if sec.GetName() != "validation_ca" {
+		t.Errorf("Secret.Name = %q, want validation_ca", sec.GetName())
+	}
+	vc := sec.GetValidationContext()
+	if vc == nil {
+		t.Fatal("Secret is not a validation_context — wrong oneof arm served")
+	}
+	if got := vc.GetTrustedCa().GetInlineBytes(); !bytes.Equal(got, caPEM) {
+		t.Errorf("trusted_ca inline_bytes = %q, want the configured CA PEM", got)
+	}
+	// The type URL is SHARED with the tls_certificate arm — same Secret message
+	// (D1), so the generic derivation in buildResponse needs no second arm.
+	if got, want := resp.GetTypeUrl(), secretTypeURL; got != want {
+		t.Errorf("TypeUrl = %q, want %q", got, want)
 	}
 }
 

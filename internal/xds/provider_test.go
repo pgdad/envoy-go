@@ -2,13 +2,17 @@ package xds
 
 import (
 	"context"
+	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
+	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	secretv3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/pgdad/envoy-go/internal/stats"
 	"github.com/pgdad/envoy-go/test/helpers/sdsserver"
@@ -156,5 +160,135 @@ func TestProvider_FetchInitialCertificate_Rejected(t *testing.T) {
 
 	if got := sdsStats.updateRejected.Load(); got != 1 {
 		t.Errorf("update_rejected = %d, want 1", got)
+	}
+}
+
+// vcFakeOpener returns a Stream serving a canned validation_context response —
+// keeping the FetchInitialValidationContext tests independent of the sdsserver
+// extension (which does not learn WithValidationContext until a later task).
+type vcFakeOpener struct {
+	resp    *discoveryv3.DiscoveryResponse
+	openErr error
+	block   bool // when true, Recv blocks until ctx cancels (drives the timeout path)
+	ctx     context.Context
+}
+
+func (o *vcFakeOpener) StreamSecrets(ctx context.Context) (Stream, error) {
+	if o.openErr != nil {
+		return nil, o.openErr
+	}
+	o.ctx = ctx
+	return &vcFakeStream{o: o}, nil
+}
+
+type vcFakeStream struct{ o *vcFakeOpener }
+
+func (s *vcFakeStream) Send(*discoveryv3.DiscoveryRequest) error { return nil }
+
+func (s *vcFakeStream) Recv() (*discoveryv3.DiscoveryResponse, error) {
+	if s.o.block {
+		<-s.o.ctx.Done()
+		return nil, s.o.ctx.Err()
+	}
+	return s.o.resp, nil
+}
+
+func TestProvider_FetchInitialValidationContext_Success(t *testing.T) {
+	reg := stats.NewRegistry()
+	sdsStats := RegisterSDSStats(reg, "validation_ca")
+	op := &vcFakeOpener{resp: &discoveryv3.DiscoveryResponse{
+		VersionInfo: "v1", Nonce: "n1",
+		Resources: []*anypb.Any{validVCSecretAny(t, "validation_ca")},
+	}}
+
+	p := NewProvider(op, Node{ID: "n", Cluster: "c"}, "", time.Second, sdsStats)
+
+	pool, err := p.FetchInitialValidationContext(context.Background(), "validation_ca")
+	if err != nil {
+		t.Fatalf("FetchInitialValidationContext() unexpected error: %v", err)
+	}
+	if pool == nil {
+		t.Error("FetchInitialValidationContext() pool = nil, want non-nil")
+	}
+
+	if got := sdsStats.updateAttempt.Load(); got != 1 {
+		t.Errorf("update_attempt = %d, want 1", got)
+	}
+	if got := sdsStats.updateSuccess.Load(); got != 1 {
+		t.Errorf("update_success = %d, want 1", got)
+	}
+}
+
+func TestProvider_FetchInitialValidationContext_Timeout(t *testing.T) {
+	reg := stats.NewRegistry()
+	sdsStats := RegisterSDSStats(reg, "validation_ca")
+
+	p := NewProvider(&vcFakeOpener{block: true}, Node{ID: "n", Cluster: "c"}, "", 50*time.Millisecond, sdsStats)
+
+	pool, err := p.FetchInitialValidationContext(context.Background(), "validation_ca")
+	if err == nil {
+		t.Fatal("FetchInitialValidationContext() error = nil, want non-nil (deadline)")
+	}
+	if pool != nil {
+		t.Errorf("FetchInitialValidationContext() pool = %v, want nil", pool)
+	}
+	if !strings.Contains(err.Error(), "initial fetch timed out") {
+		t.Errorf("error = %q, want it to mention the initial-fetch timeout", err.Error())
+	}
+
+	if got := sdsStats.initFetchTimeout.Load(); got != 1 {
+		t.Errorf("init_fetch_timeout = %d, want 1", got)
+	}
+}
+
+func TestProvider_FetchInitialValidationContext_MgmtDown(t *testing.T) {
+	reg := stats.NewRegistry()
+	sdsStats := RegisterSDSStats(reg, "validation_ca")
+
+	p := NewProvider(&vcFakeOpener{openErr: errors.New("dial refused")}, Node{ID: "n", Cluster: "c"}, "", time.Second, sdsStats)
+
+	pool, err := p.FetchInitialValidationContext(context.Background(), "validation_ca")
+	if err == nil {
+		t.Fatal("FetchInitialValidationContext() error = nil, want non-nil (mgmt down)")
+	}
+	if pool != nil {
+		t.Errorf("FetchInitialValidationContext() pool = %v, want nil", pool)
+	}
+	if !strings.Contains(err.Error(), "open stream") {
+		t.Errorf("error = %q, want it to mention open stream", err.Error())
+	}
+
+	if got := sdsStats.updateAttempt.Load(); got != 1 {
+		t.Errorf("update_attempt = %d, want 1 (counted unconditionally, before the opener)", got)
+	}
+	if got := sdsStats.updateFailure.Load(); got != 1 {
+		t.Errorf("update_failure = %d, want 1", got)
+	}
+}
+
+func TestProvider_FetchInitialValidationContext_Rejected(t *testing.T) {
+	reg := stats.NewRegistry()
+	sdsStats := RegisterSDSStats(reg, "validation_ca")
+	// A tls_certificate served where a validation_context was requested -> rejected.
+	op := &vcFakeOpener{resp: &discoveryv3.DiscoveryResponse{
+		VersionInfo: "v1", Nonce: "n1",
+		Resources: []*anypb.Any{validSecretAny(t, "validation_ca")},
+	}}
+
+	p := NewProvider(op, Node{ID: "n", Cluster: "c"}, "", time.Second, sdsStats)
+
+	pool, err := p.FetchInitialValidationContext(context.Background(), "validation_ca")
+	if err == nil {
+		t.Fatal("FetchInitialValidationContext() error = nil, want non-nil (rejected)")
+	}
+	if pool != nil {
+		t.Errorf("FetchInitialValidationContext() pool = %v, want nil", pool)
+	}
+
+	if got := sdsStats.updateRejected.Load(); got != 1 {
+		t.Errorf("update_rejected = %d, want 1 (a validation failure classifies as rejected, not failure)", got)
+	}
+	if got := sdsStats.updateFailure.Load(); got != 0 {
+		t.Errorf("update_failure = %d, want 0 (a reject must NOT also count as a failure)", got)
 	}
 }

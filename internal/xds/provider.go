@@ -3,16 +3,24 @@ package xds
 import (
 	"context"
 	stdtls "crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"time"
 )
 
-// SecretProvider is the blocking seam internal/tls (60.2) uses to obtain an
-// SDS-delivered downstream server certificate at listener construction. Bounded by
-// initial_fetch_timeout. INITIAL-FETCH only — no rotation.
+// SecretProvider is the blocking seam internal/tls (60.2) uses to obtain
+// SDS-delivered secrets at listener construction. Both methods are INITIAL-FETCH
+// only (no rotation/watch — SPEC-60 scope, unchanged at phase 65) and are bounded
+// by initial_fetch_timeout.
+//
+// The two methods are parallel chains over the SAME SotW machinery, differing in
+// resource type and return type: a tls_certificate yields a *stdtls.Certificate
+// (a downstream server leaf, phase 60.2 / ADR-0280); a validation_context yields
+// an *x509.CertPool (a downstream mTLS trusted-CA, phase 65 / ADR-0286).
 type SecretProvider interface {
 	FetchInitialCertificate(ctx context.Context, secretName string) (*stdtls.Certificate, error)
+	FetchInitialValidationContext(ctx context.Context, secretName string) (*x509.CertPool, error)
 }
 
 // StreamOpener opens one SotW SDS stream. Abstracted so unit tests inject an
@@ -72,4 +80,43 @@ func (p *Provider) FetchInitialCertificate(ctx context.Context, secretName strin
 	}
 	p.stats.incUpdateSuccess()
 	return cert, nil
+}
+
+// FetchInitialValidationContext performs the ONE bounded initial fetch of an
+// SDS-delivered validation_context and returns the trusted-CA pool.
+//
+// Byte-parallel to FetchInitialCertificate: the same timeout bound, the same
+// SDSStats accounting, and the same error classification (rejected /
+// init-fetch-timeout / failure). A timeout or unreachable management server
+// returns an error, which boot-FAILS the listener — the documented envoy-go
+// DEPARTURE from the reference's serve-anyway (ADR-0280, extended unchanged to
+// this resource type; SPEC-65 §11 D-SDSVC-FETCHTIMEOUT).
+func (p *Provider) FetchInitialValidationContext(ctx context.Context, secretName string) (*x509.CertPool, error) {
+	p.stats.incUpdateAttempt()
+	if p.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.timeout)
+		defer cancel()
+	}
+	stream, err := p.opener.StreamSecrets(ctx)
+	if err != nil {
+		p.stats.incUpdateFailure()
+		return nil, fmt.Errorf("xds: sds: secret %q: open stream: %w", secretName, err)
+	}
+	pool, err := fetchValidationSecret(stream, p.node, secretName, p.baseDir)
+	if err != nil {
+		switch {
+		case errors.Is(err, errValidation):
+			p.stats.incUpdateRejected()
+			return nil, err
+		case ctx.Err() != nil: // deadline / cancel during recv
+			p.stats.incInitFetchTimeout()
+			return nil, fmt.Errorf("xds: sds: secret %q: initial fetch timed out after %s: %w", secretName, p.timeout, ctx.Err())
+		default:
+			p.stats.incUpdateFailure()
+			return nil, err
+		}
+	}
+	p.stats.incUpdateSuccess()
+	return pool, nil
 }

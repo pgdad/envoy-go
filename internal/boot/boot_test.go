@@ -332,3 +332,127 @@ func TestNewSDSProvider_Success_FetchesDeliveredCertificate(t *testing.T) {
 		t.Errorf("delivered leaf serial = %v, want %v", leaf.SerialNumber, wantSerial)
 	}
 }
+
+// sdsListenerCTCYAMLTemplate mirrors sdsListenerYAMLTemplate but leaves the
+// ENTIRE common_tls_context body to the caller as a flow-style mapping, so a
+// test can shape the pre-scan's two SDS arms independently (phase 65). Same
+// listener/cluster topology otherwise. %s/%s = node.id/node.cluster; %s = the
+// flow-style common_tls_context body; %d = sds_cluster's single endpoint port.
+const sdsListenerCTCYAMLTemplate = `
+node: { id: "%s", cluster: "%s" }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  listeners:
+    - name: l_tls
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: c_echo
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context: %s
+  clusters:
+    - name: c_echo
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_echo
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 0 }
+    - name: sds_cluster
+      type: STATIC
+      connect_timeout: 1s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: sds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: %d }
+`
+
+// The three flow-style common_tls_context bodies the pre-scan tests below
+// shape. Each takes the sds_config flow (grpcSdsConfigFlow) per SDS arm.
+//
+// ctcValidationOnlySDSFlow carries NO tls_certificates on purpose: the pre-scan
+// never reads the static server cert (only the two *_sds_secret_config* arms),
+// so adding a placeholder PEM here would be inert noise. The static-server-cert
+// half of this listener shape is covered by internal/tls's own tests.
+const (
+	ctcValidationOnlySDSFlow = `{validation_context_sds_secret_config: {name: validation_ca, sds_config: %s}}`
+	ctcBothViaSDSFlow        = `{tls_certificate_sds_secret_configs: [{name: server_cert, sds_config: %s}], validation_context_sds_secret_config: {name: validation_ca, sds_config: %s}}`
+	ctcCertOnlySDSFlow       = `{tls_certificate_sds_secret_configs: [{name: server_cert, sds_config: %s}]}`
+)
+
+// TestNewSDSProvider_ValidationOnlySDS_BuildsProvider: a listener using SDS ONLY
+// for the validation_context (static server cert) must build a provider. Before
+// phase 65 the pre-scan keyed solely on tls_certificate_sds_secret_configs, so
+// this shape yielded (nil, nil) and internal/tls's nil-provider reject fired —
+// making the whole feature unreachable in a real boot (ADR-0286).
+func TestNewSDSProvider_ValidationOnlySDS_BuildsProvider(t *testing.T) {
+	ctc := fmt.Sprintf(ctcValidationOnlySDSFlow, grpcSdsConfigFlow)
+	yaml := fmt.Sprintf(sdsListenerCTCYAMLTemplate, "test-node", "test-cluster", ctc, 1)
+	bs, dialer := loadSDSBootstrapAndDialer(t, yaml)
+
+	provider, err := NewSDSProvider(dialer, bs, t.TempDir(), bs.Stats)
+	if err != nil {
+		t.Errorf("NewSDSProvider: got error %v, want nil", err)
+	}
+	if provider == nil {
+		t.Error("NewSDSProvider: got nil provider — a validation-only-SDS listener must build a provider")
+	}
+}
+
+// TestNewSDSProvider_BothViaSDS_Rejects: a context using SDS for BOTH the server
+// cert AND the validation_context is the DEFERRED compose-two edge — the
+// single-slot provider model (one secretName, one *xds.SDSStats) cannot serve
+// it, so the seen>1 guard must REJECT rather than silently build a provider for
+// whichever arm won the scan. This is why the validation arm increments `seen`.
+func TestNewSDSProvider_BothViaSDS_Rejects(t *testing.T) {
+	ctc := fmt.Sprintf(ctcBothViaSDSFlow, grpcSdsConfigFlow, grpcSdsConfigFlow)
+	yaml := fmt.Sprintf(sdsListenerCTCYAMLTemplate, "test-node", "test-cluster", ctc, 1)
+	bs, dialer := loadSDSBootstrapAndDialer(t, yaml)
+
+	_, err := NewSDSProvider(dialer, bs, t.TempDir(), bs.Stats)
+	if err == nil {
+		t.Fatal("NewSDSProvider: want the seen>1 reject, got nil (compose-two is DEFERRED)")
+	}
+	const want = "multiple SDS-bound downstream TLS contexts unsupported"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("NewSDSProvider error = %q; want substring %q", err.Error(), want)
+	}
+}
+
+// TestNewSDSProvider_CertOnlySDS_Unchanged: the phase-60.2 shape (the 0103
+// differential) must be byte-unaffected by the pre-scan extension. This test is
+// the fence — if it ever fires, phase 65 regressed the cert-only SDS path.
+func TestNewSDSProvider_CertOnlySDS_Unchanged(t *testing.T) {
+	ctc := fmt.Sprintf(ctcCertOnlySDSFlow, grpcSdsConfigFlow)
+	yaml := fmt.Sprintf(sdsListenerCTCYAMLTemplate, "test-node", "test-cluster", ctc, 1)
+	bs, dialer := loadSDSBootstrapAndDialer(t, yaml)
+
+	provider, err := NewSDSProvider(dialer, bs, t.TempDir(), bs.Stats)
+	if err != nil {
+		t.Errorf("NewSDSProvider: got error %v, want nil", err)
+	}
+	if provider == nil {
+		t.Error("NewSDSProvider: got nil provider — the cert-only SDS shape must still build a provider")
+	}
+}

@@ -90,7 +90,10 @@ func TestDataSourceBytes_NoneSet(t *testing.T) {
 
 // selfSignedPEM generates a fresh self-signed leaf certificate + key pair (PEM
 // encoded) for use as valid tls_certificate DataSource bytes in tests.
-func selfSignedPEM(t *testing.T) (certPEM, keyPEM []byte) {
+//
+// It takes a testing.TB (not a *testing.T) so the fuzz seed helpers in
+// fuzz_test.go, which hold a *testing.F, can reuse it.
+func selfSignedPEM(t testing.TB) (certPEM, keyPEM []byte) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -210,5 +213,136 @@ func TestParseSecret_BadPEM(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "load") {
 		t.Fatalf("error = %q, want it to contain %q", err.Error(), "load")
+	}
+}
+
+// vcSecret builds a Secret{name, validation_context{trusted_ca: inline caPEM}},
+// the phase-65 happy-path shape (SPEC-65 §11 config_dump).
+func vcSecret(t *testing.T, name string, caPEM []byte) *anypb.Any {
+	t.Helper()
+	return anyOf(t, &tlsv3.Secret{
+		Name: name,
+		Type: &tlsv3.Secret_ValidationContext{ValidationContext: &tlsv3.CertificateValidationContext{
+			TrustedCa: inlineDS(caPEM),
+		}},
+	})
+}
+
+func TestParseValidationSecret_Valid(t *testing.T) {
+	caPEM, _ := selfSignedPEM(t)
+	pool, err := parseValidationSecret(vcSecret(t, "validation_ca", caPEM), "validation_ca", "")
+	if err != nil {
+		t.Fatalf("parseValidationSecret: unexpected err %v", err)
+	}
+	if pool == nil {
+		t.Fatal("pool is nil")
+	}
+	// The pool must actually carry the CA — an empty pool would silently
+	// accept nothing (or, as ClientCAs, reject every client).
+	if got := len(pool.Subjects()); got != 1 { //nolint:staticcheck // Subjects() is fine for a test-only count
+		t.Errorf("pool holds %d subjects, want 1", got)
+	}
+}
+
+func TestParseValidationSecret_WrongName(t *testing.T) {
+	caPEM, _ := selfSignedPEM(t)
+	_, err := parseValidationSecret(vcSecret(t, "other", caPEM), "validation_ca", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "!= requested") {
+		t.Errorf("error = %q, want it to mention the name mismatch", err.Error())
+	}
+}
+
+// TestParseValidationSecret_WrongOneof is the MIRROR of TestParseSecret_WrongOneof
+// (secret_test.go:175): parseSecret rejects a validation_context, and
+// parseValidationSecret rejects a tls_certificate. The two appliers stay disjoint.
+func TestParseValidationSecret_WrongOneof(t *testing.T) {
+	certPEM, keyPEM := selfSignedPEM(t)
+	sec := anyOf(t, &tlsv3.Secret{
+		Name: "validation_ca",
+		Type: &tlsv3.Secret_TlsCertificate{TlsCertificate: &tlsv3.TlsCertificate{
+			CertificateChain: inlineDS(certPEM),
+			PrivateKey:       inlineDS(keyPEM),
+		}},
+	})
+	_, err := parseValidationSecret(sec, "validation_ca", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "is not a validation_context") {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), "is not a validation_context")
+	}
+}
+
+// TestParseValidationSecret_CVCRejects: lifting the SDS envelope is NOT license to
+// silently accept CertificateValidationContext sub-fields envoy-go cannot honor
+// (reference_strict_reject_sibling_typeurl_gap). Each mirrors an inline reject
+// (internal/tls/config.go:234-245) with an `xds: sds:`-prefixed DISTINCT substring
+// (ADR-0080). Errorf per row so one failure does not mask the rest.
+func TestParseValidationSecret_CVCRejects(t *testing.T) {
+	caPEM, _ := selfSignedPEM(t)
+	cases := []struct {
+		name    string
+		mut     func(*tlsv3.CertificateValidationContext)
+		wantSub string
+	}{
+		{"custom_validator_config", func(v *tlsv3.CertificateValidationContext) {
+			v.CustomValidatorConfig = &corev3.TypedExtensionConfig{Name: "x"}
+		}, "custom_validator_config is not supported"},
+		{"match_typed_subject_alt_names", func(v *tlsv3.CertificateValidationContext) {
+			v.MatchTypedSubjectAltNames = []*tlsv3.SubjectAltNameMatcher{{}}
+		}, "match_typed_subject_alt_names is not supported"},
+		{"verify_certificate_hash", func(v *tlsv3.CertificateValidationContext) {
+			v.VerifyCertificateHash = []string{"deadbeef"}
+		}, "verify_certificate_hash is not supported"},
+		{"verify_certificate_spki", func(v *tlsv3.CertificateValidationContext) {
+			v.VerifyCertificateSpki = []string{"c3BraQ=="}
+		}, "verify_certificate_spki is not supported"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			vc := &tlsv3.CertificateValidationContext{TrustedCa: inlineDS(caPEM)}
+			tc.mut(vc)
+			sec := anyOf(t, &tlsv3.Secret{
+				Name: "validation_ca",
+				Type: &tlsv3.Secret_ValidationContext{ValidationContext: vc},
+			})
+			_, err := parseValidationSecret(sec, "validation_ca", "")
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), tc.wantSub)
+			}
+			if !strings.HasPrefix(err.Error(), "xds: sds: ") {
+				t.Errorf("error = %q, want the `xds: sds: ` prefix", err.Error())
+			}
+		})
+	}
+}
+
+func TestParseValidationSecret_NoTrustedCa(t *testing.T) {
+	sec := anyOf(t, &tlsv3.Secret{
+		Name: "validation_ca",
+		Type: &tlsv3.Secret_ValidationContext{ValidationContext: &tlsv3.CertificateValidationContext{}},
+	})
+	_, err := parseValidationSecret(sec, "validation_ca", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "trusted_ca") {
+		t.Errorf("error = %q, want it to mention trusted_ca", err.Error())
+	}
+}
+
+func TestParseValidationSecret_BadPEM(t *testing.T) {
+	_, err := parseValidationSecret(vcSecret(t, "validation_ca", []byte("not a pem")), "validation_ca", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "parse failure") {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), "parse failure")
 	}
 }

@@ -2,6 +2,7 @@ package xds
 
 import (
 	stdtls "crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -77,4 +78,61 @@ func parseSecret(resource *anypb.Any, wantName, baseDir string) (*stdtls.Certifi
 		return nil, fmt.Errorf("xds: sds: secret %q: load cert: %w", wantName, err)
 	}
 	return &pair, nil
+}
+
+// parseValidationSecret unmarshals an SDS-delivered resource into a
+// tls.v3.Secret, verifies it carries the validation_context oneof arm under the
+// requested name, holds the served CertificateValidationContext to the SAME
+// support surface as the inline path (internal/tls/config.go:234-245 — lifting
+// the SDS envelope is not license to silently accept CVC sub-fields envoy-go
+// cannot honor, reference_strict_reject_sibling_typeurl_gap), and loads
+// trusted_ca into an *x509.CertPool.
+//
+// It is the validation_context sibling of parseSecret (which stays
+// tls_certificate-only). The two are deliberately DISJOINT: each rejects the
+// other's oneof arm, so a mis-served secret fails loudly rather than silently
+// yielding a zero-value trust anchor.
+//
+// The CertPool build DUPLICATES internal/tls.loadTrustedCAPool rather than
+// calling it: internal/tls imports internal/xds (config.go:13), so the reverse
+// edge would cycle (ADR-0278 / reference_xds_config_seam_transitive_cycle_guard).
+// This mirrors dataSourceBytes's deliberate duplication of
+// internal/tls.loadDataSource. Keep internal/xds's dep set at internal/stats only.
+//
+// crl is NOT rejected — the inline path does not check it either
+// (config.go:233-246), so rejecting here would be a NEW asymmetry. A documented
+// SHARED gap, deferred to the CVC-feature follow-on (SPEC-65 §6).
+func parseValidationSecret(resource *anypb.Any, wantName, baseDir string) (*x509.CertPool, error) {
+	var sec tlsv3.Secret
+	if err := resource.UnmarshalTo(&sec); err != nil {
+		return nil, fmt.Errorf("xds: sds: resource is not a %s: %w", secretTypeURL(), err)
+	}
+	if sec.GetName() != wantName {
+		return nil, fmt.Errorf("xds: sds: response secret name %q != requested %q", sec.GetName(), wantName)
+	}
+	vc := sec.GetValidationContext()
+	if vc == nil {
+		return nil, fmt.Errorf("xds: sds: secret %q is not a validation_context (unsupported oneof arm)", wantName)
+	}
+	if vc.GetCustomValidatorConfig() != nil {
+		return nil, fmt.Errorf("xds: sds: validation secret %q: custom_validator_config is not supported", wantName)
+	}
+	if len(vc.GetMatchTypedSubjectAltNames()) > 0 {
+		return nil, fmt.Errorf("xds: sds: validation secret %q: match_typed_subject_alt_names is not supported", wantName)
+	}
+	if len(vc.GetVerifyCertificateHash()) > 0 {
+		return nil, fmt.Errorf("xds: sds: validation secret %q: verify_certificate_hash is not supported", wantName)
+	}
+	if len(vc.GetVerifyCertificateSpki()) > 0 {
+		return nil, fmt.Errorf("xds: sds: validation secret %q: verify_certificate_spki is not supported", wantName)
+	}
+	caPEM, err := dataSourceBytes(vc.GetTrustedCa(), baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("xds: sds: validation secret %q: trusted_ca: %w", wantName, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("xds: sds: validation secret %q: trusted_ca: parse failure", wantName)
+	}
+	return pool, nil
 }

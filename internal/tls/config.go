@@ -66,15 +66,49 @@ func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string, provider xd
 	// commonTLSContextToConfig pre-checks.
 	if ctx.GetRequireClientCertificate().GetValue() {
 		common := ctx.GetCommonTlsContext()
-		vc := common.GetValidationContext()
-		if vc == nil || vc.GetTrustedCa() == nil {
-			return nil, fmt.Errorf("tls: downstream: require_client_certificate=true requires validation_context.trusted_ca")
+		if sdsVC, ok := common.GetValidationContextType().(*tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig); ok {
+			// Phase 65 (ADR-0286): the trusted-CA bundle is delivered by an SDS
+			// management server over the landed SotW stream, bounded by
+			// initial_fetch_timeout. The fetch lives HERE (not in
+			// commonTLSContextToConfig) because require_client_certificate is a
+			// DownstreamTlsContext field, invisible from the CommonTlsContext — and
+			// gating on it means the deferred require==false case performs NO
+			// wasteful boot-time fetch (SPEC-65 §3.3b / §3.5).
+			if provider == nil {
+				// Defense-in-depth: commonTLSContextToConfig's
+				// validation_context_sds_secret_config arm already refuses the
+				// nil-provider SDS-validation shape above, so this guard is
+				// UNREACHABLE from today's entry points. It is kept so a future caller
+				// that relaxes that reject cannot nil-deref here.
+				return nil, fmt.Errorf("tls: downstream: SDS-delivered validation_context requires a live SDS provider (unavailable in this mode)")
+			}
+			// ParseSDSConfig takes a LIST (it enforces len==1, internal/xds/config.go:23);
+			// validation_context_sds_secret_config is SINGULAR, so wrap it.
+			secretName, _, _, err := xds.ParseSDSConfig([]*tlsv3.SdsSecretConfig{sdsVC.ValidationContextSdsSecretConfig})
+			if err != nil {
+				// xds: -prefixed -> wrap to preserve the `tls: ` invariant
+				// (FuzzTLSContextParse).
+				return nil, fmt.Errorf("tls: downstream: %w", err)
+			}
+			pool, err := provider.FetchInitialValidationContext(context.Background(), secretName)
+			if err != nil {
+				// A timeout / unreachable management server boot-FAILS the listener —
+				// the documented envoy-go DEPARTURE from the reference's serve-anyway
+				// (ADR-0280, extended to this resource type).
+				return nil, fmt.Errorf("tls: downstream: SDS validation secret %q: %w", secretName, err)
+			}
+			cfg.ClientCAs = pool
+		} else {
+			vc := common.GetValidationContext()
+			if vc == nil || vc.GetTrustedCa() == nil {
+				return nil, fmt.Errorf("tls: downstream: require_client_certificate=true requires validation_context.trusted_ca")
+			}
+			pool, err := loadTrustedCAPool(vc, baseDir, "downstream")
+			if err != nil {
+				return nil, err
+			}
+			cfg.ClientCAs = pool
 		}
-		pool, err := loadTrustedCAPool(vc, baseDir, "downstream")
-		if err != nil {
-			return nil, err
-		}
-		cfg.ClientCAs = pool
 		cfg.ClientAuth = stdtls.RequireAndVerifyClientCert
 	}
 	return &DownstreamConfig{TLSConfig: cfg}, nil
@@ -225,7 +259,24 @@ func commonTLSContextToConfig(c *tlsv3.CommonTlsContext, baseDir, side string, p
 	if c.GetValidationContextType() != nil {
 		switch c.GetValidationContextType().(type) {
 		case *tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig:
-			return nil, fmt.Errorf("tls: %s: SDS-bound validation_context_sds_secret_config is not supported in phase 03", side)
+			// Phase 65 (ADR-0286): a downstream SDS-delivered validation_context is
+			// HONORED — fetched and installed as ClientCAs by NewDownstreamConfig's
+			// require_client_certificate block (the only scope that sees
+			// require_client_certificate, which lives on the DownstreamTlsContext,
+			// not on this CommonTlsContext). Here it is a NO-OP for the
+			// downstream+provider path.
+			//
+			// The guard below has exactly ONE live consumer: NewQUICDownstreamConfig,
+			// which passes side == "downstream" with a NIL provider (QUIC carries no
+			// SDS), so it keeps the BYTE-IDENTICAL phase-03 reject (ADR-0080 distinct
+			// substring). NewUpstreamConfig never reaches this arm: validation_context_type
+			// is a ONEOF, so selecting the SDS arm makes its GetValidationContext()
+			// return nil and it refuses earlier with its own trusted_ca message. The
+			// side != "downstream" half is therefore dead from today's entry points;
+			// it is kept so a future upstream caller cannot silently skip validation.
+			if side != "downstream" || provider == nil {
+				return nil, fmt.Errorf("tls: %s: SDS-bound validation_context_sds_secret_config is not supported in phase 03", side)
+			}
 		case *tlsv3.CommonTlsContext_CombinedValidationContext:
 			return nil, fmt.Errorf("tls: %s: combined_validation_context is not supported in phase 03", side)
 		}
