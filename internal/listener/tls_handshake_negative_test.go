@@ -7,7 +7,10 @@ import (
 	"testing"
 	"time"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/pgdad/envoy-go/internal/stats"
 )
@@ -76,5 +79,93 @@ func TestNewManager_LiveHandshake_UnmatchedSNI_NoCatchAll_Aborts(t *testing.T) {
 	if err == nil {
 		_ = badConn.Close()
 		t.Fatal("TLS handshake with unmatched SNI and no catch-all SUCCEEDED; expected an aborted handshake (reference Envoy closes on no filter chain match)")
+	}
+}
+
+// mkDownstreamTSInlineALPN mirrors mkDownstreamTSInline but sets
+// alpn_protocols on the CommonTlsContext, so the chain's *stdtls.Config
+// carries NextProtos and the server ENFORCES ALPN overlap.
+func mkDownstreamTSInlineALPN(t *testing.T, certPEM, keyPEM string, alpn []string) *corev3.TransportSocket {
+	t.Helper()
+	inner := &tlsv3.DownstreamTlsContext{
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			AlpnProtocols: alpn,
+			TlsCertificates: []*tlsv3.TlsCertificate{{
+				CertificateChain: &corev3.DataSource{
+					Specifier: &corev3.DataSource_InlineBytes{InlineBytes: []byte(certPEM)},
+				},
+				PrivateKey: &corev3.DataSource{
+					Specifier: &corev3.DataSource_InlineBytes{InlineBytes: []byte(keyPEM)},
+				},
+			}},
+		},
+	}
+	a, err := anypb.New(inner)
+	if err != nil {
+		t.Fatalf("anypb.New DownstreamTlsContext (alpn): %v", err)
+	}
+	return &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.tls",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: a},
+	}
+}
+
+// TestNewManager_LiveHandshake_ALPNNegotiationFailure_Aborts closes the
+// remaining runtime TLS-handshake-failure gap from the 2026-07-11 test-gap
+// analysis (§4 item 3): a listener whose DownstreamTlsContext advertises
+// alpn_protocols must ABORT the handshake for a client that offers only a
+// non-overlapping protocol (crypto/tls: no_application_protocol — matching
+// reference Envoy, which alerts no_application_protocol on ALPN mismatch),
+// while a client offering an overlapping protocol completes the handshake
+// and observes the negotiated protocol.
+func TestNewManager_LiveHandshake_ALPNNegotiationFailure_Aborts(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	ts := mkDownstreamTSInlineALPN(t, testAlphaCertPEM, testAlphaKeyPEM, []string{"h2", "http/1.1"})
+
+	l := mkTLSListener("l_alpn_live", "127.0.0.1", 0, []*listenerv3.FilterChain{
+		mkTLSChain(nil, ts, filter), // single catch-all TLS chain
+	})
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer mgr.Stop()
+
+	ls := mgr.Listeners()
+	if len(ls) != 1 {
+		t.Fatalf("expected 1 listener, got %d", len(ls))
+	}
+	addr := ls[0].Addr
+	caPool := testCAPool(t)
+
+	// Control: an overlapping ALPN offer completes and negotiates.
+	okConn, err := stdtls.DialWithDialer(
+		&net.Dialer{Timeout: 2 * time.Second}, "tcp", addr,
+		&stdtls.Config{ServerName: "alpha.envoy-go.test", RootCAs: caPool, MinVersion: stdtls.VersionTLS12, NextProtos: []string{"http/1.1"}},
+	)
+	if err != nil {
+		t.Fatalf("control dial with overlapping ALPN unexpectedly failed: %v", err)
+	}
+	if got := okConn.ConnectionState().NegotiatedProtocol; got != "http/1.1" {
+		t.Errorf("negotiated ALPN = %q, want %q", got, "http/1.1")
+	}
+	_ = okConn.Close()
+
+	// Non-overlapping ALPN offer → the handshake must NOT succeed.
+	badConn, err := stdtls.DialWithDialer(
+		&net.Dialer{Timeout: 2 * time.Second}, "tcp", addr,
+		&stdtls.Config{ServerName: "alpha.envoy-go.test", RootCAs: caPool, MinVersion: stdtls.VersionTLS12, NextProtos: []string{"bogus/9"}},
+	)
+	if err == nil {
+		_ = badConn.Close()
+		t.Fatal("TLS handshake offering only a non-overlapping ALPN protocol SUCCEEDED; expected an aborted handshake (no_application_protocol)")
 	}
 }
