@@ -1,5 +1,9 @@
 # Test Gap Analysis — envoy-go
 
+> **Second pass appended 2026-07-17** — see the dated section at the end of this
+> document. The first-pass §2.5 statement "xDS absent by design" is superseded:
+> phases 57–66 landed an SDS subsystem, a QUIC/HTTP-3 listener, and more.
+
 **Date:** 2026-07-11
 **Reference Envoy pin:** `envoyproxy/envoy:contrib-v1.37.2` (per `docs/envoy-go/ENVOY_TARGET.md`)
 **Scope:** analysis of the tests that verify *proper functionality* against upstream
@@ -210,3 +214,188 @@ Ordered by (a) risk of silent incorrectness vs Envoy, (b) breadth of code exerci
 
 6. **Flakiness pre-emption** (optional): convert the ~10 goroutine-ordering `time.Sleep`
    sites in `hcm/h2`/`tcpproxy` tests to `sync`/channel handshakes if CI ever flakes.
+
+---
+
+# Second pass — 2026-07-17
+
+**Branch:** `test-review-20260717` (from `facb0faa`).
+**Reference Envoy pin:** unchanged, `envoyproxy/envoy:contrib-v1.37.2`.
+**Scope:** the 58 commits since the first pass (`39e2140e..facb0faa`) landed phases
+57–66 — a MAJOR new surface the 2026-07-11 analysis predates entirely: an xDS/SDS
+subsystem (`internal/xds`, SotW gRPC stream, SDS `tls_certificate` /
+`validation_context` / `combined_validation_context`), a QUIC/HTTP-3 downstream
+listener (quic-go v0.54.1, the first external module), a Graphite statsd sink, and
+four tracing rows. §2.5's "xDS absent by design" is now FALSE. This pass is the
+same kind of orthogonal test-quality overlay as the first: test files + CI config
+only, no production code, no `docs/envoy-go/` state, no fixture changes.
+
+## 5. Baseline (2026-07-17, clean checkout of facb0faa)
+
+| Signal | First pass | This pass |
+|---|---|---|
+| Go source files | 928 | 976 |
+| Test files | 408 | 426 (430 after this pass) |
+| Fuzz targets | 46 | 55 |
+| Differential fixtures | 101 | 111 (`0000`–`0109`) |
+| Unit suite `go test -short -race ./...` | PASS ~90s | **PASS** (124 pkgs; 16s wall / 1m42s CPU on this host) |
+| Differential suite | PASS ~5m21s | **PASS** (see caveat below) |
+
+**Environment finding (not a code failure):** during the first baseline run the
+local Docker Desktop daemon died mid-suite; the differential package's
+`TestHostGatewayIP` pre-check hung for the full 10-minute package timeout against
+the half-dead socket, failing the run. After a daemon restart the suite is green.
+The differential harness could bound its Docker liveness probe (a dial timeout on
+the socket) so a dying daemon fails in seconds, not 10 minutes — noted in §8.
+
+## 6. Gap analysis of the new surface
+
+Sources: code inspection of `internal/xds`, `internal/boot`, `internal/tls`,
+`internal/listener/quic.go`, `internal/filter/hcm/h3dispatch.go`, plus the phase
+docs' own recorded coverage boundaries (`docs/envoy-go/phases/6*/PROGRESS*.md`).
+
+### 6.1 What was already well covered (credit where due)
+
+The phase-driven TDD process left the new surface in strong shape at the UNIT
+level: SDS provider fetch classification (success / timeout / mgmt-down /
+rejected, for both resource types), the `NewSDSProvider` pre-scan arms (all three
+SDS shapes, the seen>1 compose-two reject, node-required, ADS reject), the
+phase-66 E3 security reject (a CVC listener with `require_client_certificate`
+false/absent CANNOT boot — pinned twice, by message and by the
+`ClientAuth != NoClientCert` property test), all four CVC sub-field rejects
+re-pointed at `default_validation_context`, malformed-served-secret rejection
+(wrong name / wrong oneof / bad PEM / unsupported sub-fields), and an
+`FuzzDiscoveryResponseParse` fuzzer over both Secret parse chains. The three
+Docker differential fixtures 0103/0108/0109 pin the cross-side behavior.
+
+### 6.2 Gaps found (and what this pass did about each)
+
+1. **No in-process end-to-end SDS test existed.** Every joint was tested in
+   isolation; nothing proved they COMPOSE — `bootstrap.Load → cluster manager →
+   NewSDSProvider → Construct → lm.Start → live TLS handshake`. In particular:
+   (a) nothing asserted a live handshake actually serves the SDS-delivered leaf;
+   (b) nothing drove live mTLS against the SDS-delivered CA (the phase-67
+   brainstorm's "Go cert-withholding vacuous-green driver trap" — a Go client
+   silently withholds its cert when the server's CA advertisement doesn't match,
+   so a naive test goes green without testing anything);
+   (c) **the phase-66 Design A "pool substitution" had NO behavioral test**: the
+   ADR-0287 equivalence theorem (P3/P5) says the SDS pool REPLACES the inline
+   default CA, and its own code comment admits "if either ever diverges, this
+   equivalence is SILENTLY falsified with no test to catch it";
+   (d) the fail-closed boot posture (ADR-0280 departure; the phase-67 drift
+   question D-RCCF-FETCHFAIL-POSTURE) was pinned only at the `internal/tls` unit
+   level, never at the real apply-point.
+   **Landed:** `internal/boot/boot_sds_e2e_test.go` — four test groups covering
+   exactly (a)–(d): serial-exact SDS leaf on a live handshake + echo round-trip
+   through tcp_proxy; mTLS accept/reject with FORCE-SENT client certs
+   (`GetClientCertificate`) so reject tests cannot go vacuously green; CVC
+   substitution (a leaf signed by the INLINE DEFAULT CA is REFUSED); silent
+   SDS server (config-driven 200ms `initial_fetch_timeout`) and unreachable SDS
+   server both FAIL the boot with no listener bound.
+
+2. **A RECORDED coverage gap in the provider's error classification.**
+   `phases/65-.../PROGRESS.md:122` honestly records that a deliberate break
+   swapping the `errValidation`-before-`ctx.Err()` classification ordering fired
+   NO test — no test created the discriminating condition (a validation failure
+   arriving after the fetch deadline expired). **Landed:**
+   `internal/xds/provider_classification_test.go` — a fake stream blocks on the
+   provider's own ctx.Done(), then delivers a validation-failing response; the
+   error must classify `update_rejected`, not `init_fetch_timeout`. Verified
+   discriminating by re-running the recorded break (both new tests fire).
+
+3. **QUIC listener had zero negative-path tests.** All three committed phase-61
+   tests are positive-path; ALPN mismatch existed only as a TEMPORARY
+   deliberate-break during 61.1, and nothing ever fed the UDP socket non-QUIC
+   bytes. For a public-facing UDP listener the containment property matters: a
+   failed handshake or garbage datagram must not exit the accept loop.
+   **Landed:** `internal/listener/quic_negative_test.go` — ALPN-h2-only client
+   refused AND the listener still serves h3 afterwards; garbage datagrams (short
+   junk / 1200B noise / QUIC-long-header-shaped junk) neither crash nor wedge
+   the listener (before/after control GETs guard against vacuous passes).
+
+4. **First-pass ranked item 3 (ALPN negotiation failure, TCP TLS)** — still
+   open from 2026-07-11. **Landed:** extended
+   `internal/listener/tls_handshake_negative_test.go` with a live-handshake
+   abort test (`no_application_protocol`) plus an overlapping-ALPN control that
+   asserts the negotiated protocol.
+
+5. **First-pass ranked item 2 (upstream mid-response-body death)** — the
+   router's distinct `io.ReadAll` failure path (partial status + non-nil action
+   error) had no test. **Landed:**
+   `internal/filter/hcm/upstream_midbody_reset_test.go`, FIN and RST flavors.
+   **Characterized behavior:** envoy-go's fully-buffered proxy has written
+   nothing downstream when the body read fails and HCM gates the wire-write on
+   `actionErr == nil`, so the downstream connection closes with ZERO response
+   bytes and the connection loop exits. Reference Envoy (streaming) forwards
+   the 200 header block and truncates. Both terminate without a deliverable
+   complete response (no smuggling/desync class), but the wire shape differs —
+   an architectural consequence of buffered proxying, recorded here as a
+   characterized divergence like the four §2.1 H1 rows. If envoy-go ever
+   streams responses, these tests fail loudly (the re-pin signal).
+
+6. **Fuzz-smoke matrix lagged the new trust boundary.** The SDS Secret parser
+   consumes bytes from the management server — a genuine trust boundary feeding
+   X509 material into listener trust anchors — but only its seed corpus ran in
+   CI. **Landed:** `FuzzDiscoveryResponseParse` added to the `fuzz-smoke`
+   matrix (9 → 10 targets; local 20s engine run clean, ~1.5M execs).
+
+### 6.3 Judged and deliberately NOT done this pass
+
+- **Hardening H1 request framing (first-pass item 1)** — still open, still the
+  right call to defer: it is a behavior change on a differential-covered path
+  requiring an ADR + `BEHAVIOR_CONTRACT` extension per repo doctrine. The four
+  divergences remain characterized in `connection_robustness_test.go`.
+- **The D-RCCF-FETCHFAIL-POSTURE reference-side probe** — phase 67's own SPEC
+  obligation (a discriminating server-cert-fetch-failure probe against the
+  reference, reconciling BC:900/ADR-0286/config.go against the
+  init-hold-then-fail-closed finding). That is doc/contract reconciliation work
+  belonging to the phase machinery, not a test overlay. envoy-go's OWN posture
+  (boot-FAIL, both resource types) is now integration-pinned (§6.2.1d).
+- **H3 differential POST-body / access-log `Protocol=HTTP/3` cross-side
+  assertions** (recorded deferrals in PROGRESS-61.3) — need harness surgery in
+  the phase workflow's territory (`test/differential/harness_h3_test.go`).
+- **Downstream idle/stream/request timeouts and `max_request_headers_kb`
+  (first-pass items 4–5)** — feature + test land together; too large for a
+  test-only pass, unchanged ranking.
+- **`quicAcceptLoop` accept-error backoff (M6-1)** — the deferred robustness
+  row's business; the error path is currently believed unreachable outside
+  listener close (quic-go's Accept only errors terminally).
+
+## 7. Verification
+
+- `gofmt` clean, `go vet ./...` clean, `golangci-lint run` clean over every
+  touched package, `go build ./...` clean.
+- `go test -short -race -count=1 ./...`: **PASS**, 124 packages, 0 failures.
+- `go test ./test/differential/ -count=1`: **PASS** after the Docker daemon
+  restart (111 fixtures; test-only changes cannot affect it, run for the
+  before/after record).
+- The new classification tests were proven discriminating via the recorded
+  deliberate break (ordering swap → both fire → restored green). The SDS e2e
+  reject arms are guarded against vacuous passes by force-sent client certs and
+  control dials; the QUIC negatives by before/after control GETs.
+- No production code changed. Fixtures untouched (111). Fuzz targets unchanged
+  (55 — a matrix row is not a new fuzzer).
+
+## 8. Re-ranked remaining recommended work
+
+1. **Harden H1 request framing to Envoy semantics + differential fixture**
+   (unchanged #1; ADR + BEHAVIOR_CONTRACT + phase machinery required — the four
+   characterized divergences include the TE+CL smuggling vector).
+2. **Resolve the D-RCCF-FETCHFAIL-POSTURE drift** with the discriminating
+   reference probe phase 67 already obligates, then reconcile the three
+   serve-anyway doc sites (or pin the departure explicitly). The envoy-go-side
+   posture is now locked by `boot_sds_e2e_test.go` either way.
+3. **Downstream idle/stream/request timeout support + tests** (feature+test;
+   thread `internal/clock` for determinism) — unchanged.
+4. **Oversized-header enforcement** (`max_request_headers_kb`, H2
+   `SETTINGS_MAX_HEADER_LIST_SIZE`) — unchanged.
+5. **H3 differential depth**: POST-body arm and a cross-side
+   `Protocol=HTTP/3` access-log assertion for fixture 0104's family; also a
+   standing SDS-rotation story once watch/rotation lands (today's SDS is
+   initial-fetch-only by design).
+6. **Differential-harness Docker liveness probe timeout** (§5 environment
+   finding): bound the socket probe so a dying daemon fails the suite in
+   seconds instead of eating the 10-minute package timeout.
+7. **Flakiness pre-emption** (unchanged, still optional): the ~10
+   goroutine-ordering `time.Sleep` sites in `hcm/h2`/`tcpproxy` tests; none
+   have flaked in CI to date.
