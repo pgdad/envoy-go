@@ -67,6 +67,7 @@ jobs:
           - { pkg: internal/filter/network/kafkabroker, target: FuzzKafkaDecode }       # Kafka wire codec
           - { pkg: internal/filter/network/mongoproxy,  target: FuzzMongoDecode }       # Mongo/BSON wire codec
           - { pkg: internal/filter/network/redisproxy,  target: FuzzRESPDecode }        # RESP wire codec
+          - { pkg: internal/xds,                        target: FuzzDiscoveryResponseParse } # SDS Secret parse (phases 60/65/66 trust boundary)
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
