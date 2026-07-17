@@ -153,6 +153,30 @@ func NewSDSProvider(dialer *grpcclient.Dialer, bs *bootstrap.Bootstrap, baseDir 
 				seen++
 				found = []*tlsv3.SdsSecretConfig{vsc.ValidationContextSdsSecretConfig}
 			}
+			// Phase 66 (D6): also detect an SDS-bound combined_validation_context
+			// (CVC) — the counterpart to the arm above, so the ordinary
+			// single-listener CVC case (no static server cert, no cert-SDS) builds a
+			// provider too. Without this the pre-scan returns (nil, nil) and
+			// commonTLSContextToConfig's retained phase-03 reject fires — a loud
+			// boot-FAIL with the misleading-but-safe "tls: downstream:
+			// combined_validation_context is not supported in phase 03" message —
+			// even though the SDS-delivered CA pool is right there.
+			//
+			// E2's condition, honored here too (D2): a pure-inline CVC contributes NO
+			// secret. Skipping (rather than counting) keeps seen==0 for the
+			// single-listener case, so the retained reject fires in tls/config.go
+			// rather than ParseSDSConfig tripping on a nil entry.
+			//
+			// seen++ here composes with the arms above exactly as phase 65 already
+			// documented: a context using SDS for the server cert or the plain
+			// validation_context AND the CVC's SDS half trips the seen>1 guard below
+			// — the DEFERRED compose-two edge stays shut for the CVC shape too.
+			if cvc, ok := ctc.GetValidationContextType().(*tlsv3.CommonTlsContext_CombinedValidationContext); ok {
+				if sc := cvc.CombinedValidationContext.GetValidationContextSdsSecretConfig(); sc != nil {
+					seen++
+					found = []*tlsv3.SdsSecretConfig{sc}
+				}
+			}
 		}
 	}
 	if seen == 0 {

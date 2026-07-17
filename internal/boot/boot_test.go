@@ -456,3 +456,90 @@ func TestNewSDSProvider_CertOnlySDS_Unchanged(t *testing.T) {
 		t.Error("NewSDSProvider: got nil provider — the cert-only SDS shape must still build a provider")
 	}
 }
+
+// The three flow-style common_tls_context bodies phase 66's CVC pre-scan
+// tests below shape (task 4, PLAN-66 T4). Each takes the sds_config flow
+// (grpcSdsConfigFlow) per SDS arm, mirroring the phase-65 constants above.
+//
+// ctcCVCValidationOnlySDSFlow carries a combined_validation_context (CVC)
+// whose SDS half (validation_context_sds_secret_config) is present — the
+// ordinary single-listener CVC case the third pre-scan arm exists to detect
+// (D6).
+//
+// ctcCVCPureInlineFlow carries a combined_validation_context with NO SDS
+// half — a pure-inline CVC contributes no secret, so the pre-scan must skip
+// it (seen stays 0), per E2/D2.
+//
+// ctcCVCPlusCertSDSFlow combines a CVC's SDS half with a cert-SDS secret on
+// the SAME CommonTlsContext — the seen>1 hard-fail guard must still fire
+// (the DEFERRED compose-two edge, same as the phase-65 plain-VC arm).
+const (
+	ctcCVCValidationOnlySDSFlow = `{combined_validation_context: {validation_context_sds_secret_config: {name: validation_ca, sds_config: %s}}}`
+	ctcCVCPureInlineFlow        = `{combined_validation_context: {}}`
+	ctcCVCPlusCertSDSFlow       = `{tls_certificate_sds_secret_configs: [{name: server_cert, sds_config: %s}], combined_validation_context: {validation_context_sds_secret_config: {name: validation_ca, sds_config: %s}}}`
+)
+
+// TestNewSDSProvider_CVCValidationOnlySDS_BuildsProvider: a listener whose
+// downstream validation_context is a combined_validation_context (CVC) with
+// its SDS half present must build a provider (D6, PLAN-66 T4). Before the
+// third pre-scan arm this shape yielded seen==0 ⇒ (nil, nil) even though the
+// SDS secret is right there — the tls apply-point (internal/tls/config.go)
+// then rejected with "combined_validation_context requires a live SDS
+// provider" rather than the ordinary single-listener CVC case actually
+// working.
+func TestNewSDSProvider_CVCValidationOnlySDS_BuildsProvider(t *testing.T) {
+	ctc := fmt.Sprintf(ctcCVCValidationOnlySDSFlow, grpcSdsConfigFlow)
+	yaml := fmt.Sprintf(sdsListenerCTCYAMLTemplate, "test-node", "test-cluster", ctc, 1)
+	bs, dialer := loadSDSBootstrapAndDialer(t, yaml)
+
+	provider, err := NewSDSProvider(dialer, bs, t.TempDir(), bs.Stats)
+	if err != nil {
+		t.Errorf("NewSDSProvider: got error %v, want nil", err)
+	}
+	if provider == nil {
+		t.Error("NewSDSProvider: got nil provider — a CVC listener with its SDS half present must build a provider (seen==1)")
+	}
+}
+
+// TestNewSDSProvider_CVCPureInline_ReturnsNilNil: a combined_validation_context
+// with NO validation_context_sds_secret_config contributes NO secret — the
+// third arm must SKIP it (not count it), per the third arm's own comment
+// (E2/D2). seen stays 0, so NewSDSProvider returns the genuinely-nil (nil,
+// nil) pair — no panic, no spurious provider.
+func TestNewSDSProvider_CVCPureInline_ReturnsNilNil(t *testing.T) {
+	yaml := fmt.Sprintf(sdsListenerCTCYAMLTemplate, "test-node", "test-cluster", ctcCVCPureInlineFlow, 1)
+	bs, dialer := loadSDSBootstrapAndDialer(t, yaml)
+
+	provider, err := NewSDSProvider(dialer, bs, t.TempDir(), bs.Stats)
+	if err != nil {
+		t.Errorf("NewSDSProvider: got error %v, want nil", err)
+	}
+	if provider != nil {
+		t.Errorf("NewSDSProvider: got non-nil provider, want nil — a pure-inline CVC contributes no secret")
+	}
+}
+
+// TestNewSDSProvider_CVCPlusCertSDS_Rejects: a CVC's SDS half combined with a
+// cert-SDS secret on the SAME CommonTlsContext trips seen>1 — the same
+// DEFERRED compose-two edge the phase-65 plain-VC arm guards, now also shut
+// for the CVC shape (D6's "compose-two edge stays shut").
+func TestNewSDSProvider_CVCPlusCertSDS_Rejects(t *testing.T) {
+	ctc := fmt.Sprintf(ctcCVCPlusCertSDSFlow, grpcSdsConfigFlow, grpcSdsConfigFlow)
+	yaml := fmt.Sprintf(sdsListenerCTCYAMLTemplate, "test-node", "test-cluster", ctc, 1)
+	bs, dialer := loadSDSBootstrapAndDialer(t, yaml)
+
+	_, err := NewSDSProvider(dialer, bs, t.TempDir(), bs.Stats)
+	if err == nil {
+		t.Fatal("NewSDSProvider: want the seen>1 reject, got nil (compose-two is DEFERRED)")
+	}
+	const want = "multiple SDS-bound downstream TLS contexts unsupported"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("NewSDSProvider error = %q; want substring %q", err.Error(), want)
+	}
+}
+
+// TestNewSDSProvider_ValidationOnlySDS_BuildsProvider above (the landed
+// phase-65 plain-VC arm) doubles as this task's regression pin (test 4,
+// PLAN-66 T4): an 0108-shaped bootstrap (plain validation_context_sds_secret_
+// config, no CVC) must still yield a non-nil provider, byte-unaffected by
+// the CVC third arm added here.

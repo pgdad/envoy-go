@@ -1254,3 +1254,679 @@ func TestValidationContextSDS_SiblingRejectsStay(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Phase 66: combined_validation_context (CVC).
+// ---------------------------------------------------------------------------
+
+// cvcCTC builds a *tlsv3.CommonTlsContext carrying a combined_validation_context
+// plus a tls_certificates entry. The tls_certificates entry is REQUIRED: without
+// it commonTLSContextToConfig errors `no tls_certificates configured` further
+// down and any CVC-arm assertion above would be vacuous. mut lets a caller strip
+// either CVC half to exercise the E1/E2 arms.
+func cvcCTC(mut ...func(*tlsv3.CommonTlsContext_CombinedCertificateValidationContext)) *tlsv3.CommonTlsContext {
+	cvc := &tlsv3.CommonTlsContext_CombinedCertificateValidationContext{
+		DefaultValidationContext: &tlsv3.CertificateValidationContext{
+			TrustedCa: inlineBytes(pki.caPEM),
+		},
+		ValidationContextSdsSecretConfig: sdsSecretConfig("validation-secret", "sds_cluster"),
+	}
+	for _, m := range mut {
+		m(cvc)
+	}
+	return &tlsv3.CommonTlsContext{
+		TlsCertificates: []*tlsv3.TlsCertificate{
+			{
+				CertificateChain: inlineBytes(pki.leafCertPEM),
+				PrivateKey:       inlineBytes(pki.leafKeyPEM),
+			},
+		},
+		ValidationContextType: &tlsv3.CommonTlsContext_CombinedValidationContext{
+			CombinedValidationContext: cvc,
+		},
+	}
+}
+
+// cvcDownstreamTS wraps cvcCTC in a DownstreamTlsContext + TransportSocket,
+// with require_client_certificate set to require (nil => field absent).
+func cvcDownstreamTS(t *testing.T, require *wrapperspb.BoolValue) *corev3.TransportSocket {
+	t.Helper()
+	return makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+		RequireClientCertificate: require,
+		CommonTlsContext:         cvcCTC(),
+	})
+}
+
+// cvcRetainedReject is the BYTE-IDENTICAL phase-03 reject substring the CVC arm
+// keeps for its three nil-provider / non-downstream consumers (ADR-0080).
+const cvcRetainedReject = "combined_validation_context is not supported in phase 03"
+
+// TestCVC_DownstreamWithProvider_Accepted pins the phase-66 lift: a well-formed
+// CVC on the downstream side WITH a live provider is a NO-OP that returns no
+// error. It drives commonTLSContextToConfig DIRECTLY (in-package) rather than
+// NewDownstreamConfig: at this task NewDownstreamConfig's require block has no
+// CVC arm, so require:true would fall to the else and error with
+// `require_client_certificate=true requires validation_context.trusted_ca`,
+// proving nothing about the CVC arm.
+func TestCVC_DownstreamWithProvider_Accepted(t *testing.T) {
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(pki.caPEM) {
+		t.Fatal("pki.caPEM: no certificates parsed")
+	}
+	cfg, err := commonTLSContextToConfig(cvcCTC(), "", "downstream", &fakeProvider{pool: caPool})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Error("expected a non-nil *tls.Config from the accepted CVC arm")
+	}
+}
+
+// TestCVC_NilProvider_KeepsByteIdenticalReject: the retained guard fires for the
+// nil-provider consumers (NewQUICDownstreamConfig, validate.Bootstrap, and
+// main.go's ordinary path when boot.NewSDSProvider returns (nil, nil)).
+func TestCVC_NilProvider_KeepsByteIdenticalReject(t *testing.T) {
+	_, err := commonTLSContextToConfig(cvcCTC(), "", "downstream", nil)
+	if err == nil {
+		t.Fatal("expected the retained phase-03 reject, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "tls: ") {
+		t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", err.Error())
+	}
+	if !strings.Contains(err.Error(), cvcRetainedReject) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), cvcRetainedReject)
+	}
+}
+
+// TestCVC_Upstream_KeepsByteIdenticalReject pins the RETAINED GUARD on the
+// non-downstream half.
+//
+// This path is DEAD from today's entry points: NewUpstreamConfig rejects earlier
+// with its own trusted_ca message, because validation_context_type is a ONEOF —
+// selecting the CVC arm makes GetValidationContext() return nil, so the upstream
+// pre-check refuses before commonTLSContextToConfig's switch is ever reached
+// (verified by execution). This test pins the retained guard, NOT a live path;
+// do not mistake it for evidence that the upstream arm is reachable.
+func TestCVC_Upstream_KeepsByteIdenticalReject(t *testing.T) {
+	_, err := commonTLSContextToConfig(cvcCTC(), "", "upstream", &fakeProvider{})
+	if err == nil {
+		t.Fatal("expected the retained phase-03 reject, got nil")
+	}
+	if !strings.Contains(err.Error(), cvcRetainedReject) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), cvcRetainedReject)
+	}
+}
+
+// TestCVC_MissingDefaultValidationContext_E1: downstream + provider, CVC with no
+// default_validation_context.
+func TestCVC_MissingDefaultValidationContext_E1(t *testing.T) {
+	ctc := cvcCTC(func(c *tlsv3.CommonTlsContext_CombinedCertificateValidationContext) {
+		c.DefaultValidationContext = nil
+	})
+	_, err := commonTLSContextToConfig(ctc, "", "downstream", &fakeProvider{})
+	if err == nil {
+		t.Fatal("expected E1, got nil")
+	}
+	const want = "combined_validation_context.default_validation_context is required"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+}
+
+// TestCVC_MissingSDSSecretConfig_E2: downstream + provider, CVC with no
+// validation_context_sds_secret_config.
+func TestCVC_MissingSDSSecretConfig_E2(t *testing.T) {
+	ctc := cvcCTC(func(c *tlsv3.CommonTlsContext_CombinedCertificateValidationContext) {
+		c.ValidationContextSdsSecretConfig = nil
+	})
+	_, err := commonTLSContextToConfig(ctc, "", "downstream", &fakeProvider{})
+	if err == nil {
+		t.Fatal("expected E2, got nil")
+	}
+	const want = "combined_validation_context.validation_context_sds_secret_config is required"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+}
+
+// TestCVC_E1E2_DoNotPreemptTheRetainedReject: with provider == nil, an E1-shaped
+// or E2-shaped CVC must still produce the BYTE-IDENTICAL retained reject — the
+// gate precedes the E1/E2 checks (ADR-0080). If E1/E2 leaked here, the three
+// nil-provider consumers would see a NEW message.
+func TestCVC_E1E2_DoNotPreemptTheRetainedReject(t *testing.T) {
+	tests := []struct {
+		name string
+		mut  func(*tlsv3.CommonTlsContext_CombinedCertificateValidationContext)
+	}{
+		{"E1-shaped (no default_validation_context)", func(c *tlsv3.CommonTlsContext_CombinedCertificateValidationContext) {
+			c.DefaultValidationContext = nil
+		}},
+		{"E2-shaped (no validation_context_sds_secret_config)", func(c *tlsv3.CommonTlsContext_CombinedCertificateValidationContext) {
+			c.ValidationContextSdsSecretConfig = nil
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := commonTLSContextToConfig(cvcCTC(tc.mut), "", "downstream", nil)
+			if err == nil {
+				t.Fatal("expected the retained phase-03 reject, got nil")
+			}
+			if !strings.Contains(err.Error(), cvcRetainedReject) {
+				t.Errorf("error = %q, want the RETAINED reject %q — the gate must precede E1/E2", err.Error(), cvcRetainedReject)
+			}
+			if strings.Contains(err.Error(), "is required") {
+				t.Errorf("error = %q, want the RETAINED reject, NOT an E1/E2 message", err.Error())
+			}
+		})
+	}
+}
+
+// TestCVC_RequireFalse_Rejected_E3 drives NewDownstreamConfig: a CVC listener
+// with require_client_certificate false OR absent is refused LOUDLY rather than
+// booting silently unauthenticated (ADR-0080 envoy-go-strict).
+func TestCVC_RequireFalse_Rejected_E3(t *testing.T) {
+	const want = "combined_validation_context requires require_client_certificate: true in phase 03"
+	tests := []struct {
+		name    string
+		require *wrapperspb.BoolValue
+	}{
+		{"require_client_certificate: false", &wrapperspb.BoolValue{Value: false}},
+		{"require_client_certificate absent (nil BoolValue)", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			caPool := x509.NewCertPool()
+			if !caPool.AppendCertsFromPEM(pki.caPEM) {
+				t.Fatal("pki.caPEM: no certificates parsed")
+			}
+			_, err := NewDownstreamConfig(cvcDownstreamTS(t, tc.require), "", &fakeProvider{pool: caPool})
+			if err == nil {
+				t.Fatal("expected E3, got nil")
+			}
+			if !strings.HasPrefix(err.Error(), "tls: ") {
+				t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", err.Error())
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+			}
+		})
+	}
+}
+
+// TestCVC_RequireFalse_NeverYieldsNoClientCert states the SECURITY PROPERTY
+// rather than the mechanism: for a CVC listener with require_client_certificate
+// false/absent, NewDownstreamConfig must return an error, and must NEVER hand
+// back a cfg whose ClientAuth is NoClientCert — i.e. a silently unauthenticated
+// listener. This holds independently of E3's exact wording.
+func TestCVC_RequireFalse_NeverYieldsNoClientCert(t *testing.T) {
+	tests := []struct {
+		name    string
+		require *wrapperspb.BoolValue
+	}{
+		{"require_client_certificate: false", &wrapperspb.BoolValue{Value: false}},
+		{"require_client_certificate absent (nil BoolValue)", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			caPool := x509.NewCertPool()
+			if !caPool.AppendCertsFromPEM(pki.caPEM) {
+				t.Fatal("pki.caPEM: no certificates parsed")
+			}
+			cfg, err := NewDownstreamConfig(cvcDownstreamTS(t, tc.require), "", &fakeProvider{pool: caPool})
+			if err == nil {
+				t.Error("NewDownstreamConfig returned nil error — a CVC listener without require_client_certificate must NOT boot")
+			}
+			if cfg != nil && cfg.TLSConfig != nil && cfg.TLSConfig.ClientAuth == stdtls.NoClientCert {
+				t.Error("NewDownstreamConfig returned a cfg with ClientAuth == NoClientCert — a SILENTLY UNAUTHENTICATED listener")
+			}
+		})
+	}
+}
+
+// --- Phase 66 task 2: the four sub-field rejects under a combined_validation_context ---
+//
+// validation_context_type is a ONEOF, so under a CVC GetValidationContext()
+// returns nil and the four sub-field rejects in commonTLSContextToConfig were
+// BYPASSED. Task 1 lifted the CVC envelope to a NO-OP for downstream+provider;
+// without an effective-inline-context selector that lift would SILENTLY ACCEPT
+// sub-fields envoy-go cannot honor. Each test below drives a CVC whose
+// default_validation_context carries one offending sub-field.
+
+// cvcPKIPool builds the CA pool the live fake provider hands back.
+func cvcPKIPool(t *testing.T) *x509.CertPool {
+	t.Helper()
+	p := x509.NewCertPool()
+	if !p.AppendCertsFromPEM(pki.caPEM) {
+		t.Fatal("pki.caPEM: no certificates parsed")
+	}
+	return p
+}
+
+// cvcWithDefaultVC returns a well-formed CVC ctc whose default_validation_context
+// has been mutated by f. The ctc keeps its tls_certificates, or the build would
+// error `no tls_certificates configured` and prove nothing.
+func cvcWithDefaultVC(f func(*tlsv3.CertificateValidationContext)) *tlsv3.CommonTlsContext {
+	return cvcCTC(func(c *tlsv3.CommonTlsContext_CombinedCertificateValidationContext) {
+		f(c.DefaultValidationContext)
+	})
+}
+
+func TestCVC_DefaultVC_CustomValidatorConfig_Rejected(t *testing.T) {
+	ctc := cvcWithDefaultVC(func(vc *tlsv3.CertificateValidationContext) {
+		vc.CustomValidatorConfig = &corev3.TypedExtensionConfig{Name: "x"}
+	})
+	_, err := commonTLSContextToConfig(ctc, "", "downstream", &fakeProvider{pool: cvcPKIPool(t)})
+	if err == nil {
+		t.Fatal("expected the custom_validator_config reject, got nil error — the CVC default_validation_context's sub-field was SILENTLY ACCEPTED")
+	}
+	if !strings.HasPrefix(err.Error(), "tls: ") {
+		t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", err.Error())
+	}
+	const want = "custom_validator_config is not supported in phase 03"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+}
+
+func TestCVC_DefaultVC_MatchTypedSAN_Rejected(t *testing.T) {
+	ctc := cvcWithDefaultVC(func(vc *tlsv3.CertificateValidationContext) {
+		vc.MatchTypedSubjectAltNames = []*tlsv3.SubjectAltNameMatcher{{}}
+	})
+	_, err := commonTLSContextToConfig(ctc, "", "downstream", &fakeProvider{pool: cvcPKIPool(t)})
+	if err == nil {
+		t.Fatal("expected the match_typed_subject_alt_names reject, got nil error — the CVC default_validation_context's sub-field was SILENTLY ACCEPTED")
+	}
+	if !strings.HasPrefix(err.Error(), "tls: ") {
+		t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", err.Error())
+	}
+	const want = "match_typed_subject_alt_names is not supported in phase 03"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+}
+
+func TestCVC_DefaultVC_VerifyCertHash_Rejected(t *testing.T) {
+	ctc := cvcWithDefaultVC(func(vc *tlsv3.CertificateValidationContext) {
+		vc.VerifyCertificateHash = []string{"x"}
+	})
+	_, err := commonTLSContextToConfig(ctc, "", "downstream", &fakeProvider{pool: cvcPKIPool(t)})
+	if err == nil {
+		t.Fatal("expected the verify_certificate_hash reject, got nil error — the CVC default_validation_context's sub-field was SILENTLY ACCEPTED")
+	}
+	if !strings.HasPrefix(err.Error(), "tls: ") {
+		t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", err.Error())
+	}
+	const want = "verify_certificate_hash is not supported in phase 03"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+}
+
+func TestCVC_DefaultVC_VerifyCertSpki_Rejected(t *testing.T) {
+	ctc := cvcWithDefaultVC(func(vc *tlsv3.CertificateValidationContext) {
+		vc.VerifyCertificateSpki = []string{"x"}
+	})
+	_, err := commonTLSContextToConfig(ctc, "", "downstream", &fakeProvider{pool: cvcPKIPool(t)})
+	if err == nil {
+		t.Fatal("expected the verify_certificate_spki reject, got nil error — the CVC default_validation_context's sub-field was SILENTLY ACCEPTED")
+	}
+	if !strings.HasPrefix(err.Error(), "tls: ") {
+		t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", err.Error())
+	}
+	const want = "verify_certificate_spki is not supported in phase 03"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+}
+
+// --- Phase 66 task 3: the apply-point — NewDownstreamConfig's CVC arm ---
+
+// altCA generates a SECOND, independent CA (call it CA_Y) plus a leaf signed by
+// it. pki's CA is CA_X. Two disjoint trust roots are what makes the equivalence
+// theorem's observable DISCRIMINATING: a pool built by the theorem contains X
+// and NOT Y, whereas a pool UNION (the rejected Design C) contains BOTH.
+func altCA(t *testing.T) (caYPEM []byte, leafY *x509.Certificate) {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("altCA: generate CA key: %v", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(101),
+		Subject:               pkix.Name{CommonName: "envoy-go test CA Y"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("altCA: create CA cert: %v", err)
+	}
+	caYPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("altCA: generate leaf key: %v", err)
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(102),
+		Subject:      pkix.Name{CommonName: "yankee.envoy-go.test"},
+		DNSNames:     []string{"yankee.envoy-go.test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caTmpl, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("altCA: create leaf cert: %v", err)
+	}
+	leafY, err = x509.ParseCertificate(leafDER)
+	if err != nil {
+		t.Fatalf("altCA: parse leaf: %v", err)
+	}
+	return caYPEM, leafY
+}
+
+// chainsTo reports whether leaf verifies against pool as a trust root. This is
+// the DISCRIMINATING check used below instead of pool.Subjects(): Subjects() is
+// deprecated (SA1019) and returns only RawSubject bytes, whereas an actual
+// Verify exercises the pool the way the TLS stack will. A leaf signed by CA_N
+// verifies against pool IFF CA_N is in pool — so running it for BOTH CA_X's leaf
+// and CA_Y's leaf reads out set membership for each root independently.
+// ExtKeyUsageAny + no DNSName keep the result a pure statement about the trust
+// root, not about SAN/EKU policy.
+func chainsTo(leaf *x509.Certificate, pool *x509.CertPool) bool {
+	if pool == nil {
+		return false
+	}
+	_, err := leaf.Verify(x509.VerifyOptions{
+		Roots:     pool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	})
+	return err == nil
+}
+
+// leafX parses pki's leaf (signed by CA_X) as an *x509.Certificate.
+func leafX(t *testing.T) *x509.Certificate {
+	t.Helper()
+	block, _ := pem.Decode(pki.leafCertPEM)
+	if block == nil {
+		t.Fatal("pki.leafCertPEM: PEM decode failed")
+	}
+	c, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse pki leaf: %v", err)
+	}
+	return c
+}
+
+// cvcDownstreamTSWith wraps a caller-supplied CVC-bearing CommonTlsContext in a
+// DownstreamTlsContext + TransportSocket with require_client_certificate: true —
+// the only shape that reaches the apply-point (E3 refuses the rest).
+func cvcDownstreamTSWith(t *testing.T, ctc *tlsv3.CommonTlsContext) *corev3.TransportSocket {
+	t.Helper()
+	return makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+		RequireClientCertificate: &wrapperspb.BoolValue{Value: true},
+		CommonTlsContext:         ctc,
+	})
+}
+
+// TestCVC_RequireTrue_InstallsSDSPoolAsClientCAs: the apply-point's happy path —
+// the pool the provider serves IS the pool installed as ClientCAs, and mandatory
+// mTLS is switched on.
+func TestCVC_RequireTrue_InstallsSDSPoolAsClientCAs(t *testing.T) {
+	served := cvcPKIPool(t)
+	cfg, err := NewDownstreamConfig(cvcDownstreamTS(t, &wrapperspb.BoolValue{Value: true}), "", &fakeProvider{pool: served})
+	if err != nil {
+		t.Fatalf("NewDownstreamConfig: unexpected err %v", err)
+	}
+	if cfg.TLSConfig.ClientCAs != served {
+		t.Errorf("ClientCAs = %p, want the SDS-served pool %p — the CVC arm did not install the fetched pool", cfg.TLSConfig.ClientCAs, served)
+	}
+	if cfg.TLSConfig.ClientAuth != stdtls.RequireAndVerifyClientCert {
+		t.Errorf("ClientAuth = %v, want RequireAndVerifyClientCert (mandatory mTLS)", cfg.TLSConfig.ClientAuth)
+	}
+}
+
+// TestCVC_ServedPoolWins_DefaultTrustedCaNotRead is THE EQUIVALENCE THEOREM'S
+// OBSERVABLE, and it is a REFUTATION, not a happy path: the SDS-served pool
+// (CA_X) wins outright and default_validation_context.trusted_ca (CA_Y) is NOT
+// read. Design C — union the default's trusted_ca into the served pool — would
+// leave CA_Y in the pool and is REFUTED by the second assertion below.
+func TestCVC_ServedPoolWins_DefaultTrustedCaNotRead(t *testing.T) {
+	caYPEM, certY := altCA(t)
+	// The CVC's default_validation_context.trusted_ca is CA_Y; the provider serves
+	// a pool holding ONLY CA_X.
+	ctc := cvcWithDefaultVC(func(vc *tlsv3.CertificateValidationContext) {
+		vc.TrustedCa = inlineBytes(caYPEM)
+	})
+	served := cvcPKIPool(t) // CA_X only
+	cfg, err := NewDownstreamConfig(cvcDownstreamTSWith(t, ctc), "", &fakeProvider{pool: served})
+	if err != nil {
+		t.Fatalf("NewDownstreamConfig: unexpected err %v", err)
+	}
+	if !chainsTo(leafX(t), cfg.TLSConfig.ClientCAs) {
+		t.Error("a leaf signed by CA_X does NOT verify against ClientCAs — the SDS-served pool was not installed")
+	}
+	if chainsTo(certY, cfg.TLSConfig.ClientCAs) {
+		t.Error("a leaf signed by CA_Y VERIFIES against ClientCAs — default_validation_context.trusted_ca was read into the pool (this is Design C, the rejected pool-UNION; the equivalence theorem requires the served pool to win outright)")
+	}
+}
+
+// TestCVC_MalformedSDSConfig_Rejected: the CVC's validation_context_sds_secret_config
+// routes through xds.ParseSDSConfig, so a malformed sds_config (here: an
+// envoy_grpc with no cluster_name) is REFUSED — a bare GetName() would silently
+// accept it, since the NAME is perfectly well-formed. Two independent properties,
+// two Errorf's.
+func TestCVC_MalformedSDSConfig_Rejected(t *testing.T) {
+	ctc := cvcCTC(func(c *tlsv3.CommonTlsContext_CombinedCertificateValidationContext) {
+		c.ValidationContextSdsSecretConfig = sdsSecretConfig("validation-secret", "" /* no cluster_name */)
+	})
+	_, err := NewDownstreamConfig(cvcDownstreamTSWith(t, ctc), "", &fakeProvider{pool: cvcPKIPool(t)})
+	// (i) it REJECTS at all.
+	if err == nil {
+		t.Error("NewDownstreamConfig returned nil — a malformed sds_config (no cluster_name) was SILENTLY ACCEPTED; the CVC arm is not routing through xds.ParseSDSConfig")
+	}
+	// (ii) the reject keeps the `tls: ` prefix FuzzTLSContextParse enforces: an
+	// UNWRAPPED xds:-prefixed error would violate the invariant. Evaluated
+	// independently of (i) — with no error at all there is no `tls: `-prefixed
+	// reject either, so this property fails on its own terms.
+	got := ""
+	if err != nil {
+		got = err.Error()
+	}
+	if !strings.HasPrefix(got, "tls: ") {
+		t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", got)
+	}
+}
+
+// TestCVC_GateRunsBeforeRequireBlock pins the ORDERING the apply-point's
+// dereferences depend on: commonTLSContextToConfig runs FIRST and its error
+// propagates BEFORE the require_client_certificate block, so a nil provider can
+// never reach the CVC arm. The RETAINED phase-03 substring proves it was the gate
+// that fired, not the arm's own defense-in-depth guard.
+func TestCVC_GateRunsBeforeRequireBlock(t *testing.T) {
+	_, err := NewDownstreamConfig(cvcDownstreamTS(t, &wrapperspb.BoolValue{Value: true}), "", nil)
+	if err == nil {
+		t.Fatal("expected the retained phase-03 reject, got nil")
+	}
+	if !strings.Contains(err.Error(), cvcRetainedReject) {
+		t.Errorf("error = %q, want it to contain the RETAINED gate reject %q — the gate must run BEFORE the require_client_certificate block", err.Error(), cvcRetainedReject)
+	}
+}
+
+// TestCVC_EmptyDynamicVC_BootFails: a provider whose fetch ERRORS — which is what
+// parseValidationSecret does for a served validation context carrying no usable
+// trusted_ca — boot-FAILS the listener.
+//
+// DEPARTURE (ADR-0280 family): the reference ACKs the empty dynamic context,
+// falls back to the DEFAULT CA, and SERVES. envoy-go boot-FAILS instead. This is
+// NOT "envoy-go rejects where the reference rejects" — the reference ACCEPTS this
+// shape. envoy-go refuses LOUDLY rather than serving a listener whose trust roots
+// are not the ones the operator's SDS server was asked for.
+func TestCVC_EmptyDynamicVC_BootFails(t *testing.T) {
+	fetchErr := errors.New("xds: sds: secret \"validation-secret\": validation context has no trusted_ca")
+	_, err := NewDownstreamConfig(cvcDownstreamTS(t, &wrapperspb.BoolValue{Value: true}), "", &fakeProvider{vcErr: fetchErr})
+	if err == nil {
+		t.Fatal("expected a boot failure, got nil (the reference falls back to the default CA and SERVES; envoy-go boot-FAILS — ADR-0280 family)")
+	}
+	if !strings.HasPrefix(err.Error(), "tls: ") {
+		t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", err.Error())
+	}
+	if !errors.Is(err, fetchErr) {
+		t.Errorf("error = %q, want the provider's classified cause WRAPPED (errors.Is)", err.Error())
+	}
+	if !strings.Contains(err.Error(), "validation-secret") {
+		t.Errorf("error = %q, want the secret name preserved for operator diagnosis", err.Error())
+	}
+}
+
+// TestSDSVC_And_Inline_Paths_Unchanged: the 3-way branch must not regress either
+// landed arm. The SDS-VC arm (phase 65) still fetches and installs; the inline
+// arm (phase 16) still loads trusted_ca and still refuses a require:true listener
+// with no trusted_ca, with its BYTE-IDENTICAL message.
+func TestSDSVC_And_Inline_Paths_Unchanged(t *testing.T) {
+	t.Run("SDS-VC arm still installs the served pool", func(t *testing.T) {
+		served := cvcPKIPool(t)
+		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+			RequireClientCertificate: &wrapperspb.BoolValue{Value: true},
+			CommonTlsContext: &tlsv3.CommonTlsContext{
+				TlsCertificates: []*tlsv3.TlsCertificate{
+					{
+						CertificateChain: inlineBytes(pki.leafCertPEM),
+						PrivateKey:       inlineBytes(pki.leafKeyPEM),
+					},
+				},
+				ValidationContextType: &tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
+					ValidationContextSdsSecretConfig: sdsSecretConfig("validation-secret", "sds_cluster"),
+				},
+			},
+		})
+		cfg, err := NewDownstreamConfig(ts, "", &fakeProvider{pool: served})
+		if err != nil {
+			t.Fatalf("NewDownstreamConfig: unexpected err %v", err)
+		}
+		if cfg.TLSConfig.ClientCAs != served {
+			t.Errorf("ClientCAs = %p, want the SDS-served pool %p", cfg.TLSConfig.ClientCAs, served)
+		}
+		if cfg.TLSConfig.ClientAuth != stdtls.RequireAndVerifyClientCert {
+			t.Errorf("ClientAuth = %v, want RequireAndVerifyClientCert", cfg.TLSConfig.ClientAuth)
+		}
+	})
+
+	t.Run("inline arm still loads trusted_ca", func(t *testing.T) {
+		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+			RequireClientCertificate: &wrapperspb.BoolValue{Value: true},
+			CommonTlsContext: &tlsv3.CommonTlsContext{
+				TlsCertificates: []*tlsv3.TlsCertificate{
+					{
+						CertificateChain: inlineBytes(pki.leafCertPEM),
+						PrivateKey:       inlineBytes(pki.leafKeyPEM),
+					},
+				},
+				ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+					ValidationContext: &tlsv3.CertificateValidationContext{
+						TrustedCa: inlineBytes(pki.caPEM),
+					},
+				},
+			},
+		})
+		// A nil provider is deliberate: the inline arm must not have acquired an SDS
+		// dependency from the 3-way split.
+		cfg, err := NewDownstreamConfig(ts, "", nil)
+		if err != nil {
+			t.Fatalf("NewDownstreamConfig: unexpected err %v", err)
+		}
+		if !chainsTo(leafX(t), cfg.TLSConfig.ClientCAs) {
+			t.Error("a leaf signed by CA_X does not verify against ClientCAs — the inline trusted_ca was not loaded")
+		}
+		if cfg.TLSConfig.ClientAuth != stdtls.RequireAndVerifyClientCert {
+			t.Errorf("ClientAuth = %v, want RequireAndVerifyClientCert", cfg.TLSConfig.ClientAuth)
+		}
+	})
+
+	t.Run("inline arm still refuses require:true with no trusted_ca (byte-identical)", func(t *testing.T) {
+		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+			RequireClientCertificate: &wrapperspb.BoolValue{Value: true},
+			CommonTlsContext: &tlsv3.CommonTlsContext{
+				TlsCertificates: []*tlsv3.TlsCertificate{
+					{
+						CertificateChain: inlineBytes(pki.leafCertPEM),
+						PrivateKey:       inlineBytes(pki.leafKeyPEM),
+					},
+				},
+			},
+		})
+		_, err := NewDownstreamConfig(ts, "", nil)
+		if err == nil {
+			t.Fatal("expected the trusted_ca reject, got nil")
+		}
+		const want = "tls: downstream: require_client_certificate=true requires validation_context.trusted_ca"
+		if err.Error() != want {
+			t.Errorf("error = %q, want %q (byte-identical)", err.Error(), want)
+		}
+	})
+}
+
+// TestInlineVC_FourRejects_Unchanged: the PLAIN validation_context path still
+// rejects all four sub-fields — the effective-inline-context selector must not
+// regress the inline half it shares its error strings with.
+func TestInlineVC_FourRejects_Unchanged(t *testing.T) {
+	inlineCTC := func(f func(*tlsv3.CertificateValidationContext)) *tlsv3.CommonTlsContext {
+		vc := &tlsv3.CertificateValidationContext{TrustedCa: inlineBytes(pki.caPEM)}
+		f(vc)
+		return &tlsv3.CommonTlsContext{
+			TlsCertificates: []*tlsv3.TlsCertificate{
+				{
+					CertificateChain: inlineBytes(pki.leafCertPEM),
+					PrivateKey:       inlineBytes(pki.leafKeyPEM),
+				},
+			},
+			ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{ValidationContext: vc},
+		}
+	}
+	tests := []struct {
+		name string
+		mut  func(*tlsv3.CertificateValidationContext)
+		want string
+	}{
+		{
+			name: "custom_validator_config",
+			mut: func(vc *tlsv3.CertificateValidationContext) {
+				vc.CustomValidatorConfig = &corev3.TypedExtensionConfig{Name: "x"}
+			},
+			want: "custom_validator_config is not supported in phase 03",
+		},
+		{
+			name: "match_typed_subject_alt_names",
+			mut: func(vc *tlsv3.CertificateValidationContext) {
+				vc.MatchTypedSubjectAltNames = []*tlsv3.SubjectAltNameMatcher{{}}
+			},
+			want: "match_typed_subject_alt_names is not supported in phase 03",
+		},
+		{
+			name: "verify_certificate_hash",
+			mut:  func(vc *tlsv3.CertificateValidationContext) { vc.VerifyCertificateHash = []string{"x"} },
+			want: "verify_certificate_hash is not supported in phase 03",
+		},
+		{
+			name: "verify_certificate_spki",
+			mut:  func(vc *tlsv3.CertificateValidationContext) { vc.VerifyCertificateSpki = []string{"x"} },
+			want: "verify_certificate_spki is not supported in phase 03",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := commonTLSContextToConfig(inlineCTC(tc.mut), "", "downstream", nil)
+			if err == nil {
+				t.Fatalf("expected the %s reject on the inline validation_context path, got nil", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), tc.want)
+			}
+		})
+	}
+}

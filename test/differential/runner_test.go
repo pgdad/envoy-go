@@ -133,6 +133,7 @@ import (
 	_ "github.com/pgdad/envoy-go/test/fixtures/0106-tracing-custom-tags-environment/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0107-tracing-max-path-tag-length/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0108-xds-sds-validation-context/driver"
+	_ "github.com/pgdad/envoy-go/test/fixtures/0109-xds-sds-combined-validation-context/driver"
 	"github.com/pgdad/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

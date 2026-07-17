@@ -53,17 +53,37 @@ func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string, provider xd
 	if err != nil {
 		return nil, err
 	}
+	// Phase 66 (C1/D1): the CVC arm's reject was lifted in
+	// commonTLSContextToConfig, which CANNOT see require_client_certificate (it
+	// lives on DownstreamTlsContext, not on CommonTlsContext). Without this arm a
+	// CVC listener with require_client_certificate false/absent would boot
+	// SUCCESSFULLY with ClientCAs nil and ClientAuth == NoClientCert — converting
+	// today's loud boot-FAIL into a silently unauthenticated listener.
+	// envoy-go-strict (ADR-0080): the reference HONORS the anchor here
+	// (verify-if-presented); envoy-go refuses LOUDLY rather than diverging
+	// silently. GetValue() on a nil *wrapperspb.BoolValue returns false, so this
+	// covers require:false AND require: absent (verified by execution).
+	if _, isCVC := ctx.GetCommonTlsContext().GetValidationContextType().(*tlsv3.CommonTlsContext_CombinedValidationContext); isCVC &&
+		!ctx.GetRequireClientCertificate().GetValue() {
+		return nil, fmt.Errorf("tls: downstream: combined_validation_context requires require_client_certificate: true in phase 03")
+	}
 	// Phase-16 ADR-0147 (unanticipated): when require_client_certificate is
-	// true, configure the downstream listener for mandatory mTLS — load the
-	// validation_context.trusted_ca into the ClientCAs pool and set
+	// true, configure the downstream listener for mandatory mTLS — load a
+	// trusted-CA pool into ClientCAs and set
 	// ClientAuth=RequireAndVerifyClientCert. This lifts the phase-03 clause-7
 	// rejection (ADR-0032 §Decision (7)) to support fixture 0018's scenario 6
 	// (ADR-0144 framework primitive end-to-end validation). The lift is
-	// SCOPED — only require_client_certificate=true with a validation_context
-	// carrying a trusted_ca PEM is accepted; the previously parse-rejected
-	// surfaces (SDS-bound secrets, custom_validator_config, match_typed_san,
-	// verify_certificate_hash/spki) remain rejected via the unchanged
-	// commonTLSContextToConfig pre-checks.
+	// SCOPED to require_client_certificate=true; the trusted-CA pool may be
+	// sourced from an inline validation_context.trusted_ca PEM, an SDS-bound
+	// validation_context_sds_secret_config (phase 65, ADR-0286 — downstream
+	// with a live provider only), or a combined_validation_context (phase 66,
+	// this row — downstream with a live provider only; both landed since
+	// this comment was first written and are no longer "parse-rejected").
+	// custom_validator_config, match_typed_subject_alt_names, and
+	// verify_certificate_hash/spki remain rejected regardless of source —
+	// including under a combined_validation_context's
+	// default_validation_context — via the unchanged
+	// commonTLSContextToConfig pre-checks below.
 	if ctx.GetRequireClientCertificate().GetValue() {
 		common := ctx.GetCommonTlsContext()
 		if sdsVC, ok := common.GetValidationContextType().(*tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig); ok {
@@ -95,6 +115,62 @@ func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string, provider xd
 				// A timeout / unreachable management server boot-FAILS the listener —
 				// the documented envoy-go DEPARTURE from the reference's serve-anyway
 				// (ADR-0280, extended to this resource type).
+				return nil, fmt.Errorf("tls: downstream: SDS validation secret %q: %w", secretName, err)
+			}
+			cfg.ClientCAs = pool
+		} else if cvc, ok := common.GetValidationContextType().(*tlsv3.CommonTlsContext_CombinedValidationContext); ok {
+			// Phase 66 — the EQUIVALENCE THEOREM. envoy-go does NOT implement
+			// Message::MergeFrom() for combined_validation_context and MUST NOT:
+			// FetchInitialValidationContext returns an *x509.CertPool, so the served
+			// CertificateValidationContext message never crosses the internal/xds seam
+			// and proto.Merge has no operand. Instead the SDS-delivered pool wins
+			// outright and default_validation_context.trusted_ca is NOT read — provably
+			// identical to a true merge on envoy-go's honored surface, because:
+			//   P1 only trusted_ca is HONORED (four more sub-fields are REJECTED — see
+			//      the inlineVC selector in commonTLSContextToConfig; the remaining ten
+			//      CertificateValidationContext fields are silently ignored by BOTH
+			//      paths, a shared gap, not a divergence);
+			//   P2 the DataSource specifier oneof REPLACES rather than appends;
+			//   P3 a successful fetch GUARANTEES that specifier is set
+			//      (parseValidationSecret errors otherwise), so the default can never
+			//      contribute;
+			//   P4 the four rejects are RE-POINTED at default_validation_context. This
+			//      premise is load-bearing and was nearly omitted: without it a CVC
+			//      whose default demands e.g. match_typed_subject_alt_names would boot
+			//      with NO SAN check where a true merge boot-FAILS — a silently weaker
+			//      listener.
+			//
+			// P5 — this rests on a COINCIDENCE, not a guarantee: internal/xds's
+			// dataSourceBytes and internal/tls's loadDataSource are arm-for-arm
+			// identical (differing only in error-string prefix), and main.go passes the
+			// SAME filepath.Dir(*cfgPath) as baseDir to BOTH NewSDSProvider and
+			// boot.Construct. Nothing structurally enforces either equality. If either
+			// ever diverges, this equivalence is SILENTLY falsified and CVC goes wrong
+			// with no test to catch it.
+			if provider == nil {
+				// Defense-in-depth, mirroring the phase-65 SDS-VC arm above: the CVC arm
+				// in commonTLSContextToConfig already refuses the nil-provider shape, so
+				// this is UNREACHABLE from today's entry points. Kept so a future caller
+				// that relaxes that reject cannot nil-deref here.
+				return nil, fmt.Errorf("tls: downstream: combined_validation_context requires a live SDS provider (unavailable in this mode)")
+			}
+			// ParseSDSConfig takes a LIST (it enforces len==1); the CVC's
+			// validation_context_sds_secret_config is SINGULAR, so wrap it. This is what
+			// validates sds_config/api_config_source/resource_api_version:V3/GRPC/
+			// cluster_name — a bare GetName() would silently accept a malformed
+			// sds_config that the SDS-VC sibling REJECTS.
+			secretName, _, _, err := xds.ParseSDSConfig([]*tlsv3.SdsSecretConfig{cvc.CombinedValidationContext.GetValidationContextSdsSecretConfig()})
+			if err != nil {
+				// xds: -prefixed -> wrap to preserve the `tls: ` invariant
+				// (FuzzTLSContextParse).
+				return nil, fmt.Errorf("tls: downstream: %w", err)
+			}
+			pool, err := provider.FetchInitialValidationContext(context.Background(), secretName)
+			if err != nil {
+				// A served validation context with no usable trusted_ca, a timeout, or an
+				// unreachable management server boot-FAILS the listener. DEPARTURE: the
+				// reference ACKs an empty dynamic context, falls back to the DEFAULT CA,
+				// and SERVES; envoy-go refuses to boot (ADR-0280 family).
 				return nil, fmt.Errorf("tls: downstream: SDS validation secret %q: %w", secretName, err)
 			}
 			cfg.ClientCAs = pool
@@ -217,8 +293,15 @@ func loadTrustedCAPool(vc *tlsv3.CertificateValidationContext, baseDir, side str
 // Phase-03 forbids the following; each errors with a clear message:
 //   - tls_certificate_sds_secret_configs set (upstream/validate only — see
 //     the ADR-0280 downstream lift below)
-//   - validation_context_sds_secret_config set
-//   - combined_validation_context set
+//   - validation_context_sds_secret_config set, UNLESS side=="downstream"
+//     with a live provider (phase 65, ADR-0286): accepted there as a NO-OP
+//     in this function — NewDownstreamConfig's require_client_certificate
+//     block performs the actual fetch and installs ClientCAs
+//   - combined_validation_context set, UNLESS side=="downstream" with a
+//     live provider (phase 66, this row): accepted there as a NO-OP in
+//     this function, subject to the default_validation_context /
+//     validation_context_sds_secret_config presence checks below — the SDS
+//     half is fetched and installed the same way
 //   - custom_validator_config set
 //   - match_typed_subject_alt_names set
 //   - verify_certificate_hash / verify_certificate_spki set
@@ -266,9 +349,30 @@ func commonTLSContextToConfig(c *tlsv3.CommonTlsContext, baseDir, side string, p
 			// not on this CommonTlsContext). Here it is a NO-OP for the
 			// downstream+provider path.
 			//
-			// The guard below has exactly ONE live consumer: NewQUICDownstreamConfig,
-			// which passes side == "downstream" with a NIL provider (QUIC carries no
-			// SDS), so it keeps the BYTE-IDENTICAL phase-03 reject (ADR-0080 distinct
+			// The guard below has TWO live production consumers plus TWO exported
+			// test-only constructors (verified by walking every caller of
+			// NewDownstreamConfig/NewQUICDownstreamConfig/NewManagerWithBaseDirAndAllowH2C
+			// repo-wide, including cmd/ and validate/, not just internal/):
+			//   - NewQUICDownstreamConfig, which passes side == "downstream" with a
+			//     NIL provider (QUIC carries no SDS in phase 61.1) — and whose
+			//     transport_socket type_url is invisible to boot.NewSDSProvider's
+			//     pre-scan (it matches only the plain DownstreamTlsContext type_url,
+			//     never QUIC's wrapper), so this fires independent of any other
+			//     listener's SDS shape;
+			//   - validate.Bootstrap (validate/validate.go), which threads a LITERAL
+			//     nil sdsProvider into boot.Construct unconditionally — no pre-scan
+			//     gates it;
+			//   - listener.NewManager / NewManagerWithBaseDir (exported, test-only):
+			//     both hardcode sdsProvider=nil regardless of bootstrap contents.
+			// main.go's ordinary boot path is NOT a consumer of THIS arm — unlike the
+			// combined_validation_context arm below (whose pure-inline shape the
+			// pre-scan deliberately excludes from its seen count),
+			// boot.NewSDSProvider increments seen UNCONDITIONALLY whenever a
+			// (non-QUIC) listener selects THIS oneof arm (internal/boot/boot.go: no
+			// nil-secret gate on this branch), so any real occurrence forces
+			// seen>=1 and main.go can only reach this reject via the
+			// NewQUICDownstreamConfig path above, never via a seen==0 nil provider.
+			// It keeps the BYTE-IDENTICAL phase-03 reject (ADR-0080 distinct
 			// substring). NewUpstreamConfig never reaches this arm: validation_context_type
 			// is a ONEOF, so selecting the SDS arm makes its GetValidationContext()
 			// return nil and it refuses earlier with its own trusted_ca message. The
@@ -278,10 +382,45 @@ func commonTLSContextToConfig(c *tlsv3.CommonTlsContext, baseDir, side string, p
 				return nil, fmt.Errorf("tls: %s: SDS-bound validation_context_sds_secret_config is not supported in phase 03", side)
 			}
 		case *tlsv3.CommonTlsContext_CombinedValidationContext:
-			return nil, fmt.Errorf("tls: %s: combined_validation_context is not supported in phase 03", side)
+			// Phase 66: a downstream SDS-delivered combined_validation_context is
+			// HONORED — the SDS half is fetched and installed as ClientCAs by
+			// NewDownstreamConfig's require_client_certificate block (the only scope
+			// that sees require_client_certificate, which lives on the
+			// DownstreamTlsContext, not on this CommonTlsContext). Here it is a NO-OP
+			// for the downstream+provider path.
+			//
+			// The guard below is retained BYTE-IDENTICAL (ADR-0080). It has THREE live
+			// consumers: NewQUICDownstreamConfig (literal nil provider),
+			// validate.Bootstrap (nil), and main.go's ordinary path when
+			// boot.NewSDSProvider returns (nil, nil) at seen==0. It MUST precede the
+			// E1/E2 checks below, or those consumers would receive E1/E2's message
+			// instead of this byte-identical one.
+			if side != "downstream" || provider == nil {
+				return nil, fmt.Errorf("tls: %s: combined_validation_context is not supported in phase 03", side)
+			}
+			cvc := c.GetCombinedValidationContext()
+			if cvc.GetDefaultValidationContext() == nil {
+				return nil, fmt.Errorf("tls: %s: combined_validation_context.default_validation_context is required", side)
+			}
+			if cvc.GetValidationContextSdsSecretConfig() == nil {
+				return nil, fmt.Errorf("tls: %s: combined_validation_context.validation_context_sds_secret_config is required", side)
+			}
+			// else: NO-OP. NewDownstreamConfig's require_client_certificate block
+			// performs the fetch and installs the pool.
 		}
 	}
-	if vc := c.GetValidationContext(); vc != nil {
+	// Phase 66: under a combined_validation_context the validation_context_type
+	// oneof makes GetValidationContext() nil, so the four rejects below were
+	// BYPASSED — lifting the envelope without this selector would SILENTLY ACCEPT
+	// sub-fields envoy-go cannot honor. The four error strings are shared with the
+	// inline path and stay BYTE-IDENTICAL (ADR-0080).
+	inlineVC := c.GetValidationContext()
+	if inlineVC == nil {
+		if cvc := c.GetCombinedValidationContext(); cvc != nil {
+			inlineVC = cvc.GetDefaultValidationContext()
+		}
+	}
+	if vc := inlineVC; vc != nil {
 		if vc.GetCustomValidatorConfig() != nil {
 			return nil, fmt.Errorf("tls: %s: custom_validator_config is not supported in phase 03", side)
 		}

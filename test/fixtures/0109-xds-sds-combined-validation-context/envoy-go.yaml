@@ -1,0 +1,127 @@
+# envoy-go bootstrap for fixture 0109-xds-sds-combined-validation-context.
+#
+# A disciplined clone of 0108's envoy-go.yaml. Functionally equivalent to
+# envoy.yaml modulo:
+#   - cluster type: STATIC (envoy-go convention per ADR-0002) vs STRICT_DNS.
+#   - cluster endpoint addresses: 127.0.0.1 (envoy-go runs on the host loopback)
+#     vs host.docker.internal (reference Envoy runs in a Docker container).
+#   - admin/listener ports independently allocated by the runner.
+#
+# Single-listener downstream-mTLS topology: one TLS-terminating tcp_proxy
+# listener (l_sds_cvc) whose DownstreamTlsContext carries
+# require_client_certificate: true, a STATIC inline server cert, and a
+# combined_validation_context nesting an INLINE
+# default_validation_context.trusted_ca (CA_Y) alongside a
+# validation_context_sds_secret_config naming secret "validation_ca" — fetched
+# over a SotW SDS gRPC stream against cluster sds_cluster, the driver-owned
+# in-process test/helpers/sdsserver receiver on the host loopback.
+#
+# THE PROPOSITION: envoy-go's CVC apply-point (internal/tls) makes the
+# SDS-delivered CA_X the trust anchor and NEVER reads the inline CA_Y — a REPLACE,
+# not a union. require_client_certificate: true is MANDATORY (PLAN-66 D1):
+# without it envoy-go rejects the downstream CVC.
+#
+# node: {id, cluster} is REQUIRED — SDS boot-fails without it
+# (internal/boot.NewSDSProvider). Only the validation_context arrives via SDS;
+# the server cert is STATIC, so internal/boot's SDS pre-scan sees exactly one
+# secret (the CVC's inner half; PLAN-66 T4) and the deferred compose-two edge is
+# never touched.
+#
+# Templating: rendered by the driver's mustRender() at SubjectConfig time.
+# Substitution keys:
+#   {{.AdminPort}}   — admin endpoint port (runner-allocated).
+#   {{.ListenPort}}  — l_sds_cvc listener port (runner-allocated).
+#   {{.BackendPort}} — TCP echo backend port (runner-allocated, loopback).
+#   {{.SDSPort}}     — driver-owned sdsserver.Server receiver port
+#                       (driver-allocated; pre-bound on 0.0.0.0:<port> before
+#                       the subject starts).
+#   .ServerCert      — server leaf PEM (signed by CA_X), generated in-memory per
+#                       run and injected inline_string. Pre-indented to 24 spaces.
+#   .ServerKey       — the leaf's ECDSA P-256 key PEM, likewise.
+#   .InlineCA        — CA_Y PEM, the inline default_validation_context.trusted_ca.
+#                       Pre-indented to 26 spaces for its block scalar.
+#
+# NOTE: the three PEM keys above are deliberately written WITHOUT their
+# double-brace template-action delimiters. text/template expands actions inside
+# YAML comments too, and a multi-line PEM expanded into a "#" comment line
+# splatters its continuation lines outside the comment and produces invalid YAML.
+node:
+  id: envoygo-node
+  cluster: envoygo-cluster
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+static_resources:
+  listeners:
+    - name: l_sds_cvc
+      address:
+        socket_address: { address: 0.0.0.0, port_value: {{.ListenPort}} }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      inline_string: |
+{{.ServerCert}}
+                    private_key:
+                      inline_string: |
+{{.ServerKey}}
+                combined_validation_context:
+                  default_validation_context:
+                    trusted_ca:
+                      inline_string: |
+{{.InlineCA}}
+                  validation_context_sds_secret_config:
+                    name: validation_ca
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc:
+                              cluster_name: sds_cluster
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_sds_cvc
+                cluster: c_backend
+
+  clusters:
+    # c_backend: TCP echo backend on host loopback (BackendCount=1). The good arm
+    # writes a payload and reads the echo.
+    - name: c_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.BackendPort}} }
+    # sds_cluster: driver-owned in-process sdsserver.Server SDS receiver on host
+    # loopback. MANDATORY http2_protocol_options: {} for gRPC framing. Plaintext
+    # h2c — no TLS.
+    - name: sds_cluster
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: sds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.SDSPort}} }

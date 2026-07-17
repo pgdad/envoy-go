@@ -1,0 +1,169 @@
+# Phase 66 fixture 0109-xds-sds-combined-validation-context expectations
+# (ADR-0019 — prose; the driver is the enforcer via its per-side structural check
+# AND the runner's CompareBytes; this file is documentation).
+#
+# A disciplined clone of 0108-xds-sds-validation-context. Same observable shape,
+# same PKI machinery, same per-side SDS receivers. The ONE semantic delta is in
+# the DownstreamTlsContext: a combined_validation_context (CVC) replaces 0108's
+# bare validation_context_sds_secret_config.
+#
+# ## The NEW proposition
+#
+#   The SDS-delivered CA REPLACES the inline default_validation_context.trusted_ca;
+#   it does NOT union with it.
+#
+# 0108 proves the served CA is the anchor when NO competitor is configured. 0109
+# proves the served CA BEATS A CONFIGURED COMPETITOR: the inline default
+# (0108's never-delivered CA_unserved) is here a real, parsed, configured CA. This
+# REFUTES Design C (pool union), which would trust BOTH CAs and accept client_Y.
+#
+# Topology (single-listener downstream-mTLS tcp_proxy; driver-owned in-process
+# SDS gRPC receiver; TCP echo backend):
+#   l_sds_cvc  — one TLS-terminating tcp_proxy listener. Its DownstreamTlsContext
+#                carries:
+#                  require_client_certificate: true      <- MANDATORY (PLAN-66 D1);
+#                    without it envoy-go REJECTS the downstream CVC at parse time.
+#                  common_tls_context.tls_certificates = [{ inline_string
+#                    server leaf (signed by CA_X) + key }]   <- STATIC, per-run.
+#                  common_tls_context.combined_validation_context = {
+#                    default_validation_context: { trusted_ca: { inline_string
+#                      CA_Y PEM } },                          <- INLINE competitor
+#                    validation_context_sds_secret_config: {
+#                      name: validation_ca,
+#                      sds_config: { resource_api_version: V3,
+#                        api_config_source: { api_type: GRPC,
+#                          transport_api_version: V3,
+#                          grpc_services: [{envoy_grpc:
+#                            {cluster_name: sds_cluster}}] } } } }
+#                No tls_inspector — a single filter chain, no SNI match.
+#   c_backend  — TCP echo backend (BackendCount=1). The positive arm writes a
+#                payload through the tcp_proxy and reads the echo back.
+#   sds_cluster — driver-owned in-process test/helpers/sdsserver.Server SDS
+#                receiver (SotW StreamSecrets). The driver starts TWO private
+#                receivers — one per side — on two separately-allocated ports,
+#                each bound 0.0.0.0:<port>, BOTH serving the SAME in-memory CA_X
+#                as Secret{validation_context{trusted_ca}} under name
+#                "validation_ca". The served wire is byte-identical to 0108's —
+#                the management server cannot tell a CVC client from a plain-SDS
+#                client (SPEC §8). MANDATORY http2_protocol_options:{} for gRPC
+#                framing + plaintext h2c (no TLS).
+#
+# Only the validation_context arrives via SDS; the server cert is STATIC, so
+# internal/boot's SDS pre-scan sees exactly one secret (the CVC's INNER SDS half,
+# counted by PLAN-66 T4) and the deferred compose-two edge is never touched.
+#
+# node: {id: envoygo-node, cluster: envoygo-cluster} is REQUIRED on BOTH sides
+# — SDS boot-fails without it (internal/boot.NewSDSProvider).
+#
+# Reference Envoy contrib-v1.37.2 (STRICT_DNS via host.docker.internal, listener
+# port 10445) vs envoy-go (STATIC, in-process, loopback).
+#
+# ## PKI — generated IN MEMORY, per run; there is NO pki/ dir (PLAN-66 D2)
+#
+#   CA_X         — self-signed ECDSA P-256, CN "envoy-go 0109 CA_X (served over
+#                  SDS)". Delivered over SDS as the trusted_ca. THE ANCHOR THAT
+#                  MUST WIN.
+#   server leaf  — ECDSA P-256 signed by CA_X; ServerAuth;
+#                  SAN=DNS:l_sds_cvc.fixture.test. Injected inline_string into
+#                  BOTH yamls (no file, no HostMount, no Docker mount).
+#   client_X     — ECDSA P-256 signed by CA_X; ClientAuth. MUST be ACCEPTED.
+#   CA_Y         — self-signed ECDSA P-256, CN "envoy-go 0109 CA_Y (inline
+#                  default)". CONFIGURED as the inline
+#                  default_validation_context.trusted_ca on BOTH sides. THE ANCHOR
+#                  THAT MUST LOSE.
+#   client_Y     — ECDSA P-256 signed by CA_Y; ClientAuth. MUST be REJECTED
+#                  (this is what proves REPLACE, not union).
+#
+# Nothing touches disk. Per-run freshness is safe: the observable is an
+# accept/reject verdict, not a serial=/san= identity.
+#
+# ## Workload
+#
+# Each side runs TWO arms against the proxy's l_sds_cvc listener, folded into ONE
+# byte stream (CompareBytes compares a single []byte per side):
+#   1. positive — dial presenting client_X (chains to the SERVED CA_X), complete
+#                 the handshake, write "phase66-cvc-probe\n", read the echo back
+#                 through tcp_proxy.
+#   2. negative — dial presenting client_Y (chains to the INLINE CA_Y); the round
+#                 trip MUST fail.
+#
+# Each arm drives the FULL round trip (handshake -> write -> read), not just the
+# handshake: under TLS 1.3 the server's verdict on the client cert arrives AFTER
+# the client's Handshake() has already returned, so a handshake-only probe would
+# mis-report a rejection as success.
+#
+# Before the arms, the driver asserts a SERVED-THIS-ARM precondition: THIS run's
+# per-side SDS receiver recorded at least one StreamSecrets request. Zero requests
+# means the proxy never fetched the CVC's inner secret from this server and the
+# verdict would be meaningless (SPEC §8 stale-server trap). 0108 lacks this
+# assert; 0109 adds it (0108 itself stays untouched).
+#
+# ## Asserted
+#
+#   (a) PER SIDE, structurally (the driver's structuralCheck; the runner turns a
+#       Drive error into t.Fatalf("<side> drive: ...")):
+#         the side's OWN bytes are exactly
+#           "good=ok echo=phase66-cvc-probe\nbad=rejected\n"
+#       This is LOAD-BEARING, not decoration. A break that changes the SERVED CA,
+#       or re-signs client_Y with it, changes BOTH sides identically — the two
+#       streams still compare EQUAL and a pure-CompareBytes fixture PASSES
+#       (reference_vacuous_break_receiver_normalizes). Verified empirically at
+#       Task 6: with structuralCheck disabled, the served-CA break runs GREEN.
+#       structuralCheck is what makes "the served CA REPLACES the inline default"
+#       the proposition under test, rather than "both sides agree".
+#
+#   (b) CROSS-SIDE, byte-exact (the runner's CompareBytes):
+#       the two sides emit identical streams. Proven live at Task 6 by isolating
+#       it (asymmetric break + structuralCheck disabled -> mismatch at byte
+#       offset 5).
+#
+#   Because exactly ONE structurally-valid stream exists, (a) strictly subsumes
+#   (b) for this fixture: any deviation on either side trips (a) first. (b) is
+#   retained as the harness-standard cross-side leg.
+#
+# ## UNasserted (named coverage boundaries)
+#
+#   The §3.9 empty-dynamic departure is NOT on this fixture's cross-side path —
+#   one fixture dir = ONE runner branch (reference_differential_fixture_dispatch_constraint).
+#   Per shape:
+#     (a) empty-dynamic context: the sides DISAGREE — the reference ACKs, falls
+#         back to the inline default CA, and SERVES; envoy-go boot-FAILS
+#         (ADR-0280 family). This divergence is covered as a SUBJECT-side unit
+#         test at T3, NOT as a differential arm here.
+#     (b)/(c) a non-empty served context: both sides AGREE on the TRAFFIC verdict
+#         (served CA is the anchor) and diverge only on lifecycle/rotation
+#         mechanics, which this fixture does not probe.
+#
+#   The require_client_certificate == false boundary (envoy-go E3-rejects a
+#   downstream CVC without it — PLAN-66 D1). Named, UNasserted here: this fixture
+#   always sets it true.
+#
+#   The TLS handshake-failure ALERT TEXT. The reference (BoringSSL) sends
+#   `unknown ca`; envoy-go (Go crypto/tls) sends `bad certificate`. Cross-side
+#   text equality is IMPOSSIBLE — the negative arm records only the normalized
+#   verdict token `rejected` (the 0045 closeOK idiom). The reject may also surface
+#   as "client didn't provide a certificate": Go's TLS client withholds a cert
+#   that does not match the CertificateRequest's acceptable-CA hint — a hint
+#   itself derived from the SDS-served CA_X (never CA_Y). Both manifestations are
+#   the same proposition; normalizing is what makes the arm portable.
+#
+#   The ssl.* stat family. Observed live on the reference, but envoy-go emits NO
+#   ssl.* stats whatsoever (the only listener-scope counter is
+#   downstream_cx_total). A negative-arm StatsAsserter is therefore INFEASIBLE
+#   (inherits PLAN-65 C3). A PRE-EXISTING framework gap phase 66 neither opens nor
+#   closes; recorded as a deferred Observability/xDS candidate. The accept/reject
+#   CONTRAST discharges the proof obligation and is strictly STRONGER than a
+#   subject-only stat — it is cross-side.
+#
+#   SDS stream framing (VersionInfo/Nonce/request-count/ACK cadence —
+#   impl-specific; only the DELIVERED CA's EFFECT is asserted).
+#   The sds.<secret>.* stat counters (no StatsAsserter).
+#
+# Cross-refs: phase 66 SPEC §8 + PLAN-66 D1/D2/D4 + T3 (subject-side empty-dynamic
+#             unit test) + T4 (boot pre-scan of the CVC inner secret) + ADR-0019 +
+#             reference_differential_grpc_receiver_driver_owned +
+#             reference_periodic_sink_differential_two_receivers +
+#             reference_vacuous_break_receiver_normalizes +
+#             reference_differential_backendcount_min_one +
+#             reference_differential_fixture_dispatch_constraint +
+#             reference_differential_run_selector
