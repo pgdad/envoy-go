@@ -36,8 +36,12 @@ both CAs and **accept** `client_Y`. Only a REPLACE emits `bad=rejected`.
 
 One TLS-terminating `tcp_proxy` listener. Its `DownstreamTlsContext` carries:
 
-- `require_client_certificate: true` — **MANDATORY** (PLAN-66 D1), not
-  incidental: without it envoy-go **rejects** the downstream CVC at parse time.
+- `require_client_certificate: true` — was **MANDATORY** under phase-66 scope
+  (PLAN-66 D1): without it envoy-go **rejected** the downstream CVC at parse
+  time (the E3 guard). Phase 67/ADR-0289 **lifts** E3 — the flag is now a
+  **choice** for the CVC shape (verify-if-presented at false/absent; fixture
+  `0110` covers it). This fixture retains `true` to keep its cross-CA
+  substitution observable.
 - a **STATIC** server cert (`tls_certificates`, `inline_string`, signed by
   `CA_X`), and
 - a **`combined_validation_context`** nesting:
@@ -147,8 +151,12 @@ records only the stable token `rejected`.
   empty dynamic context, falls back to the inline default CA, and SERVES;
   envoy-go boot-FAILS. That divergence is covered as a **subject-side unit test at
   T3**, not as a differential arm here.
-- The **`require_client_certificate == false` / E3** boundary (envoy-go rejects a
-  downstream CVC without it — PLAN-66 D1). This fixture always sets it true.
+- *(Retired at phase 67/ADR-0289.)* The **`require_client_certificate == false`
+  / E3** boundary — under phase-66 scope envoy-go rejected a downstream CVC at
+  false (PLAN-66 D1). Phase 67 lifts E3 across all three validation shapes
+  (verify-if-presented); the flag is now a choice, and fixture `0110` covers
+  the false arm. This fixture continues to always set it `true`, to preserve
+  its cross-CA substitution observable.
 - **No `ssl.*` stats** — envoy-go emits none, so a negative-arm `StatsAsserter` is
   infeasible (inherits PLAN-65 C3); a pre-existing framework gap.
 

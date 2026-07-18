@@ -17,6 +17,8 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	xds "github.com/pgdad/envoy-go/internal/xds"
+
 	// crypto imports used by pki init
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -996,7 +998,7 @@ func TestNewDownstreamConfig_SDS(t *testing.T) {
 		})
 		_, err := NewDownstreamConfig(ts, "", fp)
 		if err == nil {
-			t.Fatal("expected a boot failure, got nil (envoy-go boot-FAILS where the reference serves anyway — ADR-0280)")
+			t.Fatal("expected a boot failure, got nil (envoy-go boot-FAILS where the reference init-holds then fails closed per-connection — ADR-0280 family, characterization corrected at ADR-0289)")
 		}
 		if !strings.HasPrefix(err.Error(), "tls: ") {
 			t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", err.Error())
@@ -1006,13 +1008,16 @@ func TestNewDownstreamConfig_SDS(t *testing.T) {
 		}
 	})
 
-	t.Run("require_client_certificate=false leaves the SDS validation_context INERT", func(t *testing.T) {
-		// Mirrors the landed inline behavior: an inline validation_context with
-		// require_client_certificate=false is ALSO inert (only the require==true
-		// block loads ClientCAs). Phase 65 introduces no NEW inconsistency, and
-		// crucially performs NO boot-time SDS fetch for this shape (SPEC-65 §3.5) —
-		// the vcErr below would surface as a boot failure if a fetch happened.
-		fp := &fakeProvider{vcErr: errors.New("FETCH MUST NOT HAPPEN")}
+	t.Run("require_client_certificate=false CONSUMES the SDS validation_context (verify-if-presented)", func(t *testing.T) {
+		// Post phase-67 lift: an SDS-delivered validation_context with
+		// require_client_certificate=false/absent is HONORED (verify-if-presented),
+		// not inert. The fetch fires at ANY require value (un-gated), the returned
+		// pool is installed as ClientCAs, and ClientAuth is VerifyClientCertIfGiven.
+		caPool := x509.NewCertPool()
+		if !caPool.AppendCertsFromPEM(pki.caPEM) {
+			t.Fatal("pki.caPEM: no certificates parsed")
+		}
+		fp := &fakeProvider{pool: caPool}
 		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
 			// RequireClientCertificate deliberately absent (false).
 			CommonTlsContext: &tlsv3.CommonTlsContext{
@@ -1029,13 +1034,16 @@ func TestNewDownstreamConfig_SDS(t *testing.T) {
 		})
 		cfg, err := NewDownstreamConfig(ts, "", fp)
 		if err != nil {
-			t.Fatalf("NewDownstreamConfig: unexpected err %v (the fetch must be SKIPPED, not attempted)", err)
+			t.Errorf("NewDownstreamConfig: unexpected err %v — false/absent + SDS anchor must verify-if-presented", err)
 		}
-		if cfg.TLSConfig.ClientCAs != nil {
-			t.Error("ClientCAs is non-nil — require_client_certificate=false must leave the SDS validation_context inert")
+		if cfg == nil || cfg.TLSConfig == nil {
+			t.Fatal("NewDownstreamConfig returned a nil cfg/TLSConfig")
 		}
-		if cfg.TLSConfig.ClientAuth != stdtls.NoClientCert {
-			t.Errorf("ClientAuth = %v, want NoClientCert (inert)", cfg.TLSConfig.ClientAuth)
+		if cfg.TLSConfig.ClientCAs == nil {
+			t.Error("ClientCAs is nil — require_client_certificate=false must CONSUME the SDS validation_context")
+		}
+		if cfg.TLSConfig.ClientAuth != stdtls.VerifyClientCertIfGiven {
+			t.Errorf("ClientAuth = %v, want VerifyClientCertIfGiven (verify-if-presented)", cfg.TLSConfig.ClientAuth)
 		}
 	})
 }
@@ -1421,11 +1429,12 @@ func TestCVC_E1E2_DoNotPreemptTheRetainedReject(t *testing.T) {
 	}
 }
 
-// TestCVC_RequireFalse_Rejected_E3 drives NewDownstreamConfig: a CVC listener
-// with require_client_certificate false OR absent is refused LOUDLY rather than
-// booting silently unauthenticated (ADR-0080 envoy-go-strict).
-func TestCVC_RequireFalse_Rejected_E3(t *testing.T) {
-	const want = "combined_validation_context requires require_client_certificate: true in phase 03"
+// TestNewDownstreamConfig_RequireFalse_CVC_VerifyIfGiven drives
+// NewDownstreamConfig: a CVC listener with require_client_certificate false OR
+// absent now HONORS the anchor (verify-if-presented) rather than boot-rejecting
+// (phase 67 retires E3). The SDS-delivered pool is fetched and installed as
+// ClientCAs, and ClientAuth is VerifyClientCertIfGiven.
+func TestNewDownstreamConfig_RequireFalse_CVC_VerifyIfGiven(t *testing.T) {
 	tests := []struct {
 		name    string
 		require *wrapperspb.BoolValue
@@ -1439,15 +1448,18 @@ func TestCVC_RequireFalse_Rejected_E3(t *testing.T) {
 			if !caPool.AppendCertsFromPEM(pki.caPEM) {
 				t.Fatal("pki.caPEM: no certificates parsed")
 			}
-			_, err := NewDownstreamConfig(cvcDownstreamTS(t, tc.require), "", &fakeProvider{pool: caPool})
-			if err == nil {
-				t.Fatal("expected E3, got nil")
+			cfg, err := NewDownstreamConfig(cvcDownstreamTS(t, tc.require), "", &fakeProvider{pool: caPool})
+			if err != nil {
+				t.Errorf("NewDownstreamConfig: unexpected err %v — false/absent + anchor must verify-if-presented, not reject", err)
 			}
-			if !strings.HasPrefix(err.Error(), "tls: ") {
-				t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", err.Error())
+			if cfg == nil || cfg.TLSConfig == nil {
+				t.Fatal("NewDownstreamConfig returned a nil cfg/TLSConfig")
 			}
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+			if cfg.TLSConfig.ClientAuth != stdtls.VerifyClientCertIfGiven {
+				t.Errorf("ClientAuth = %v, want VerifyClientCertIfGiven", cfg.TLSConfig.ClientAuth)
+			}
+			if cfg.TLSConfig.ClientCAs == nil {
+				t.Error("ClientCAs is nil — the SDS-delivered anchor pool must be installed at false/absent")
 			}
 		})
 	}
@@ -1455,9 +1467,10 @@ func TestCVC_RequireFalse_Rejected_E3(t *testing.T) {
 
 // TestCVC_RequireFalse_NeverYieldsNoClientCert states the SECURITY PROPERTY
 // rather than the mechanism: for a CVC listener with require_client_certificate
-// false/absent, NewDownstreamConfig must return an error, and must NEVER hand
-// back a cfg whose ClientAuth is NoClientCert — i.e. a silently unauthenticated
-// listener. This holds independently of E3's exact wording.
+// false/absent AND an anchor, NewDownstreamConfig must verify-if-presented and
+// must NEVER hand back a cfg whose ClientAuth is NoClientCert — i.e. a silently
+// unauthenticated listener. Post phase-67 lift the anchor is HONORED
+// (ClientAuth == VerifyClientCertIfGiven), which entails != NoClientCert.
 func TestCVC_RequireFalse_NeverYieldsNoClientCert(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -1473,11 +1486,14 @@ func TestCVC_RequireFalse_NeverYieldsNoClientCert(t *testing.T) {
 				t.Fatal("pki.caPEM: no certificates parsed")
 			}
 			cfg, err := NewDownstreamConfig(cvcDownstreamTS(t, tc.require), "", &fakeProvider{pool: caPool})
-			if err == nil {
-				t.Error("NewDownstreamConfig returned nil error — a CVC listener without require_client_certificate must NOT boot")
+			if err != nil {
+				t.Errorf("NewDownstreamConfig returned err %v — want nil err (verify-if-presented honors the anchor)", err)
 			}
-			if cfg != nil && cfg.TLSConfig != nil && cfg.TLSConfig.ClientAuth == stdtls.NoClientCert {
-				t.Error("NewDownstreamConfig returned a cfg with ClientAuth == NoClientCert — a SILENTLY UNAUTHENTICATED listener")
+			if cfg == nil || cfg.TLSConfig == nil {
+				t.Fatal("NewDownstreamConfig returned a nil cfg/TLSConfig")
+			}
+			if cfg.TLSConfig.ClientAuth != stdtls.VerifyClientCertIfGiven {
+				t.Errorf("ClientAuth = %v, want VerifyClientCertIfGiven (never NoClientCert with an anchor)", cfg.TLSConfig.ClientAuth)
 			}
 		})
 	}
@@ -1928,5 +1944,305 @@ func TestInlineVC_FourRejects_Unchanged(t *testing.T) {
 				t.Errorf("error = %q, want it to contain %q", err.Error(), tc.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 67 (SPEC §10): the require_client_certificate false/absent mapping
+// cross-product — inline / SDS-VC / CVC (T1) shapes, each at {false, absent} —
+// plus the anchorless regression pin, the corrupt-CA boot-error pin, and the
+// §3.6 nil-pool unconstructibility property.
+// ---------------------------------------------------------------------------
+
+// requireFalseCases is the {false, absent} pair shared by every phase-67
+// mapping test: GetValue() on a nil *wrapperspb.BoolValue returns false, so
+// require:false and require:absent coincide (no tri-state).
+var requireFalseCases = []struct {
+	name    string
+	require *wrapperspb.BoolValue
+}{
+	{"require_client_certificate: false", &wrapperspb.BoolValue{Value: false}},
+	{"require_client_certificate absent (nil BoolValue)", nil},
+}
+
+// TestNewDownstreamConfig_RequireFalse_Inline_VerifyIfGiven pins the phase-67
+// hoist for the PLAIN inline validation_context.trusted_ca arm:
+// require_client_certificate false/absent with an inline anchor now HONORS
+// the anchor (verify-if-presented) instead of leaving it inert.
+func TestNewDownstreamConfig_RequireFalse_Inline_VerifyIfGiven(t *testing.T) {
+	for _, tc := range requireFalseCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+				RequireClientCertificate: tc.require,
+				CommonTlsContext: &tlsv3.CommonTlsContext{
+					TlsCertificates: []*tlsv3.TlsCertificate{
+						{
+							CertificateChain: inlineBytes(pki.leafCertPEM),
+							PrivateKey:       inlineBytes(pki.leafKeyPEM),
+						},
+					},
+					ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+						ValidationContext: &tlsv3.CertificateValidationContext{
+							TrustedCa: inlineBytes(pki.caPEM),
+						},
+					},
+				},
+			})
+			cfg, err := NewDownstreamConfig(ts, "", nil)
+			if err != nil {
+				t.Errorf("NewDownstreamConfig: unexpected err %v — false/absent + inline anchor must verify-if-presented", err)
+			}
+			if cfg == nil || cfg.TLSConfig == nil {
+				t.Fatal("NewDownstreamConfig returned a nil cfg/TLSConfig")
+			}
+			if cfg.TLSConfig.ClientAuth != stdtls.VerifyClientCertIfGiven {
+				t.Errorf("ClientAuth = %v, want VerifyClientCertIfGiven", cfg.TLSConfig.ClientAuth)
+			}
+			if cfg.TLSConfig.ClientCAs == nil {
+				t.Error("ClientCAs is nil — the inline trusted_ca anchor must be installed at false/absent")
+			}
+		})
+	}
+}
+
+// sdsVCDownstreamTS builds a DownstreamTlsContext carrying a single leaf
+// tls_certificate plus an SDS-delivered validation_context (phase 65,
+// ADR-0286), with require_client_certificate set to require (nil => absent).
+func sdsVCDownstreamTS(t *testing.T, require *wrapperspb.BoolValue) *corev3.TransportSocket {
+	t.Helper()
+	return makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+		RequireClientCertificate: require,
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			TlsCertificates: []*tlsv3.TlsCertificate{
+				{
+					CertificateChain: inlineBytes(pki.leafCertPEM),
+					PrivateKey:       inlineBytes(pki.leafKeyPEM),
+				},
+			},
+			ValidationContextType: &tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
+				ValidationContextSdsSecretConfig: sdsSecretConfig("validation-secret", "sds_cluster"),
+			},
+		},
+	})
+}
+
+// TestNewDownstreamConfig_RequireFalse_SDSVC_VerifyIfGiven pins the phase-67
+// hoist for the SDS-delivered validation_context arm (phase 65, ADR-0286):
+// require_client_certificate false/absent now HONORS the SDS-fetched anchor
+// (verify-if-presented) rather than leaving it inert. It ALSO pins the §3.5
+// departure directly: a require=false SDS validation_context fetch FAILURE
+// now boot-FAILS the listener (it is no longer inert just because
+// require_client_certificate is false) — the fetch is UN-GATED (T1). No
+// deliberate break is owed for the fetch-failure arm; it is a green-stable
+// pin whose integration twin is TestSDSEndToEnd_FetchFailure_BootFailsClosed.
+func TestNewDownstreamConfig_RequireFalse_SDSVC_VerifyIfGiven(t *testing.T) {
+	for _, tc := range requireFalseCases {
+		t.Run(tc.name, func(t *testing.T) {
+			caPool := x509.NewCertPool()
+			if !caPool.AppendCertsFromPEM(pki.caPEM) {
+				t.Fatal("pki.caPEM: no certificates parsed")
+			}
+			cfg, err := NewDownstreamConfig(sdsVCDownstreamTS(t, tc.require), "", &fakeProvider{pool: caPool})
+			if err != nil {
+				t.Errorf("NewDownstreamConfig: unexpected err %v — false/absent + SDS anchor must verify-if-presented", err)
+			}
+			if cfg == nil || cfg.TLSConfig == nil {
+				t.Fatal("NewDownstreamConfig returned a nil cfg/TLSConfig")
+			}
+			if cfg.TLSConfig.ClientCAs == nil {
+				t.Error("ClientCAs is nil — the SDS fetch did not fire / the pool was not installed")
+			}
+			if cfg.TLSConfig.ClientAuth != stdtls.VerifyClientCertIfGiven {
+				t.Errorf("ClientAuth = %v, want VerifyClientCertIfGiven", cfg.TLSConfig.ClientAuth)
+			}
+		})
+	}
+
+	t.Run("fetch failure propagates at require=false (§3.5 departure)", func(t *testing.T) {
+		for _, tc := range requireFalseCases {
+			t.Run(tc.name, func(t *testing.T) {
+				fetchErr := errors.New("xds: sds: secret \"validation-secret\": initial fetch timed out after 15s: context deadline exceeded")
+				cfg, err := NewDownstreamConfig(sdsVCDownstreamTS(t, tc.require), "", &fakeProvider{vcErr: fetchErr})
+				if err == nil {
+					t.Fatal("expected a boot failure, got nil — require=false must not mask an SDS fetch failure (§3.5)")
+				}
+				if !strings.HasPrefix(err.Error(), "tls: ") {
+					t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", err.Error())
+				}
+				if !strings.Contains(err.Error(), "initial fetch timed out") {
+					t.Errorf("error = %q, want the provider's classified cause preserved", err.Error())
+				}
+				if cfg != nil {
+					t.Errorf("cfg = %+v, want nil on a boot failure", cfg)
+				}
+			})
+		}
+	})
+}
+
+// TestNewDownstreamConfig_RequireFalse_Anchorless_NoClientCert is a
+// green-stable REGRESSION PIN: this cell (no anchor + require false/absent)
+// is UNCHANGED by the phase-67 hoist — no break is owed. Two anchorless
+// shapes are covered: no validation config at all, and a present-but-empty
+// validation_context carrying no trusted_ca.
+func TestNewDownstreamConfig_RequireFalse_Anchorless_NoClientCert(t *testing.T) {
+	shapes := []struct {
+		name    string
+		withVCT func(*tlsv3.CommonTlsContext)
+	}{
+		{"no validation config at all", func(c *tlsv3.CommonTlsContext) {}},
+		{"anchorless validation_context (empty, no trusted_ca)", func(c *tlsv3.CommonTlsContext) {
+			c.ValidationContextType = &tlsv3.CommonTlsContext_ValidationContext{
+				ValidationContext: &tlsv3.CertificateValidationContext{},
+			}
+		}},
+	}
+	for _, shape := range shapes {
+		for _, tc := range requireFalseCases {
+			t.Run(shape.name+"/"+tc.name, func(t *testing.T) {
+				common := &tlsv3.CommonTlsContext{
+					TlsCertificates: []*tlsv3.TlsCertificate{
+						{
+							CertificateChain: inlineBytes(pki.leafCertPEM),
+							PrivateKey:       inlineBytes(pki.leafKeyPEM),
+						},
+					},
+				}
+				shape.withVCT(common)
+				ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+					RequireClientCertificate: tc.require,
+					CommonTlsContext:         common,
+				})
+				cfg, err := NewDownstreamConfig(ts, "", nil)
+				if err != nil {
+					t.Errorf("NewDownstreamConfig: unexpected err %v", err)
+				}
+				if cfg == nil || cfg.TLSConfig == nil {
+					t.Fatal("NewDownstreamConfig returned a nil cfg/TLSConfig")
+				}
+				if cfg.TLSConfig.ClientAuth != stdtls.NoClientCert {
+					t.Errorf("ClientAuth = %v, want NoClientCert (zero value)", cfg.TLSConfig.ClientAuth)
+				}
+				if cfg.TLSConfig.ClientCAs != nil {
+					t.Error("ClientCAs is non-nil; want nil (no anchor was configured)")
+				}
+			})
+		}
+	}
+}
+
+// TestInlineCorruptTrustedCA_RequireFalse_BootError is a DECISION on
+// envoy-go's strict posture (SPEC §3.12(1)), NOT a parity claim — the
+// reference's corrupt-CA config-validate posture was NOT probed here. A
+// corrupt inline trusted_ca PEM must boot-FAIL even at
+// require_client_certificate=false/absent — the un-gated (T1) load must not
+// be silently swallowed just because require is false.
+func TestInlineCorruptTrustedCA_RequireFalse_BootError(t *testing.T) {
+	for _, tc := range requireFalseCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+				RequireClientCertificate: tc.require,
+				CommonTlsContext: &tlsv3.CommonTlsContext{
+					TlsCertificates: []*tlsv3.TlsCertificate{
+						{
+							CertificateChain: inlineBytes(pki.leafCertPEM),
+							PrivateKey:       inlineBytes(pki.leafKeyPEM),
+						},
+					},
+					ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+						ValidationContext: &tlsv3.CertificateValidationContext{
+							TrustedCa: inlineBytes([]byte("not a pem")),
+						},
+					},
+				},
+			})
+			cfg, err := NewDownstreamConfig(ts, "", nil)
+			if err == nil {
+				t.Fatal("expected a boot error for a corrupt trusted_ca, got nil")
+			}
+			if !strings.HasPrefix(err.Error(), "tls: ") {
+				t.Errorf("error = %q, want the `tls: ` prefix (the FuzzTLSContextParse invariant)", err.Error())
+			}
+			if cfg != nil {
+				t.Errorf("cfg = %+v, want nil on a boot error", cfg)
+			}
+		})
+	}
+}
+
+// compile-time interface pin (§3.6): fakeProvider must satisfy xds.SecretProvider
+// so TestVerifyIfGiven_NilPool_Unconstructible's (nil,nil) arm is a legitimate
+// value of the SAME interface production fetchers implement — not a shape
+// only a test double could return.
+var _ xds.SecretProvider = &fakeProvider{}
+
+// TestVerifyIfGiven_NilPool_Unconstructible pins §3.6: NO config ×
+// provider-behavior combination may yield the forbidden state
+// ClientAuth==VerifyClientCertIfGiven && ClientCAs==nil.
+// VerifyClientCertIfGiven + a nil ClientCAs pool makes Go's crypto/tls fall
+// back to the SYSTEM root pool — rejecting the legitimate anchor-signed
+// client while ADMITTING anonymous ones (reference_go_client_cert_withholding):
+// the worst-direction failure mode, silently weaker than either NoClientCert
+// or a boot failure. installPool's nil-pool guard (config.go) is the only
+// thing standing between a (nil, nil) FetchInitialValidationContext return
+// and that forbidden state.
+//
+// This test's liveness is NOT provable by a red-first run: no live
+// production fetcher (SDS server, CVC) can itself return (nil, nil) without
+// an error, so the guard is unreachable from today's entry points under
+// normal input. Its ONLY liveness proof is a deliberate break (T2 Break D)
+// that deletes the installPool nil-pool guard — see the T2 report for the
+// break's execution.
+func TestVerifyIfGiven_NilPool_Unconstructible(t *testing.T) {
+	validPool := x509.NewCertPool()
+	if !validPool.AppendCertsFromPEM(pki.caPEM) {
+		t.Fatal("pki.caPEM: no certificates parsed")
+	}
+
+	providers := []struct {
+		name string
+		fp   *fakeProvider
+	}{
+		{"success (non-nil pool, nil error)", &fakeProvider{pool: validPool}},
+		{"nil pool, nil error (the hazard arm)", &fakeProvider{}},
+		{"fetch error (non-nil err)", &fakeProvider{vcErr: errors.New("boom")}},
+	}
+
+	shapes := []struct {
+		name string
+		ts   func(t *testing.T, require *wrapperspb.BoolValue) *corev3.TransportSocket
+	}{
+		{"SDS-VC", func(t *testing.T, require *wrapperspb.BoolValue) *corev3.TransportSocket {
+			return sdsVCDownstreamTS(t, require)
+		}},
+		{"CVC", func(t *testing.T, require *wrapperspb.BoolValue) *corev3.TransportSocket {
+			return cvcDownstreamTS(t, require)
+		}},
+	}
+
+	for _, shape := range shapes {
+		for _, tc := range requireFalseCases {
+			for _, p := range providers {
+				t.Run(shape.name+"/"+tc.name+"/"+p.name, func(t *testing.T) {
+					cfg, err := NewDownstreamConfig(shape.ts(t, tc.require), "", p.fp)
+
+					// The property, independent of which arm produced it: NEVER
+					// ClientAuth==VerifyClientCertIfGiven with ClientCAs==nil.
+					if cfg != nil && cfg.TLSConfig != nil &&
+						cfg.TLSConfig.ClientAuth == stdtls.VerifyClientCertIfGiven &&
+						cfg.TLSConfig.ClientCAs == nil {
+						t.Errorf("forbidden state reached: ClientAuth=VerifyClientCertIfGiven, ClientCAs=nil (shape=%s, provider=%s)", shape.name, p.name)
+					}
+
+					// The (nil, nil) hazard arm specifically: the installPool
+					// nil-pool guard must turn this into an error, never a cfg.
+					if p.fp.pool == nil && p.fp.vcErr == nil {
+						if err == nil {
+							t.Errorf("(nil,nil) fetch: expected an error from the installPool nil-pool guard, got nil (cfg=%+v)", cfg)
+						}
+					}
+				})
+			}
+		}
 	}
 }

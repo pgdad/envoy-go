@@ -89,8 +89,11 @@ func (p *Provider) FetchInitialCertificate(ctx context.Context, secretName strin
 // SDSStats accounting, and the same error classification (rejected /
 // init-fetch-timeout / failure). A timeout or unreachable management server
 // returns an error, which boot-FAILS the listener — the documented envoy-go
-// DEPARTURE from the reference's serve-anyway (ADR-0280, extended unchanged to
-// this resource type; SPEC-65 §11 D-SDSVC-FETCHTIMEOUT).
+// DEPARTURE (ADR-0280 family; reference characterization corrected at
+// ADR-0289): the reference init-holds (port unbound), then at
+// initial_fetch_timeout starts workers and binds, then fails closed
+// per-connection (downstream_context_secrets_not_ready) — it never serves
+// TLS traffic without the resource. (SPEC-65 §11 D-SDSVC-FETCHTIMEOUT.)
 func (p *Provider) FetchInitialValidationContext(ctx context.Context, secretName string) (*x509.CertPool, error) {
 	p.stats.incUpdateAttempt()
 	if p.timeout > 0 {

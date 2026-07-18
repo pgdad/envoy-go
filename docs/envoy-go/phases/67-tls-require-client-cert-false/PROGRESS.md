@@ -16,15 +16,15 @@
 
 | T | Title | Status | Commit |
 |---|---|---|---|
-| T1 | ATOMIC core: hoist + three-way `ClientAuth` (assignment-adjacent) + E3 RETIRED + flip roster items 1–4 (red-first inversions) + theorem block moved intact + retained rejects byte-diffed + stays-green roster | pending | — |
-| T2 | Mapping cross-product unit tests (3 shapes × {false, absent}, anchorless, corrupt-CA, the require=false fetch-failure vcErr arm — amendment M9) + `TestVerifyIfGiven_NilPool_Unconstructible` (interface-pinned) | pending | — |
-| T3 | Fuzz seeds on correct dispatch sides (+0 fuzzers; count reconciled 55 → 55) | pending | — |
-| T4 | Fixture `0110-tls-require-client-cert-false` — CVC-primary, three arms, FORCED-SEND untrusted arm (fixtures 111 → 112) | pending | — |
-| T5 | 0110 break protocol: Break B + structuralCheck triplet + per-side pin + served-this-arm | pending | — |
-| T6 | Comment sweeps: B11/B18 (config.go) + B16 (provider.go, chartered) + B17 (:999) + **B19** (boot_sds_e2e, chartered — PLAN A2) + the 0109 enumerated set + grep discharged (three-category dispositions, M10) + non-drift dispositions (A5 + BC:914); T6-SCOPED `.go` grep only — the full-repo drift closure moved to T9 (MOD-2) | pending | — |
-| T7 | BC delta B1–B10/B13–B14 (pinned verbatim) + FOUR-site TEST_GAP sweep (B15) by claim+grep (A1); B11@T6, B12@T9 (M8) | pending | — |
-| T8 | VERIFY: six-gate + cycle guard + full 112-dir differential + `-race` + mechanical counts + envelope audit | pending | — |
-| T9 | ADR-0289 completed IN PLACE + B12 annotation + ROADMAP/STATE/PROGRESS/router + sentinel + squash-push | pending | — |
+| T1 | ATOMIC core: hoist + three-way `ClientAuth` (assignment-adjacent) + E3 RETIRED + flip roster items 1–4 (red-first inversions) + theorem block moved intact + retained rejects byte-diffed + stays-green roster | done | c0144adc |
+| T2 | Mapping cross-product unit tests (3 shapes × {false, absent}, anchorless, corrupt-CA, the require=false fetch-failure vcErr arm — amendment M9) + `TestVerifyIfGiven_NilPool_Unconstructible` (interface-pinned) | done | 50bb10db |
+| T3 | Fuzz seeds on correct dispatch sides (+0 fuzzers; count reconciled 55 → 55) | done | 86967b0b |
+| T4 | Fixture `0110-tls-require-client-cert-false` — CVC-primary, three arms, FORCED-SEND untrusted arm (fixtures 111 → 112) | done | d6bee060 |
+| T5 | 0110 break protocol: Break B + structuralCheck triplet + per-side pin + served-this-arm | done | d6bee060 (breaks; tree byte-identical to T4) |
+| T6 | Comment sweeps: B11/B18 (config.go) + B16 (provider.go, chartered) + B17 (:999) + **B19** (boot_sds_e2e, chartered — PLAN A2) + the 0109 enumerated set + grep discharged (three-category dispositions, M10) + non-drift dispositions (A5 + BC:914); T6-SCOPED `.go` grep only — the full-repo drift closure moved to T9 (MOD-2) | done | 3a231c1d |
+| T7 | BC delta B1–B10/B13–B14 (pinned verbatim) + FOUR-site TEST_GAP sweep (B15) by claim+grep (A1); B11@T6, B12@T9 (M8) | done | 6e8f7f81 (+35f13315 B6 fixup) |
+| T8 | VERIFY: six-gate + cycle guard + full 112-dir differential + `-race` + mechanical counts + envelope audit | done | — (verify; evidence below) |
+| T9 | ADR-0289 completed IN PLACE + B12 annotation + ROADMAP/STATE/PROGRESS/router + sentinel + squash-push | done | aba88dfc (ADR) + stage-close squash |
 
 ## Red-first ledger (T1 — filled with VERBATIM observed failures; a red for the wrong reason is VACUOUS, stop)
 
@@ -52,27 +52,41 @@
 
 ## Six-gate checklist (T8; controller-run on the frozen HEAD — evidence verbatim)
 
-- [ ] `gofmt -l internal/ test/ cmd/` → SILENT
-- [ ] `go vet ./...` → exit 0
-- [ ] `go build ./...` → exit 0
-- [ ] `go mod tidy -diff` EMPTY + `git diff --exit-code master -- go.mod go.sum` NO DIFF
-- [ ] `golangci-lint run ./...` → exit 0
-- [ ] full differential `go test ./test/differential/ -count=1` — **112** dirs, exit 0 (startup-flake / 0061-flake discrimination rules per PLAN T8)
+- [x] `gofmt -l internal/ test/ cmd/` → SILENT
+- [x] `go vet ./...` → exit 0
+- [x] `go build ./...` → exit 0
+- [x] `go mod tidy -diff` EMPTY + `git diff --exit-code master -- go.mod go.sum` NO DIFF
+- [x] `golangci-lint run ./...` → exit 0
+- [x] full differential `go test ./test/differential/ -count=1` — **112** dirs, exit 0 (startup-flake / 0061-flake discrimination rules per PLAN T8)
 - [ ] cycle guard `go list -deps ./internal/xds | grep 'envoy-go/internal'` (no `...`) → `internal/stats` + `internal/xds` ONLY
-- [ ] `-race`: `go test ./internal/tls/ ./internal/boot/ -race -count=1` (init_fetch_timeout flake = pre-existing on FIRST occurrence)
-- [ ] counts MECHANICAL: fixtures **112** · fuzzers **55** · BackendKind **38** · DECISIONS tail **ADR-0289** · stat surface **1201**
-- [ ] envelope audit: `internal/xds` comment-only · `internal/boot` test-comment-only (B19) · `boot.go`/`listener`/`validate/`/`sdsserver` ABSENT from `git diff master --stat`
-- [ ] retained-reject roster byte-diff re-confirmed on the final tree; retired E3 substring gone from code
-- [ ] stays-green roster (PLAN A3): manager_test tripwire + the three SDS e2e tripwires — green on the final tree
+- [x] `-race`: `go test ./internal/tls/ ./internal/boot/ -race -count=1` (init_fetch_timeout flake = pre-existing on FIRST occurrence)
+- [x] counts MECHANICAL: fixtures **112** · fuzzers **55** · BackendKind **38** · DECISIONS tail **ADR-0289** · stat surface **1201**
+- [x] envelope audit: `internal/xds` comment-only · `internal/boot` test-comment-only (B19) · `boot.go`/`listener`/`validate/`/`sdsserver` ABSENT from `git diff master --stat`
+- [x] retained-reject roster byte-diff re-confirmed on the final tree; retired E3 substring gone from code
+- [x] stays-green roster (PLAN A3): manager_test tripwire + the three SDS e2e tripwires — green on the final tree
 
 ## Stage-close checklist (T9)
 
-- [ ] ADR-0289 §Decision/§Consequences appended IN PLACE (no new ADR; tail ADR-0289, next-free ADR-0290)
-- [ ] B12 bracketed annotation at DECISIONS:16899 (verbatim SPEC §9 B12)
-- [ ] full-repo serve-anyway drift closure (MOVED from T6 — MOD-2): both greps re-run AFTER B2/B12/pointer-edit land; zero LIVING drifted sites; every hit classified per PLAN T9's expected-hits table (a hit fitting no row is a FINDING)
-- [ ] ROADMAP row 67 → `done`; deferred sentence UNTOUCHED (no fabricated narrow)
-- [ ] STATE.md pointer edited in place; lineage capped at five
-- [ ] router roll (`next-prompt.txt` — tracked; by SUBJECT)
-- [ ] sentinel re-run mechanically: (1) silent post-flip, (2) prints 3 via full-phrase command, (3) unchanged — does NOT fire; no `stop`
-- [ ] memory updates: `reference_go_client_cert_withholding` extension · serve-anyway drift lesson · the B19 parallel-stream-mints-fresh-drift lesson (PLAN T9)
-- [ ] controller squash-push
+- [x] ADR-0289 §Decision/§Consequences appended IN PLACE (no new ADR; tail ADR-0289, next-free ADR-0290)
+- [x] B12 bracketed annotation at DECISIONS:16899 (verbatim SPEC §9 B12)
+- [x] full-repo serve-anyway drift closure (MOVED from T6 — MOD-2): both greps re-run AFTER B2/B12/pointer-edit land; zero LIVING drifted sites; every hit classified per PLAN T9's expected-hits table (a hit fitting no row is a FINDING)
+- [x] ROADMAP row 67 → `done`; deferred sentence UNTOUCHED (no fabricated narrow)
+- [x] STATE.md pointer edited in place; lineage capped at five
+- [x] router roll (`next-prompt.txt` — tracked; by SUBJECT)
+- [x] sentinel re-run mechanically: (1) silent post-flip, (2) prints 3 via full-phrase command, (3) unchanged — does NOT fire; no `stop`
+- [x] memory updates: `reference_go_client_cert_withholding` extension · serve-anyway drift lesson · the B19 parallel-stream-mints-fresh-drift lesson (PLAN T9)
+- [x] controller squash-push
+
+
+## T8/T9 completion evidence (controller-run on the frozen HEAD, 2026-07-18)
+
+- **Six-gate ALL GREEN:** gofmt -l silent · go vet ./... exit 0 · go build ./... exit 0 · go mod tidy -diff EMPTY · git diff master -- go.mod go.sum EMPTY · golangci-lint run ./... exit 0.
+- **Full differential:** `ok  github.com/pgdad/envoy-go/test/differential  375.345s` — EXIT 0, **0 FAIL**, all **112** dirs (0110 registered + green; 111 pre-existing byte-stable). No startup flakes.
+- **Cycle guard:** `go list -deps ./internal/xds | grep envoy-go/internal` → `internal/stats` + `internal/xds` ONLY.
+- **-race:** `go test ./internal/tls/ ./internal/boot/ -race -count=1` → ok (tls 1.101s / boot 1.281s); no init_fetch_timeout flake.
+- **Counts:** fixtures **112** (tail 0110) · fuzzers **55** · BackendKind **38** · DECISIONS tail **ADR-0289** · stat surface **1201** (docs) · go.mod modules **2**.
+- **Envelope audit:** `git diff master --stat` production `.go` = `internal/tls/config.go` (functional) + `internal/xds/provider.go` (chartered comment-only B16) ONLY; `boot.go`/`internal/listener`/`validate/`/`sdsserver` ABSENT.
+- **Retained-reject byte-diff:** all five substrings = 1 in config.go; the retired E3 substring = 0 in all `internal/` `.go`.
+- **Break ACTUALs:** full verbatim firings recorded in the per-task reports (scratchpad task-{1,2,4}-report.md) — T1 Break A (mapping-value Errorf) + Break C (require=true CVC units + ONLY the refuse e2e subtest); T2 Break A (all 3 shapes) + Break D (test6 (nil,nil) arm) + corrupt-CA two-edit (test5 on err==nil); T4/T5 Break B (untrusted-arm structuralCheck on the polite-withhold vacuous green, 0109 the control) + the structuralCheck triplet (2a PASS / 2b fires / 2c CompareBytes offset 8) + per-side pin + served-this-arm. Every break re-greened.
+- **Drift closure (T9 gate):** both greps re-run after B12 + the STATE pointer edit; every hit classifies per the expected-hits table (counterfactuals boot_sds_e2e:43/519/545 + BC:914 · corrected-in-place BC:900/config.go/provider.go/config_test.go:999/TEST_GAP · historical-with-correction DECISIONS:16899 · ADR-0289 §Context DECISIONS:17026 · STATE pointer/lineage). Zero LIVING drift.
+- **Task/branch commits:** c0144adc (T1) · 50bb10db (T2) · 86967b0b (T3) · d6bee060 (T4/T5) · 3a231c1d (T6) · 6e8f7f81 + 35f13315 (T7) · aba88dfc (T9 ADR) · + the stage-close docs squash. Controller squash-pushes at close.

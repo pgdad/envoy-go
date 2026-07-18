@@ -516,9 +516,14 @@ func TestSDSEndToEnd_CVC_PoolSubstitution(t *testing.T) {
 // TestSDSEndToEnd_FetchFailure_BootFailsClosed pins the ADR-0280-family
 // fail-closed posture at the REAL apply-point: when the initial SDS fetch
 // cannot complete, the boot itself must FAIL — no listener may come up
-// serving with an unpopulated trust store (the phase-67 drift question
-// D-RCCF-FETCHFAIL-POSTURE records the reference-side ambiguity; envoy-go's
-// own posture is boot-FAIL and this test is its integration-level pin).
+// serving with an unpopulated trust store
+// (D-RCCF-FETCHFAIL-POSTURE was RESOLVED at the phase-67 SPEC — probe P1,
+// {server-cert, validation-context} × {silent, unreachable}, all four cells
+// identical: the reference init-holds (port unbound), then at
+// initial_fetch_timeout starts workers and binds, then fails closed
+// per-connection (downstream_context_secrets_not_ready); envoy-go's own
+// posture is boot-FAIL — ADR-0280 family, characterization corrected at
+// ADR-0289 — and this test is its integration-level pin).
 func TestSDSEndToEnd_FetchFailure_BootFailsClosed(t *testing.T) {
 	echoPort := startEchoBackend(t)
 

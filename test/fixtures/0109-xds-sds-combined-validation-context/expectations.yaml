@@ -21,8 +21,13 @@
 # SDS gRPC receiver; TCP echo backend):
 #   l_sds_cvc  — one TLS-terminating tcp_proxy listener. Its DownstreamTlsContext
 #                carries:
-#                  require_client_certificate: true      <- MANDATORY (PLAN-66 D1);
-#                    without it envoy-go REJECTS the downstream CVC at parse time.
+#                  require_client_certificate: true      <- was MANDATORY under
+#                    phase-66 scope (PLAN-66 D1); without it envoy-go REJECTED
+#                    the downstream CVC at parse time (the E3 guard). Phase
+#                    67/ADR-0289 LIFTS E3 — now a CHOICE for the CVC shape
+#                    (verify-if-presented at false/absent; fixture 0110 covers
+#                    it). This fixture retains true to keep its cross-CA
+#                    substitution observable.
 #                  common_tls_context.tls_certificates = [{ inline_string
 #                    server leaf (signed by CA_X) + key }]   <- STATIC, per-run.
 #                  common_tls_context.combined_validation_context = {
@@ -134,9 +139,12 @@
 #         (served CA is the anchor) and diverge only on lifecycle/rotation
 #         mechanics, which this fixture does not probe.
 #
-#   The require_client_certificate == false boundary (envoy-go E3-rejects a
-#   downstream CVC without it — PLAN-66 D1). Named, UNasserted here: this fixture
-#   always sets it true.
+#   The require_client_certificate == false boundary. *(Retired at phase
+#   67/ADR-0289.)* Under phase-66 scope envoy-go E3-rejected a downstream CVC
+#   without it (PLAN-66 D1); phase 67 lifts E3 across all three validation
+#   shapes (verify-if-presented) — the flag is now a CHOICE, and fixture 0110
+#   covers the false arm. Named, UNasserted here: this fixture always sets it
+#   true, to preserve its cross-CA substitution observable.
 #
 #   The TLS handshake-failure ALERT TEXT. The reference (BoringSSL) sends
 #   `unknown ca`; envoy-go (Go crypto/tls) sends `bad certificate`. Cross-side
@@ -144,8 +152,12 @@
 #   verdict token `rejected` (the 0045 closeOK idiom). The reject may also surface
 #   as "client didn't provide a certificate": Go's TLS client withholds a cert
 #   that does not match the CertificateRequest's acceptable-CA hint — a hint
-#   itself derived from the SDS-served CA_X (never CA_Y). Both manifestations are
-#   the same proposition; normalizing is what makes the arm portable.
+#   itself derived from the SDS-served CA_X (never CA_Y). This manifestation
+#   depends on the CertificateRequest this fixture's retained
+#   require_client_certificate: true sends (a choice, not a mandate, since
+#   phase 67/ADR-0289 — see the boundary note above); it does not arise at
+#   false/absent, which fixture 0110 covers. Both manifestations are the same
+#   proposition; normalizing is what makes the arm portable.
 #
 #   The ssl.* stat family. Observed live on the reference, but envoy-go emits NO
 #   ssl.* stats whatsoever (the only listener-scope counter is

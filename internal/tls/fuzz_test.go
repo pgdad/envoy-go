@@ -207,14 +207,15 @@ func FuzzTLSContextParse(f *testing.F) {
 		f.Add("downstream-sds", anyTC.GetTypeUrl(), anyTC.GetValue())
 	}
 
-	// Seed (i), phase 66 task 5: E3's shape — a well-formed
-	// combined_validation_context with require_client_certificate: false,
-	// dispatched via "downstream-sds". commonTLSContextToConfig SUCCEEDS (the CVC
-	// arm is a well-formed NO-OP), so NewDownstreamConfig reaches its own C1/D1
-	// guard (the isCVC + !GetRequireClientCertificate().GetValue() check that
-	// precedes the require_client_certificate block): "combined_validation_context
-	// requires require_client_certificate: true in phase 03". Mirrors the
-	// "require_client_certificate: false" case of TestCVC_RequireFalse_Rejected_E3.
+	// Seed (i), phase 67: a well-formed combined_validation_context with
+	// require_client_certificate: false, dispatched via "downstream-sds".
+	// commonTLSContextToConfig SUCCEEDS (the CVC arm is a well-formed NO-OP), and
+	// NewDownstreamConfig now HONORS the anchor via verify-if-presented — E3 is
+	// RETIRED (phase 67, SPEC §10). The un-gated CVC arm fetches the SDS-delivered
+	// pool, installs it as ClientCAs, and sets ClientAuth = VerifyClientCertIfGiven:
+	// the input CONSUMES the validation_context and returns no error. Mirrors the
+	// "require_client_certificate: false" case of
+	// TestNewDownstreamConfig_RequireFalse_CVC_VerifyIfGiven.
 	{
 		inner := &tlsv3.DownstreamTlsContext{
 			RequireClientCertificate: &wrapperspb.BoolValue{Value: false},
@@ -321,6 +322,118 @@ func FuzzTLSContextParse(f *testing.F) {
 			f.Fatalf("anypb.New: %v", err)
 		}
 		f.Add("downstream", anyTC.GetTypeUrl(), anyTC.GetValue())
+	}
+
+	// Seed (o), phase 67 task 3: inline trusted_ca (a direct validation_context,
+	// not SDS/CVC) + a leaf + require_client_certificate: false, dispatched via
+	// "downstream" (a NIL provider — inline needs none: loadTrustedCAPool reads
+	// the DataSource directly). NewDownstreamConfig's require block falls to the
+	// default (non-SDS, non-CVC) arm, finds vc.GetTrustedCa() non-nil, loads the
+	// pool, and installPool sets ClientAuth = VerifyClientCertIfGiven (the
+	// hoisted "anchor + require=false/absent" case, SPEC §10). err nil.
+	{
+		inner := &tlsv3.DownstreamTlsContext{
+			RequireClientCertificate: &wrapperspb.BoolValue{Value: false},
+			CommonTlsContext: &tlsv3.CommonTlsContext{
+				TlsCertificates: []*tlsv3.TlsCertificate{{
+					CertificateChain: inlineBytes(pki.leafCertPEM),
+					PrivateKey:       inlineBytes(pki.leafKeyPEM),
+				}},
+				ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+					ValidationContext: &tlsv3.CertificateValidationContext{
+						TrustedCa: inlineBytes(pki.caPEM),
+					},
+				},
+			},
+		}
+		anyTC, err := anypb.New(inner)
+		if err != nil {
+			f.Fatalf("anypb.New: %v", err)
+		}
+		f.Add("downstream", anyTC.GetTypeUrl(), anyTC.GetValue())
+	}
+
+	// Seed (p), phase 67 task 3: the ABSENT twin of seed (o) — the identical
+	// inline anchor + leaf, but require_client_certificate is OMITTED entirely
+	// (nil *wrapperspb.BoolValue), still dispatched via "downstream".
+	// GetValue() on a nil BoolValue returns false, so this reaches the SAME
+	// hoisted "anchor + require=false/absent -> VerifyClientCertIfGiven" case as
+	// seed (o); err nil.
+	{
+		inner := &tlsv3.DownstreamTlsContext{
+			CommonTlsContext: &tlsv3.CommonTlsContext{
+				TlsCertificates: []*tlsv3.TlsCertificate{{
+					CertificateChain: inlineBytes(pki.leafCertPEM),
+					PrivateKey:       inlineBytes(pki.leafKeyPEM),
+				}},
+				ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+					ValidationContext: &tlsv3.CertificateValidationContext{
+						TrustedCa: inlineBytes(pki.caPEM),
+					},
+				},
+			},
+		}
+		anyTC, err := anypb.New(inner)
+		if err != nil {
+			f.Fatalf("anypb.New: %v", err)
+		}
+		f.Add("downstream", anyTC.GetTypeUrl(), anyTC.GetValue())
+	}
+
+	// Seed (q), phase 67 task 3: an SDS-bound validation_context_sds_secret_config
+	// + a leaf + require_client_certificate: false, dispatched via
+	// "downstream-sds" (cvcFuzzProvider — a LIVE provider). THE NAMED VACUITY TRAP
+	// (SPEC §7): riding "downstream" (nil provider) instead would make this shape
+	// die at commonTLSContextToConfig's retained "SDS-bound
+	// validation_context_sds_secret_config is not supported in phase 03" gate
+	// BEFORE ever reaching NewDownstreamConfig's hoisted require block — pinning
+	// only the "tls: "-prefix invariant, not the verify-if-presented mapping (the
+	// exact phase-66 T5 vacuity). On "downstream-sds",
+	// commonTLSContextToConfig's ValidationContextSdsSecretConfig arm NO-OPs
+	// (side=="downstream" && provider!=nil); NewDownstreamConfig's own
+	// ValidationContextSdsSecretConfig case then fetches cvcFuzzProvider's pool
+	// via ParseSDSConfig + FetchInitialValidationContext, and installPool sets
+	// ClientAuth = VerifyClientCertIfGiven (require=false + anchor). err nil.
+	{
+		inner := &tlsv3.DownstreamTlsContext{
+			RequireClientCertificate: &wrapperspb.BoolValue{Value: false},
+			CommonTlsContext: &tlsv3.CommonTlsContext{
+				TlsCertificates: []*tlsv3.TlsCertificate{{
+					CertificateChain: inlineBytes(pki.leafCertPEM),
+					PrivateKey:       inlineBytes(pki.leafKeyPEM),
+				}},
+				ValidationContextType: &tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
+					ValidationContextSdsSecretConfig: sdsSecretConfig("validation_ca", "sds_cluster"),
+				},
+			},
+		}
+		anyTC, err := anypb.New(inner)
+		if err != nil {
+			f.Fatalf("anypb.New: %v", err)
+		}
+		f.Add("downstream-sds", anyTC.GetTypeUrl(), anyTC.GetValue())
+	}
+
+	// Seed (r), phase 67 task 3: a well-formed combined_validation_context
+	// (cvcCTC(), both halves present) with require_client_certificate ABSENT
+	// (nil BoolValue), dispatched via "downstream-sds" — completes the CVC pair:
+	// seed (i) above is the require=false twin; this is its absent twin, landing
+	// the SAME un-gated CVC arm (GetValue() on nil returns false). Same NAMED
+	// VACUITY TRAP as seed (q): on "downstream" this shape would die at the
+	// retained "combined_validation_context is not supported in phase 03" gate.
+	// On "downstream-sds", commonTLSContextToConfig's CombinedValidationContext
+	// arm NO-OPs past E1/E2 (both halves present); NewDownstreamConfig's
+	// CombinedValidationContext case fetches cvcFuzzProvider's pool and
+	// installPool sets ClientAuth = VerifyClientCertIfGiven. err nil.
+	{
+		inner := &tlsv3.DownstreamTlsContext{
+			CommonTlsContext: cvcCTC(),
+		}
+		anyTC, err := anypb.New(inner)
+		if err != nil {
+			f.Fatalf("anypb.New: %v", err)
+		}
+		f.Add("downstream-sds", anyTC.GetTypeUrl(), anyTC.GetValue())
 	}
 
 	f.Fuzz(func(t *testing.T, side, typeURL string, value []byte) {

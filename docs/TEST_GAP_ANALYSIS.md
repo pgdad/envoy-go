@@ -135,10 +135,13 @@ transitions, TLS *config-build* rejections. Gaps (see §4 for ranking):
   code path (returns `ActionResponse{Status: resp.StatusCode}, picked, err` with a partial
   status and no body) exercised by no test.
 - **Runtime TLS handshake failures** — partially closed in this pass (see §3): a live
-  aborted-handshake test for unmatched-SNI-with-no-catch-all now exists. Still uncovered:
-  missing client cert vs `RequireAndVerifyClientCert` (blocked — envoy-go build-rejects
-  `require_client_certificate`, so there is no runtime mTLS to drive) and ALPN negotiation
-  failure.
+  aborted-handshake test for unmatched-SNI-with-no-catch-all now exists. Missing-client-cert
+  rejection vs `RequireAndVerifyClientCert` is also covered: `require_client_certificate` has
+  been a supported runtime feature since phase 16/ADR-0147 (this bullet's "build-rejects"
+  claim was stale against that row, pre-dating phase 67 — corrected here in passing, not new
+  drift this row created), and verify-if-presented mTLS at false/absent landed at phase
+  67/ADR-0289. Runtime mTLS is drivable and exercised by fixtures 0018/0108/0109/0110. Still
+  uncovered: ALPN negotiation failure.
 - **No downstream `idle_timeout` / `stream_idle_timeout` / `request_timeout`** exists at
   the HCM level at all — a slow/idle client is never timed out (feature gap, not just a
   test gap).
@@ -200,9 +203,11 @@ Ordered by (a) risk of silent incorrectness vs Envoy, (b) breadth of code exerci
    stream-reset — must be pinned to Envoy, not guessed). Low-medium effort.
 
 3. **Remaining runtime TLS handshake-failure tests.** The unmatched-SNI-no-catch-all abort
-   is now covered (§3). Still open: ALPN negotiation failure; and missing-client-cert
-   rejection — the latter first needs `require_client_certificate` to be a supported runtime
-   feature (it currently build-rejects), so feature + test land together. Low-medium effort.
+   is now covered (§3). Missing-client-cert rejection is also now covered: `require_client_certificate`
+   has been a supported runtime feature since phase 16/ADR-0147 (this item's "build-rejects"
+   framing was stale against that row, pre-dating phase 67 — corrected here in passing) and
+   verify-if-presented at false/absent landed at phase 67/ADR-0289 — see fixtures
+   0018/0108/0109/0110. Still open: ALPN negotiation failure. Low-medium effort.
 
 4. **Downstream timeout coverage** — but the feature (`idle_timeout` /
    `stream_idle_timeout` / `request_timeout`) does not exist yet; the test and the feature
@@ -260,9 +265,13 @@ The phase-driven TDD process left the new surface in strong shape at the UNIT
 level: SDS provider fetch classification (success / timeout / mgmt-down /
 rejected, for both resource types), the `NewSDSProvider` pre-scan arms (all three
 SDS shapes, the seen>1 compose-two reject, node-required, ADS reject), the
-phase-66 E3 security reject (a CVC listener with `require_client_certificate`
-false/absent CANNOT boot — pinned twice, by message and by the
-`ClientAuth != NoClientCert` property test), all four CVC sub-field rejects
+phase-66 E3 security reject — *(RETIRED at phase 67/ADR-0289.)* Previously, a CVC
+listener with `require_client_certificate` false/absent CANNOT boot — pinned twice,
+by message and by the `ClientAuth != NoClientCert` property test; phase 67 lifts
+verify-if-presented across all three validation shapes and retires E3, so the
+property test now pins `ClientAuth == VerifyClientCertIfGiven` for that shape, and
+the pin-twice discipline (property test + differential fixture, now `0110`) carries
+forward — all four CVC sub-field rejects
 re-pointed at `default_validation_context`, malformed-served-secret rejection
 (wrong name / wrong oneof / bad PEM / unsupported sub-fields), and an
 `FuzzDiscoveryResponseParse` fuzzer over both Secret parse chains. The three
@@ -381,10 +390,15 @@ Docker differential fixtures 0103/0108/0109 pin the cross-side behavior.
 1. **Harden H1 request framing to Envoy semantics + differential fixture**
    (unchanged #1; ADR + BEHAVIOR_CONTRACT + phase machinery required — the four
    characterized divergences include the TE+CL smuggling vector).
-2. **Resolve the D-RCCF-FETCHFAIL-POSTURE drift** with the discriminating
-   reference probe phase 67 already obligates, then reconcile the three
-   serve-anyway doc sites (or pin the departure explicitly). The envoy-go-side
-   posture is now locked by `boot_sds_e2e_test.go` either way.
+2. *(COMPLETED at phase 67/ADR-0289.)* The D-RCCF-FETCHFAIL-POSTURE drift is resolved:
+   the discriminating reference probe (P1 — {server-cert, validation-context} ×
+   {silent, unreachable}, all four cells identical) ran at the phase-67 SPEC, and
+   all FIVE living serve-anyway sites — not three — are reconciled at the phase-67
+   IMPL: `BEHAVIOR_CONTRACT.md:900` (B2), `internal/tls/config.go:115-117` (B11),
+   the DECISIONS.md ADR-0286 D-SDSVC-FETCHTIMEOUT bullet (B12),
+   `internal/xds/provider.go:91-93` (B16), and `internal/tls/config_test.go:999`
+   (B17). The envoy-go-side posture was already locked by `boot_sds_e2e_test.go`
+   either way.
 3. **Downstream idle/stream/request timeout support + tests** (feature+test;
    thread `internal/clock` for determinism) — unchanged.
 4. **Oversized-header enforcement** (`max_request_headers_kb`, H2

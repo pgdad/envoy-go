@@ -1,28 +1,27 @@
-# Reference Envoy bootstrap for fixture 0109-xds-sds-combined-validation-context.
+# Reference Envoy bootstrap for fixture 0110-tls-require-client-cert-false.
 #
-# A disciplined clone of 0108-xds-sds-validation-context. Single-listener
-# downstream-mTLS topology (phase 66 — the SDS combined_validation_context (CVC)
-# apply differential). One TLS-terminating tcp_proxy listener (l_sds_cvc) whose
-# DownstreamTlsContext carries require_client_certificate: true, a STATIC inline
-# server cert, and a combined_validation_context.
+# A disciplined clone of 0109-xds-sds-combined-validation-context. Single-listener
+# downstream-mTLS topology (phase 67 — the require_client_certificate: false
+# verify-if-presented differential). One TLS-terminating tcp_proxy listener
+# (l_rccf) whose DownstreamTlsContext carries require_client_certificate: FALSE, a
+# STATIC inline server cert, and a combined_validation_context (CVC).
 #
-# THE DELTA vs 0108: where 0108 uses a bare validation_context_sds_secret_config,
-# 0109 nests it inside combined_validation_context alongside an INLINE
-# default_validation_context.trusted_ca (CA_Y). The SDS-delivered CA (CA_X) MUST
-# REPLACE that inline default — never union with it. The served wire is
-# byte-identical to 0108's; the management server cannot tell a CVC client from a
-# plain-SDS client (SPEC §8).
+# THE DELTA vs 0109: require_client_certificate flips true -> FALSE. At false the
+# server does verify-if-presented (Go: VerifyClientCertIfGiven): a presented cert
+# is verified against the served pool and rejected if untrusted, but a NO-CERT
+# connection is ACCEPTED. The CVC shape is retained unchanged: the SDS-delivered CA
+# (CA_X) MUST REPLACE the inline default_validation_context.trusted_ca (CA_Y) —
+# never union with it. The served wire is byte-identical to 0109's; the management
+# server cannot tell a CVC client from a plain-SDS client (SPEC §8).
 #
-# require_client_certificate: true was MANDATORY under phase-66 scope (PLAN-66
-# D1): without it envoy-go rejected the CVC at parse time (the E3 guard).
-# Phase 67/ADR-0289 lifts E3 — require_client_certificate is now a CHOICE for
-# the CVC shape (verify-if-presented at false/absent; fixture 0110 covers it).
-# This fixture retains true to keep its cross-CA substitution observable.
+# require_client_certificate: false is verify-if-presented, NOT mandatory mTLS. The
+# no-cert arm is the DISCRIMINATOR: it is ACCEPTED here and would be REJECTED (TLS
+# alert 116) at require=true (0109). This is the whole point of the flip.
 #
-# The observable is the driver's normalized accept/reject verdict over two client
-# certs (client_X chaining to the SERVED CA_X, client_Y chaining to the INLINE
-# CA_Y) — NOT the served leaf identity and NOT a stat (envoy-go emits no ssl.*
-# family; see README).
+# The observable is the driver's normalized accept/reject verdict over THREE arms
+# (client_X chaining to the SERVED CA_X — accepted; client_Y chaining to the INLINE
+# CA_Y, FORCED-SEND — rejected; NO client cert — accepted) — NOT the served leaf
+# identity and NOT a stat (envoy-go emits no ssl.* family; see README).
 #
 # node: {id, cluster} is REQUIRED — SDS boot-fails without it.
 #
@@ -61,15 +60,15 @@ admin:
 
 static_resources:
   listeners:
-    - name: l_sds_cvc
+    - name: l_rccf
       address:
-        socket_address: { address: 0.0.0.0, port_value: 10445 }
+        socket_address: { address: 0.0.0.0, port_value: 10446 }
       filter_chains:
         - transport_socket:
             name: envoy.transport_sockets.tls
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
-              require_client_certificate: true
+              require_client_certificate: false
               common_tls_context:
                 tls_certificates:
                   - certificate_chain:
@@ -84,7 +83,7 @@ static_resources:
                       inline_string: |
 {{.InlineCA}}
                   validation_context_sds_secret_config:
-                    name: validation_ca
+                    name: rccf_validation_ca
                     sds_config:
                       resource_api_version: V3
                       api_config_source:
@@ -97,12 +96,12 @@ static_resources:
             - name: envoy.filters.network.tcp_proxy
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                stat_prefix: ingress_sds_cvc
+                stat_prefix: ingress_rccf
                 cluster: c_backend
 
   clusters:
-    # c_backend: TCP echo backend (BackendCount=1). The good arm writes a payload
-    # and reads the echo back through it.
+    # c_backend: TCP echo backend (BackendCount=1). The accepting arms write a
+    # payload and read the echo back through it.
     - name: c_backend
       type: STRICT_DNS
       connect_timeout: 1s
