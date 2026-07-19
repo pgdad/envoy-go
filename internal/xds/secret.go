@@ -126,6 +126,23 @@ func parseValidationSecret(resource *anypb.Any, wantName, baseDir string) (*x509
 	if len(vc.GetVerifyCertificateSpki()) > 0 {
 		return nil, fmt.Errorf("xds: sds: validation secret %q: verify_certificate_spki is not supported", wantName)
 	}
+	if vc.GetTrustedCa() == nil {
+		// S1: the validation_context ACKs with trusted_ca ABSENT ENTIRELY (an
+		// entirely empty CertificateValidationContext — a PGV-valid message). The
+		// reference ACKs this and merges the empty context away, so the default's
+		// trusted_ca survives and the listener serves; classify it so internal/tls
+		// can fall back (phase 68, ADR-0290).
+		//
+		// This gate is NARROW by design. A present-but-specifier-unset
+		// trusted_ca:{} (a DataSource with the specifier oneof unset) is NOT a
+		// fallback trigger: the reference PGV-NACKs that served secret
+		// (CertificateValidationContext.TrustedCa … field: "specifier", reason:
+		// is required — SPEC-66 §3.9(b)/ADR-0287 live probe). It therefore falls
+		// through to the dataSourceBytes no-specifier reject below and stays a
+		// plain errValidation boot-FAIL, exactly like a set-but-empty
+		// inline_bytes:"" (S2) or a corrupt PEM (S3).
+		return nil, fmt.Errorf("xds: sds: validation secret %q: %w", wantName, ErrEmptyValidationContext)
+	}
 	caPEM, err := dataSourceBytes(vc.GetTrustedCa(), baseDir)
 	if err != nil {
 		return nil, fmt.Errorf("xds: sds: validation secret %q: trusted_ca: %w", wantName, err)

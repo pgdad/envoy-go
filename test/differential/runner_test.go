@@ -135,6 +135,7 @@ import (
 	_ "github.com/pgdad/envoy-go/test/fixtures/0108-xds-sds-validation-context/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0109-xds-sds-combined-validation-context/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0110-tls-require-client-cert-false/driver"
+	_ "github.com/pgdad/envoy-go/test/fixtures/0111-tls-cvc-empty-dynamic-fallback/driver"
 	"github.com/pgdad/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

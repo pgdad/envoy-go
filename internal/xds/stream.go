@@ -32,6 +32,17 @@ type Stream interface {
 // the caller increments update_rejected), distinct from a transport error.
 var errValidation = errors.New("xds: sds: secret validation failed")
 
+// ErrEmptyValidationContext classifies an SDS-delivered validation_context whose
+// trusted_ca is ABSENT ENTIRELY (the reference's ACK-and-merge-empty shape). It is
+// wrapped ALONGSIDE errValidation (dual-%w in applyValidationResponse) so the
+// provider still NACKs (update_rejected) while internal/tls can errors.Is it and
+// fall back to default_validation_context.trusted_ca (phase 68, ADR-0290). A
+// present-but-specifier-unset trusted_ca:{} is NOT classified — the reference
+// PGV-NACKs it (specifier … is required, ADR-0287) — nor is a set-but-empty
+// (inline_bytes:"") or corrupt trusted_ca, nor a zero-resource response; those all
+// stay plain errValidation boot-FAILs, matching the reference's NACK.
+var ErrEmptyValidationContext = errors.New("xds: sds: validation_context has no usable trusted_ca specifier")
+
 // fetchSecret runs one State-of-the-World fetch: sends the initial DiscoveryRequest
 // for secretName, Recv's the first response, parses+validates its Secret, and ACKs
 // (echoing version_info+nonce) on success or NACKs (keeping the prior version,
@@ -161,7 +172,7 @@ func applyValidationResponse(resp *discoveryv3.DiscoveryResponse, secretName, ba
 	}
 	pool, err := parseValidationSecret(resp.GetResources()[0], secretName, baseDir)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errValidation, err)
+		return nil, fmt.Errorf("%w: %w", errValidation, err)
 	}
 	return pool, nil
 }

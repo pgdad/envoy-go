@@ -1,0 +1,138 @@
+# Reference Envoy bootstrap for fixture 0111-tls-cvc-empty-dynamic-fallback.
+#
+# A disciplined clone of 0110-tls-require-client-cert-false. Single-listener
+# downstream-mTLS topology (phase 68 — the empty-dynamic-fallback differential).
+# One TLS-terminating tcp_proxy listener (l_edf) whose DownstreamTlsContext carries
+# require_client_certificate: TRUE, a STATIC inline server cert, and a
+# combined_validation_context (CVC).
+#
+# THE DELTA vs 0110: the SDS-delivered dynamic validation_context is served EMPTY
+# (validation_context:{} with trusted_ca UNSET — the fully-absent-trusted_ca S1 shape). The
+# reference ACKs it, MERGES it away (an empty half contributes nothing), and FALLS
+# BACK to the inline default_validation_context.trusted_ca (CA_A). So CA_A is the
+# LIVE trust anchor here — the inverse of 0110, where the SDS-served CA won and the
+# inline default lost. require_client_certificate flips false -> TRUE: mandatory
+# mTLS against the FALLBACK anchor.
+#
+# require_client_certificate: true is mandatory mTLS. The no-cert arm is REJECTED
+# with TLS alert 116 (certificate_required) — proving require=true is ENFORCED
+# against the fallback anchor.
+#
+# The observable is the driver's normalized accept/reject verdict over THREE arms
+# (client_A chaining to the inline default CA_A / fallback anchor — accepted;
+# client_B chaining to a FOREIGN CA_B, FORCED-SEND — rejected; NO client cert —
+# rejected) — NOT the served leaf identity and NOT a stat (envoy-go emits no ssl.*
+# family; see README).
+#
+# node: {id, cluster} is REQUIRED — SDS boot-fails without it.
+#
+# Templating: rendered by the driver's mustRender() at ReferenceBootstrap time.
+# Substitution keys:
+#   {{.SDSHost}}     — driver-owned SDS receiver host (host.docker.internal
+#                       for the reference container per ADR-0010).
+#   {{.SDSPort}}     — driver-owned SDS receiver port (driver-allocated; the
+#                       in-process sdsserver.Server binds 0.0.0.0:<port>
+#                       before the container starts). Serves an EMPTY
+#                       validation_context (S1) under secret edf_validation_ca.
+#   {{.BackendPort}} — TCP echo backend port (runner-allocated; reached via
+#                       host.docker.internal).
+#   .ServerCert      — server leaf PEM (signed by CA_A), generated in-memory per
+#                       run and injected inline_string. Pre-indented to 24 spaces.
+#   .ServerKey       — the leaf's ECDSA P-256 key PEM, likewise.
+#   .InlineCA        — CA_A PEM, the inline default_validation_context.trusted_ca
+#                       (the FALLBACK anchor). Pre-indented to 26 spaces.
+#
+# NOTE: the three PEM keys above are deliberately written WITHOUT their
+# double-brace template-action delimiters. text/template expands actions inside
+# YAML comments too, and a multi-line PEM expanded into a "#" comment line
+# splatters its continuation lines outside the comment and produces invalid YAML.
+# The single-line keys above stay delimited safely because their values are
+# single-line scalars; the multi-line PEMs must not be.
+#
+# Cluster types: STRICT_DNS so the reference Envoy container resolves
+# host.docker.internal (the Docker bridge host alias per ADR-0010).
+# dns_lookup_family: V4_ONLY per the established fixture precedent.
+node:
+  id: envoygo-node
+  cluster: envoygo-cluster
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: l_edf
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10447 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      inline_string: |
+{{.ServerCert}}
+                    private_key:
+                      inline_string: |
+{{.ServerKey}}
+                combined_validation_context:
+                  default_validation_context:
+                    trusted_ca:
+                      inline_string: |
+{{.InlineCA}}
+                  validation_context_sds_secret_config:
+                    name: edf_validation_ca
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc:
+                              cluster_name: sds_cluster
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_edf
+                cluster: c_backend
+
+  clusters:
+    # c_backend: TCP echo backend (BackendCount=1). The accepting arm writes a
+    # payload and reads the echo back through it.
+    - name: c_backend
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: host.docker.internal, port_value: {{.BackendPort}} }
+    # sds_cluster: driver-owned in-process sdsserver.Server SDS receiver.
+    # MANDATORY http2_protocol_options: {} for gRPC framing. Plaintext h2c —
+    # no TLS. STRICT_DNS so the container can resolve the bridge hostname.
+    - name: sds_cluster
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: sds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{.SDSHost}}, port_value: {{.SDSPort}} }

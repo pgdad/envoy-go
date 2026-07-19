@@ -1800,6 +1800,156 @@ func TestCVC_EmptyDynamicVC_BootFails(t *testing.T) {
 	}
 }
 
+// --- Phase 68 T2: the empty-dynamic fallback + empty-both routing ---
+
+// cvcSentinelErr models the real dual-wrapped chain on the ONE bit config.go
+// reads — errors.Is(err, xds.ErrEmptyValidationContext) — for a served
+// validation_context whose trusted_ca is absent entirely (S1). The real chain
+// (internal/xds's parseValidationSecret + applyValidationResponse, T1) also
+// carries the unexported errValidation dual-%w'd alongside the sentinel; that
+// second bit is not observable from this package and is not modeled here.
+var cvcSentinelErr = fmt.Errorf("xds: sds: validation secret %q: %w", "x", xds.ErrEmptyValidationContext)
+
+// TestNewDownstreamConfig_CVC_EmptyDynamic_FallsBackToDefault pins the T2
+// fallback: an ACKed-but-empty dynamic fetch (the sentinel) with a CVC whose
+// default_validation_context carries a valid trusted_ca falls back to that
+// default and SERVES, at both require=true and require=false/absent.
+func TestNewDownstreamConfig_CVC_EmptyDynamic_FallsBackToDefault(t *testing.T) {
+	t.Run("require_client_certificate: true", func(t *testing.T) {
+		ts := cvcDownstreamTS(t, &wrapperspb.BoolValue{Value: true})
+		cfg, err := NewDownstreamConfig(ts, "", &fakeProvider{vcErr: cvcSentinelErr})
+		if err != nil {
+			t.Fatalf("NewDownstreamConfig: unexpected err %v — the sentinel-shaped empty-dynamic fetch must fall back to the default anchor and serve", err)
+		}
+		if cfg == nil || cfg.TLSConfig == nil {
+			t.Fatal("NewDownstreamConfig returned a nil cfg/TLSConfig")
+		}
+		if cfg.TLSConfig.ClientCAs == nil {
+			t.Error("ClientCAs is nil — the default_validation_context.trusted_ca fallback pool was not installed")
+		}
+		if cfg.TLSConfig.ClientAuth != stdtls.RequireAndVerifyClientCert {
+			t.Errorf("ClientAuth = %v, want RequireAndVerifyClientCert", cfg.TLSConfig.ClientAuth)
+		}
+	})
+
+	for _, tc := range requireFalseCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := cvcDownstreamTS(t, tc.require)
+			cfg, err := NewDownstreamConfig(ts, "", &fakeProvider{vcErr: cvcSentinelErr})
+			if err != nil {
+				t.Fatalf("NewDownstreamConfig: unexpected err %v — the sentinel-shaped empty-dynamic fetch must fall back to the default anchor and serve", err)
+			}
+			if cfg == nil || cfg.TLSConfig == nil {
+				t.Fatal("NewDownstreamConfig returned a nil cfg/TLSConfig")
+			}
+			if cfg.TLSConfig.ClientCAs == nil {
+				t.Error("ClientCAs is nil — the default_validation_context.trusted_ca fallback pool was not installed")
+			}
+			if cfg.TLSConfig.ClientAuth != stdtls.VerifyClientCertIfGiven {
+				t.Errorf("ClientAuth = %v, want VerifyClientCertIfGiven", cfg.TLSConfig.ClientAuth)
+			}
+		})
+	}
+}
+
+// TestNewDownstreamConfig_CVC_EmptyBoth_NoAnchor pins the empty-both routing:
+// the sentinel-shaped empty-dynamic fetch WITH a CVC whose
+// default_validation_context ALSO carries no trusted_ca routes through the
+// phase-67 no-anchor logic exactly like the inline default arm — a require:true
+// listener boot-rejects with the byte-identical :203 message; require:false/
+// absent yields NoClientCert with no pool installed (no new reject).
+func TestNewDownstreamConfig_CVC_EmptyBoth_NoAnchor(t *testing.T) {
+	ctc := cvcCTC(func(c *tlsv3.CommonTlsContext_CombinedCertificateValidationContext) {
+		c.DefaultValidationContext = &tlsv3.CertificateValidationContext{}
+	})
+
+	t.Run("require_client_certificate: true", func(t *testing.T) {
+		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+			RequireClientCertificate: &wrapperspb.BoolValue{Value: true},
+			CommonTlsContext:         ctc,
+		})
+		cfg, err := NewDownstreamConfig(ts, "", &fakeProvider{vcErr: cvcSentinelErr})
+		if err == nil {
+			t.Fatal("expected the require+no-anchor reject, got nil")
+		}
+		const want = "require_client_certificate=true requires validation_context.trusted_ca"
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain the byte-identical :203 message %q", err.Error(), want)
+		}
+		if cfg != nil {
+			t.Errorf("cfg = %+v, want nil on the empty-both require:true reject", cfg)
+		}
+	})
+
+	for _, tc := range requireFalseCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+				RequireClientCertificate: tc.require,
+				CommonTlsContext:         ctc,
+			})
+			cfg, err := NewDownstreamConfig(ts, "", &fakeProvider{vcErr: cvcSentinelErr})
+			if err != nil {
+				t.Fatalf("NewDownstreamConfig: unexpected err %v — empty-both at false/absent must yield NoClientCert, not an error", err)
+			}
+			if cfg == nil || cfg.TLSConfig == nil {
+				t.Fatal("NewDownstreamConfig returned a nil cfg/TLSConfig")
+			}
+			if cfg.TLSConfig.ClientAuth != stdtls.NoClientCert {
+				t.Errorf("ClientAuth = %v, want NoClientCert (zero value)", cfg.TLSConfig.ClientAuth)
+			}
+			if cfg.TLSConfig.ClientCAs != nil {
+				t.Error("ClientCAs is non-nil, want nil — empty-both must not install a pool")
+			}
+		})
+	}
+}
+
+// TestNewDownstreamConfig_CVC_SetButEmpty_And_Corrupt_BootFail pins the NARROW
+// gate at the consumer: a fetch error that does NOT carry
+// xds.ErrEmptyValidationContext (a set-but-empty trusted_ca specifier, a
+// corrupt served PEM, a timeout, or an unreachable management server) does NOT
+// fall back — it boot-FAILS, even though the CVC's default_validation_context
+// carries a VALID trusted_ca. Building the CVC with a valid default (rather
+// than an empty one) is deliberate (M3): it is what makes this test
+// DISCRIMINATE Break C (widening errors.Is to fire on any error), because an
+// empty default would boot-FAIL via the empty-both branch regardless of the
+// gate. This test is expected ALREADY GREEN before the fallback branch exists
+// (the pre-T2 code boot-FAILs on every fetch error) — a regression pin, no red
+// owed.
+func TestNewDownstreamConfig_CVC_SetButEmpty_And_Corrupt_BootFail(t *testing.T) {
+	nonSentinelErr := errors.New("xds: sds: validation secret \"x\": trusted_ca: parse failure")
+	ts := cvcDownstreamTS(t, &wrapperspb.BoolValue{Value: true})
+	cfg, err := NewDownstreamConfig(ts, "", &fakeProvider{vcErr: nonSentinelErr})
+	if err == nil {
+		t.Fatal("expected a boot failure for a non-sentinel fetch error, got nil — the fallback fired where it must not")
+	}
+	if cfg != nil {
+		t.Errorf("cfg = %+v, want nil on a boot failure", cfg)
+	}
+}
+
+// TestNewDownstreamConfig_CVC_EmptyDynamic_RequireEnforcedAgainstFallback pins
+// the require x fallback cross-product at the unit level: require=true +
+// sentinel + a valid default yields RequireAndVerifyClientCert with a non-nil
+// ClientCAs pool. The wire-level CA_B-reject / no-cert-reject behavior against
+// this fallback anchor is the fixture's job (T5), not this unit test's.
+func TestNewDownstreamConfig_CVC_EmptyDynamic_RequireEnforcedAgainstFallback(t *testing.T) {
+	ts := cvcDownstreamTS(t, &wrapperspb.BoolValue{Value: true})
+	cfg, err := NewDownstreamConfig(ts, "", &fakeProvider{vcErr: cvcSentinelErr})
+	if err != nil {
+		t.Fatalf("NewDownstreamConfig: unexpected err %v", err)
+	}
+	if cfg == nil || cfg.TLSConfig == nil {
+		t.Fatal("NewDownstreamConfig returned a nil cfg/TLSConfig")
+	}
+	if cfg.TLSConfig.ClientAuth != stdtls.RequireAndVerifyClientCert {
+		t.Errorf("ClientAuth = %v, want RequireAndVerifyClientCert", cfg.TLSConfig.ClientAuth)
+	}
+	if cfg.TLSConfig.ClientCAs == nil {
+		t.Error("ClientCAs is nil, want the installed fallback pool")
+	}
+}
+
 // TestSDSVC_And_Inline_Paths_Unchanged: the 3-way branch must not regress either
 // landed arm. The SDS-VC arm (phase 65) still fetches and installs; the inline
 // arm (phase 16) still loads trusted_ca and still refuses a require:true listener

@@ -1,0 +1,200 @@
+# Phase 68 fixture 0111-tls-cvc-empty-dynamic-fallback expectations
+# (ADR-0019 — prose; the driver is the enforcer via its per-side structural check
+# AND the runner's CompareBytes; this file is documentation).
+#
+# A disciplined clone of 0110-tls-require-client-cert-false. Same CVC shape, same
+# PKI machinery, same per-side SDS receivers. TWO semantic deltas: (1) the SDS half
+# is served EMPTY (validation_context:{} with trusted_ca UNSET — the
+# fully-absent-trusted_ca S1 shape), so the trust anchor FALLS BACK to the inline
+# default; (2)
+# require_client_certificate flips false -> TRUE (mandatory mTLS against the
+# fallback anchor).
+#
+# ## The proposition
+#
+#   When the SDS-delivered dynamic validation_context ACKs EMPTY (S1,
+#   trusted_ca-absent), the CVC FALLS BACK to the inline
+#   default_validation_context.trusted_ca (CA_A) and SERVES — matching the
+#   reference's MergeFrom (an empty half contributes nothing, so the inline
+#   default survives). At require_client_certificate=true this is mandatory mTLS
+#   against the FALLBACK anchor:
+#     - client_A (chains to the inline default CA_A) is ACCEPTED (the fallback is
+#       LIVE and the anchor is CA_A);
+#     - client_B (chains to a FOREIGN CA_B, FORCED-SEND) is REJECTED — the served
+#       pool is CA_A SPECIFICALLY: the untrusted arm UPPER-BOUNDS the fallback pool
+#       (a CA_A∪CA_B union / accept-all pool would accept client_B);
+#     - a NO-CERT connection is REJECTED (alert 116) — require=true is ENFORCED
+#       against the fallback anchor.
+#
+# 0110 proves the SDS-served CA REPLACES the inline default under verify-if-presented.
+# 0111 INVERTS the CA roles: the SDS half is EMPTY, so the inline default WINS via
+# the phase-68 fallback, under MANDATORY mTLS. Three arms discriminate:
+#   (1) trusted   — the fallback is LIVE and the anchor is CA_A (client_A accepted+echo);
+#   (2) untrusted — the fallback pool is CA_A ONLY (client_B rejected — a union accepts it);
+#   (3) none      — require=true is ENFORCED against the fallback (no-cert rejected, alert 116).
+#
+# Topology (single-listener downstream-mTLS tcp_proxy; driver-owned in-process
+# SDS gRPC receiver; TCP echo backend):
+#   l_edf      — one TLS-terminating tcp_proxy listener. Its DownstreamTlsContext
+#                carries:
+#                  require_client_certificate: true      <- mandatory mTLS
+#                    (Go: RequireAndVerifyClientCert against the fallback pool).
+#                  common_tls_context.tls_certificates = [{ inline_string
+#                    server leaf (signed by CA_A) + key }]   <- STATIC, per-run.
+#                  common_tls_context.combined_validation_context = {
+#                    default_validation_context: { trusted_ca: { inline_string
+#                      CA_A PEM } },                          <- INLINE fallback anchor
+#                    validation_context_sds_secret_config: {
+#                      name: edf_validation_ca,
+#                      sds_config: { resource_api_version: V3,
+#                        api_config_source: { api_type: GRPC,
+#                          transport_api_version: V3,
+#                          grpc_services: [{envoy_grpc:
+#                            {cluster_name: sds_cluster}}] } } } }   <- served EMPTY (S1)
+#                No tls_inspector — a single filter chain, no SNI match.
+#   c_backend  — TCP echo backend (BackendCount=1). The accepting arm writes a
+#                payload through the tcp_proxy and reads the echo back.
+#   sds_cluster — driver-owned in-process test/helpers/sdsserver.Server SDS
+#                receiver (SotW StreamSecrets). The driver starts TWO private
+#                receivers — one per side — on two separately-allocated ports,
+#                each bound 0.0.0.0:<port>, BOTH serving an EMPTY validation_context
+#                (validation_context:{}, trusted_ca UNSET — S1) under name
+#                "edf_validation_ca" via sdsserver.WithEmptyValidationContext. The
+#                management server cannot tell a CVC client from a plain-SDS client
+#                (SPEC §8). MANDATORY http2_protocol_options:{} for gRPC framing +
+#                plaintext h2c (no TLS).
+#
+# Only the validation_context arrives via SDS; the server cert is STATIC, so
+# internal/boot's SDS pre-scan sees exactly one secret (the CVC's INNER SDS half)
+# and the deferred compose-two edge is never touched.
+#
+# node: {id: envoygo-node, cluster: envoygo-cluster} is REQUIRED on BOTH sides
+# — SDS boot-fails without it (internal/boot.NewSDSProvider).
+#
+# Reference Envoy contrib-v1.37.2 (STRICT_DNS via host.docker.internal, listener
+# port 10447) vs envoy-go (STATIC, in-process, loopback).
+#
+# ## PKI — generated IN MEMORY, per run; there is NO pki/ dir
+#
+#   CA_A         — self-signed ECDSA P-256, CN "envoy-go 0111 CA_A (inline default,
+#                  fallback anchor)". Configured as the inline
+#                  default_validation_context.trusted_ca on BOTH sides. THE FALLBACK
+#                  ANCHOR THAT MUST WIN (the served dynamic VC is EMPTY and merges
+#                  away).
+#   server leaf  — ECDSA P-256 signed by CA_A; ServerAuth;
+#                  SAN=DNS:l_edf.fixture.test. Injected inline_string into
+#                  BOTH yamls (no file, no HostMount, no Docker mount).
+#   client_A     — ECDSA P-256 signed by CA_A; ClientAuth. MUST be ACCEPTED
+#                  (via the fallback).
+#   CA_B         — self-signed ECDSA P-256, CN "envoy-go 0111 CA_B (foreign)".
+#                  Templated into NO yaml — a foreign CA used only to sign client_B.
+#   client_B     — ECDSA P-256 signed by CA_B; ClientAuth. MUST be REJECTED
+#                  (this upper-bounds the fallback pool to CA_A: a union accepts it).
+#
+# Nothing touches disk. Per-run freshness is safe: the observable is an
+# accept/reject verdict, not a serial=/san= identity.
+#
+# ## Workload
+#
+# Each side runs THREE arms against the proxy's l_edf listener, folded into ONE
+# byte stream (CompareBytes compares a single []byte per side):
+#   1. trusted   — dial presenting client_A (chains to the inline default CA_A /
+#                  fallback anchor), FORCED-SEND, complete the handshake, write
+#                  "phase68-edf-probe\n", read the echo back through tcp_proxy.
+#   2. untrusted — dial presenting client_B (chains to the FOREIGN CA_B), FORCED-SEND;
+#                  the round trip MUST fail.
+#   3. none      — dial presenting NO client cert; at require=true the round trip
+#                  MUST fail (alert 116, certificate_required).
+#
+# ### FORCED-SEND on the untrusted arm (SPEC §8 RD3; reference_go_client_cert_withholding)
+#
+# The trusted and untrusted arms install GetClientCertificate so the cert is written
+# to the wire REGARDLESS of the server's advertised acceptable-CA list. RD3: at
+# require=true the forced-send is NOT the observable's discriminator (a polite dial
+# yields the same `untrusted=rejected`, and a permissive CA_A∪CA_B union pool
+# ADVERTISES CA_B so the polite client would send client_B too — the union hazard is
+# caught in both send-modes). It is RETAINED so the untrusted arm actually EXERCISES
+# verify-and-reject against the fallback pool rather than collapsing into a no-cert
+# duplicate of the `none` arm, and to keep both sides symmetric cross-side. It is NOT
+# claimed to flip the require=true observable — it does not.
+#
+# Each arm drives the FULL round trip (handshake -> write -> read), not just the
+# handshake: under TLS 1.3 the server's verdict on the client cert arrives AFTER
+# the client's Handshake() has already returned, so a handshake-only probe would
+# mis-report a rejection as success.
+#
+# Before the arms, the driver asserts a SERVED-THIS-ARM precondition: THIS run's
+# per-side SDS receiver recorded at least one StreamSecrets request. Zero requests
+# means the proxy never fetched the CVC's inner secret from this server and the
+# verdict would be meaningless (SPEC §8 stale-server trap). NOTE: the served
+# resource is EMPTY, but the fetch STILL happens (and is ACKed), so Requests() > 0
+# holds — the assert is about the fetch occurring, not the resource being non-empty.
+#
+# ## Asserted
+#
+#   (a) PER SIDE, structurally (the driver's structuralCheck; the runner turns a
+#       Drive error into t.Fatalf("<side> drive: ...")):
+#         the side's OWN bytes are exactly
+#           "trusted=ok echo=phase68-edf-probe\nuntrusted=rejected\nnone=rejected\n"
+#       This is LOAD-BEARING, not decoration. A break that changes the fallback CA,
+#       or re-signs client_B with it, changes BOTH sides identically — the two
+#       streams still compare EQUAL and a pure-CompareBytes fixture PASSES
+#       (reference_vacuous_break_receiver_normalizes). structuralCheck asserts each
+#       arm independently and reports ALL violations in one error
+#       (reference_fatalf_makes_assertions_unreachable).
+#
+#   (b) CROSS-SIDE, byte-exact (the runner's CompareBytes):
+#       the two sides emit identical streams.
+#
+#   Because exactly ONE structurally-valid stream exists, (a) strictly subsumes
+#   (b) for this fixture: any deviation on either side trips (a) first. (b) is
+#   retained as the harness-standard cross-side leg. Per-side FAILURE tokens are
+#   pinned per side — never cross-side string equality on the alert text
+#   (reference_differential_reference_parses_full_message).
+#
+# ## Named departures / siblings (SPEC §8)
+#
+#   S1 (trusted_ca-absent, THIS fixture): the reference ACKs the empty half, merges
+#   it away, and falls back to the inline default — envoy-go now MATCHES via
+#   xds.ErrEmptyValidationContext. A RESIDUAL S1-only stream-posture divergence
+#   remains (envoy-go NACKs/update_rejected on the empty resource while still
+#   serving via the fallback) — NAMED, unasserted.
+#
+#   S2 (trusted_ca:{inline_bytes:""}, set-but-empty DataSource) and S3 (corrupt
+#   PEM): these are NOT fallback triggers — they stay a REJECT / boot-FAIL on BOTH
+#   sides (the reference NACKs). This fixture serves S1 only; S2/S3 are NAMED as
+#   boot-FAIL siblings, not asserted here (one fixture dir = ONE runner branch —
+#   reference_differential_fixture_dispatch_constraint).
+#
+# ## UNasserted (named coverage boundaries)
+#
+#   The reject ALERT TEXT is NOT asserted: the reference (BoringSSL) sends
+#   `unknown ca` / `certificate required`; envoy-go (Go crypto/tls) sends
+#   `bad certificate` / `certificate required`. Cross-side text equality is
+#   IMPOSSIBLE — the negative arms record only the normalized verdict token
+#   `rejected` (reference_differential_reference_parses_full_message).
+#
+#   The ssl.* stat family. Observed live on the reference, but envoy-go emits NO
+#   ssl.* stats whatsoever. A verdict StatsAsserter is therefore INFEASIBLE
+#   (inherits PLAN-65 C3). A PRE-EXISTING framework gap. The accept/reject CONTRAST
+#   discharges the proof obligation and is strictly STRONGER than a subject-only
+#   stat — it is cross-side. Never assert /listeners or total_listeners_active, and
+#   never treat a docker-proxy accept as listener liveness (SPEC §8: S2/S3 report
+#   /ready LIVE while every connection fail-closes; the served-this-arm assert +
+#   a real handshake are the truth).
+#
+#   SDS stream framing (VersionInfo/Nonce/request-count/ACK cadence —
+#   impl-specific; only the DELIVERED-empty half's EFFECT — the fallback — is asserted).
+#   The sds.<secret>.* stat counters (no StatsAsserter).
+#
+# Cross-refs: phase 68 SPEC §8 + ADR-0290 + ADR-0019 +
+#             reference_go_client_cert_withholding +
+#             reference_differential_grpc_receiver_driver_owned +
+#             reference_periodic_sink_differential_two_receivers +
+#             reference_vacuous_break_receiver_normalizes +
+#             reference_fatalf_makes_assertions_unreachable +
+#             reference_differential_backendcount_min_one +
+#             reference_differential_fixture_dispatch_constraint +
+#             reference_differential_reference_parses_full_message +
+#             reference_protojson_wrapper_scalar_not_object +
+#             reference_differential_run_selector

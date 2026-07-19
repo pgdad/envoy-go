@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -344,5 +345,81 @@ func TestParseValidationSecret_BadPEM(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "parse failure") {
 		t.Errorf("error = %q, want it to contain %q", err.Error(), "parse failure")
+	}
+}
+
+// TestParseValidationSecret_TrustedCaAbsent_YieldsEmptySentinel covers S1
+// (trusted_ca ABSENT ENTIRELY — an entirely empty CertificateValidationContext,
+// a PGV-valid message): it classifies as ErrEmptyValidationContext (phase 68,
+// ADR-0290), the reference's ACK-and-merge-empty shape that should fall back to
+// default_validation_context.trusted_ca in internal/tls (Task 2), not boot-FAIL
+// like a genuinely corrupt/malformed CA. A present-but-specifier-unset
+// trusted_ca:{} (S1b) is NOT classified here — the reference PGV-NACKs it
+// (specifier … is required, SPEC-66 §3.9(b)/ADR-0287); it lives in the
+// no-sentinel test below.
+func TestParseValidationSecret_TrustedCaAbsent_YieldsEmptySentinel(t *testing.T) {
+	sec := anyOf(t, &tlsv3.Secret{
+		Name: "validation_ca",
+		Type: &tlsv3.Secret_ValidationContext{ValidationContext: &tlsv3.CertificateValidationContext{}},
+	})
+	_, err := parseValidationSecret(sec, "validation_ca", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrEmptyValidationContext) {
+		t.Errorf("error = %v, want it to wrap ErrEmptyValidationContext", err)
+	}
+}
+
+// TestParseValidationSecret_SetButEmpty_And_Corrupt_NoSentinel covers S2 (a
+// SET-but-empty inline_bytes specifier), S3 (a corrupt/malformed trusted_ca),
+// and S1b (a present-but-specifier-unset trusted_ca:{}): none may carry the
+// empty-validation-context sentinel — they stay plain errValidation boot-FAILs,
+// matching the reference's NACK (the sentinel fires ONLY on the fully-absent
+// trusted_ca). S1b is the PGV-NACK-parity case: the reference PGV-NACKs a served
+// trusted_ca:{} (specifier … is required, SPEC-66 §3.9(b)/ADR-0287), so envoy-go
+// must NOT treat it as the ACK-and-merge fallback shape — it falls through to the
+// no-specifier dataSourceBytes reject ("none of inline_bytes … set"), exactly
+// like inline_bytes:"" (S2) and corrupt PEM (S3).
+func TestParseValidationSecret_SetButEmpty_And_Corrupt_NoSentinel(t *testing.T) {
+	cases := []struct {
+		name    string
+		vc      *tlsv3.CertificateValidationContext
+		wantSub string // optional: a substring the error must contain (empty ⇒ skip)
+	}{
+		{"S2_SetButEmptyInlineBytes", &tlsv3.CertificateValidationContext{
+			TrustedCa: &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: []byte{}}},
+		}, ""},
+		{"S3_CorruptPEM", &tlsv3.CertificateValidationContext{
+			TrustedCa: &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{
+				InlineBytes: []byte("-----BEGIN CERTIFICATE-----\nnotpem\n-----END CERTIFICATE-----\n"),
+			}},
+		}, ""},
+		// S1b — trusted_ca:{} present but its DataSource specifier oneof unset. The
+		// reference PGV-NACKs this served secret (specifier … is required,
+		// SPEC-66 §3.9(b)/ADR-0287), so it must NOT trigger the fallback: it falls
+		// through the narrowed sentinel gate to the no-specifier dataSourceBytes
+		// reject. PGV-NACK-parity with the reference.
+		{"S1b_TrustedCaPresentSpecifierUnset", &tlsv3.CertificateValidationContext{
+			TrustedCa: &corev3.DataSource{},
+		}, "none of inline_bytes"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sec := anyOf(t, &tlsv3.Secret{
+				Name: "validation_ca",
+				Type: &tlsv3.Secret_ValidationContext{ValidationContext: tc.vc},
+			})
+			_, err := parseValidationSecret(sec, "validation_ca", "")
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if errors.Is(err, ErrEmptyValidationContext) {
+				t.Errorf("error = %v, want it NOT to wrap ErrEmptyValidationContext (set-but-empty/corrupt/specifier-unset DataSource stays plain errValidation)", err)
+			}
+			if tc.wantSub != "" && !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error = %v, want it to contain %q (the no-specifier dataSourceBytes reject)", err, tc.wantSub)
+			}
+		})
 	}
 }

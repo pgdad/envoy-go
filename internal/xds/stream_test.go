@@ -300,3 +300,48 @@ func TestApplyValidationResponse_EmptyResources(t *testing.T) {
 		t.Errorf("error = %q, want it to mention empty resources", err.Error())
 	}
 }
+
+// TestApplyValidationResponse_DualSentinel proves the dual-%w wrap at
+// applyValidationResponse preserves BOTH sentinels up the chain for a
+// fully-absent-trusted_ca (S1) validation_context: the provider's existing
+// errors.Is(err, errValidation) NACK branch still fires (provider.go stays
+// byte-untouched), AND internal/tls (Task 2) can errors.Is(err,
+// ErrEmptyValidationContext) to detect the fallback-eligible shape.
+func TestApplyValidationResponse_DualSentinel(t *testing.T) {
+	sec := anyOf(t, &tlsv3.Secret{
+		Name: "validation_ca",
+		Type: &tlsv3.Secret_ValidationContext{ValidationContext: &tlsv3.CertificateValidationContext{}},
+	})
+	resp := &discoveryv3.DiscoveryResponse{
+		VersionInfo: "v1", Nonce: "n1",
+		Resources: []*anypb.Any{sec},
+	}
+	_, err := applyValidationResponse(resp, "validation_ca", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, errValidation) {
+		t.Errorf("error = %v, want it to wrap errValidation", err)
+	}
+	if !errors.Is(err, ErrEmptyValidationContext) {
+		t.Errorf("error = %v, want it to wrap ErrEmptyValidationContext", err)
+	}
+}
+
+// TestApplyValidationResponse_EmptyResources_NoEmptySentinel is the scope pin
+// (SPEC §3.2 M4): a zero-resource response (the server delivered NOTHING for
+// the requested name) stays errValidation-only — ErrEmptyValidationContext
+// must NOT leak into this branch, or internal/tls would fall back to the
+// default anchor on a server that served nothing at all.
+func TestApplyValidationResponse_EmptyResources_NoEmptySentinel(t *testing.T) {
+	_, err := applyValidationResponse(&discoveryv3.DiscoveryResponse{Resources: nil}, "validation_ca", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, errValidation) {
+		t.Errorf("error = %v, want it to wrap errValidation", err)
+	}
+	if errors.Is(err, ErrEmptyValidationContext) {
+		t.Errorf("error = %v, want it NOT to wrap ErrEmptyValidationContext (zero resources is a distinct failure)", err)
+	}
+}

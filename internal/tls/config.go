@@ -4,6 +4,7 @@ import (
 	"context"
 	stdtls "crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -182,15 +183,44 @@ func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string, provider xd
 		}
 		pool, err := provider.FetchInitialValidationContext(context.Background(), secretName)
 		if err != nil {
-			// A served validation context with no usable trusted_ca, a timeout, or an
-			// unreachable management server boot-FAILS the listener (ADR-0280 family).
-			// DEPARTURE, per cause: for a served-but-EMPTY dynamic context the reference
-			// ACKs, falls back to the DEFAULT CA, and SERVES (the phase-66 empty-dynamic
-			// departure); for timeout/unreachable the reference init-holds (port
-			// unbound), then at initial_fetch_timeout starts workers and binds, then
-			// fails closed per-connection (downstream_context_secrets_not_ready —
-			// characterization corrected at ADR-0289). envoy-go refuses to boot on all
-			// three causes.
+			if errors.Is(err, xds.ErrEmptyValidationContext) {
+				// Empty-dynamic fallback (phase 68, ADR-0290 — the honored-surface
+				// projection of MergeFrom, P3 restated). The SDS half ACKed a
+				// validation_context with trusted_ca absent entirely (S1); the
+				// reference merges the empty context away and the DEFAULT's trusted_ca
+				// survives, so envoy-go falls back to it. The default is read via
+				// internal/tls's OWN loadTrustedCAPool (never across the internal/xds
+				// seam), so the P5 coincidence hazard does not apply to this branch.
+				// A specifier-unset trusted_ca:{} (PGV-NACKed by the reference), a
+				// set-but-empty (inline_bytes:"") / corrupt served trusted_ca, a
+				// timeout, or an unreachable server does NOT carry the sentinel and
+				// falls through to the boot-FAIL below (matching the reference's NACK /
+				// per-connection fail-closed).
+				dvc := vct.CombinedValidationContext.GetDefaultValidationContext() // E1-guaranteed non-nil (the commonTLSContextToConfig CVC missing-default reject)
+				if dvc.GetTrustedCa() == nil {
+					// Empty-both: the served VC AND the default both lack an anchor.
+					// Route through the phase-67 no-anchor logic exactly like the inline
+					// default arm below (D-EDF-EMPTYBOTH — no new reject).
+					if require {
+						return nil, fmt.Errorf("tls: downstream: require_client_certificate=true requires validation_context.trusted_ca")
+					}
+					return &DownstreamConfig{TLSConfig: cfg}, nil // false/absent + no anchor -> NoClientCert
+				}
+				fbPool, ferr := loadTrustedCAPool(dvc, baseDir, "downstream")
+				if ferr != nil {
+					return nil, ferr
+				}
+				if ierr := installPool(fbPool); ierr != nil {
+					return nil, ierr
+				}
+				return &DownstreamConfig{TLSConfig: cfg}, nil
+			}
+			// A served validation context that is present-but-broken (inline_bytes:"",
+			// corrupt PEM), a timeout, or an unreachable management server boot-FAILS
+			// the listener (ADR-0280 family; the reference NACKs the broken shapes and
+			// fails closed per-connection, characterization corrected at ADR-0289).
+			// envoy-go refuses to boot on these causes — only the ACKed-empty S1 shape
+			// above falls back and serves.
 			return nil, fmt.Errorf("tls: downstream: SDS validation secret %q: %w", secretName, err)
 		}
 		if err := installPool(pool); err != nil {

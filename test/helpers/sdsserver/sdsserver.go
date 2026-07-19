@@ -38,6 +38,13 @@ type Server struct {
 	vcSecretName string
 	trustedCAPEM []byte
 
+	// emptyVC, when true with vcSecretName set, serves validation_context:{} with
+	// trusted_ca ABSENT ENTIRELY (the fully-absent-trusted_ca S1 shape) — the
+	// reference's ACK-and-merge-empty case. WithValidationContext(name,nil) instead
+	// yields trusted_ca:{inline_bytes:""} (S2), which does NOT trigger the fallback
+	// (phase 68). See WithEmptyValidationContext.
+	emptyVC bool
+
 	silent bool // when true, never Send a response (drives the client's initial-fetch timeout)
 
 	mu       sync.RWMutex
@@ -61,6 +68,17 @@ func WithSecret(name string, certPEM, keyPEM []byte) Option {
 // branch whenever a validation-context name is set.
 func WithValidationContext(name string, trustedCAPEM []byte) Option {
 	return func(s *Server) { s.vcSecretName = name; s.trustedCAPEM = trustedCAPEM }
+}
+
+// WithEmptyValidationContext configures the delivered
+// Secret{name, validation_context:{}} with trusted_ca ABSENT ENTIRELY — the
+// fully-absent-trusted_ca (S1) shape the reference ACKs, merges away, and falls
+// back on (phase 68). Distinct from WithValidationContext(name, nil), which serves
+// trusted_ca:{inline_bytes:""} (S2, a set-but-empty DataSource that stays a reject
+// on both sides), and from a specifier-unset trusted_ca:{} (S1b), which the
+// reference PGV-NACKs and which likewise stays a reject.
+func WithEmptyValidationContext(name string) Option {
+	return func(s *Server) { s.vcSecretName = name; s.emptyVC = true }
 }
 
 // Silent makes the server accept the stream but never Send a response — used to
@@ -138,13 +156,15 @@ func (s *Server) buildResponse(names []string) (*discoveryv3.DiscoveryResponse, 
 	switch {
 	case s.vcSecretName != "":
 		// Phase 65: the validation_context arm — the SAME tls.v3.Secret message,
-		// a different oneof arm, so the generic TypeUrl derivation below is
-		// unchanged.
+		// a different oneof arm. Phase 68: emptyVC serves it with trusted_ca UNSET
+		// (S1); otherwise a non-nil inline trusted_ca (the phase-65 shape).
+		vc := &tlsv3.CertificateValidationContext{}
+		if !s.emptyVC {
+			vc.TrustedCa = &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: s.trustedCAPEM}}
+		}
 		sec = &tlsv3.Secret{
 			Name: s.vcSecretName,
-			Type: &tlsv3.Secret_ValidationContext{ValidationContext: &tlsv3.CertificateValidationContext{
-				TrustedCa: &corev3.DataSource{Specifier: &corev3.DataSource_InlineBytes{InlineBytes: s.trustedCAPEM}},
-			}},
+			Type: &tlsv3.Secret_ValidationContext{ValidationContext: vc},
 		}
 	default:
 		sec = &tlsv3.Secret{

@@ -204,6 +204,37 @@ func TestWithValidationContext_ServesValidationSecret(t *testing.T) {
 	}
 }
 
+// TestWithEmptyValidationContext_ServesTrustedCaAbsent: the server delivers a
+// Secret{name, validation_context:{}} with trusted_ca ABSENT ENTIRELY (the
+// fully-absent-trusted_ca S1 shape) — distinct from WithValidationContext(name,
+// nil), which serves trusted_ca:{inline_bytes:""} (S2, a set-but-empty DataSource),
+// and from a specifier-unset trusted_ca:{} (S1b, PGV-NACKed by the reference).
+// Phase 68 rests on this distinction: only the fully-absent S1 triggers the
+// reference's ACK-and-merge-empty fallback.
+func TestWithEmptyValidationContext_ServesTrustedCaAbsent(t *testing.T) {
+	srv := New(t, WithEmptyValidationContext("empty_vc"))
+
+	resp := fetchOne(t, srv.Addr(), "empty_vc")
+
+	if got := len(resp.GetResources()); got != 1 {
+		t.Fatalf("Resources = %d, want 1", got)
+	}
+	var sec tlsv3.Secret
+	if err := resp.GetResources()[0].UnmarshalTo(&sec); err != nil {
+		t.Fatalf("UnmarshalTo Secret: %v", err)
+	}
+	if sec.GetName() != "empty_vc" {
+		t.Errorf("Secret.Name = %q, want empty_vc", sec.GetName())
+	}
+	vc := sec.GetValidationContext()
+	if vc == nil {
+		t.Fatal("Secret is not a validation_context — wrong oneof arm served")
+	}
+	if got := vc.GetTrustedCa(); got != nil {
+		t.Errorf("TrustedCa = %v, want nil (fully-absent-trusted_ca S1, not a non-nil DataSource)", got)
+	}
+}
+
 // TestStop_Idempotent verifies calling Stop twice does not panic.
 func TestStop_Idempotent(t *testing.T) {
 	srv := New(t)

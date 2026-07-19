@@ -2,6 +2,7 @@ package tls
 
 import (
 	"crypto/x509"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -10,6 +11,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	xds "github.com/pgdad/envoy-go/internal/xds"
 )
 
 // cvcFuzzProvider is a live xds.SecretProvider consulted only by the
@@ -35,6 +38,13 @@ var cvcFuzzProvider = &fakeProvider{pool: func() *x509.CertPool {
 	}
 	return p
 }()}
+
+// cvcEmptyFuzzProvider returns the classified empty-validation-context error so a
+// CVC seed dispatched via "downstream-sds-empty" reaches NewDownstreamConfig's
+// empty-dynamic FALLBACK branch (phase 68). Its vcErr satisfies
+// errors.Is(_, xds.ErrEmptyValidationContext); a CVC with a valid
+// default_validation_context.trusted_ca then falls back and returns nil error.
+var cvcEmptyFuzzProvider = &fakeProvider{vcErr: fmt.Errorf("xds: sds: validation secret %q: %w", "fuzz_empty_vc", xds.ErrEmptyValidationContext)}
 
 // FuzzTLSContextParse exercises NewDownstreamConfig and NewUpstreamConfig
 // against mutated TransportSocket.typed_config bytes. Seeds:
@@ -436,6 +446,28 @@ func FuzzTLSContextParse(f *testing.F) {
 		f.Add("downstream-sds", anyTC.GetTypeUrl(), anyTC.GetValue())
 	}
 
+	// Seed (s), phase 68: a well-formed combined_validation_context (cvcCTC(): a
+	// valid default_validation_context.trusted_ca + a valid
+	// validation_context_sds_secret_config) + require:true, dispatched via
+	// "downstream-sds-empty" so cvcEmptyFuzzProvider's classified empty-VC error
+	// drives the FALLBACK: NewDownstreamConfig falls back to the default's trusted_ca,
+	// installs it as ClientCAs, and returns NIL error. THE NAMED VACUITY TRAP (SPEC §7):
+	// on "downstream" (nil provider) this shape dies at commonTLSContextToConfig's
+	// retained "combined_validation_context is not supported in phase 03" gate; on
+	// "downstream-sds" (cvcFuzzProvider — a VALID pool) the fetch SUCCEEDS and never
+	// reaches the empty branch. Only "downstream-sds-empty" exercises the fallback.
+	{
+		inner := &tlsv3.DownstreamTlsContext{
+			RequireClientCertificate: &wrapperspb.BoolValue{Value: true},
+			CommonTlsContext:         cvcCTC(),
+		}
+		anyTC, err := anypb.New(inner)
+		if err != nil {
+			f.Fatalf("anypb.New: %v", err)
+		}
+		f.Add("downstream-sds-empty", anyTC.GetTypeUrl(), anyTC.GetValue())
+	}
+
 	f.Fuzz(func(t *testing.T, side, typeURL string, value []byte) {
 		ts := &corev3.TransportSocket{
 			ConfigType: &corev3.TransportSocket_TypedConfig{
@@ -452,6 +484,11 @@ func FuzzTLSContextParse(f *testing.F) {
 			// rejects/the well-formed accept path instead of the earlier
 			// nil-provider retained gate. See cvcFuzzProvider's doc comment.
 			_, err = NewDownstreamConfig(ts, "", cvcFuzzProvider)
+		case "downstream-sds-empty":
+			// Phase 68: cvcEmptyFuzzProvider returns the classified empty-VC error, so
+			// a well-formed CVC (valid default trusted_ca) reaches the empty-dynamic
+			// fallback and returns nil error. See the dispatch trap in the seed comment.
+			_, err = NewDownstreamConfig(ts, "", cvcEmptyFuzzProvider)
 		case "upstream":
 			_, err = NewUpstreamConfig(ts, "")
 		default:
