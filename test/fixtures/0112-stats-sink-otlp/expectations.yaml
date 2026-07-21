@@ -1,0 +1,91 @@
+# Phase 69 fixture 0112-stats-sink-otlp expectations (ADR-0019 — prose; the driver
+# is the enforcer via AssertStats; this file is documentation). ADR-0291.
+#
+# Proposition: the open_telemetry OTLP metrics stats sink (DEFAULT arm — knobs
+# absent) exports the USED counter subset as monotonic CUMULATIVE Sums with
+# value == K, tag-extracted RESIDUAL metric names, tags emitted as envoy.<tag>
+# attributes (the TRUE default), and the telemetry.sdk.* resource triple.
+# Assertions are NAMED subsets — never the whole family set/count, never
+# cross-side StartTime/framing/sink-cluster stats.
+#
+# Topology (single-listener plaintext H1; HTTPFixedBody backend; two driver-owned
+# in-process OTLP MetricsService gRPC receivers):
+#   l_test (hcm_local)  — one downstream HTTP/1.1 listener; route prefix "/" →
+#                         cluster c_backend (HTTPFixedBody, 17-byte body).
+#   c_backend           — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
+#   c_otlp              — driver-owned in-process OTLP receiver
+#                         (test/helpers/otlpmetrics). The driver starts TWO private
+#                         receivers — one per side — on two separately-allocated
+#                         ports, each bound 0.0.0.0:<port> so the reference container
+#                         (host.docker.internal, STRICT_DNS + V4_ONLY per P-16) and
+#                         the subject (127.0.0.1) each reach its own. The cluster
+#                         carries the mandatory http2_protocol_options:{} for gRPC
+#                         framing + plaintext h2c (no TLS).
+#
+# A bootstrap-level stats_sinks[] open_telemetry entry on BOTH sides names c_otlp +
+# a SHORT stats_flush_interval (0.1s) with NO knob fields (the DEFAULT arm:
+# report_counters_as_deltas=false ⇒ CUMULATIVE; use_tag_extracted_name and
+# emit_tags_as_attributes doc-default TRUE). Each flush the proxy maps its stats
+# registry to ONE unary OTLP ExportMetricsServiceRequest and sends it.
+#
+# Reference Envoy contrib-v1.37.2 (STRICT_DNS via host.docker.internal) vs envoy-go
+# (STATIC, in-process).
+#
+# ## Workload
+#
+# Each side fires K = 7 deterministic GET /probe requests (Host: otlp.example, UA:
+# otlp-probe/1; all 2xx). The driver POLLS that side's private receiver until the
+# listener-scoped residual Sum subset converges to value == 7 == K on EACH side AND
+# at least one Export has arrived (served-this-arm; a zero-Export pass is a false
+# green), then waits for ≥2 further Exports to re-read the cumulative StartTime.
+# Per-side separation: two private receivers (reference_periodic_sink_differential_two_receivers).
+# After the subject snapshot BOTH receivers are hard-stopped via Close().
+#
+# ## The residual-name COLLISION
+#
+# Under use_tag_extracted_name=true, tag extraction collapses
+# cluster.<name>.upstream_rq_total → residual cluster.upstream_rq_total. BOTH the
+# application backend cluster (c_backend) AND the OTLP sink's OWN gRPC cluster
+# (c_otlp) emit that residual in the SAME Export, differing only in envoy.cluster_name
+# — and the sink cluster's count grows with flushes. So a NAME-ONLY lookup is
+# ambiguous; the driver selects c_backend's datapoint by its envoy.cluster_name
+# attribute (the receiver's attribute-qualified Datapoints() snapshot). The
+# LISTENER-scoped http.* residuals do NOT collide (one HCM), so their value==K
+# lookup uses the residual name directly.
+#
+# ## Asserted (both sides — NAMED SUBSETS only, reference_stats_sink_emits_used_only)
+#
+#   Listener-scoped residual Sums, monotonic CUMULATIVE, value == 7, selected by
+#   their FULL attribute set (none is unique — see below):
+#     http.downstream_rq_total   attrs {envoy.http_conn_manager_prefix=hcm_local}
+#     http.downstream_rq_xx      attrs {envoy.http_conn_manager_prefix=hcm_local,
+#                                       envoy.response_code_class=2}
+#   NB: the residuals are NOT unique — the built-in ADMIN HCM shares
+#   http.downstream_rq_total/_xx (envoy.http_conn_manager_prefix=admin), and the
+#   SUBJECT additionally emits http.downstream_rq_xx for response classes 3/4/5
+#   (used-but-zero) sharing hcm_local; the reference emits only class 2 (used-only).
+#   Each asserted datapoint is therefore selected by its FULL envoy.<tag> attribute
+#   set; the class 3/4/5 zero datapoints are part of the UNasserted whole-family set.
+#   Application-backend cluster Sum (collision-resolved by attribute), value == 7:
+#     cluster.upstream_rq_total  where envoy.cluster_name=c_backend
+#   Resource attributes: the three telemetry.sdk.* KEYS present
+#     (telemetry.sdk.name / .language / .version — per-side VALUES unasserted).
+#   Subject side: the cumulative StartTimeUnixNano is ns-magnitude and CONSTANT
+#     across ≥2 further flushes.
+#
+# ## UNasserted (vary side-to-side / impl-specific / non-deterministic)
+#
+#   The WHOLE family set / count (surfaces differ — envoy-go has no histograms).
+#   The reference's StartTimeUnixNano shape (its µs factor-1000 bug — never
+#       cross-side StartTime equality).
+#   The c_otlp sink cluster's own cluster.upstream_rq_total value + upstream_cx_*
+#       (dial-unaccounted + the feedback loop, reference_cluster_sink_dial_unaccounted).
+#   OTLP message framing + per-Export metric count + flush cadence
+#       (reference_streaming_sink_differential_framing).
+#
+# Cross-refs: phase 69 SPEC §8 + ADR-0291 +
+#             reference_periodic_sink_differential_two_receivers +
+#             reference_differential_grpc_receiver_driver_owned +
+#             reference_stats_sink_emits_used_only +
+#             reference_cluster_sink_dial_unaccounted +
+#             reference_host_gateway_ip_docker_desktop.

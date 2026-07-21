@@ -61,6 +61,7 @@ import (
 	metricsv3 "github.com/envoyproxy/go-control-plane/envoy/service/metrics/v3"
 	secretv3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -152,8 +153,8 @@ func (d *Dialer) DialContext(ctx context.Context, clusterName string) (*grpc.Cli
 
 // connHolder is the shared `*grpc.ClientConn` + idempotent-close base embedded
 // by every typed wrapper in this package (AuthClient, ALSClient,
-// MetricsServiceClient, OTLPLogsClient, OTLPTracesClient, RateLimitClient,
-// ProcessorClient). It consolidates the previously seven byte-identical
+// MetricsServiceClient, OTLPLogsClient, OTLPTracesClient, OTLPMetricsClient,
+// RateLimitClient, ProcessorClient). It consolidates the previously seven byte-identical
 // `closeOnce`-guarded Close bodies into one implementation.
 //
 // The close body is guarded by `sync.Once` per SPEC §3.1 so repeated calls
@@ -542,6 +543,61 @@ func (c *OTLPTracesClient) Export(ctx context.Context, req *coltracepb.ExportTra
 // Close releases the underlying *grpc.ClientConn. Idempotent (shared connHolder
 // sync.Once). A nil receiver is tolerated (returns nil).
 func (c *OTLPTracesClient) Close() error {
+	if c == nil {
+		return nil
+	}
+	return c.connHolder.close()
+}
+
+// ----------------------------------------------------------------------------
+// OTLPMetricsClient — the typed MetricsService/Export UNARY wrapper (phase 69).
+// ----------------------------------------------------------------------------
+
+// OTLPMetricsClient wraps a *grpc.ClientConn with the typed
+// go.opentelemetry.io/proto/otlp collector MetricsServiceClient stub. One
+// *OTLPMetricsClient per OTLP metrics stats sink (cluster_name), owned by the
+// OTLPMetricsSink and Close()d at sink close. The OTLPLogsClient precedent
+// (ADR-0258) but for metrics — Export is a plain unary RPC (no stream
+// lifecycle). Named OTLPMetricsClient (not MetricsServiceClient) to
+// disambiguate from colmetricspb's own MetricsServiceClient AND the
+// go-control-plane streaming metricsv3.MetricsServiceClient already wrapped
+// in this package.
+type OTLPMetricsClient struct {
+	connHolder
+	stub colmetricspb.MetricsServiceClient
+}
+
+// NewOTLPMetricsClient dials the named cluster via d.DialContext and wraps
+// the resulting *grpc.ClientConn in a typed OTLPMetricsClient. On dial error
+// returns (nil, err) verbatim (already cluster-named via DialContext's
+// wrapping).
+func NewOTLPMetricsClient(d *Dialer, clusterName string) (*OTLPMetricsClient, error) {
+	conn, err := dialConn(d, "OTLP metrics client", clusterName)
+	if err != nil {
+		return nil, err
+	}
+	return &OTLPMetricsClient{
+		connHolder: connHolder{conn: conn},
+		stub:       colmetricspb.NewMetricsServiceClient(conn),
+	}, nil
+}
+
+// Export sends one ExportMetricsServiceRequest over the unary
+// MetricsService/Export RPC. The return is narrowed to error alone (the
+// *ExportMetricsServiceResponse is discarded) to satisfy the
+// internal/statssink otlpMetricsClient seam. The sink's writer goroutine
+// bounds ctx; on error the sink retries once.
+func (c *OTLPMetricsClient) Export(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) error {
+	if c == nil || c.stub == nil {
+		return errors.New("grpcclient: Export: nil OTLPMetricsClient / stub")
+	}
+	_, err := c.stub.Export(ctx, req)
+	return err
+}
+
+// Close releases the underlying *grpc.ClientConn. Idempotent (shared connHolder
+// sync.Once). A nil receiver is tolerated (returns nil).
+func (c *OTLPMetricsClient) Close() error {
 	if c == nil {
 		return nil
 	}

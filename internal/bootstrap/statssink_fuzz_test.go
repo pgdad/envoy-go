@@ -27,6 +27,7 @@ static_resources:
 `
 	const msType = "type.googleapis.com/envoy.config.metrics.v3.MetricsServiceConfig"
 	const statsdType = "type.googleapis.com/envoy.config.metrics.v3.StatsdSink"
+	const otlpType = "type.googleapis.com/envoy.extensions.stat_sinks.open_telemetry.v3.SinkConfig"
 
 	// valid accept (default knobs)
 	f.Add([]byte(head + `stats_sinks:
@@ -115,6 +116,16 @@ stats_sinks:
     typed_config:
       "@type": ` + statsdType + `
       tcp_cluster_name: statsd
+`))
+	// open_telemetry valid accept (default knobs; the SinkConfig has NO
+	// transport_api_version field, unlike msType — omitted deliberately)
+	f.Add([]byte(head + `stats_sinks:
+  - name: envoy.stat_sinks.open_telemetry
+    typed_config:
+      "@type": ` + otlpType + `
+      grpc_service:
+        envoy_grpc:
+          cluster_name: oc
 `))
 	// stats_flush_on_admin (reject)
 	f.Add([]byte(head + `stats_flush_on_admin: true

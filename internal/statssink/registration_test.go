@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
+
 	"github.com/pgdad/envoy-go/internal/stats"
 )
 
@@ -123,5 +125,40 @@ func TestNoNewStat_GraphiteRegistrationGuard(t *testing.T) {
 
 	if after := countMetrics(reg); after != 0 {
 		t.Fatalf("graphite_statsd sink+flusher constructors registered %d metric(s); D-GR-STATS requires +0", after)
+	}
+}
+
+// TestNoNewStat_OTLPRegistrationGuard pins SPEC §7 / P-14: the OTLP metrics sink
+// surface delta is +0. Constructing an OTLPMetricsSink + Flusher against a fresh
+// registry AND running one flush must register ZERO new metrics — the reference
+// registers no otlp-scoped stat, the sink EMITS stats (it does not create them), and
+// fail-open drops/retries are rate-limit-LOGGED, not counted. This is the concrete
+// gate the phase-69 six-gate's "+0 stats" verification cites (surface stays 1201).
+func TestNoNewStat_OTLPRegistrationGuard(t *testing.T) {
+	reg := stats.NewRegistry()
+	if before := countMetrics(reg); before != 0 {
+		t.Fatalf("fresh registry should have 0 metrics, got %d", before)
+	}
+
+	// The exact main.go construction shape: an OTLPMetricsSink over a client +
+	// version + knobs, then a Flusher over the registry/interval/sinks.
+	client := &fakeOTLPMetricsClient{exported: make(chan struct{}, 8)}
+	sink := NewOTLPMetricsSink(client, "test", false, true, true, "")
+	t.Cleanup(func() { _ = sink.Close() })
+
+	flusher := NewFlusher(reg, 500*time.Millisecond, []Sink{sink})
+	_ = flusher
+
+	// Run one flush directly through the sink (the writer goroutine maps + would
+	// register any self-stat here) and wait for it to land.
+	sink.Submit([]*dto.MetricFamily{counterFam("cluster.svc.upstream_rq_total", 1)})
+	select {
+	case <-client.exported:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the flush to be exported")
+	}
+
+	if after := countMetrics(reg); after != 0 {
+		t.Fatalf("otlp sink+flusher+flush registered %d metric(s); SPEC §7 requires +0", after)
 	}
 }

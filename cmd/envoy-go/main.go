@@ -203,7 +203,7 @@ func main() {
 	var statsFlusher *statssink.Flusher
 	var statsSinks []statssink.Sink
 	flusherDone := make(chan struct{})
-	if len(bs.StatsSinkConfigs) > 0 || len(bs.StatsdSinkConfigs) > 0 || len(bs.DogStatsdSinkConfigs) > 0 || len(bs.GraphiteStatsdSinkConfigs) > 0 {
+	if len(bs.StatsSinkConfigs) > 0 || len(bs.StatsdSinkConfigs) > 0 || len(bs.DogStatsdSinkConfigs) > 0 || len(bs.GraphiteStatsdSinkConfigs) > 0 || len(bs.OTLPSinkConfigs) > 0 {
 		if len(bs.StatsSinkConfigs) > 0 {
 			for _, cfg := range bs.StatsSinkConfigs {
 				client, err := grpcclient.NewMetricsServiceClient(dialer, cfg.ClusterName)
@@ -211,6 +211,18 @@ func main() {
 					log.Fatalf("statssink: metrics_service client for cluster %q: %v", cfg.ClusterName, err)
 				}
 				statsSinks = append(statsSinks, statssink.NewMetricsServiceSink(client, minNode, cfg.ReportCountersAsDeltas, cfg.EmitTagsAsLabels))
+			}
+		}
+		// Phase 69 (ADR-0291): the open_telemetry OTLP metrics stats sink —
+		// the FIFTH stats_sinks[] consumer, reusing the hoisted dialer. Version
+		// is envoy-go's own telemetry.sdk.version via admin.BuildVersionString().
+		if len(bs.OTLPSinkConfigs) > 0 {
+			for _, cfg := range bs.OTLPSinkConfigs {
+				client, err := grpcclient.NewOTLPMetricsClient(dialer, cfg.ClusterName)
+				if err != nil {
+					log.Fatalf("statssink: open_telemetry client for cluster %q: %v", cfg.ClusterName, err)
+				}
+				statsSinks = append(statsSinks, statssink.NewOTLPMetricsSink(client, admin.BuildVersionString(), cfg.ReportCountersAsDeltas, cfg.UseTagExtractedName, cfg.EmitTagsAsAttributes, cfg.Prefix))
 			}
 		}
 		// Phase 48 (ADR-0265): the statsd UDP stats sink — synchronous, no

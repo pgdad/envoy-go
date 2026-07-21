@@ -162,6 +162,16 @@ import (
 	// and provides the typed MetricsServiceConfig for the parse arm.
 	metricsconfigv3 "github.com/envoyproxy/go-control-plane/envoy/config/metrics/v3"
 	graphitestatsdv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/stat_sinks/graphite_statsd/v3"
+
+	// Phase 69 registers the OTLP metrics stat-sink extension proto so protojson
+	// round-trips bootstraps carrying a stats_sinks[] open_telemetry SinkConfig
+	// typed_config (ADR-0291). The named otelsinkv3 import both registers the
+	// descriptor (the prerequisite for @type dispatch AND, via the
+	// DiscardUnknown:false posture, the FREE version-skew reject of the
+	// v1.37.2-only resource_detectors/custom_metric_conversions fields absent
+	// from the pinned v1.32.4 SinkConfig — RD-SKEW) and provides the typed
+	// SinkConfig for the parse arm.
+	otelsinkv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/stat_sinks/open_telemetry/v3"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -248,6 +258,16 @@ var dogStatsdSinkTypeURL = "type.googleapis.com/" + string((&metricsconfigv3.Dog
 // AMEND-GR-IMAGE; zero new go.mod modules). A test asserts it equals the
 // SPEC-57 §11 live-verified string.
 var graphiteStatsdSinkTypeURL = "type.googleapis.com/" + string((&graphitestatsdv3.GraphiteStatsdSink{}).ProtoReflect().Descriptor().FullName())
+
+// openTelemetrySinkTypeURL is the typed_config TypeURL for the OTLP metrics stats
+// sink (envoy.extensions.stat_sinks.open_telemetry.v3.SinkConfig) — the FIFTH
+// stats_sinks[] TypeURL (ADR-0291). DERIVED from the proto descriptor (the
+// metricsServiceTypeURL precedent — reference_network_filter_typeurl_extensions);
+// the SinkConfig type resolves at the otelsinkv3 package (v1.32.4). The named
+// import ALSO blank-registers the descriptor, which is the prerequisite for both
+// @type dispatch AND the free version-skew reject (RD-SKEW). A test asserts it
+// equals the SPEC §11 live-verified string.
+var openTelemetrySinkTypeURL = "type.googleapis.com/" + string((&otelsinkv3.SinkConfig{}).ProtoReflect().Descriptor().FullName())
 
 // AccessLogConfig is the parsed-but-not-yet-opened representation of one
 // envoy.access_loggers.file entry from HCM access_log[]. The sink itself is
@@ -371,6 +391,38 @@ type StatsSinkConfig struct {
 	EmitTagsAsLabels bool
 }
 
+// OTLPSinkConfig is the parsed-but-not-yet-constructed representation of one
+// open_telemetry (OTLP metrics) stats sink typed_config
+// (envoy.extensions.stat_sinks.open_telemetry.v3.SinkConfig — ADR-0291). The
+// sink (OTLPMetricsSink) is constructed in cmd/envoy-go/main.go after Load
+// returns; this struct carries only the parse-time data. The hand-written
+// strict-reject arms (google_grpc / empty cluster / report_histograms_as_deltas)
+// run in parseOpenTelemetrySinkConfig before the config is appended; a non-V3
+// transport_api_version and the v1.37.2-only skew fields are rejected FOR FREE by
+// the DiscardUnknown:false layer (the SinkConfig has no transport_api_version
+// field — RD-SKEW).
+type OTLPSinkConfig struct {
+	ClusterName string // SinkConfig.grpc_service.envoy_grpc.cluster_name
+	// ReportCountersAsDeltas is SinkConfig.report_counters_as_deltas (a scalar
+	// bool — CONTRAST the metrics_service *BoolValue): true ⇒ each COUNTER family
+	// carries the per-flush delta riding deltaState; GAUGES stay absolute.
+	// Absent/false ⇒ the cumulative path.
+	ReportCountersAsDeltas bool
+	// UseTagExtractedName is SinkConfig.use_tag_extracted_name, a
+	// *wrapperspb.BoolValue whose doc-default is TRUE (nil → TRUE — INVERTING the
+	// metrics_service scalar .GetValue() nil→FALSE template, RD-WRAPPER): true ⇒
+	// the tag-extracted residual name is emitted; false ⇒ the full dotted name.
+	UseTagExtractedName bool
+	// EmitTagsAsAttributes is SinkConfig.emit_tags_as_attributes, a
+	// *wrapperspb.BoolValue whose doc-default is TRUE (nil → TRUE, RD-WRAPPER):
+	// true ⇒ extracted tags are emitted as OTLP KeyValue attributes; false ⇒ no
+	// attributes. Independent of UseTagExtractedName.
+	EmitTagsAsAttributes bool
+	// Prefix is SinkConfig.prefix, prepended to every metric name (empty ⇒ no
+	// prefix). Composes with tag extraction.
+	Prefix string
+}
+
 // Bootstrap wraps the parsed Envoy v3 Bootstrap proto together with the
 // boot-time *stats.Registry that downstream constructors (cluster/listener/HCM
 // managers in Tasks 8–11) register their metrics on. Per the settled SPEC
@@ -462,6 +514,20 @@ type Bootstrap struct {
 	// GraphiteStatsdSink is built in cmd/envoy-go/main.go after Load returns
 	// (and ONLY when this slice is non-empty).
 	GraphiteStatsdSinkConfigs []GraphiteStatsdSinkConfig
+	// OTLPSinkConfigs is the parsed top-level stats_sinks[] open_telemetry (OTLP
+	// metrics) sink entries (ADR-0291), in declaration order. Empty when no OTLP
+	// SinkConfig stats_sinks[] entry is configured. Per ADR-0291/ADR-0080:
+	// google_grpc, an empty cluster_name, and report_histograms_as_deltas
+	// (envoy-go has no histograms) are rejected by hand at parse time; a non-V3
+	// transport_api_version and the v1.37.2-only fields (resource_detectors /
+	// custom_metric_conversions) — all absent from the pinned v1.32.4 SinkConfig —
+	// are rejected FOR FREE by the DiscardUnknown:false layer (RD-SKEW).
+	// report_counters_as_deltas is CONSUMED into ReportCountersAsDeltas;
+	// use_tag_extracted_name and emit_tags_as_attributes are *BoolValue knobs
+	// defaulting TRUE (nil → TRUE, RD-WRAPPER); prefix is CONSUMED. The
+	// OTLPMetricsSink is built in cmd/envoy-go/main.go after Load returns (and
+	// ONLY when this slice is non-empty).
+	OTLPSinkConfigs []OTLPSinkConfig
 	// FlushInterval is the stats_flush_interval (default 5s when absent/non-positive
 	// — D-MS-FLUSH). Parsed-and-stored even when no stats_sinks[] entry exists
 	// (inert in that case — D-MS-FLUSH-INERT); the Flusher uses it only when
@@ -526,9 +592,10 @@ func Load(r io.Reader) (*Bootstrap, error) {
 // result.FlushInterval, even with no stats_sinks[] (inert — D-MS-FLUSH-INERT).
 // stats_flush_on_admin is STRICT-REJECTED (ADR-0080; envoy-go ships only the
 // periodic stats_flush_interval loop). Each stats_sinks[] entry must carry one
-// of the four supported typed_config types (metrics_service, statsd,
-// dog_statsd, graphite_statsd); a sibling sink TypeURL is rejected naming all
-// four supported TypeURLs (reference_strict_reject_sibling_typeurl_gap).
+// of the five supported typed_config types (metrics_service, statsd,
+// dog_statsd, graphite_statsd, open_telemetry); a sibling sink TypeURL is
+// rejected naming all five supported TypeURLs
+// (reference_strict_reject_sibling_typeurl_gap).
 func parseStatsSinks(bs *bootstrapv3.Bootstrap, result *Bootstrap) error {
 	result.FlushInterval = statsFlushIntervalDefault
 	if d := bs.GetStatsFlushInterval(); d != nil {
@@ -561,8 +628,12 @@ func parseStatsSinks(bs *bootstrapv3.Bootstrap, result *Bootstrap) error {
 			if err := parseGraphiteStatsdSinkConfig(tc, i, result); err != nil {
 				return err
 			}
+		case openTelemetrySinkTypeURL:
+			if err := parseOpenTelemetrySinkConfig(tc, i, result); err != nil {
+				return err
+			}
 		default:
-			return fmt.Errorf("bootstrap: stats_sinks[%d]: unsupported sink type %q (envoy-go supports the metrics_service sink %q, the statsd sink %q, the dog_statsd sink %q, and the graphite_statsd sink %q)", i, tc.GetTypeUrl(), metricsServiceTypeURL, statsdSinkTypeURL, dogStatsdSinkTypeURL, graphiteStatsdSinkTypeURL)
+			return fmt.Errorf("bootstrap: stats_sinks[%d]: unsupported sink type %q (envoy-go supports the metrics_service sink %q, the statsd sink %q, the dog_statsd sink %q, the graphite_statsd sink %q, and the open_telemetry sink %q)", i, tc.GetTypeUrl(), metricsServiceTypeURL, statsdSinkTypeURL, dogStatsdSinkTypeURL, graphiteStatsdSinkTypeURL, openTelemetrySinkTypeURL)
 		}
 	}
 	return nil
@@ -599,6 +670,57 @@ func parseMetricsServiceConfig(tc *anypb.Any, idx int, result *Bootstrap) error 
 		ClusterName:            eg.GetClusterName(),
 		ReportCountersAsDeltas: msc.GetReportCountersAsDeltas().GetValue(),
 		EmitTagsAsLabels:       msc.GetEmitTagsAsLabels(),
+	})
+	return nil
+}
+
+// parseOpenTelemetrySinkConfig parses one open_telemetry (OTLP metrics) stats
+// sink typed_config and appends an OTLPSinkConfig to result.OTLPSinkConfigs
+// (ADR-0291). It STRICT-REJECTS (ADR-0080; the parseMetricsServiceConfig
+// template): google_grpc (only envoy_grpc supported), an empty
+// envoy_grpc.cluster_name, and report_histograms_as_deltas (envoy-go has no
+// histograms — the metrics_service histogram_emit_mode reject precedent).
+// Unlike MetricsServiceConfig, the v1.32.4 SinkConfig has NO
+// transport_api_version field, so a non-V3 transport_api_version — like a
+// v1.37.2-only field (resource_detectors / custom_metric_conversions) absent
+// from the pinned proto — is rejected FOR FREE upstream by the
+// DiscardUnknown:false layer as an unknown field (RD-SKEW); this function never
+// sees either.
+// report_counters_as_deltas is CONSUMED (a scalar bool). use_tag_extracted_name
+// and emit_tags_as_attributes are *wrapperspb.BoolValue knobs whose doc-default
+// is TRUE, so a nil (absent) wrapper reads TRUE (w == nil || w.GetValue()) —
+// INVERTING the metrics_service scalar .GetValue() nil→FALSE template
+// (RD-WRAPPER). prefix is CONSUMED.
+func parseOpenTelemetrySinkConfig(tc *anypb.Any, idx int, result *Bootstrap) error {
+	var cfg otelsinkv3.SinkConfig
+	if err := tc.UnmarshalTo(&cfg); err != nil {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: open_telemetry typed_config: %w", idx, err)
+	}
+	// NOTE: the OTLP SinkConfig (v1.32.4) has NO transport_api_version field —
+	// unlike MetricsServiceConfig — so a non-V3 transport_api_version is rejected
+	// FOR FREE upstream by the DiscardUnknown:false layer as an unknown field
+	// (the same free strict-layer mechanism as the RD-SKEW version-skew reject),
+	// not by a hand-written arm here.
+	eg := cfg.GetGrpcService().GetEnvoyGrpc()
+	if eg == nil {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: open_telemetry requires grpc_service.envoy_grpc (google_grpc is not supported)", idx)
+	}
+	if eg.GetClusterName() == "" {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: open_telemetry grpc_service.envoy_grpc.cluster_name is required (must be non-empty)", idx)
+	}
+	if cfg.GetReportHistogramsAsDeltas() {
+		return fmt.Errorf("bootstrap: stats_sinks[%d]: open_telemetry report_histograms_as_deltas is not supported (envoy-go has no histograms)", idx)
+	}
+	// The two *BoolValue knobs doc-default TRUE: a nil (absent) wrapper reads
+	// TRUE (RD-WRAPPER — INVERTS the metrics_service .GetValue() nil→FALSE).
+	utn := cfg.GetUseTagExtractedName()
+	eta := cfg.GetEmitTagsAsAttributes()
+	result.OTLPSinkConfigs = append(result.OTLPSinkConfigs, OTLPSinkConfig{
+		ClusterName:            eg.GetClusterName(),
+		ReportCountersAsDeltas: cfg.GetReportCountersAsDeltas(),
+		UseTagExtractedName:    utn == nil || utn.GetValue(),
+		EmitTagsAsAttributes:   eta == nil || eta.GetValue(),
+		Prefix:                 cfg.GetPrefix(),
 	})
 	return nil
 }

@@ -4,23 +4,24 @@
 
 ## Stage pointer
 
+- **IMPL done** (2026-07-20) — the 11-task TDD spine (T1–T11) EXECUTED subagent-driven (one implementer + a per-task adversarial reviewer per task; `feedback_execution_style`), each committing LOCALLY (`feedback_subagents_no_push`), controller squash-push at close. **ROW 69 FLIPS `in-progress` → `done`** at the T10 six-gate (ADR-0106, the SOLE leg). Every task RE-DERIVED its anchors at the IMPL tip (a PLAN is not evidence). The one material re-derivation finding (T3): the pinned OTLP `SinkConfig`/`GrpcService` have NO `transport_api_version` field ⇒ that reject is the FREE `DiscardUnknown:false` strict-layer reject, not hand-written. A cross-task discovery (T5 review → T6): under tag extraction the app cluster + the sink's OWN cluster share a residual name ⇒ the receiver was extended additively with attribute-qualified `Datapoints()`. Six-gate ALL GREEN incl. the FULL 115-dir differential `ok 386.265s`. ADR-0291 COMPLETED IN PLACE. See the task ledger below.
 - **PLAN done** (2026-07-20) — the 11-task TDD spine (T1–T11) landed; the SPEC §11 anchors RE-DERIVED at `0ea2ec20` (ZERO unacknowledged drift — every anchor exact, unlike phase 68's RD-LINES) via a read-only re-derivation agent that also extracted the exact clone skeletons (the `NewOTLPLogsClient` stanza, the `parseMetricsServiceConfig` template, the streaming-vs-unary mapping site `sink.go:198-202`, the six-field `SinkConfig` descriptor, the `otlptrace` receiver). **Adversarial verification (PLAN §1.2):** V1 (code-claims, RD-SKEW probe EXECUTED in a clone — the `DiscardUnknown:false` free-reject HELD + discriminates) → ZERO SEVERE/MODERATE, four MINOR folded; V2 (process/coverage) → ONE SEVERE folded — the SPEC §7 `TestNoNewStat_OTLPRegistrationGuard` (+0-stats one-per-sink house guard) was cited by T10 but written by no task; CORRECTED by adding T2 Step 5b + the `registration_test.go` File-structure entry. Design direction unchanged. Fresh worktree off master `0ea2ec20`, branch `phase-69-stats-sink-otlp-plan`.
 
 ## Task ledger (filled at the IMPL)
 
 | Task | Status | Commit | Red-first / breaks / notes |
 |---|---|---|---|
-| T1 grpcclient OTLPMetricsClient | pending | | |
-| T2 statssink OTLPMetricsSink + writer | pending | | |
-| T3 bootstrap parse arm | pending | | |
-| T4 main.go wiring | pending | | |
-| T5 otlpmetrics receiver | pending | | |
-| T6 fixture 0112 (default) | pending | | |
-| T7 fixture 0113 (knobs) | pending | | |
-| T8 fuzz seed + dispatch-verify | pending | | |
-| T9 BEHAVIOR_CONTRACT B1–B2 | pending | | |
-| T10 verify (six-gate + envelope) | pending | | |
-| T11 ADR-0291 + close | pending | | |
+| T1 grpcclient OTLPMetricsClient | done | `742c0c29` | Red: `OTLPMetricsClient undefined`. Unary `NewOTLPLogsClient` clone over `colmetricspb`, `Export` narrowed to `error`. Break A (Export skips stub) fired the "server received the sentinel" assertion. SPEC ✅ / quality Approved. |
+| T2 statssink OTLPMetricsSink + writer | done | `43cc7a28` | Red: `NewOTLPMetricsSink undefined`. 9-point mapping matrix + writer drop/retry/Close + `TestNoNewStat_OTLPRegistrationGuard`. Breaks B/C/D/E/F all fired (B needed a compiling substitution `_ = temporality`). `-race` clean; cycle guard no grpcclient edge. Empty-scope emitted present-but-empty (carried→T5). SPEC ✅ / Approved. |
+| T3 bootstrap parse arm | done | `cb61075c` | Red: undefined types. 6 tests + breaks G/H/I/J all fired. **FINDING:** OTLP `SinkConfig`/`GrpcService` have NO `transport_api_version` field ⇒ that reject is the FREE `DiscardUnknown:false` strict-layer reject, NOT hand-written (transport_api_version_V2 subtest boot-FAILs via the free layer). nil→TRUE wrapper inversion; roster 4→5; histogram reject; version-skew free reject. SPEC ✅ / Approved. |
+| T4 main.go wiring | done | `59e30925` | Gate `+ len(bs.OTLPSinkConfigs)>0` + build sub-loop (arg order verified vs T2/T3 signatures at tip). `NewFlusher`/drain byte-identical. No break (fixtures T6/T7 are liveness). SPEC ✅ / Approved. |
+| T5 otlpmetrics receiver | done | `1ec08034` | Red: undefined. `otlptrace` clone over `colmetricspb`, `(name, sorted-attrs)` order-insensitive keying, Sum/Gauge/temporality/isMonotonic/startTime + running-`DeltaSum`. Break K (unsorted keying) fired. Tolerates empty scope. **Reviewer MODERATE→T6 carry:** name-only accessors collide when two clusters share a residual. SPEC ✅ / Approved. |
+| T6 fixture 0112 (default) | done | `133dac4a` | PASS `-count=1/2`, count 114. EXTENDED T5 receiver ADDITIVELY (`Datapoints()`/`DatapointView`/`ExportCount()`) — the app cluster + the sink's OWN cluster share residual `cluster.upstream_rq_total`; selection by FULL attribute set. Breaks L/M/N fired; the order-insensitive NON-break control CAUGHT + fixed a latent driver flake (folded in). Empirical residuals confirmed. SPEC ✅ / Approved. |
+| T7 fixture 0113 (knobs) | done | `cd447fac` | PASS `-count=1/2`, count 115. Deltas + `prefix` + both-false. Delta-SUM stability barrier verified genuinely post-convergence (two-sample sum1/sum2 split). Breaks O/P/Q fired — the O+P masking pair proves the barrier LOAD-BEARING; DELTA+isMonotonic+no-attrs asserted; gauges absolute; `otlp.go` byte-restored (sha256 verified). SPEC ✅ / Approved. |
+| T8 fuzz seed + dispatch-verify | done | `fc127900` | `otlpType` const + one `open_telemetry` seed (NO `transport_api_version` — T3 finding). Dispatch-verify: seed reaches `parseOpenTelemetrySinkConfig`; trap confirmed (without the blank-import it dies `unable to resolve "…SinkConfig": not found`). Count 55→55; `bootstrap.go` zero-diff; no corpus artifacts. SPEC ✅ / Approved. |
+| T9 BEHAVIOR_CONTRACT B1–B2 | done | `c00c77ad` | B1 new OTLP section (all pins verified vs landed code); B2 sibling-reject example swapped OFF OTLP-metrics → `envoy.stat_sinks.hystrix`/`HystrixSink` (matches T3 test); open_telemetry now CONSUMED. T3 accuracy honored (transport/version-skew = free strict-layer). B3 (BC:638 access-log neighbor) byte-unchanged. Docs-only. SPEC ✅ / Approved. |
+| T10 verify (six-gate + envelope) | done | (controller-run) | gofmt SILENT · vet 0 · build 0 · `go mod tidy -diff` EMPTY + go.mod/go.sum NO DIFF (+0 modules) · golangci-lint 0 · FULL 115-dir differential `ok 386.265s` EXIT 0 · cycle guard (no grpcclient edge) · `-race` green · counts fixtures 115/fuzzers 55/BackendKind 38/DECISIONS ADR-0291 · envelope: 4 functional prod files, xds/tls/boot/listener/validate + landed statssink files byte-untouched. ROW 69 FLIPS `done`. |
+| T11 ADR-0291 + close | done | (stage-close) | ADR-0291 COMPLETED IN PLACE (§Decision + §Consequences; STATUS COMPLETE; tail stays ADR-0291, next-free ADR-0292). ROADMAP row 69 → `done` + OTLP-metrics narrowed OUT of the live `candidates:` sentence. STATE/PROGRESS/router rolled; sentinel re-run (does NOT fire); 2 memory updates. |
 
 ## Findings carried from the PLAN (RE-DERIVED at `0ea2ec20`; RE-VERIFY at the IMPL tip)
 

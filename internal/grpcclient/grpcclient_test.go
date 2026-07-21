@@ -67,7 +67,9 @@ import (
 	metricsv3 "github.com/envoyproxy/go-control-plane/envoy/service/metrics/v3"
 	secretv3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	otlpmetricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -1413,6 +1415,149 @@ func TestOTLPTracesClient_Export_NilClientErrors(t *testing.T) {
 	}
 	if resp != nil {
 		t.Errorf("nil OTLPTracesClient Export: resp = %v; want nil", resp)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// In-process gRPC OTLP (MetricsService) server — Task 1 (OTLPMetricsClient,
+// phase 69).
+//
+// The OTLP MetricsService `Export` is a plain UNARY RPC (no stream
+// lifecycle), so the smoke test stands up a BARE in-test MetricsService
+// server: a stub that records the received request (guarded by a mutex) and
+// returns an empty `ExportMetricsServiceResponse`. Mirrors
+// `startTestOTLPTracesServer` (TLS-fronted, ALPN h2) so the same
+// `mkH2ClusterMgr` builder wires a cluster to it.
+// ----------------------------------------------------------------------------
+
+// fakeOTLPMetricsServer implements `colmetricspb.MetricsServiceServer`.
+// Export records the received request and returns an empty response with no
+// error.
+type fakeOTLPMetricsServer struct {
+	colmetricspb.UnimplementedMetricsServiceServer
+
+	mu  sync.Mutex
+	got *colmetricspb.ExportMetricsServiceRequest
+}
+
+func (f *fakeOTLPMetricsServer) Export(_ context.Context, req *colmetricspb.ExportMetricsServiceRequest) (*colmetricspb.ExportMetricsServiceResponse, error) {
+	f.mu.Lock()
+	f.got = req
+	f.mu.Unlock()
+	return &colmetricspb.ExportMetricsServiceResponse{}, nil
+}
+
+func (f *fakeOTLPMetricsServer) received() *colmetricspb.ExportMetricsServiceRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.got
+}
+
+// startTestOTLPMetricsServer starts a TLS-fronted `*grpc.Server` on a
+// loopback port with ALPN h2; registers the supplied `fakeOTLPMetricsServer`.
+// Returns the bound port and a `stop` func (calls `GracefulStop`). Mirrors
+// `startTestOTLPTracesServer`.
+func startTestOTLPMetricsServer(t testing.TB, pki *authTestPKI, f *fakeOTLPMetricsServer) (uint32, func()) {
+	t.Helper()
+	pair, err := stdtls.X509KeyPair(pki.leafCertPEM, pki.leafKeyPEM)
+	if err != nil {
+		t.Fatalf("server keypair: %v", err)
+	}
+	cfg := &stdtls.Config{
+		Certificates: []stdtls.Certificate{pair},
+		NextProtos:   []string{"h2"},
+		MinVersion:   stdtls.VersionTLS12,
+		MaxVersion:   stdtls.VersionTLS13,
+	}
+	ln, err := stdtls.Listen("tcp", "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatalf("listen tls: %v", err)
+	}
+	s := grpc.NewServer()
+	colmetricspb.RegisterMetricsServiceServer(s, f)
+	go func() {
+		_ = s.Serve(ln)
+	}()
+	port := uint32(ln.Addr().(*net.TCPAddr).Port)
+	stop := func() {
+		s.GracefulStop()
+		_ = ln.Close()
+	}
+	return port, stop
+}
+
+// ----------------------------------------------------------------------------
+// Group — OTLPMetricsClient surface (Task 1, phase 69) — the NewOTLPLogsClient
+// clone over colmetricspb, Export narrowed to error alone.
+// ----------------------------------------------------------------------------
+
+// TestNewOTLPMetricsClient_ExportForwards verifies that Export forwards the
+// caller's *ExportMetricsServiceRequest to the server unmodified (asserted via
+// a sentinel ResourceMetrics.SchemaUrl) and returns a nil error on success.
+func TestNewOTLPMetricsClient_ExportForwards(t *testing.T) {
+	t.Parallel()
+	pki := mkAuthPKI(t)
+	fake := &fakeOTLPMetricsServer{}
+	port, stop := startTestOTLPMetricsServer(t, pki, fake)
+	t.Cleanup(stop)
+	mgr := mkH2ClusterMgr(t, pki, "c_otlp_metrics", port)
+	d := New(mgr)
+
+	c, err := NewOTLPMetricsClient(d, "c_otlp_metrics")
+	if err != nil {
+		t.Fatalf("NewOTLPMetricsClient: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	const sentinel = "sentinel-schema-url-otlp-metrics"
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*otlpmetricspb.ResourceMetrics{
+			{SchemaUrl: sentinel},
+		},
+	}
+
+	if err := c.Export(ctx, req); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	got := fake.received()
+	if got == nil {
+		t.Fatalf("Export: server received no request")
+	}
+	if len(got.GetResourceMetrics()) != 1 || got.GetResourceMetrics()[0].GetSchemaUrl() != sentinel {
+		t.Errorf("Export: server received the sentinel = %v; want ResourceMetrics[0].SchemaUrl = %q", got, sentinel)
+	}
+}
+
+// TestNewOTLPMetricsClient_CloseIdempotent verifies the sync.Once-guarded
+// Close against a valid H2 cluster: repeated Close() returns the same (nil)
+// error, no panic.
+func TestNewOTLPMetricsClient_CloseIdempotent(t *testing.T) {
+	t.Parallel()
+	pki := mkAuthPKI(t)
+	fake := &fakeOTLPMetricsServer{}
+	port, stop := startTestOTLPMetricsServer(t, pki, fake)
+	t.Cleanup(stop)
+	mgr := mkH2ClusterMgr(t, pki, "c_otlp_metrics_close", port)
+	d := New(mgr)
+
+	c, err := NewOTLPMetricsClient(d, "c_otlp_metrics_close")
+	if err != nil {
+		t.Fatalf("NewOTLPMetricsClient: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	err1 := c.Close()
+	err2 := c.Close()
+	err3 := c.Close()
+	if (err1 == nil) != (err2 == nil) || (err2 == nil) != (err3 == nil) {
+		t.Errorf("Close idempotency: err1=%v, err2=%v, err3=%v; want all equal", err1, err2, err3)
+	}
+	if err1 != nil && (err1.Error() != err2.Error() || err2.Error() != err3.Error()) {
+		t.Errorf("Close idempotency: err1=%q, err2=%q, err3=%q; want all equal", err1, err2, err3)
 	}
 }
 

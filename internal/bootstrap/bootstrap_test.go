@@ -1988,6 +1988,235 @@ func TestStatsSink_AcceptEmitTagsAsLabels(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// Phase 69: open_telemetry (OTLP) metrics stats sink parse arm (ADR-0291)
+// ----------------------------------------------------------------------------
+
+// openTelemetrySinkType is the TypeURL for the OTLP metrics stats sink
+// (envoy.extensions.stat_sinks.open_telemetry.v3.SinkConfig) — the live-verified
+// string that matches the descriptor-derived openTelemetrySinkTypeURL.
+const openTelemetrySinkType = "type.googleapis.com/envoy.extensions.stat_sinks.open_telemetry.v3.SinkConfig"
+
+// TestOTLPSink_TypeURLConstant guards against a proto-package rename: the
+// descriptor-derived openTelemetrySinkTypeURL must equal the live-verified
+// string (reference_network_filter_typeurl_extensions).
+func TestOTLPSink_TypeURLConstant(t *testing.T) {
+	if openTelemetrySinkTypeURL != openTelemetrySinkType {
+		t.Errorf("openTelemetrySinkTypeURL: got %q, want %q", openTelemetrySinkTypeURL, openTelemetrySinkType)
+	}
+}
+
+// TestParseStatsSinks_OpenTelemetry_AllSixFields: an open_telemetry sink with all
+// six fields set ⇒ one OTLPSinkConfig with the projected values (bare-scalar
+// wrappers — reference_protojson_wrapper_scalar_not_object).
+func TestParseStatsSinks_OpenTelemetry_AllSixFields(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.open_telemetry
+    typed_config:
+      "@type": ` + openTelemetrySinkType + `
+      report_counters_as_deltas: true
+      report_histograms_as_deltas: false
+      emit_tags_as_attributes: false
+      use_tag_extracted_name: false
+      prefix: p
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.OTLPSinkConfigs); got != 1 {
+		t.Fatalf("OTLPSinkConfigs: got %d, want 1", got)
+	}
+	got := bs.OTLPSinkConfigs[0]
+	want := OTLPSinkConfig{
+		ClusterName:            "mc",
+		ReportCountersAsDeltas: true,
+		UseTagExtractedName:    false,
+		EmitTagsAsAttributes:   false,
+		Prefix:                 "p",
+	}
+	if got != want {
+		t.Errorf("OTLPSinkConfigs[0] = %+v, want %+v", got, want)
+	}
+	// StatsSinkConfigs (metrics_service) stays empty.
+	if got := len(bs.StatsSinkConfigs); got != 0 {
+		t.Errorf("StatsSinkConfigs: got %d, want 0", got)
+	}
+}
+
+// TestParseStatsSinks_OpenTelemetry_WrapperDefaultsTrue: the two *BoolValue knobs
+// ABSENT ⇒ both default TRUE (the nil→TRUE inversion — RD-WRAPPER; INVERTS the
+// metrics_service .GetValue() nil→FALSE template).
+func TestParseStatsSinks_OpenTelemetry_WrapperDefaultsTrue(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.open_telemetry
+    typed_config:
+      "@type": ` + openTelemetrySinkType + `
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`)
+	bs, err := Load(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := len(bs.OTLPSinkConfigs); got != 1 {
+		t.Fatalf("OTLPSinkConfigs: got %d, want 1", got)
+	}
+	if got := bs.OTLPSinkConfigs[0].UseTagExtractedName; got != true {
+		t.Errorf("UseTagExtractedName (absent → default): got %v, want true", got)
+	}
+	if got := bs.OTLPSinkConfigs[0].EmitTagsAsAttributes; got != true {
+		t.Errorf("EmitTagsAsAttributes (absent → default): got %v, want true", got)
+	}
+}
+
+// TestParseStatsSinks_OpenTelemetry_HistogramReject: report_histograms_as_deltas:
+// true ⇒ boot-FAIL (envoy-go has no histograms — the metrics_service
+// histogram_emit_mode reject precedent, ADR-0080).
+func TestParseStatsSinks_OpenTelemetry_HistogramReject(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.open_telemetry
+    typed_config:
+      "@type": ` + openTelemetrySinkType + `
+      report_histograms_as_deltas: true
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`)
+	_, err := Load(strings.NewReader(src))
+	if err == nil {
+		t.Fatalf("Load: want error, got nil")
+	}
+	if sub := "report_histograms_as_deltas is not supported (envoy-go has no histograms)"; !strings.Contains(err.Error(), sub) {
+		t.Errorf("error should contain %q: %q", sub, err.Error())
+	}
+}
+
+// TestParseStatsSinks_OpenTelemetry_VersionSkewReject: a v1.37.2-only field
+// (resource_detectors) absent from the pinned v1.32.4 SinkConfig ⇒ boot-FAIL with
+// a protojson "unknown field" error (RD-SKEW — the FREE strict-layer reject from
+// DiscardUnknown:false, NOT a hand-written reject).
+func TestParseStatsSinks_OpenTelemetry_VersionSkewReject(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.open_telemetry
+    typed_config:
+      "@type": ` + openTelemetrySinkType + `
+      resource_detectors:
+        - name: envoy.tracers.opentelemetry.resource_detectors.environment
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`)
+	_, err := Load(strings.NewReader(src))
+	if err == nil {
+		t.Fatalf("Load: want error, got nil")
+	}
+	if sub := "unknown field"; !strings.Contains(err.Error(), sub) {
+		t.Errorf("error should contain %q (the strict-layer skew reject): %q", sub, err.Error())
+	}
+	if sub := "resource_detectors"; !strings.Contains(err.Error(), sub) {
+		t.Errorf("error should name the offending field %q: %q", sub, err.Error())
+	}
+}
+
+// TestParseStatsSinks_OpenTelemetry_TransportRejects covers the mirrored
+// metrics_service transport rejects: missing grpc_service (protocol_specifier
+// required), empty cluster_name, google_grpc, and a non-V3 transport_api_version.
+func TestParseStatsSinks_OpenTelemetry_TransportRejects(t *testing.T) {
+	cases := []struct {
+		name     string
+		topLevel string
+		errSubs  []string
+	}{
+		{
+			name: "missing_grpc_service",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.open_telemetry
+    typed_config:
+      "@type": ` + openTelemetrySinkType + `
+`,
+			errSubs: []string{"bootstrap:", "envoy_grpc"},
+		},
+		{
+			name: "empty_cluster_name",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.open_telemetry
+    typed_config:
+      "@type": ` + openTelemetrySinkType + `
+      grpc_service:
+        envoy_grpc:
+          cluster_name: ""
+`,
+			errSubs: []string{"bootstrap:", "cluster_name"},
+		},
+		{
+			name: "google_grpc",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.open_telemetry
+    typed_config:
+      "@type": ` + openTelemetrySinkType + `
+      grpc_service:
+        google_grpc:
+          target_uri: 127.0.0.1:50051
+          stat_prefix: mc
+`,
+			errSubs: []string{"bootstrap:", "envoy_grpc"},
+		},
+		{
+			name: "transport_api_version_V2",
+			topLevel: `stats_sinks:
+  - name: envoy.stat_sinks.open_telemetry
+    typed_config:
+      "@type": ` + openTelemetrySinkType + `
+      transport_api_version: V2
+      grpc_service:
+        envoy_grpc:
+          cluster_name: mc
+`,
+			errSubs: []string{"bootstrap:", "transport_api_version"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(strings.NewReader(statsBootstrap(tc.topLevel)))
+			if err == nil {
+				t.Fatalf("Load: want error for %s, got nil", tc.name)
+			}
+			for _, sub := range tc.errSubs {
+				if !strings.Contains(err.Error(), sub) {
+					t.Errorf("error should contain %q: %q", sub, err.Error())
+				}
+			}
+		})
+	}
+}
+
+// TestParseStatsSinks_SiblingRejectRosterFive: an unhandled-but-real sink TypeURL
+// (envoy.config.metrics.v3.HystrixSink) ⇒ the default reject now names FIVE
+// supported sinks incl. open_telemetry (the roster grew 4→5 —
+// reference_strict_reject_sibling_typeurl_gap).
+func TestParseStatsSinks_SiblingRejectRosterFive(t *testing.T) {
+	src := statsBootstrap(`stats_sinks:
+  - name: envoy.stat_sinks.hystrix
+    typed_config:
+      "@type": type.googleapis.com/envoy.config.metrics.v3.HystrixSink
+      num_buckets: 10
+`)
+	_, err := Load(strings.NewReader(src))
+	if err == nil {
+		t.Fatalf("Load: want error, got nil")
+	}
+	for _, sub := range []string{"bootstrap:", "metrics_service", "statsd", "dog_statsd", "graphite_statsd", "open_telemetry"} {
+		if !strings.Contains(err.Error(), sub) {
+			t.Errorf("error should name supported sink %q: %q", sub, err.Error())
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
 // Phase 48: statsd UDP stats sink parse arm (ADR-0265)
 // ----------------------------------------------------------------------------
 
