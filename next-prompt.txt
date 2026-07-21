@@ -33,7 +33,7 @@ Check (3) fails SAFE by construction: a future family whose rows use a slug not 
 - **(2) prints THREE live "candidates:" sentences** — HTTP/3, xDS, Observability ⇒ three families STAY OPEN. **Cite the command, never the adjective** (`reference_sentinel_deferred_sentence_live_vs_historical`): `grep -cE 'remaining deferred \(not-yet-chartered\) candidates:' docs/envoy-go/ROADMAP.md` ⇒ **3**. (The Observability sentence stayed live — only "OTLP-metrics stats sink + " was narrowed OUT at the row-69-done edit; the `ssl` + tracing custom_tags candidates remain.)
 - **(3) prints `NEVER OPENED: gRPC`, `NEVER OPENED: Runtime`, `NEVER OPENED: WASM`** ⇒ THREE families never opened.
 
-Checks (1)+(2)+(3) print ⇒ the sentinel does NOT fire. Abundant work remains.
+Checks (2)+(3) print (check (1) is now SILENT — every chartered row is `done`) ⇒ the sentinel does NOT fire. Abundant work remains.
 
 ==============================================
 
