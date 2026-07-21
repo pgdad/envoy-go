@@ -1,0 +1,126 @@
+# Phase 70 fixture 0114-tracing-custom-tags-metadata expectations
+# (ADR-0019 — prose; the driver is the enforcer via AssertStats; this file is
+# documentation). Cloned from 0106-tracing-custom-tags-environment (the OTLP
+# tracing custom_tags chassis) + the 0027-http-lua-full-bridge Lua http_filter
+# (a dynamicMetadata():set writer). Exercises the phase-70 REQUEST `metadata`
+# custom_tags source — the FOURTH and LAST CustomTag source type after literal
+# (0102), request_header (0105), and environment (0106).
+#
+# Topology (single-listener plaintext H1; HTTPFixedBody backend; driver-owned
+# in-process OTLP TraceService gRPC receiver):
+#   l_test (hcm_local) — one downstream HTTP/1.1 listener; route prefix "/" →
+#                        cluster c_backend (HTTPFixedBody, 17-byte body). HCM
+#                        carries a `tracing` block (OpenTelemetry provider,
+#                        service_name "0114", random_sampling 100%) naming
+#                        c_otlp_collector — exporting one OTLP Span per completed
+#                        request. A Lua http_filter runs BEFORE the router and
+#                        writes a FIXED cross-side-identical value into the
+#                        request dynamic-metadata bucket:
+#                          streamInfo():dynamicMetadata():set(
+#                              "envoy.test", "meta_k", "v-meta-0114")
+#                        (scripts/writer.lua, embedded into both bootstraps'
+#                        default_source_code.inline_string via strconv.Quote —
+#                        NO container mount). The `tracing` block carries TWO
+#                        REQUEST `metadata` custom_tags:
+#                          meta_hit     — metadata_key {key: envoy.test,
+#                                         path:[meta_k]}, default_value
+#                                         "unused-default-0114" → resolves to the
+#                                         Lua-set value "v-meta-0114" (default
+#                                         NEVER used).
+#                          meta_default — metadata_key {key: envoy.test,
+#                                         path:[absent_k]}, default_value
+#                                         "fallback-0114" → the path is UNSET →
+#                                         emits "fallback-0114".
+#   c_backend          — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
+#   c_otlp_collector   — driver-owned in-process TraceService receiver
+#                        (test/helpers/otlptrace/) on a driver-allocated stable
+#                        port, bound 0.0.0.0:<port> so the reference container
+#                        (host.docker.internal) AND the subject (127.0.0.1) both
+#                        reach it. http2_protocol_options:{} + plaintext h2c.
+#
+# Reference Envoy contrib-v1.37.2 (STRICT_DNS via host.docker.internal) vs
+# envoy-go (STATIC, in-process).
+#
+# ## Workload
+#
+# Each side fires N+M = 12 requests:
+#   N = 8 PLAIN: GET /trace, Host: trace.example, UA: trace-probe/1. No inbound
+#       trace context. random_sampling 100% => each is a fresh locally-sampled span.
+#   M = 4 CONTINUATION: + Traceparent: 00-aaa...aaa-bbb...bbb-01. The proxy
+#       CONTINUES the inbound trace (keeps the inbound trace-id; sets parent_span_id
+#       to the inbound parent span id).
+# The Lua filter writes the SAME dynamic-metadata value on EVERY request (both
+# prongs, both sides), so every span carries the SAME resolved meta_hit value.
+# The driver POLLS the receiver's Count() to >= 12 (poll-to-converge; never a
+# fixed sleep). Per-side separation: the receiver is Reset() before each drive.
+#
+# ## Framing NOT asserted
+#
+# The cross-side assertion is on the per-span PAYLOAD aggregated across all
+# received spans — NOT the Export-call count / batch sizes / connection count /
+# flush cadence (reference_streaming_sink_differential_framing).
+#
+# ## Asserted (cross-side EXACT on the STABLE per-span subset, both sides)
+#
+#   len(spans) == 12   (zero-span pass is vacuous — proves decode ran on BOTH sides)
+#   Every span:
+#     name                        == "ingress"
+#     kind                        == SPAN_KIND_SERVER (= 2)
+#     StartTimeUnixNano           != 0  (presence + ordering, not value)
+#     EndTimeUnixNano             != 0
+#     StartTimeUnixNano           < EndTimeUnixNano
+#     attrs["http.method"]        == "GET"
+#     attrs["component"]          == "proxy"
+#     attrs["downstream_cluster"] == "-"
+#     attrs["response_flags"]     == "-"
+#     attrs["http.status_code"]   == "200" (normalized: int or string form accepted)
+#     attrs["request_size"]       == "0"
+#     attrs["response_size"]      == "17"  (HTTPFixedBody 17-byte body)
+#     attrs["http.url"]           PRESENT
+#     attrs["http.protocol"]      PRESENT
+#     attrs["user_agent"]         PRESENT
+#     attrs["guid:x-request-id"]  KEY PRESENT (value varies — UNasserted)
+#     attrs["upstream_cluster"]   KEY PRESENT (value UNasserted — framework gap)
+#     attrs["upstream_cluster.name"] KEY PRESENT (value UNasserted — framework gap)
+#     attrs["meta_hit"]           == "v-meta-0114" (KEY + VALUE, cross-side EXACT —
+#                                             the Lua-set dynamic-metadata value,
+#                                             resolved via metadata_key
+#                                             {envoy.test → meta_k}. The configured
+#                                             default_value "unused-default-0114" is
+#                                             NEVER used — this VALUE-equality is the
+#                                             writer-served-this-arm proof.)
+#     attrs["meta_default"]       == "fallback-0114" (KEY + VALUE, cross-side EXACT —
+#                                             metadata_key {envoy.test → absent_k}
+#                                             path is UNSET → the default_value is
+#                                             emitted; the request_header default rule.)
+#   Continuation prong (M = 4 spans where trace_id == contTraceID):
+#     trace_id     == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (the fixed inbound trace-id)
+#     parent_span_id == bbbbbbbbbbbbbbbb               (the fixed inbound parent id)
+#   Resource.attributes:
+#     service.name == "0114"   (cross-side EXACT on VALUE)
+#
+# PLUS the subject-side flat /stats counters:
+#   tracing.opentelemetry.spans_sent    == 12
+#   tracing.opentelemetry.spans_dropped == 0
+#
+# ## UNasserted (vary side-to-side / impl-specific)
+#
+#   trace_id / span_id VALUES (except the continuation prong trace_id).
+#   start/end time VALUES — non-deterministic.
+#   x-request-id / peer.address / node_id / zone VALUES.
+#   upstream_cluster / upstream_cluster.name VALUES — framework gap.
+#   Export-call count / per-call batch sizes / connection count — framing.
+#   telemetry.sdk.* resource attrs / ScopeSpans.scope.name+version — impl-specific.
+#
+# ## Cross-refs
+#
+# phase 70 SPEC §8/§10 D-CTM-* + ADR-0292 (REQUEST metadata custom_tags parse +
+# per-request resolve out of the dynamic-metadata Bucket + span-emit upsert) +
+# phase 63 environment (0106, ADR-0284) + phase 62 request_header (0105,
+# ADR-0283) + phase 59 literal (0102, ADR-0277) + phase 46.1b OTLP span emission
+# (0087, ADR-0260) + phase 22.2 Lua dynamicMetadata():set (0027) +
+# reference_streaming_sink_differential_framing +
+# reference_differential_grpc_receiver_driver_owned +
+# reference_concurrency_differential_release_barrier +
+# feedback_probe_fresh_container_per_arm (the meta_hit value-equality is the
+# writer-served-this-arm proof).

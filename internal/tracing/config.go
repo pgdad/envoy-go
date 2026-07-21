@@ -45,14 +45,16 @@ type TracingConfig struct {
 	CustomTags []CustomTagSpec
 }
 
-// customTagKind selects a CustomTagSpec's value source: a static literal, or a
-// per-request lookup of a named downstream request header.
+// customTagKind selects a CustomTagSpec's value source: a static literal, a
+// per-request lookup of a named downstream request header, a process env var, or
+// a per-request lookup of a REQUEST-kind dynamic-metadata value.
 type customTagKind uint8
 
 const (
 	kindLiteral customTagKind = iota
 	kindRequestHeader
 	kindEnvironment // reads a named process env var (os.LookupEnv), omit-on-empty-resolved
+	kindMetadata    // reads a REQUEST-kind dynamic-metadata value (metadata_key.key + path), request_header default rule
 )
 
 // CustomTagSpec is one parsed HCM tracing custom_tag, resolved per-request by
@@ -61,13 +63,15 @@ const (
 // list on TracingConfig.CustomTags is ordered and first-wins-deduplicated by Key
 // at parse (matching the reference's config-time map, SPEC-62 §11 arms C/D).
 type CustomTagSpec struct {
-	Key          string        // the span-attribute key (CustomTag.tag)
-	Kind         customTagKind // kindLiteral | kindRequestHeader | kindEnvironment
-	LiteralValue string        // Kind==kindLiteral: the static value
-	HeaderName   string        // Kind==kindRequestHeader: the header to read
-	EnvName      string        // Kind==kindEnvironment: the process env var to read (os.LookupEnv)
-	DefaultValue string        // Kind==kindRequestHeader | kindEnvironment: value when the source is absent
-	HasDefault   bool          // Kind==kindRequestHeader only: DefaultValue != "" (kindEnvironment uses the omit-iff-resolved-empty rule, not HasDefault)
+	Key           string        // the span-attribute key (CustomTag.tag)
+	Kind          customTagKind // kindLiteral | kindRequestHeader | kindEnvironment | kindMetadata
+	LiteralValue  string        // Kind==kindLiteral: the static value
+	HeaderName    string        // Kind==kindRequestHeader: the header to read
+	EnvName       string        // Kind==kindEnvironment: the process env var to read (os.LookupEnv)
+	MetaNamespace string        // Kind==kindMetadata: the dynamic-metadata namespace (metadata_key.key)
+	MetaPath      []string      // Kind==kindMetadata: the pre-extracted path segment keys (min 1, validated at parse)
+	DefaultValue  string        // Kind==kindRequestHeader | kindEnvironment | kindMetadata: value when the source is absent
+	HasDefault    bool          // Kind==kindRequestHeader | kindMetadata: DefaultValue != "" (kindEnvironment uses the omit-iff-resolved-empty rule, not HasDefault)
 }
 
 // ProviderKind names the parsed tracing provider (D-TRACE-ZIPKIN-CONFIG-SHAPE);
@@ -169,10 +173,14 @@ func NewConfig(t *hcmv3.HttpConnectionManager_Tracing) (*TracingConfig, error) {
 // downstream request header, resolved per-request by ResolveCustomTags, with an
 // optional default / omit-on-missing), and `environment` (the value of a named PROCESS
 // ENVIRONMENT VARIABLE, resolved per-span by ResolveCustomTags via os.LookupEnv, with
-// an optional default / omit-on-missing / omit-on-empty). `metadata` is STRICT-REJECTED
-// loudly (envoy-go-strict DEPARTURE, ADR-0080 — the reference accepts it). PGV-
+// an optional default / omit-on-missing / omit-on-empty), and `metadata` (a REQUEST-
+// kind dynamic-metadata value: namespace metadata_key.key + a path walk, resolved
+// per-span by ResolveCustomTags, request_header default rule). The metadata ROUTE/
+// CLUSTER/HOST/unset kinds reject LOUDLY with distinct substrings (envoy-go-strict
+// DEPARTURE, ADR-0080 — the reference accepts those kinds). PGV-
 // parity structural rejects (empty tag / empty literal.value / empty
-// request_header.name / empty environment.name / typeless) mirror the reference
+// request_header.name / empty environment.name / empty metadata namespace / empty
+// metadata path / empty metadata path segment / typeless) mirror the reference
 // boot-reject (both reject — NOT a departure). All substrings are ADR-0080-distinct.
 // Dedup runs AFTER per-tag
 // structural validation, so a later duplicate-key tag with an invalid name still
@@ -212,7 +220,37 @@ func parseCustomTags(tags []*tracingv3.CustomTag) ([]CustomTagSpec, error) {
 			}
 			spec = CustomTagSpec{Key: tag, Kind: kindEnvironment, EnvName: e.GetName(), DefaultValue: e.GetDefaultValue()}
 		case ct.GetMetadata() != nil:
-			return nil, fmt.Errorf("tracing: custom_tags metadata type unsupported")
+			md := ct.GetMetadata()
+			k := md.GetKind() // *metadatav3.MetadataKind — the kind-getters live HERE, not on md (V1 SEVERE)
+			switch {
+			case k == nil:
+				return nil, fmt.Errorf("tracing: custom_tags metadata tag %q kind required", tag)
+			case k.GetRequest() != nil:
+				mk := md.GetMetadataKey()
+				if mk.GetKey() == "" {
+					return nil, fmt.Errorf("tracing: custom_tags metadata tag %q empty namespace", tag)
+				}
+				if len(mk.GetPath()) == 0 {
+					return nil, fmt.Errorf("tracing: custom_tags metadata tag %q empty path", tag)
+				}
+				path := make([]string, 0, len(mk.GetPath()))
+				for _, seg := range mk.GetPath() {
+					if seg.GetKey() == "" {
+						return nil, fmt.Errorf("tracing: custom_tags metadata tag %q empty path segment", tag)
+					}
+					path = append(path, seg.GetKey())
+				}
+				dv := md.GetDefaultValue()
+				spec = CustomTagSpec{Key: tag, Kind: kindMetadata, MetaNamespace: mk.GetKey(), MetaPath: path, DefaultValue: dv, HasDefault: dv != ""}
+			case k.GetRoute() != nil:
+				return nil, fmt.Errorf("tracing: custom_tags metadata tag %q route kind unsupported", tag)
+			case k.GetCluster() != nil:
+				return nil, fmt.Errorf("tracing: custom_tags metadata tag %q cluster kind unsupported", tag)
+			case k.GetHost() != nil:
+				return nil, fmt.Errorf("tracing: custom_tags metadata tag %q host kind unsupported", tag)
+			default:
+				return nil, fmt.Errorf("tracing: custom_tags metadata tag %q kind required", tag)
+			}
 		default:
 			return nil, fmt.Errorf("tracing: custom_tags tag %q missing type", tag)
 		}

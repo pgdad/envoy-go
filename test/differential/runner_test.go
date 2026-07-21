@@ -138,6 +138,7 @@ import (
 	_ "github.com/pgdad/envoy-go/test/fixtures/0111-tls-cvc-empty-dynamic-fallback/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0112-stats-sink-otlp/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0113-stats-sink-otlp-knobs/driver"
+	_ "github.com/pgdad/envoy-go/test/fixtures/0114-tracing-custom-tags-metadata/driver"
 	"github.com/pgdad/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

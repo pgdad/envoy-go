@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/types/known/structpb"
+
 	"github.com/pgdad/envoy-go/internal/accesslog"
 	"github.com/pgdad/envoy-go/internal/cluster"
 	"github.com/pgdad/envoy-go/internal/filter/hcm/h2"
@@ -22,7 +24,7 @@ import (
 // early-return so that a tracing HCM with no access_log block still exports
 // spans (AMEND-TRACE-SPANEND-SEAM). A non-zero statusCode + non-nil exporter +
 // non-nil traceDecision with Sample==true triggers span build and export.
-func (f *Filter) emitAccessLog(r *http.Request, statusCode int, bytesSent int64, picked cluster.Endpoint, start time.Time, respHeaders filter_http.OrderedHeaders, traceDecision *tracing.Decision) {
+func (f *Filter) emitAccessLog(r *http.Request, statusCode int, bytesSent int64, picked cluster.Endpoint, start time.Time, respHeaders filter_http.OrderedHeaders, traceDecision *tracing.Decision, metaLookup func(ns, key string) (*structpb.Value, bool)) {
 	// SPAN BLOCK — must be BEFORE the access-log early-return (AMEND-TRACE-SPANEND-SEAM):
 	// a tracing HCM without any access_log block still exports spans.
 	if statusCode != 0 && f.exporter != nil && traceDecision != nil && traceDecision.Sample {
@@ -52,7 +54,7 @@ func (f *Filter) emitAccessLog(r *http.Request, statusCode int, bytesSent int64,
 			ClientTraceID:     r.Header.Get("X-Client-Trace-Id"),
 			Authority:         r.Host,
 		}
-		f.exporter.Export(tracing.BuildServerSpan(*traceDecision, in, tracing.ResolveCustomTags(f.tracingConfig.CustomTags, reqHeaderLookupH1(r)), start, time.Now()))
+		f.exporter.Export(tracing.BuildServerSpan(*traceDecision, in, tracing.ResolveCustomTags(f.tracingConfig.CustomTags, reqHeaderLookupH1(r), metaLookup), start, time.Now()))
 	}
 	if statusCode == 0 || len(f.accessLog) == 0 {
 		return
@@ -82,7 +84,7 @@ func (f *Filter) emitAccessLog(r *http.Request, statusCode int, bytesSent int64,
 //
 // Phase 46.1b Task 8: symmetric span block at FUNCTION HEAD (same
 // AMEND-TRACE-SPANEND-SEAM ordering as emitAccessLog above).
-func (f *Filter) emitAccessLogH2(req h2.H2Request, statusCode int, bytesSent int64, picked cluster.Endpoint, start time.Time, respHeaders filter_http.OrderedHeaders, traceDecision *tracing.Decision) {
+func (f *Filter) emitAccessLogH2(req h2.H2Request, statusCode int, bytesSent int64, picked cluster.Endpoint, start time.Time, respHeaders filter_http.OrderedHeaders, traceDecision *tracing.Decision, metaLookup func(ns, key string) (*structpb.Value, bool)) {
 	// SPAN BLOCK — must be BEFORE the access-log early-return (AMEND-TRACE-SPANEND-SEAM).
 	if statusCode != 0 && f.exporter != nil && traceDecision != nil && traceDecision.Sample {
 		// URL: scheme://authority/path.  H2 carries :scheme so use it directly.
@@ -113,7 +115,7 @@ func (f *Filter) emitAccessLogH2(req h2.H2Request, statusCode int, bytesSent int
 			ClientTraceID:     clientTraceID,
 			Authority:         req.Authority,
 		}
-		f.exporter.Export(tracing.BuildServerSpan(*traceDecision, in, tracing.ResolveCustomTags(f.tracingConfig.CustomTags, reqHeaderLookupH2(req)), start, time.Now()))
+		f.exporter.Export(tracing.BuildServerSpan(*traceDecision, in, tracing.ResolveCustomTags(f.tracingConfig.CustomTags, reqHeaderLookupH2(req), metaLookup), start, time.Now()))
 	}
 	if statusCode == 0 || len(f.accessLog) == 0 {
 		return
@@ -144,7 +146,7 @@ func (f *Filter) emitAccessLogH2(req h2.H2Request, statusCode int, bytesSent int
 // verifies the exact string cross-side). The span block precedes the
 // access-log early-return (AMEND-TRACE-SPANEND-SEAM), identical ordering to
 // emitAccessLog / emitAccessLogH2. Phase 61.2, ADR-0281.
-func (f *Filter) emitAccessLogH3(r *http.Request, statusCode int, bytesSent int64, picked cluster.Endpoint, start time.Time, respHeaders filter_http.OrderedHeaders, traceDecision *tracing.Decision) {
+func (f *Filter) emitAccessLogH3(r *http.Request, statusCode int, bytesSent int64, picked cluster.Endpoint, start time.Time, respHeaders filter_http.OrderedHeaders, traceDecision *tracing.Decision, metaLookup func(ns, key string) (*structpb.Value, bool)) {
 	// SPAN BLOCK — must be BEFORE the access-log early-return (AMEND-TRACE-SPANEND-SEAM).
 	if statusCode != 0 && f.exporter != nil && traceDecision != nil && traceDecision.Sample {
 		reqSize := r.ContentLength
@@ -174,7 +176,7 @@ func (f *Filter) emitAccessLogH3(r *http.Request, statusCode int, bytesSent int6
 			ClientTraceID:     r.Header.Get("X-Client-Trace-Id"),
 			Authority:         r.Host,
 		}
-		f.exporter.Export(tracing.BuildServerSpan(*traceDecision, in, tracing.ResolveCustomTags(f.tracingConfig.CustomTags, reqHeaderLookupH1(r)), start, time.Now()))
+		f.exporter.Export(tracing.BuildServerSpan(*traceDecision, in, tracing.ResolveCustomTags(f.tracingConfig.CustomTags, reqHeaderLookupH1(r), metaLookup), start, time.Now()))
 	}
 	if statusCode == 0 || len(f.accessLog) == 0 {
 		return

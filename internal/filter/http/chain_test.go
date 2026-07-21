@@ -2784,3 +2784,26 @@ func TestDestroy_EncoderOnlyFilterWithNoDecoderFires(t *testing.T) {
 		t.Errorf("encoder-only OnDestroy fired %d times, want 1", got)
 	}
 }
+
+// TestFilterChain_DynamicMetadata pins the phase-70 C1 accessor
+// func (c *FilterChain) DynamicMetadata() *dynamicmetadata.Bucket: it returns
+// the chain's own dynamicMetadata field (identity), and remains nil-tolerant at
+// the exact Get call shape the T4 HCM tracing emit sites use.
+func TestFilterChain_DynamicMetadata(t *testing.T) {
+	chain := NewFilterChain([]HTTPFilter{}, nil)
+
+	// Identity: the accessor returns the exact bucket set via SetDynamicMetadata.
+	b := dynamicmetadata.NewBucket()
+	chain.SetDynamicMetadata(b)
+	if got := chain.DynamicMetadata(); got != b {
+		t.Errorf("DynamicMetadata() = %p, want the set bucket %p", got, b)
+	}
+
+	// Nil-tolerance: a chain whose bucket is nil resolves Get to (nil,false)
+	// without panic (RD-BUCKET nil-receiver safety at the T4 call shape).
+	chain.SetDynamicMetadata(nil)
+	v, ok := chain.DynamicMetadata().Get("x", "y")
+	if v != nil || ok {
+		t.Errorf("nil-bucket DynamicMetadata().Get() = (%v, %v), want (nil, false)", v, ok)
+	}
+}

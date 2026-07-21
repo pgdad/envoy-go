@@ -1015,6 +1015,14 @@ func (c *FilterChain) SetDynamicMetadata(b *dynamicmetadata.Bucket) {
 	c.dynamicMetadata = b
 }
 
+// DynamicMetadata returns the chain's per-request dynamic-metadata bucket
+// (nil-tolerant via Bucket.Get). Added phase 70 so the HCM tracing emit sites
+// can resolve a REQUEST-kind custom_tag metadata value; mirrors the decoderCB/
+// encoderCB accessors, which read the same field.
+func (c *FilterChain) DynamicMetadata() *dynamicmetadata.Bucket {
+	return c.dynamicMetadata
+}
+
 // SetTLSPrincipals seeds the chain's per-stream TLS principal-name candidate
 // slice. Called by HCM dispatch (connection.go H1 / h2dispatch.go H2) at chain
 // build time BEFORE RunDecodeHeaders dispatch when the downstream conn is a

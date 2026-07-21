@@ -8,6 +8,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	tracev3 "github.com/envoyproxy/go-control-plane/envoy/config/trace/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	metadatav3 "github.com/envoyproxy/go-control-plane/envoy/type/metadata/v3"
 	typetracingv3 "github.com/envoyproxy/go-control-plane/envoy/type/tracing/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -457,9 +458,9 @@ func TestNewConfigRejectCustomTagArms(t *testing.T) {
 			wantSub: "environment tag \"e\" empty name",
 		},
 		{
-			name:    "metadata",
+			name:    "metadata-unset-kind",
 			tag:     &typetracingv3.CustomTag{Tag: "m", Type: &typetracingv3.CustomTag_Metadata_{Metadata: &typetracingv3.CustomTag_Metadata{}}},
-			wantSub: "metadata type unsupported",
+			wantSub: "kind required",
 		},
 		{
 			name:    "typeless",
@@ -577,6 +578,147 @@ func TestNewConfigCustomTagEnvironmentFirstWinsDedup(t *testing.T) {
 	}
 	if got := cfg.CustomTags[0]; got.Key != "dup" || got.Kind != kindEnvironment || got.EnvName != "ENVOY_UNSET_XYZ" {
 		t.Errorf("CustomTags[0] = %+v, want the FIRST (environment ENVOY_UNSET_XYZ)", got)
+	}
+}
+
+// reqMetaKind builds a REQUEST MetadataKind (the only accepted kind).
+func reqMetaKind() *metadatav3.MetadataKind {
+	return &metadatav3.MetadataKind{Kind: &metadatav3.MetadataKind_Request_{Request: &metadatav3.MetadataKind_Request{}}}
+}
+
+// customTagMetadata builds a *typetracingv3.CustomTag of the `metadata` type. A
+// metadata_key is attached iff key != "" or path is non-empty (so an entirely
+// absent metadata_key can be exercised by passing key=="" and a nil path).
+func customTagMetadata(tag string, kind *metadatav3.MetadataKind, key string, path []string, dv string) *typetracingv3.CustomTag {
+	md := &typetracingv3.CustomTag_Metadata{Kind: kind, DefaultValue: dv}
+	if key != "" || len(path) > 0 {
+		segs := make([]*metadatav3.MetadataKey_PathSegment, 0, len(path))
+		for _, p := range path {
+			segs = append(segs, &metadatav3.MetadataKey_PathSegment{Segment: &metadatav3.MetadataKey_PathSegment_Key{Key: p}})
+		}
+		md.MetadataKey = &metadatav3.MetadataKey{Key: key, Path: segs}
+	}
+	return &typetracingv3.CustomTag{Tag: tag, Type: &typetracingv3.CustomTag_Metadata_{Metadata: md}}
+}
+
+// TestNewConfigAcceptCustomTagMetadata_RequestAccept: a REQUEST-kind metadata tag
+// parses into a CustomTagSpec carrying the namespace (metadata_key.key), the
+// pre-extracted path segment keys, and the default (HasDefault from a non-empty
+// default_value — the request_header idiom, C2).
+func TestNewConfigAcceptCustomTagMetadata_RequestAccept(t *testing.T) {
+	tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+	tr.CustomTags = []*typetracingv3.CustomTag{
+		customTagMetadata("t", reqMetaKind(), "ns", []string{"a", "b"}, "d"),
+	}
+	cfg, err := NewConfig(tr)
+	if err != nil {
+		t.Fatalf("NewConfig accept metadata: unexpected err %v", err)
+	}
+	if len(cfg.CustomTags) != 1 {
+		t.Fatalf("CustomTags len = %d, want 1", len(cfg.CustomTags))
+	}
+	got := cfg.CustomTags[0]
+	if got.Key != "t" || got.Kind != kindMetadata || got.MetaNamespace != "ns" ||
+		!reflect.DeepEqual(got.MetaPath, []string{"a", "b"}) || got.DefaultValue != "d" || !got.HasDefault {
+		t.Errorf("CustomTags[0] = %+v, want metadata {t,ns,[a b],d,HasDefault}", got)
+	}
+}
+
+// TestNewConfigRejectCustomTagMetadata_RejectKinds: ROUTE/CLUSTER/HOST and an
+// unset kind each boot-reject with an ADR-0080-distinct substring (envoy-go-strict
+// DEPARTURE — the reference accepts these kinds).
+func TestNewConfigRejectCustomTagMetadata_RejectKinds(t *testing.T) {
+	tests := []struct {
+		name    string
+		kind    *metadatav3.MetadataKind
+		wantSub string
+	}{
+		{"route", &metadatav3.MetadataKind{Kind: &metadatav3.MetadataKind_Route_{Route: &metadatav3.MetadataKind_Route{}}}, "route kind unsupported"},
+		{"cluster", &metadatav3.MetadataKind{Kind: &metadatav3.MetadataKind_Cluster_{Cluster: &metadatav3.MetadataKind_Cluster{}}}, "cluster kind unsupported"},
+		{"host", &metadatav3.MetadataKind{Kind: &metadatav3.MetadataKind_Host_{Host: &metadatav3.MetadataKind_Host{}}}, "host kind unsupported"},
+		{"unset-kind", nil, "kind required"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+			tr.CustomTags = []*typetracingv3.CustomTag{customTagMetadata("m", tc.kind, "ns", []string{"a"}, "")}
+			got, err := NewConfig(tr)
+			if err == nil {
+				t.Fatalf("NewConfig(%s) err = nil, want reject; got %+v", tc.name, got)
+			}
+			if got != nil {
+				t.Fatalf("NewConfig(%s) returned non-nil config on reject: %+v", tc.name, got)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("NewConfig(%s) err = %q, want substring %q", tc.name, err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestNewConfigRejectCustomTagMetadata_RejectStructural: an empty namespace, an
+// empty path, and an empty path segment each boot-reject (PGV-PARITY — the
+// reference boot-rejects these too).
+func TestNewConfigRejectCustomTagMetadata_RejectStructural(t *testing.T) {
+	tests := []struct {
+		name    string
+		tag     *typetracingv3.CustomTag
+		wantSub string
+	}{
+		{"empty-namespace", customTagMetadata("m", reqMetaKind(), "", []string{"a"}, ""), "empty namespace"},
+		{"empty-path", customTagMetadata("m", reqMetaKind(), "ns", nil, ""), "empty path"},
+		{"empty-path-segment", customTagMetadata("m", reqMetaKind(), "ns", []string{""}, ""), "empty path segment"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+			tr.CustomTags = []*typetracingv3.CustomTag{tc.tag}
+			got, err := NewConfig(tr)
+			if err == nil {
+				t.Fatalf("NewConfig(%s) err = nil, want reject; got %+v", tc.name, got)
+			}
+			if got != nil {
+				t.Fatalf("NewConfig(%s) returned non-nil config on reject: %+v", tc.name, got)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("NewConfig(%s) err = %q, want substring %q", tc.name, err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestNewConfigAcceptCustomTagMetadata_HasDefaultFalseWhenEmpty: a REQUEST tag with
+// an empty default_value → HasDefault==false (the request_header idiom).
+func TestNewConfigAcceptCustomTagMetadata_HasDefaultFalseWhenEmpty(t *testing.T) {
+	tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+	tr.CustomTags = []*typetracingv3.CustomTag{customTagMetadata("t", reqMetaKind(), "ns", []string{"a"}, "")}
+	cfg, err := NewConfig(tr)
+	if err != nil {
+		t.Fatalf("NewConfig accept metadata: unexpected err %v", err)
+	}
+	if got := cfg.CustomTags[0]; got.Kind != kindMetadata || got.DefaultValue != "" || got.HasDefault {
+		t.Errorf("CustomTags[0] = %+v, want metadata with HasDefault==false, empty default", got)
+	}
+}
+
+// TestNewConfigCustomTagMetadataFirstWinsDedup: a metadata tag placed FIRST reserves
+// its key slot — a later same-key literal tag is dropped (SPEC-62 §11 arms C/D). The
+// stored spec is the FIRST (metadata).
+func TestNewConfigCustomTagMetadataFirstWinsDedup(t *testing.T) {
+	tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+	tr.CustomTags = []*typetracingv3.CustomTag{
+		customTagMetadata("dup", reqMetaKind(), "ns", []string{"a"}, ""),
+		customTagLiteral("dup", "LIT-VAL"),
+	}
+	cfg, err := NewConfig(tr)
+	if err != nil {
+		t.Fatalf("NewConfig metadata-dedup: unexpected err %v", err)
+	}
+	if len(cfg.CustomTags) != 1 {
+		t.Fatalf("CustomTags len = %d, want 1 (first-wins dedup)", len(cfg.CustomTags))
+	}
+	if got := cfg.CustomTags[0]; got.Key != "dup" || got.Kind != kindMetadata || got.MetaNamespace != "ns" {
+		t.Errorf("CustomTags[0] = %+v, want the FIRST (metadata ns)", got)
 	}
 }
 
