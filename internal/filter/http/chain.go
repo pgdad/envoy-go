@@ -15,6 +15,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
 )
@@ -1021,6 +1022,20 @@ func (c *FilterChain) SetDynamicMetadata(b *dynamicmetadata.Bucket) {
 // encoderCB accessors, which read the same field.
 func (c *FilterChain) DynamicMetadata() *dynamicmetadata.Bucket {
 	return c.dynamicMetadata
+}
+
+// RouteMetaLookup returns the matched route's static config metadata for the
+// namespace ns, wrapped as a structpb StructValue (or (nil,false) when the
+// route carries no metadata / the namespace is absent). Added phase 71 so the
+// HCM tracing emit sites can resolve a ROUTE-kind custom_tag metadata value;
+// the ROUTE analog of DynamicMetadata(). Centralizes the structpb import to
+// chain.go (the three dispatch files stay structpb-free).
+func (c *FilterChain) RouteMetaLookup(ns string) (*structpb.Value, bool) {
+	st := c.RouteMetadata().GetFilterMetadata()[ns]
+	if st == nil {
+		return nil, false
+	}
+	return structpb.NewStructValue(st), true
 }
 
 // SetTLSPrincipals seeds the chain's per-stream TLS principal-name candidate

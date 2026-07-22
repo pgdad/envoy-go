@@ -114,7 +114,7 @@ func TestSpanEmit_H1_SampledExports(t *testing.T) {
 
 	d := knownDecision()
 	start := time.Now().Add(-5 * time.Millisecond)
-	f.emitAccessLog(req, 200, 100, cluster.Endpoint{}, start, nil, d, nil)
+	f.emitAccessLog(req, 200, 100, cluster.Endpoint{}, start, nil, d, nil, nil)
 
 	spans := fe.captured()
 	if len(spans) != 1 {
@@ -148,7 +148,7 @@ func TestSpanEmit_H1_NotSampledNoExport(t *testing.T) {
 	req.Proto = "HTTP/1.1"
 
 	d := &tracing.Decision{Sample: false, TraceID: [16]byte{1}, SpanID: [8]byte{1}}
-	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, d, nil)
+	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, d, nil, nil)
 
 	if got := len(fe.captured()); got != 0 {
 		t.Errorf("expected 0 spans for not-sampled, got %d", got)
@@ -173,7 +173,7 @@ func TestSpanEmit_H1_Continued(t *testing.T) {
 		SpanID:       [8]byte{11, 22, 33, 44, 55, 66, 77, 88},
 		ParentSpanID: parentSpanID,
 	}
-	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, d, nil)
+	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, d, nil, nil)
 
 	spans := fe.captured()
 	if len(spans) != 1 {
@@ -198,7 +198,7 @@ func TestSpanEmit_H1_CancelNoSpan(t *testing.T) {
 	req.Proto = "HTTP/1.1"
 
 	d := &tracing.Decision{Sample: true}
-	f.emitAccessLog(req, 0, 0, cluster.Endpoint{}, time.Now(), nil, d, nil)
+	f.emitAccessLog(req, 0, 0, cluster.Endpoint{}, time.Now(), nil, d, nil, nil)
 
 	if got := len(fe.captured()); got != 0 {
 		t.Errorf("expected 0 spans for statusCode=0 (ctx-cancel), got %d", got)
@@ -220,7 +220,7 @@ func TestSpanEmit_H1_ExportEvenWithoutAccessLog(t *testing.T) {
 	req.Proto = "HTTP/1.1"
 
 	d := knownDecision()
-	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, d, nil)
+	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, d, nil, nil)
 
 	if got := len(fe.captured()); got != 1 {
 		t.Errorf("expected 1 span even with empty accessLog, got %d", got)
@@ -234,7 +234,7 @@ func TestSpanEmit_H1_ByteStableNoTracing(t *testing.T) {
 	req, _ := http.NewRequest("GET", "http://example.com/", nil)
 	req.Proto = "HTTP/1.1"
 	// Must not panic.
-	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, nil, nil)
+	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, nil, nil, nil)
 }
 
 // ── H2 tests ──────────────────────────────────────────────────────────────────
@@ -254,7 +254,7 @@ func TestSpanEmit_H2_SampledExports(t *testing.T) {
 
 	d := knownDecision()
 	start := time.Now().Add(-5 * time.Millisecond)
-	f.emitAccessLogH2(req, 200, 100, cluster.Endpoint{}, start, nil, d, nil)
+	f.emitAccessLogH2(req, 200, 100, cluster.Endpoint{}, start, nil, d, nil, nil)
 
 	spans := fe.captured()
 	if len(spans) != 1 {
@@ -286,7 +286,7 @@ func TestSpanEmit_H2_NotSampledNoExport(t *testing.T) {
 
 	req := h2.H2Request{Method: "GET", Path: "/", Authority: "example.com"}
 	d := &tracing.Decision{Sample: false}
-	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, d, nil)
+	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, d, nil, nil)
 
 	if got := len(fe.captured()); got != 0 {
 		t.Errorf("expected 0 spans for not-sampled, got %d", got)
@@ -309,7 +309,7 @@ func TestSpanEmit_H2_Continued(t *testing.T) {
 		SpanID:       [8]byte{11, 22, 33, 44, 55, 66, 77, 88},
 		ParentSpanID: parentSpanID,
 	}
-	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, d, nil)
+	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, d, nil, nil)
 
 	spans := fe.captured()
 	if len(spans) != 1 {
@@ -332,7 +332,7 @@ func TestSpanEmit_H2_CancelNoSpan(t *testing.T) {
 
 	req := h2.H2Request{Method: "GET", Path: "/", Authority: "example.com"}
 	d := &tracing.Decision{Sample: true}
-	f.emitAccessLogH2(req, 0, 0, cluster.Endpoint{}, time.Now(), nil, d, nil)
+	f.emitAccessLogH2(req, 0, 0, cluster.Endpoint{}, time.Now(), nil, d, nil, nil)
 
 	if got := len(fe.captured()); got != 0 {
 		t.Errorf("expected 0 spans for statusCode=0, got %d", got)
@@ -349,7 +349,7 @@ func TestSpanEmit_H2_ExportEvenWithoutAccessLog(t *testing.T) {
 
 	req := h2.H2Request{Method: "GET", Path: "/health", Scheme: "https", Authority: "example.com"}
 	d := knownDecision()
-	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, d, nil)
+	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, d, nil, nil)
 
 	if got := len(fe.captured()); got != 1 {
 		t.Errorf("expected 1 span even with empty accessLog, got %d", got)
@@ -361,7 +361,7 @@ func TestSpanEmit_H2_ByteStableNoTracing(t *testing.T) {
 	f := &Filter{exporter: nil}
 	req := h2.H2Request{Method: "GET", Path: "/", Authority: "example.com"}
 	// Must not panic.
-	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, nil, nil)
+	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, nil, nil, nil)
 }
 
 // spanAttr returns the string value of the named span attribute (or "" if absent).
@@ -386,7 +386,7 @@ func TestSpanEmit_H1_MaxPathTagLengthTruncates(t *testing.T) {
 	req.Proto = "HTTP/1.1"
 	req.Host = "h.io"
 
-	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, knownDecision(), nil)
+	f.emitAccessLog(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, knownDecision(), nil, nil)
 
 	spans := fe.captured()
 	if len(spans) != 1 {
@@ -405,7 +405,7 @@ func TestSpanEmit_H2_MaxPathTagLengthTruncates(t *testing.T) {
 	f := newTracingFilter(t, fe, cfg)
 
 	req := h2.H2Request{Method: "GET", Path: "/abcdefghijKLMNOPqrstuvwxyz", Scheme: "http", Authority: "h.io"}
-	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, knownDecision(), nil)
+	f.emitAccessLogH2(req, 200, 0, cluster.Endpoint{}, time.Now(), nil, knownDecision(), nil, nil)
 
 	spans := fe.captured()
 	if len(spans) != 1 {
@@ -487,7 +487,7 @@ func TestSpanEmit_H1_MetadataCustomTag_ThreadLive(t *testing.T) {
 		return nil, false
 	}
 
-	f.emitAccessLog(req, 200, 100, cluster.Endpoint{}, time.Now(), nil, knownDecision(), metaLookup)
+	f.emitAccessLog(req, 200, 100, cluster.Endpoint{}, time.Now(), nil, knownDecision(), metaLookup, nil)
 
 	spans := fe.captured()
 	if len(spans) != 1 {
@@ -495,5 +495,61 @@ func TestSpanEmit_H1_MetadataCustomTag_ThreadLive(t *testing.T) {
 	}
 	if got := spanAttr(spans[0], "mtag"); got != "resolved-value" {
 		t.Errorf("span attr mtag = %q, want resolved-value (metaLookup thread not live)", got)
+	}
+}
+
+// routeMetadataCustomTag builds a ROUTE-kind metadata custom_tag reading
+// metadata_key.key==ns with a single path segment `seg`.
+func routeMetadataCustomTag(tag, ns, seg string) *typetracingv3.CustomTag {
+	return &typetracingv3.CustomTag{
+		Tag: tag,
+		Type: &typetracingv3.CustomTag_Metadata_{Metadata: &typetracingv3.CustomTag_Metadata{
+			Kind: &metadatav3.MetadataKind{Kind: &metadatav3.MetadataKind_Route_{Route: &metadatav3.MetadataKind_Route{}}},
+			MetadataKey: &metadatav3.MetadataKey{
+				Key:  ns,
+				Path: []*metadatav3.MetadataKey_PathSegment{{Segment: &metadatav3.MetadataKey_PathSegment_Key{Key: seg}}},
+			},
+		}},
+	}
+}
+
+// TestSpanEmit_H1_RouteMetadataCustomTag_ThreadLive proves the routeMetaLookup
+// thread is LIVE (phase 71 T4): a ROUTE-kind metadata custom_tag resolves its
+// value from the supplied routeMetaLookup onto the ingress span. A nil (or
+// always-miss) routeMetaLookup would leave the tag at default/omit — the
+// resolved-value assertion discriminates (Break H / Break I).
+func TestSpanEmit_H1_RouteMetadataCustomTag_ThreadLive(t *testing.T) {
+	fe := &fakeExporter{}
+	cfg, err := tracing.NewConfig(otelTracingProto(t, []*typetracingv3.CustomTag{
+		routeMetadataCustomTag("rtag", "route.ns", "field"),
+	}))
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+	f := newTracingFilter(t, fe, cfg)
+
+	req, _ := http.NewRequest("GET", "http://example.com/health", nil)
+	req.Proto = "HTTP/1.1"
+	req.Host = "example.com"
+
+	// routeMetaLookup resolves ns "route.ns" -> a structpb struct value with
+	// a "field" key, mirroring FilterChain.RouteMetaLookup's shape (the
+	// namespace's filter_metadata struct, wrapped via structpb.NewStructValue).
+	routeMetaLookup := func(ns string) (*structpb.Value, bool) {
+		if ns == "route.ns" {
+			s, _ := structpb.NewStruct(map[string]interface{}{"field": "route-resolved-value"})
+			return structpb.NewStructValue(s), true
+		}
+		return nil, false
+	}
+
+	f.emitAccessLog(req, 200, 100, cluster.Endpoint{}, time.Now(), nil, knownDecision(), nil, routeMetaLookup)
+
+	spans := fe.captured()
+	if len(spans) != 1 {
+		t.Fatalf("expected 1 span, got %d", len(spans))
+	}
+	if got := spanAttr(spans[0], "rtag"); got != "route-resolved-value" {
+		t.Errorf("span attr rtag = %q, want route-resolved-value (routeMetaLookup thread not live)", got)
 	}
 }

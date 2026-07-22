@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
@@ -2806,4 +2807,55 @@ func TestFilterChain_DynamicMetadata(t *testing.T) {
 	if v != nil || ok {
 		t.Errorf("nil-bucket DynamicMetadata().Get() = (%v, %v), want (nil, false)", v, ok)
 	}
+}
+
+// TestFilterChain_RouteMetaLookup pins the phase-71 S2 accessor
+// func (c *FilterChain) RouteMetaLookup(ns string) (*structpb.Value, bool):
+// the ROUTE analog of DynamicMetadata() — it wraps
+// RouteMetadata().GetFilterMetadata()[ns] via structpb.NewStructValue, is
+// nil-tolerant, and returns (nil,false) on an absent namespace.
+func TestFilterChain_RouteMetaLookup(t *testing.T) {
+	t.Run("namespace present", func(t *testing.T) {
+		chain := NewFilterChain([]HTTPFilter{}, nil)
+		st, err := structpb.NewStruct(map[string]interface{}{"k": "v"})
+		if err != nil {
+			t.Fatalf("structpb.NewStruct: %v", err)
+		}
+		chain.SetRouteMetadata(&corev3.Metadata{
+			FilterMetadata: map[string]*structpb.Struct{"ns": st},
+		})
+
+		got, ok := chain.RouteMetaLookup("ns")
+		if !ok || got == nil {
+			t.Fatalf("RouteMetaLookup(\"ns\") = (%v, %v), want (non-nil, true)", got, ok)
+		}
+		if s := got.GetStructValue().GetFields()["k"].GetStringValue(); s != "v" {
+			t.Errorf("RouteMetaLookup(\"ns\") descended value = %q, want %q", s, "v")
+		}
+	})
+
+	t.Run("namespace absent", func(t *testing.T) {
+		chain := NewFilterChain([]HTTPFilter{}, nil)
+		st, err := structpb.NewStruct(map[string]interface{}{"k": "v"})
+		if err != nil {
+			t.Fatalf("structpb.NewStruct: %v", err)
+		}
+		chain.SetRouteMetadata(&corev3.Metadata{
+			FilterMetadata: map[string]*structpb.Struct{"ns": st},
+		})
+
+		got, ok := chain.RouteMetaLookup("missing")
+		if ok || got != nil {
+			t.Errorf("RouteMetaLookup(\"missing\") = (%v, %v), want (nil, false)", got, ok)
+		}
+	})
+
+	t.Run("nil route metadata", func(t *testing.T) {
+		chain := NewFilterChain([]HTTPFilter{}, nil)
+
+		got, ok := chain.RouteMetaLookup("ns")
+		if ok || got != nil {
+			t.Errorf("nil-RouteMetadata RouteMetaLookup(\"ns\") = (%v, %v), want (nil, false)", got, ok)
+		}
+	})
 }

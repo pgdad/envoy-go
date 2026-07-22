@@ -327,7 +327,7 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 		// nil here (PRE-Decide path) — no span for a 404 no-match.
 		start := time.Now()
 		err := writeStatusReply(bw, 404, "")
-		f.emitAccessLog(req, 404, 0, cluster.Endpoint{}, start, nil, traceDecision, nil)
+		f.emitAccessLog(req, 404, 0, cluster.Endpoint{}, start, nil, traceDecision, nil, nil)
 		return 404, err
 	}
 
@@ -461,7 +461,7 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 		log.Printf("hcm: dispatchRequest: terminal filter is not *router.Filter (got %T)", chainHF[len(chainHF)-1].Decoder)
 		start := time.Now()
 		err := writeStatusReply(bw, 500, "")
-		f.emitAccessLog(req, 500, 0, cluster.Endpoint{}, start, nil, traceDecision, chain.DynamicMetadata().Get)
+		f.emitAccessLog(req, 500, 0, cluster.Endpoint{}, start, nil, traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 		return 500, err
 	}
 	rf.SetAction(action)
@@ -594,7 +594,7 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 		}
 		// Phase 46.1b Task 8: POST-Decide site — pass traceDecision so the
 		// span block in emitAccessLog fires when sampling is active.
-		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime, lrHeaders, traceDecision, chain.DynamicMetadata().Get)
+		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime, lrHeaders, traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 		// Honor any user-supplied Connection: close on the local-reply
 		// headers (the 413 overflow path sets this; cors preflight does not).
 		if strings.EqualFold(lrHeaders.Get("Connection"), "close") {
@@ -696,7 +696,7 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 			werr = writeH1Reply(bw, lrStatus, lrHeaders, lrBody)
 		}
 		// Phase 46.1b Task 8: POST-Decide site — pass traceDecision.
-		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime, lrHeaders, traceDecision, chain.DynamicMetadata().Get)
+		f.emitAccessLog(req, lrStatus, bytesSent, cluster.Endpoint{}, startTime, lrHeaders, traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 		if strings.EqualFold(lrHeaders.Get("Connection"), "close") {
 			if werr == nil {
 				werr = errCloseAfterAction
@@ -774,7 +774,7 @@ func (f *Filter) dispatchRequest(ctx context.Context, downstream net.Conn, req *
 	// emitAccessLog is a no-op when status==0 (ctx-cancel sentinel) or when
 	// f.accessLog is empty. Phase 46.1b Task 8: POST-Decide site — pass
 	// traceDecision so the span block fires for sampled requests.
-	f.emitAccessLog(req, status, bytesSent, picked, startTime, resp.Headers, traceDecision, chain.DynamicMetadata().Get)
+	f.emitAccessLog(req, status, bytesSent, picked, startTime, resp.Headers, traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 
 	return status, actionErr
 }

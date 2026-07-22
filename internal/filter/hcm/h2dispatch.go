@@ -310,7 +310,7 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 		if err == nil && resp.Status > 0 {
 			err = writeH2Reply(sw, resp.Status, resp.Headers, resp.Body)
 		}
-		c.f.emitAccessLogH2(h2req, resp.Status, int64(len(resp.Body)), picked, startTime, resp.Headers, c.traceDecision, nil)
+		c.f.emitAccessLogH2(h2req, resp.Status, int64(len(resp.Body)), picked, startTime, resp.Headers, c.traceDecision, nil, nil)
 		if cnt := c.f.downstreamStatusClassCounter(resp.Status); cnt != nil {
 			cnt.Inc()
 		}
@@ -393,7 +393,7 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 		// dispatchRequest defensive branch. Phase 46.1b Task 8: c.traceDecision
 		// is nil here (PRE-Decide) → no span for this synthetic 500.
 		_ = c.f.write500H2(sw)
-		c.f.emitAccessLogH2(h2req, 500, 0, cluster.Endpoint{}, startTime, nil, c.traceDecision, chain.DynamicMetadata().Get)
+		c.f.emitAccessLogH2(h2req, 500, 0, cluster.Endpoint{}, startTime, nil, c.traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 		if cnt := c.f.downstreamStatusClassCounter(500); cnt != nil {
 			cnt.Inc()
 		}
@@ -527,7 +527,7 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 			werr = writeH2Reply(sw, lrStatus, lrHeaders, lrBody)
 		}
 		// Phase 46.1b Task 8: POST-Decide site — pass c.traceDecision.
-		c.f.emitAccessLogH2(h2req, lrStatus, int64(len(lrBody)), cluster.Endpoint{}, startTime, lrHeaders, c.traceDecision, chain.DynamicMetadata().Get)
+		c.f.emitAccessLogH2(h2req, lrStatus, int64(len(lrBody)), cluster.Endpoint{}, startTime, lrHeaders, c.traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 		if lrStatus > 0 {
 			if cnt := c.f.downstreamStatusClassCounter(lrStatus); cnt != nil {
 				cnt.Inc()
@@ -574,14 +574,14 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 		chain.SetEncodeResponseStatus(status)
 		if _, err := chain.RunEncodeHeaders(ctx, merged, len(resp.Body) == 0); err != nil {
 			// Phase 46.1b Task 8: POST-Decide site — pass c.traceDecision.
-			c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime, resp.Headers, c.traceDecision, chain.DynamicMetadata().Get)
+			c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime, resp.Headers, c.traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 			return err
 		}
 		resp.Headers = filter_http.ReconcileOrderedHeaders(resp.Headers, merged)
 		if len(resp.Body) > 0 {
 			if _, err := chain.RunEncodeData(ctx, resp.Body, true); err != nil {
 				// Phase 46.1b Task 8: POST-Decide site — pass c.traceDecision.
-				c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime, resp.Headers, c.traceDecision, chain.DynamicMetadata().Get)
+				c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime, resp.Headers, c.traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 				return err
 			}
 		}
@@ -610,7 +610,7 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	// emitAccessLogH2 is a no-op when status==0 (H2 ctx-cancel sentinel per
 	// SPEC §2.1 last bullet) or when f.accessLog is empty. Phase 46.1b Task 8:
 	// POST-Decide site — pass c.traceDecision for span export on sampled requests.
-	c.f.emitAccessLogH2(h2req, status, bytesSent, picked, startTime, resp.Headers, c.traceDecision, chain.DynamicMetadata().Get)
+	c.f.emitAccessLogH2(h2req, status, bytesSent, picked, startTime, resp.Headers, c.traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 
 	// Phase 06.1 Task 11: HCM-scope downstream_rq_<Nxx> Inc on the H2 path
 	// per SPEC §5.5 "HCM response hook" row — Inc once per finalized response

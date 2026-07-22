@@ -21,9 +21,15 @@ import (
 // default rule), or the DefaultValue when the value is absent/unresolvable and a
 // default was configured, or NOTHING otherwise. metaLookup may be nil (no
 // dynamic-metadata bucket available), in which case metadata specs use default /
-// omit. The returned []KV has unique keys (the specs were deduped at parse), so
+// omit. A kindMetadataRoute spec yields the serialized static route-config
+// metadata value at its namespace+path (routeMetaLookup, same present-empty
+// EMITS "" default rule), descending the FULL MetaPath from the WHOLE namespace
+// struct routeMetaLookup returns (distinct from metaLookup's two-arg,
+// pre-keyed-to-MetaPath[0] shape). routeMetaLookup may be nil (no route
+// metadata available), in which case kindMetadataRoute specs use default / omit.
+// The returned []KV has unique keys (the specs were deduped at parse), so
 // BuildServerSpan's upsert only ever overrides a colliding BUILT-IN.
-func ResolveCustomTags(specs []CustomTagSpec, headerLookup func(string) ([]string, bool), metaLookup func(ns, key string) (*structpb.Value, bool)) []KV {
+func ResolveCustomTags(specs []CustomTagSpec, headerLookup func(string) ([]string, bool), metaLookup func(ns, key string) (*structpb.Value, bool), routeMetaLookup func(ns string) (*structpb.Value, bool)) []KV {
 	if len(specs) == 0 {
 		return nil
 	}
@@ -76,6 +82,28 @@ func ResolveCustomTags(specs []CustomTagSpec, headerLookup func(string) ([]strin
 			}
 			if ok {
 				v, ok = descend(v, s.MetaPath[1:])
+			}
+			if ok {
+				if str, emit := structpbValueToString(v); emit {
+					out = append(out, KV{Key: s.Key, Str: str})
+					continue
+				}
+			}
+			if s.HasDefault {
+				out = append(out, KV{Key: s.Key, Str: s.DefaultValue})
+			} // else omit (append nothing)
+		case kindMetadataRoute:
+			// Mirror kindMetadata's default rule (present-empty EMITS ""), but the ROUTE
+			// source yields the WHOLE namespace struct, so descend the FULL MetaPath
+			// (the [1:] slice is a REQUEST-only Bucket-pre-keying artifact).
+			// routeMetaLookup may be nil (no route metadata) → default / omit.
+			var v *structpb.Value
+			var ok bool
+			if routeMetaLookup != nil {
+				v, ok = routeMetaLookup(s.MetaNamespace)
+			}
+			if ok {
+				v, ok = descend(v, s.MetaPath) // FULL path, NOT s.MetaPath[1:]
 			}
 			if ok {
 				if str, emit := structpbValueToString(v); emit {

@@ -127,7 +127,7 @@ func (f *Filter) runH3(ctx context.Context, w http.ResponseWriter, r *http.Reque
 		// 404 no-match: no chain is built (no route → no per-route config → no
 		// terminal action). Mirrors dispatchRequest's no-match branch.
 		err := writeH3Reply(w, 404, nil, nil)
-		f.emitAccessLogH3(r, 404, 0, cluster.Endpoint{}, start, nil, traceDecision, nil)
+		f.emitAccessLogH3(r, 404, 0, cluster.Endpoint{}, start, nil, traceDecision, nil, nil)
 		if cnt := f.downstreamStatusClassCounter(404); cnt != nil {
 			cnt.Inc()
 		}
@@ -207,7 +207,7 @@ func (f *Filter) runH3(ctx context.Context, w http.ResponseWriter, r *http.Reque
 	if !ok {
 		log.Printf("hcm: runH3: terminal filter is not *router.Filter (got %T)", chainHF[len(chainHF)-1].Decoder)
 		err := writeH3Reply(w, 500, nil, nil)
-		f.emitAccessLogH3(r, 500, 0, cluster.Endpoint{}, start, nil, traceDecision, chain.DynamicMetadata().Get)
+		f.emitAccessLogH3(r, 500, 0, cluster.Endpoint{}, start, nil, traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 		if cnt := f.downstreamStatusClassCounter(500); cnt != nil {
 			cnt.Inc()
 		}
@@ -277,7 +277,7 @@ func (f *Filter) runH3(ctx context.Context, w http.ResponseWriter, r *http.Reque
 		if lrStatus > 0 {
 			werr = writeH3Reply(w, lrStatus, lrHeaders, lrBody)
 		}
-		f.emitAccessLogH3(r, lrStatus, int64(len(lrBody)), cluster.Endpoint{}, start, lrHeaders, traceDecision, chain.DynamicMetadata().Get)
+		f.emitAccessLogH3(r, lrStatus, int64(len(lrBody)), cluster.Endpoint{}, start, lrHeaders, traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 		if lrStatus > 0 {
 			if cnt := f.downstreamStatusClassCounter(lrStatus); cnt != nil {
 				cnt.Inc()
@@ -338,7 +338,7 @@ func (f *Filter) runH3(ctx context.Context, w http.ResponseWriter, r *http.Reque
 		if lrStatus > 0 {
 			werr = writeH3Reply(w, lrStatus, lrHeaders, lrBody)
 		}
-		f.emitAccessLogH3(r, lrStatus, int64(len(lrBody)), cluster.Endpoint{}, start, lrHeaders, traceDecision, chain.DynamicMetadata().Get)
+		f.emitAccessLogH3(r, lrStatus, int64(len(lrBody)), cluster.Endpoint{}, start, lrHeaders, traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 		if lrStatus > 0 {
 			if cnt := f.downstreamStatusClassCounter(lrStatus); cnt != nil {
 				cnt.Inc()
@@ -364,13 +364,13 @@ func (f *Filter) runH3(ctx context.Context, w http.ResponseWriter, r *http.Reque
 		merged := resp.Headers.ToHTTPHeader()
 		chain.SetEncodeResponseStatus(status)
 		if _, err := chain.RunEncodeHeaders(ctx, merged, len(resp.Body) == 0); err != nil {
-			f.emitAccessLogH3(r, status, int64(len(resp.Body)), picked, start, resp.Headers, traceDecision, chain.DynamicMetadata().Get)
+			f.emitAccessLogH3(r, status, int64(len(resp.Body)), picked, start, resp.Headers, traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 			return status, err
 		}
 		resp.Headers = filter_http.ReconcileOrderedHeaders(resp.Headers, merged)
 		if len(resp.Body) > 0 {
 			if _, err := chain.RunEncodeData(ctx, resp.Body, true); err != nil {
-				f.emitAccessLogH3(r, status, int64(len(resp.Body)), picked, start, resp.Headers, traceDecision, chain.DynamicMetadata().Get)
+				f.emitAccessLogH3(r, status, int64(len(resp.Body)), picked, start, resp.Headers, traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 				return status, err
 			}
 		}
@@ -392,7 +392,7 @@ func (f *Filter) runH3(ctx context.Context, w http.ResponseWriter, r *http.Reque
 
 	// Single uniform access-log + span emit site at chain-completion (no-op when
 	// status==0 or f.accessLog is empty; the span block fires for sampled reqs).
-	f.emitAccessLogH3(r, status, bytesSent, picked, start, resp.Headers, traceDecision, chain.DynamicMetadata().Get)
+	f.emitAccessLogH3(r, status, bytesSent, picked, start, resp.Headers, traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 	if status > 0 {
 		if cnt := f.downstreamStatusClassCounter(status); cnt != nil {
 			cnt.Inc()
