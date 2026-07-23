@@ -1486,6 +1486,9 @@ func TestExtractEndpoints_NoMetadataIsNilMap(t *testing.T) {
 	if eps[0].Metadata != nil {
 		t.Errorf("absent envoy.lb metadata → nil map, got %v", eps[0].Metadata)
 	}
+	if v, ok := eps[0].MetaLookup("ns"); ok {
+		t.Errorf("MetaLookup(\"ns\") = (%v, true), want (nil, false) — no metadata configured at all", v)
+	}
 }
 
 // TestEndpoint_Addr_Forms pins Addr()'s output: byte-identical to the historic
@@ -2224,5 +2227,113 @@ func TestBuildCluster_RejectsOutOfRangeOnPlainCluster(t *testing.T) {
 	c.CommonLbConfig = &clusterv3.Cluster_CommonLbConfig{HealthyPanicThreshold: &typev3.Percent{Value: 200}}
 	if _, err := buildCluster(c, 0, ""); err == nil {
 		t.Fatal("out-of-range panic threshold on a plain (no-HC) cluster must still be rejected")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 72 Task 1 — extractEndpoints retains the RAW per-namespace metadata
+// ---------------------------------------------------------------------------
+
+// TestExtractEndpoints_MetaLookupAnyNamespaceNestedPath is the live-populate
+// test: it FAILS if the manager.go:884 populate is omitted or is pointed at
+// filter_metadata["envoy.lb"] instead of the WHOLE map. envoy.lb is NOT
+// privileged (SPEC P2) — ANY namespace is addressable — and the retained value
+// keeps NESTED structure, exactly what the envoy.lb scalar projection drops.
+func TestExtractEndpoints_MetaLookupAnyNamespaceNestedPath(t *testing.T) {
+	md, err := structpb.NewStruct(map[string]any{
+		"a": map[string]any{"b": "deep"}, // NESTED — dropped by ScalarsFromStruct
+		"s": "flat",
+	})
+	if err != nil {
+		t.Fatalf("structpb.NewStruct: %v", err)
+	}
+	lbe := mkLbEndpoint("127.0.0.1", 9001)
+	lbe.Metadata = &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{"envoy.test": md}}
+	c := mkStaticClusterFromLbEndpoints("c_hostmd", lbe)
+	eps, err := extractEndpoints(c.GetLoadAssignment(), "c_hostmd")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v, ok := eps[0].MetaLookup("envoy.test")
+	if !ok {
+		t.Errorf("MetaLookup(\"envoy.test\") ok = false — the non-envoy.lb namespace must be retained")
+	}
+	fields := v.GetStructValue().GetFields()
+	if got := fields["s"].GetStringValue(); got != "flat" {
+		t.Errorf("MetaLookup(\"envoy.test\")[s] = %q, want %q", got, "flat")
+	}
+	if got := fields["a"].GetStructValue().GetFields()["b"].GetStringValue(); got != "deep" {
+		t.Errorf("MetaLookup(\"envoy.test\")[a][b] = %q, want %q — the NESTED value must survive", got, "deep")
+	}
+	// envoy.lb is genuinely unprivileged in the OTHER direction too: this
+	// endpoint carries no envoy.lb namespace at all.
+	if _, ok := eps[0].MetaLookup("envoy.lb"); ok {
+		t.Errorf("MetaLookup(\"envoy.lb\") ok = true, want false (no envoy.lb namespace configured)")
+	}
+	if eps[0].Metadata != nil {
+		t.Errorf("Endpoint.Metadata = %v, want nil (the envoy.lb projection is unaffected)", eps[0].Metadata)
+	}
+}
+
+// TestExtractEndpoints_EnvoyLbProjectionUnchangedBesideMetaLookup is the
+// byte-unchanged guard on the phase-38 projection (manager.go:883 /
+// ScalarsFromStruct): an envoy.lb SCALAR still lands in Endpoint.Metadata as a
+// SubsetValue and a NON-scalar envoy.lb key is still DROPPED from it — while
+// that same non-scalar key is now reachable through MetaLookup.
+func TestExtractEndpoints_EnvoyLbProjectionUnchangedBesideMetaLookup(t *testing.T) {
+	md, err := structpb.NewStruct(map[string]any{
+		"version": "v1",
+		"nested":  map[string]any{"x": "y"}, // non-scalar → DROPPED from Metadata
+	})
+	if err != nil {
+		t.Fatalf("structpb.NewStruct: %v", err)
+	}
+	lbe := mkLbEndpoint("127.0.0.1", 9001)
+	lbe.Metadata = &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{"envoy.lb": md}}
+	c := mkStaticClusterFromLbEndpoints("c_lbmd", lbe)
+	eps, err := extractEndpoints(c.GetLoadAssignment(), "c_lbmd")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := eps[0].Metadata["version"]; got.Kind != subsetString || got.Str != "v1" {
+		t.Errorf("Endpoint.Metadata[version] = %+v, want the v1 string SubsetValue", got)
+	}
+	if _, ok := eps[0].Metadata["nested"]; ok {
+		t.Errorf("Endpoint.Metadata[nested] present — the non-scalar key must still be DROPPED by the phase-38 projection")
+	}
+	v, ok := eps[0].MetaLookup("envoy.lb")
+	if !ok {
+		t.Errorf("MetaLookup(\"envoy.lb\") ok = false, want true")
+	}
+	if got := v.GetStructValue().GetFields()["nested"].GetStructValue().GetFields()["x"].GetStringValue(); got != "y" {
+		t.Errorf("MetaLookup(\"envoy.lb\")[nested][x] = %q, want %q — the dropped key stays reachable RAW", got, "y")
+	}
+}
+
+// TestParseLbSubsetConfig_DefaultSubsetUnchanged pins manager.go:754: the
+// default_subset lowering still drops non-scalars and keeps scalars, untouched
+// by the phase-72 retention field.
+func TestParseLbSubsetConfig_DefaultSubsetUnchanged(t *testing.T) {
+	ds, err := structpb.NewStruct(map[string]any{
+		"version": "v1",
+		"nested":  map[string]any{"x": "y"},
+	})
+	if err != nil {
+		t.Fatalf("structpb.NewStruct: %v", err)
+	}
+	cfg := parseLbSubsetConfig(&clusterv3.Cluster_LbSubsetConfig{
+		FallbackPolicy: clusterv3.Cluster_LbSubsetConfig_DEFAULT_SUBSET,
+		DefaultSubset:  ds,
+	})
+	if cfg.fallback != fallbackDefaultSubset {
+		t.Errorf("fallback = %v, want fallbackDefaultSubset", cfg.fallback)
+	}
+	if got := cfg.defaultSubset["version"]; got.Kind != subsetString || got.Str != "v1" {
+		t.Errorf("defaultSubset[version] = %+v, want the v1 string SubsetValue", got)
+	}
+	if _, ok := cfg.defaultSubset["nested"]; ok {
+		t.Errorf("defaultSubset[nested] present — non-scalars must still be dropped")
 	}
 }

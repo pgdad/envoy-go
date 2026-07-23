@@ -881,7 +881,7 @@ func extractEndpoints(la *endpointv3.ClusterLoadAssignment, clusterName string) 
 				return nil, fmt.Errorf("cluster: %q: endpoints[%d].lb_endpoints[%d]: only socket_address endpoints supported", clusterName, gi, ei)
 			}
 			scalars, _ := ScalarsFromStruct(lbe.GetMetadata().GetFilterMetadata()["envoy.lb"]) // drop non-scalar keys
-			e := Endpoint{Host: sa.GetAddress(), Port: sa.GetPortValue(), Metadata: scalars, Locality: loc, LocalityWeight: weight, Priority: priority}
+			e := Endpoint{Host: sa.GetAddress(), Port: sa.GetPortValue(), Metadata: scalars, filterMetadata: lbe.GetMetadata().GetFilterMetadata(), Locality: loc, LocalityWeight: weight, Priority: priority}
 			e.addr = e.Addr() // precompute the hot-path Addr() string once at build time
 			out = append(out, e)
 		}

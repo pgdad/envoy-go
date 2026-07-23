@@ -27,9 +27,23 @@ import (
 // struct routeMetaLookup returns (distinct from metaLookup's two-arg,
 // pre-keyed-to-MetaPath[0] shape). routeMetaLookup may be nil (no route
 // metadata available), in which case kindMetadataRoute specs use default / omit.
+// A kindMetadataHost spec yields the serialized static metadata value of the
+// SELECTED UPSTREAM ENDPOINT at its namespace+path (hostMetaLookup, same
+// present-empty EMITS "" default rule), likewise descending the FULL MetaPath
+// from the WHOLE namespace struct hostMetaLookup returns (the same one-arg shape
+// as routeMetaLookup, NOT metaLookup's two-arg pre-keyed one). hostMetaLookup
+// may be nil (no host lookup available), and picked may be the ZERO Endpoint —
+// at the span-capable local-reply sites, and ALSO at the post-decision upstream
+// emit sites (which forward the router's own picked) whenever the upstream
+// ACQUIRE failed: circuit-breaker / pool-overflow / connect-failure / the
+// defensive H2 grant-race, since doH1ClusterAction and doH2ClusterAction
+// initialize picked := cluster.Endpoint{} and assign only AFTER the acquire
+// succeeds. That second source is the phase-72 named departure B2; POST-acquire
+// failures forward the REAL endpoint and resolve normally. Either way, a ZERO
+// picked makes kindMetadataHost specs use default / omit.
 // The returned []KV has unique keys (the specs were deduped at parse), so
 // BuildServerSpan's upsert only ever overrides a colliding BUILT-IN.
-func ResolveCustomTags(specs []CustomTagSpec, headerLookup func(string) ([]string, bool), metaLookup func(ns, key string) (*structpb.Value, bool), routeMetaLookup func(ns string) (*structpb.Value, bool)) []KV {
+func ResolveCustomTags(specs []CustomTagSpec, headerLookup func(string) ([]string, bool), metaLookup func(ns, key string) (*structpb.Value, bool), routeMetaLookup func(ns string) (*structpb.Value, bool), hostMetaLookup func(ns string) (*structpb.Value, bool)) []KV {
 	if len(specs) == 0 {
 		return nil
 	}
@@ -101,6 +115,36 @@ func ResolveCustomTags(specs []CustomTagSpec, headerLookup func(string) ([]strin
 			var ok bool
 			if routeMetaLookup != nil {
 				v, ok = routeMetaLookup(s.MetaNamespace)
+			}
+			if ok {
+				v, ok = descend(v, s.MetaPath) // FULL path, NOT s.MetaPath[1:]
+			}
+			if ok {
+				if str, emit := structpbValueToString(v); emit {
+					out = append(out, KV{Key: s.Key, Str: str})
+					continue
+				}
+			}
+			if s.HasDefault {
+				out = append(out, KV{Key: s.Key, Str: s.DefaultValue})
+			} // else omit (append nothing)
+		case kindMetadataHost:
+			// Mirror kindMetadataRoute exactly: the HOST source yields the WHOLE
+			// namespace struct (the selected upstream endpoint's
+			// lb_endpoints[].metadata.filter_metadata[ns]), so descend the FULL
+			// MetaPath (the [1:] slice is a REQUEST-only Bucket-pre-keying artifact).
+			// hostMetaLookup may be nil, and picked may be the ZERO Endpoint — at
+			// the 5 span-capable local-reply sites, and ALSO at the post-decision
+			// upstream emit sites in connection.go / h2dispatch.go / h3dispatch.go
+			// (which forward rf.Picked()) whenever the upstream ACQUIRE failed,
+			// since doH1ClusterAction / doH2ClusterAction initialize
+			// picked := cluster.Endpoint{} and assign only AFTER the acquire
+			// succeeds — the phase-72 departure B2. POST-acquire failures forward
+			// the REAL endpoint and resolve normally. → default / omit.
+			var v *structpb.Value
+			var ok bool
+			if hostMetaLookup != nil {
+				v, ok = hostMetaLookup(s.MetaNamespace)
 			}
 			if ok {
 				v, ok = descend(v, s.MetaPath) // FULL path, NOT s.MetaPath[1:]

@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/types/known/structpb"
+
 	"github.com/pgdad/envoy-go/internal/stats"
 )
 
@@ -888,5 +890,52 @@ func TestDialSink_DialFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cluster: dial: ") {
 		t.Errorf("error %q should carry the byte-stable prefix %q", err, "cluster: dial: ")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 72 Task 1 — Endpoint.filterMetadata retention + the MetaLookup accessor
+// ---------------------------------------------------------------------------
+
+// TestEndpoint_MetaLookup pins the accessor's own return contract (NOT a span
+// attribute — a span-routed assertion would be vacuous, PLAN F5b): a present
+// namespace yields (non-nil, true) wrapping the WHOLE namespace struct; an
+// absent namespace, the ZERO Endpoint and a nil-valued namespace all yield
+// (nil, false) without panicking.
+func TestEndpoint_MetaLookup(t *testing.T) {
+	st, err := structpb.NewStruct(map[string]any{"k": "v"})
+	if err != nil {
+		t.Fatalf("structpb.NewStruct: %v", err)
+	}
+	e := Endpoint{Host: "127.0.0.1", Port: 9001, filterMetadata: map[string]*structpb.Struct{"ns": st}}
+
+	// (a) present namespace → the whole namespace struct, wrapped.
+	v, ok := e.MetaLookup("ns")
+	if !ok {
+		t.Errorf("MetaLookup(\"ns\") ok = false, want true")
+	}
+	if v == nil {
+		t.Errorf("MetaLookup(\"ns\") value = nil, want a non-nil StructValue wrapper")
+	} else if got := v.GetStructValue().GetFields()["k"].GetStringValue(); got != "v" {
+		t.Errorf("MetaLookup(\"ns\") wrapped fields[k] = %q, want %q", got, "v")
+	}
+
+	// (b) absent namespace → (nil, false).
+	if v, ok := e.MetaLookup("absent"); v != nil || ok {
+		t.Errorf("MetaLookup(\"absent\") = (%v, %v), want (nil, false)", v, ok)
+	}
+
+	// (c) the ZERO Endpoint (the 5 span-capable local-reply sites carry it) →
+	// (nil, false), no panic on the nil map.
+	var zero Endpoint
+	if v, ok := zero.MetaLookup("ns"); v != nil || ok {
+		t.Errorf("zero Endpoint MetaLookup(\"ns\") = (%v, %v), want (nil, false)", v, ok)
+	}
+
+	// (d) a namespace mapped to a nil *structpb.Struct → (nil, false) (the
+	// guard's own contract: structpb.NewStructValue(nil) is NON-nil).
+	nilNS := Endpoint{filterMetadata: map[string]*structpb.Struct{"ns": nil}}
+	if v, ok := nilNS.MetaLookup("ns"); v != nil || ok {
+		t.Errorf("nil-struct namespace MetaLookup(\"ns\") = (%v, %v), want (nil, false)", v, ok)
 	}
 }

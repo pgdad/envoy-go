@@ -18,6 +18,8 @@ import (
 	// (Task 10). The blank import is the load-it-and-register-it idiom.
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 
+	"google.golang.org/protobuf/types/known/structpb"
+
 	"github.com/pgdad/envoy-go/internal/stats"
 )
 
@@ -67,6 +69,15 @@ type Endpoint struct {
 	// priorityLB. NOT part of the dial identity.
 	Priority uint32
 
+	// filterMetadata retains the endpoint's RAW per-namespace static metadata
+	// (lb_endpoints[].metadata.filter_metadata), ALIASING the already-parsed
+	// proto map — zero new allocation. Added phase 72 so a HOST-kind tracing
+	// custom_tag can address ANY namespace and walk a NESTED path; the phase-38
+	// Metadata projection above stays the envoy.lb scalars-only subset-LB
+	// dimension and is BYTE-UNCHANGED. NOT part of the dial identity: Addr()
+	// ignores it.
+	filterMetadata map[string]*structpb.Struct
+
 	// addr is the Addr() string precomputed at extractEndpoints time (the pick
 	// hot path — health scans, pool/hash keys — calls Addr() per host; caching
 	// removes the per-call formatting allocation). Empty for directly-constructed
@@ -90,6 +101,20 @@ func (e Endpoint) Addr() string {
 // picked" guard at the connect-failure seam sites uses !ep.IsZero() rather
 // than ep != Endpoint{}.
 func (e Endpoint) IsZero() bool { return e.Host == "" && e.Port == 0 }
+
+// MetaLookup returns the endpoint's static metadata for the namespace ns,
+// wrapped as a structpb StructValue (or (nil,false) when the endpoint carries
+// no metadata / the namespace is absent). The HOST analog of the HTTP filter
+// chain's RouteMetaLookup (internal/filter/http/chain.go); threaded as a
+// method value at the three tracing emit sites. Safe on the ZERO Endpoint
+// (nil map → (nil,false)).
+func (e Endpoint) MetaLookup(ns string) (*structpb.Value, bool) {
+	st := e.filterMetadata[ns]
+	if st == nil {
+		return nil, false
+	}
+	return structpb.NewStructValue(st), true
+}
 
 // PooledH1Conn bundles a pooled HTTP/1.1 upstream connection with its
 // bufio.Reader so the next request can resume parsing the response stream

@@ -86,14 +86,16 @@ func FuzzHCMConfigParse(f *testing.F) {
 	})
 	f.Add(withMaxPathTag.GetTypeUrl(), withMaxPathTag.GetValue())
 
-	// Phase 70/71: a metadata custom_tags seed — one ACCEPTED REQUEST-kind
+	// Phase 70/71/72: a metadata custom_tags seed — one ACCEPTED REQUEST-kind
 	// metadata tag (namespace + one path segment + default) + one ACCEPTED
 	// ROUTE-kind metadata tag (same shape, phase 71 lifted ROUTE from reject to
-	// accept) + one REJECTED CLUSTER-kind tag (CLUSTER/HOST stay envoy-go-strict
-	// departures, ADR-0080). The custom_tags loop runs BEFORE the provider check
+	// accept) + one ACCEPTED HOST-kind metadata tag (same shape, phase 72
+	// lifted HOST from reject to accept) + one REJECTED CLUSTER-kind tag (CLUSTER stays an envoy-go-strict
+	// departure, ADR-0080). The custom_tags loop runs BEFORE the provider check
 	// (tracing/config.go: parseCustomTags precedes "provider required"), so this
 	// seed exercises the REQUEST metadata accept-append, the ROUTE metadata
-	// accept-append, and the CLUSTER kind-unsupported reject arm.
+	// accept-append, the HOST metadata accept-append, and the
+	// CLUSTER kind-unsupported reject arm.
 	withMetaTags := mkHCM(func(h *hcmv3.HttpConnectionManager) {
 		h.Tracing = &hcmv3.HttpConnectionManager_Tracing{
 			CustomTags: []*tracingv3.CustomTag{
@@ -104,6 +106,11 @@ func FuzzHCMConfigParse(f *testing.F) {
 				}}},
 				{Tag: "meta_route_ok", Type: &tracingv3.CustomTag_Metadata_{Metadata: &tracingv3.CustomTag_Metadata{
 					Kind:         &metadatav3.MetadataKind{Kind: &metadatav3.MetadataKind_Route_{Route: &metadatav3.MetadataKind_Route{}}},
+					MetadataKey:  &metadatav3.MetadataKey{Key: "envoy.test", Path: []*metadatav3.MetadataKey_PathSegment{{Segment: &metadatav3.MetadataKey_PathSegment_Key{Key: "k"}}}},
+					DefaultValue: "fb",
+				}}},
+				{Tag: "meta_host_ok", Type: &tracingv3.CustomTag_Metadata_{Metadata: &tracingv3.CustomTag_Metadata{
+					Kind:         &metadatav3.MetadataKind{Kind: &metadatav3.MetadataKind_Host_{Host: &metadatav3.MetadataKind_Host{}}},
 					MetadataKey:  &metadatav3.MetadataKey{Key: "envoy.test", Path: []*metadatav3.MetadataKey_PathSegment{{Segment: &metadatav3.MetadataKey_PathSegment_Key{Key: "k"}}}},
 					DefaultValue: "fb",
 				}}},

@@ -1,0 +1,200 @@
+# Phase 72 fixture 0116-tracing-custom-tags-metadata-host expectations
+# (ADR-0019 — prose; the driver is the enforcer via AssertStats; this file is
+# documentation). Cloned from 0115-tracing-custom-tags-metadata-route (the OTLP
+# tracing custom_tags ROUTE metadata chassis) with the static metadata block
+# RELOCATED from the matched route onto the cluster's lb_endpoints[0].
+# Exercises the phase-72 HOST `metadata` custom_tags source (ADR-0294) — the
+# THIRD `metadata` MetadataKind after REQUEST (phase 70, 0114) and ROUTE
+# (phase 71, 0115).
+#
+# Topology (single-listener plaintext H1; HTTPFixedBody backend; driver-owned
+# in-process OTLP TraceService gRPC receiver):
+#   l_test (hcm_local) — one downstream HTTP/1.1 listener; route prefix "/" →
+#                        cluster c_backend (HTTPFixedBody, 17-byte body). The
+#                        route carries NO metadata at all (that is 0115's
+#                        source, deliberately removed here so a leftover route
+#                        source cannot mask the endpoint source — break Q).
+#                        The SELECTED UPSTREAM ENDPOINT instead carries a
+#                        STATIC metadata block, a SIBLING of `endpoint:` on the
+#                        LbEndpoint message at the same indent:
+#                          - endpoint:
+#                              address: { socket_address: { ... } }
+#                            metadata:
+#                              filter_metadata:
+#                                envoy.test:
+#                                  host_k: v-host-0116
+#                        retained at cluster-build time on
+#                        cluster.Endpoint.filterMetadata
+#                        (internal/cluster/manager.go:884
+#                        `filterMetadata: lbe.GetMetadata().GetFilterMetadata()`
+#                        — ALL namespaces, aliasing the parsed proto map), read
+#                        back via (cluster.Endpoint).MetaLookup threaded as the
+#                        5th ResolveCustomTags argument from the SELECTED
+#                        endpoint at
+#                        internal/filter/hcm/accesslog_emit.go:57/:118/:179. NO
+#                        writer/Lua filter — both sides read the IDENTICAL
+#                        static endpoint config. HCM carries a `tracing` block
+#                        (OpenTelemetry provider, service_name "0116",
+#                        random_sampling 100%) naming c_otlp_collector —
+#                        exporting one OTLP Span per completed request. The
+#                        `tracing` block carries TWO HOST `metadata`
+#                        custom_tags:
+#                          host_hit     — metadata_key {key: envoy.test,
+#                                         path:[host_k]}, default_value
+#                                         "unused-default-0116" → resolves to
+#                                         the static endpoint value
+#                                         "v-host-0116" (default NEVER used).
+#                          host_default — metadata_key {key: envoy.test,
+#                                         path:[absent_k]}, default_value
+#                                         "fallback-0116" → the path is UNSET
+#                                         → emits "fallback-0116".
+#   c_backend          — HTTPFixedBody subprocess ("backend:v1/fixed\n" = 17 bytes).
+#                        EXACTLY ONE lb_endpoint ⇒ the LB pick is deterministic
+#                        and no round-robin spread enters the assertion
+#                        (reference_round_robin_offset_randomized).
+#   c_otlp_collector   — driver-owned in-process TraceService receiver
+#                        (test/helpers/otlptrace/) on a driver-allocated stable
+#                        port, bound 0.0.0.0:<port> so the reference container
+#                        (host.docker.internal) AND the subject (127.0.0.1) both
+#                        reach it. http2_protocol_options:{} + plaintext h2c.
+#
+# Reference Envoy contrib-v1.37.2 (STRICT_DNS via host.docker.internal) vs
+# envoy-go (STATIC, in-process). The reference therefore propagates
+# lb_endpoints[].metadata THROUGH DNS resolution — the landed 0064-lb-subset
+# precedent does exactly that (driver-GENERATED inline YAML; that fixture has NO
+# envoy.yaml/envoy-go.yaml files).
+#
+# ## NEW CROSS-SIDE GROUND — the non-"envoy.lb" namespace
+#
+# 0064-lb-subset covers the "envoy.lb" namespace ONLY (the subset-LB dimension,
+# projected onto Endpoint.Metadata as scalars by the byte-unchanged phase-38
+# path). That a HOST-kind custom_tag can address an ARBITRARY filter_metadata
+# namespace rested on the phase-72 SPEC's live probe P2 alone. This fixture uses
+# "envoy.test" and is the CROSS-SIDE proof: the reference DOES resolve it (the
+# host_hit VALUE-equality assertion below is green on the reference side).
+#
+# ## STRING VALUES ONLY (SPEC S4/P3)
+#
+# A struct-valued or numeric metadata value is NOT cross-side comparable: the
+# reference serializes multi-key structs in an ARBITRARY key order (Go always
+# sorts), scalar-vs-nested numbers use DIFFERENT reference renderers, and
+# top-level scalar numbers render at ~6 significant digits on the reference vs
+# full precision in Go. Envoy's YAML loader additionally coerces any
+# non-integer scalar to a string. Both asserted values here are plain strings.
+#
+# ## Workload
+#
+# Each side fires N+M = 12 requests:
+#   N = 8 PLAIN: GET /trace, Host: trace.example, UA: trace-probe/1. No inbound
+#       trace context. random_sampling 100% => each is a fresh locally-sampled span.
+#   M = 4 CONTINUATION: + Traceparent: 00-aaa...aaa-bbb...bbb-01. The proxy
+#       CONTINUES the inbound trace (keeps the inbound trace-id; sets parent_span_id
+#       to the inbound parent span id).
+# The endpoint's static metadata is the SAME on EVERY request (both prongs, both
+# sides — it is config, not per-request state) and the single-endpoint cluster
+# makes the pick deterministic, so every span carries the SAME resolved host_hit
+# value. The driver POLLS the receiver's Count() to >= 12 (poll-to-converge;
+# never a fixed sleep). Per-side separation: the receiver is Reset() before each
+# drive.
+#
+# ## Framing NOT asserted
+#
+# The cross-side assertion is on the per-span PAYLOAD aggregated across all
+# received spans — NOT the Export-call count / batch sizes / connection count /
+# flush cadence (reference_streaming_sink_differential_framing).
+#
+# ## Asserted (cross-side EXACT on the STABLE per-span subset, both sides)
+#
+#   len(spans) == 12   (zero-span pass is vacuous — proves decode ran on BOTH sides)
+#   Every span:
+#     name                        == "ingress"
+#     kind                        == SPAN_KIND_SERVER (= 2)
+#     StartTimeUnixNano           != 0  (presence + ordering, not value)
+#     EndTimeUnixNano             != 0
+#     StartTimeUnixNano           < EndTimeUnixNano
+#     attrs["http.method"]        == "GET"
+#     attrs["component"]          == "proxy"
+#     attrs["downstream_cluster"] == "-"
+#     attrs["response_flags"]     == "-"
+#     attrs["http.status_code"]   == "200" (normalized: int or string form accepted)
+#     attrs["request_size"]       == "0"
+#     attrs["response_size"]      == "17"  (HTTPFixedBody 17-byte body)
+#     attrs["http.url"]           PRESENT
+#     attrs["http.protocol"]      PRESENT
+#     attrs["user_agent"]         PRESENT
+#     attrs["guid:x-request-id"]  KEY PRESENT (value varies — UNasserted)
+#     attrs["upstream_cluster"]   KEY PRESENT (value UNasserted — framework gap)
+#     attrs["upstream_cluster.name"] KEY PRESENT (value UNasserted — framework gap)
+#     attrs["host_hit"]           == "v-host-0116" (KEY + VALUE, cross-side
+#                                             EXACT — the SELECTED UPSTREAM
+#                                             ENDPOINT's static metadata value,
+#                                             resolved via metadata_key
+#                                             {envoy.test → host_k}. The
+#                                             configured default_value
+#                                             "unused-default-0116" is NEVER
+#                                             used — this VALUE-equality is BOTH
+#                                             the host-metadata-served proof AND
+#                                             the non-"envoy.lb"-namespace
+#                                             cross-side proof.)
+#     attrs["host_default"]       == "fallback-0116" (KEY + VALUE, cross-side
+#                                             EXACT — metadata_key {envoy.test →
+#                                             absent_k} path is UNSET → the
+#                                             default_value is emitted; the
+#                                             absent-path default rule.)
+#   Continuation prong (M = 4 spans where trace_id == contTraceID):
+#     trace_id     == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (the fixed inbound trace-id)
+#     parent_span_id == bbbbbbbbbbbbbbbb               (the fixed inbound parent id)
+#   Resource.attributes:
+#     service.name == "0116"   (cross-side EXACT on VALUE)
+#
+# PLUS the subject-side flat /stats counters:
+#   tracing.opentelemetry.spans_sent    == 12
+#   tracing.opentelemetry.spans_dropped == 0
+#
+# ## UNasserted (vary side-to-side / impl-specific)
+#
+#   trace_id / span_id VALUES (except the continuation prong trace_id).
+#   start/end time VALUES — non-deterministic.
+#   x-request-id / peer.address / node_id / zone VALUES.
+#   upstream_cluster / upstream_cluster.name VALUES — framework gap.
+#   Export-call count / per-call batch sizes / connection count — framing.
+#   telemetry.sdk.* resource attrs / ScopeSpans.scope.name+version — impl-specific.
+#
+# ## NOT covered here (a NAMED departure, scoped out — SPEC §B2)
+#
+# The reference resolves a HOST tag at LOAD-BALANCER PICK TIME, so a picked-but-
+# unreachable endpoint still contributes its metadata to the span; envoy-go
+# carries the ZERO Endpoint on every upstream-ACQUIRE failure sub-path
+# (circuit-breaker 503, pool-overflow 503, connect-failure H1 503 / H2 502, and
+# the defensive H2 grant-race 503 — doH1ClusterAction/doH2ClusterAction
+# initialize picked := cluster.Endpoint{} and assign only AFTER the acquire
+# succeeds), so a HOST tag falls to default_value/omit THERE. NOT "on any
+# failure": POST-acquire failures are PARITY — the H1 upstream-write and
+# read-response 502s and the H2 RoundTrip 502 return the REAL picked endpoint,
+# so a HOST tag resolves normally from that endpoint's own metadata. This
+# fixture drives only SUCCESSFUL upstream requests (200 on every probe), so
+# neither arm is exercised here — the zero-Endpoint arm is pinned by unit
+# tests (the zero-picked test at T4) and deliberately deferred to its own row.
+#
+# The cluster carries exactly ONE lb_endpoint, so this fixture cannot
+# discriminate "the SELECTED endpoint's metadata" from "the ONLY endpoint's" /
+# "the FIRST endpoint's" / cluster-wide metadata — per-endpoint SELECTION is
+# not exercised here. A second lb_endpoint would introduce load-balancer pick
+# spread (reference_round_robin_offset_randomized) and make the resolved
+# value non-deterministic across requests, so a two-endpoint variant is
+# deliberately not attempted.
+#
+# ## Cross-refs
+#
+# phase 72 SPEC §8/§10 D-CTMH-* + ADR-0294 (HOST metadata custom_tags parse +
+# per-request resolve out of the selected upstream endpoint's static
+# lb_endpoints[].metadata + span-emit upsert) + phase 71 ROUTE metadata (0115,
+# ADR-0293) + phase 70 REQUEST metadata (0114, ADR-0292) + phase 63 environment
+# (0106, ADR-0284) + phase 62 request_header (0105, ADR-0283) + phase 59 literal
+# (0102, ADR-0277) + phase 46.1b OTLP span emission (0087, ADR-0260) + phase 38
+# subset LB endpoint metadata (0064-lb-subset, the envoy.lb-only cross-side
+# precedent) + reference_streaming_sink_differential_framing +
+# reference_differential_grpc_receiver_driver_owned +
+# reference_concurrency_differential_release_barrier +
+# reference_structpb_tag_cross_side_string_only +
+# reference_round_robin_offset_randomized.

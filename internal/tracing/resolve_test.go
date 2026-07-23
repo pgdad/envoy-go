@@ -1,6 +1,7 @@
 package tracing
 
 import (
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/types/known/structpb"
@@ -31,7 +32,7 @@ func TestResolveCustomTagsMatrix(t *testing.T) {
 		"x-present": {"PRESENT-VAL"},
 		"x-multi":   {"MV-A", "MV-B"}, // multi-value → FIRST
 	})
-	got := ResolveCustomTags(specs, lookup, nil, nil)
+	got := ResolveCustomTags(specs, lookup, nil, nil, nil)
 
 	// Build a key→value map from the resolved KVs; assert presence + values by key
 	// (omitted keys are simply absent).
@@ -69,7 +70,7 @@ func TestResolveCustomTagsNilLookup(t *testing.T) {
 		{Key: "hdrdef", Kind: kindRequestHeader, HeaderName: "x", DefaultValue: "D", HasDefault: true},
 		{Key: "hdrnodef", Kind: kindRequestHeader, HeaderName: "y"},
 	}
-	got := ResolveCustomTags(specs, nil, nil, nil)
+	got := ResolveCustomTags(specs, nil, nil, nil, nil)
 	byKey := map[string]string{}
 	for _, kv := range got {
 		byKey[kv.Key] = kv.Str
@@ -94,7 +95,7 @@ func TestResolveCustomTagsEmptyPresentHeader(t *testing.T) {
 		{Key: "e", Kind: kindRequestHeader, HeaderName: "x-empty", DefaultValue: "DEF", HasDefault: true},
 	}
 	lookup := lookupFunc(map[string][]string{"x-empty": {""}}) // present, empty value
-	got := ResolveCustomTags(specs, lookup, nil, nil)
+	got := ResolveCustomTags(specs, lookup, nil, nil, nil)
 	if len(got) != 1 || got[0].Key != "e" || got[0].Str != "" {
 		t.Errorf("resolved = %+v, want one {e, \"\"} (present empty, not the default)", got)
 	}
@@ -102,7 +103,7 @@ func TestResolveCustomTagsEmptyPresentHeader(t *testing.T) {
 
 // TestResolveCustomTagsEmpty: no specs → nil (byte-stable no-tags path).
 func TestResolveCustomTagsEmpty(t *testing.T) {
-	if got := ResolveCustomTags(nil, lookupFunc(nil), nil, nil); got != nil {
+	if got := ResolveCustomTags(nil, lookupFunc(nil), nil, nil, nil); got != nil {
 		t.Errorf("ResolveCustomTags(nil, ...) = %+v, want nil", got)
 	}
 }
@@ -121,21 +122,21 @@ func TestResolveCustomTagsEnvironment(t *testing.T) {
 	t.Run("present-uses-env-value", func(t *testing.T) {
 		t.Setenv("ENVOY_GO_TEST_PRESENT", "PRESENT-VAL")
 		specs := []CustomTagSpec{{Key: "e", Kind: kindEnvironment, EnvName: "ENVOY_GO_TEST_PRESENT", DefaultValue: "def"}}
-		got := ResolveCustomTags(specs, nil, nil, nil)
+		got := ResolveCustomTags(specs, nil, nil, nil, nil)
 		if len(got) != 1 || got[0].Key != "e" || got[0].Str != "PRESENT-VAL" {
 			t.Errorf("present: got %+v, want one {e, PRESENT-VAL} (env value, default ignored)", got)
 		}
 	})
 	t.Run("absent-with-default", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "e", Kind: kindEnvironment, EnvName: absent, DefaultValue: "def-m"}}
-		got := ResolveCustomTags(specs, nil, nil, nil)
+		got := ResolveCustomTags(specs, nil, nil, nil, nil)
 		if len(got) != 1 || got[0].Str != "def-m" {
 			t.Errorf("absent+default: got %+v, want one {e, def-m}", got)
 		}
 	})
 	t.Run("absent-no-default-omits", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "e", Kind: kindEnvironment, EnvName: absent}}
-		got := ResolveCustomTags(specs, nil, nil, nil)
+		got := ResolveCustomTags(specs, nil, nil, nil, nil)
 		if len(got) != 0 {
 			t.Errorf("absent+no-default: got %+v, want OMITTED (empty resolved value)", got)
 		}
@@ -143,7 +144,7 @@ func TestResolveCustomTagsEnvironment(t *testing.T) {
 	t.Run("present-empty-omits", func(t *testing.T) {
 		t.Setenv("ENVOY_GO_TEST_EMPTY", "") // present, empty string
 		specs := []CustomTagSpec{{Key: "e", Kind: kindEnvironment, EnvName: "ENVOY_GO_TEST_EMPTY", DefaultValue: "def-empty"}}
-		got := ResolveCustomTags(specs, nil, nil, nil)
+		got := ResolveCustomTags(specs, nil, nil, nil, nil)
 		if len(got) != 0 {
 			t.Errorf("present-empty: got %+v, want OMITTED (present-empty ignores the default, arm G)", got)
 		}
@@ -185,7 +186,7 @@ func TestResolveCustomTagsMetadataPathWalk(t *testing.T) {
 	t.Run("single-segment", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadata, MetaNamespace: "ns", MetaPath: []string{"k"}}}
 		ml := metaFunc(map[string]*structpb.Value{"ns\x00k": structpb.NewStringValue("v")})
-		got := ResolveCustomTags(specs, nil, ml, nil)
+		got := ResolveCustomTags(specs, nil, ml, nil, nil)
 		if len(got) != 1 || got[0].Key != "m" || got[0].Str != "v" {
 			t.Errorf("single: got %+v, want one {m, v}", got)
 		}
@@ -195,7 +196,7 @@ func TestResolveCustomTagsMetadataPathWalk(t *testing.T) {
 		// nested {a:{b:"deep"}}
 		nested := mustStruct(t, map[string]interface{}{"a": map[string]interface{}{"b": "deep"}})
 		ml := metaFunc(map[string]*structpb.Value{"ns\x00k": nested})
-		got := ResolveCustomTags(specs, nil, ml, nil)
+		got := ResolveCustomTags(specs, nil, ml, nil, nil)
 		if len(got) != 1 || got[0].Str != "deep" {
 			t.Errorf("multi: got %+v, want one {m, deep}", got)
 		}
@@ -204,7 +205,7 @@ func TestResolveCustomTagsMetadataPathWalk(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadata, MetaNamespace: "ns", MetaPath: []string{"k", "MISSING", "b"}, DefaultValue: "DEF", HasDefault: true}}
 		nested := mustStruct(t, map[string]interface{}{"a": map[string]interface{}{"b": "deep"}})
 		ml := metaFunc(map[string]*structpb.Value{"ns\x00k": nested})
-		got := ResolveCustomTags(specs, nil, ml, nil)
+		got := ResolveCustomTags(specs, nil, ml, nil, nil)
 		if len(got) != 1 || got[0].Str != "DEF" {
 			t.Errorf("unresolvable-middle: got %+v, want one {m, DEF} (default)", got)
 		}
@@ -213,7 +214,7 @@ func TestResolveCustomTagsMetadataPathWalk(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadata, MetaNamespace: "ns", MetaPath: []string{"k", "MISSING"}}}
 		nested := mustStruct(t, map[string]interface{}{"a": map[string]interface{}{"b": "deep"}})
 		ml := metaFunc(map[string]*structpb.Value{"ns\x00k": nested})
-		got := ResolveCustomTags(specs, nil, ml, nil)
+		got := ResolveCustomTags(specs, nil, ml, nil, nil)
 		if len(got) != 0 {
 			t.Errorf("unresolvable-middle-no-default: got %+v, want OMITTED", got)
 		}
@@ -241,7 +242,7 @@ func TestResolveCustomTagsMetadataSerialize(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			specs := []CustomTagSpec{{Key: "m", Kind: kindMetadata, MetaNamespace: "ns", MetaPath: []string{"k"}}}
 			ml := metaFunc(map[string]*structpb.Value{"ns\x00k": c.val})
-			got := ResolveCustomTags(specs, nil, ml, nil)
+			got := ResolveCustomTags(specs, nil, ml, nil, nil)
 			if len(got) != 1 || got[0].Str != c.want {
 				t.Errorf("%s: got %+v, want one {m, %q}", c.name, got, c.want)
 			}
@@ -251,7 +252,7 @@ func TestResolveCustomTagsMetadataSerialize(t *testing.T) {
 	t.Run("null-falls-to-default", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadata, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
 		ml := metaFunc(map[string]*structpb.Value{"ns\x00k": structpb.NewNullValue()})
-		got := ResolveCustomTags(specs, nil, ml, nil)
+		got := ResolveCustomTags(specs, nil, ml, nil, nil)
 		if len(got) != 1 || got[0].Str != "DEF" {
 			t.Errorf("null: got %+v, want one {m, DEF} (default)", got)
 		}
@@ -265,7 +266,7 @@ func TestResolveCustomTagsMetadataMatrix(t *testing.T) {
 	t.Run("present-non-empty-emits", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadata, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
 		ml := metaFunc(map[string]*structpb.Value{"ns\x00k": structpb.NewStringValue("V")})
-		got := ResolveCustomTags(specs, nil, ml, nil)
+		got := ResolveCustomTags(specs, nil, ml, nil, nil)
 		if len(got) != 1 || got[0].Str != "V" {
 			t.Errorf("present-non-empty: got %+v, want one {m, V}", got)
 		}
@@ -273,7 +274,7 @@ func TestResolveCustomTagsMetadataMatrix(t *testing.T) {
 	t.Run("present-empty-emits-empty", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadata, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
 		ml := metaFunc(map[string]*structpb.Value{"ns\x00k": structpb.NewStringValue("")})
-		got := ResolveCustomTags(specs, nil, ml, nil)
+		got := ResolveCustomTags(specs, nil, ml, nil, nil)
 		if len(got) != 1 || got[0].Key != "m" || got[0].Str != "" {
 			t.Errorf("present-empty: got %+v, want one {m, \"\"} (present-empty EMITS \"\", NOT the default)", got)
 		}
@@ -281,7 +282,7 @@ func TestResolveCustomTagsMetadataMatrix(t *testing.T) {
 	t.Run("absent-with-default", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadata, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
 		ml := metaFunc(map[string]*structpb.Value{}) // absent
-		got := ResolveCustomTags(specs, nil, ml, nil)
+		got := ResolveCustomTags(specs, nil, ml, nil, nil)
 		if len(got) != 1 || got[0].Str != "DEF" {
 			t.Errorf("absent+default: got %+v, want one {m, DEF}", got)
 		}
@@ -289,7 +290,7 @@ func TestResolveCustomTagsMetadataMatrix(t *testing.T) {
 	t.Run("absent-no-default-omits", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadata, MetaNamespace: "ns", MetaPath: []string{"k"}}}
 		ml := metaFunc(map[string]*structpb.Value{}) // absent
-		got := ResolveCustomTags(specs, nil, ml, nil)
+		got := ResolveCustomTags(specs, nil, ml, nil, nil)
 		if len(got) != 0 {
 			t.Errorf("absent+no-default: got %+v, want OMITTED", got)
 		}
@@ -301,14 +302,14 @@ func TestResolveCustomTagsMetadataMatrix(t *testing.T) {
 func TestResolveCustomTagsMetadataNilLookup(t *testing.T) {
 	t.Run("nil-lookup-with-default", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadata, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
-		got := ResolveCustomTags(specs, nil, nil, nil)
+		got := ResolveCustomTags(specs, nil, nil, nil, nil)
 		if len(got) != 1 || got[0].Str != "DEF" {
 			t.Errorf("nil-lookup+default: got %+v, want one {m, DEF}", got)
 		}
 	})
 	t.Run("nil-lookup-no-default-omits", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadata, MetaNamespace: "ns", MetaPath: []string{"k"}}}
-		got := ResolveCustomTags(specs, nil, nil, nil)
+		got := ResolveCustomTags(specs, nil, nil, nil, nil)
 		if len(got) != 0 {
 			t.Errorf("nil-lookup+no-default: got %+v, want OMITTED", got)
 		}
@@ -337,7 +338,7 @@ func TestResolveCustomTagsRouteMetadataPathWalk(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataRoute, MetaNamespace: "ns", MetaPath: []string{"k"}}}
 		nsStruct := mustStruct(t, map[string]interface{}{"k": "v"})
 		rl := routeMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
-		got := ResolveCustomTags(specs, nil, nil, rl)
+		got := ResolveCustomTags(specs, nil, nil, rl, nil)
 		if len(got) != 1 || got[0].Key != "m" || got[0].Str != "v" {
 			t.Errorf("single: got %+v, want one {m, v}", got)
 		}
@@ -346,7 +347,7 @@ func TestResolveCustomTagsRouteMetadataPathWalk(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataRoute, MetaNamespace: "ns", MetaPath: []string{"a", "b"}}}
 		nsStruct := mustStruct(t, map[string]interface{}{"a": map[string]interface{}{"b": "deep"}})
 		rl := routeMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
-		got := ResolveCustomTags(specs, nil, nil, rl)
+		got := ResolveCustomTags(specs, nil, nil, rl, nil)
 		if len(got) != 1 || got[0].Str != "deep" {
 			t.Errorf("multi: got %+v, want one {m, deep}", got)
 		}
@@ -355,7 +356,7 @@ func TestResolveCustomTagsRouteMetadataPathWalk(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataRoute, MetaNamespace: "ns", MetaPath: []string{"MISSING"}, DefaultValue: "DEF", HasDefault: true}}
 		nsStruct := mustStruct(t, map[string]interface{}{"a": map[string]interface{}{"b": "deep"}})
 		rl := routeMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
-		got := ResolveCustomTags(specs, nil, nil, rl)
+		got := ResolveCustomTags(specs, nil, nil, rl, nil)
 		if len(got) != 1 || got[0].Str != "DEF" {
 			t.Errorf("unresolvable: got %+v, want one {m, DEF} (default)", got)
 		}
@@ -364,7 +365,7 @@ func TestResolveCustomTagsRouteMetadataPathWalk(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataRoute, MetaNamespace: "ns", MetaPath: []string{"MISSING"}}}
 		nsStruct := mustStruct(t, map[string]interface{}{"a": map[string]interface{}{"b": "deep"}})
 		rl := routeMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
-		got := ResolveCustomTags(specs, nil, nil, rl)
+		got := ResolveCustomTags(specs, nil, nil, rl, nil)
 		if len(got) != 0 {
 			t.Errorf("unresolvable-no-default: got %+v, want OMITTED", got)
 		}
@@ -400,7 +401,7 @@ func TestResolveCustomTagsRouteMetadataSerialize(t *testing.T) {
 				Fields: map[string]*structpb.Value{"k": c.val},
 			}}}
 			rl := routeMetaFunc(map[string]*structpb.Value{"ns": wrapped})
-			got := ResolveCustomTags(specs, nil, nil, rl)
+			got := ResolveCustomTags(specs, nil, nil, rl, nil)
 			if len(got) != 1 || got[0].Str != c.want {
 				t.Errorf("%s: got %+v, want one {m, %q}", c.name, got, c.want)
 			}
@@ -413,7 +414,7 @@ func TestResolveCustomTagsRouteMetadataSerialize(t *testing.T) {
 			Fields: map[string]*structpb.Value{"k": structpb.NewNullValue()},
 		}}}
 		rl := routeMetaFunc(map[string]*structpb.Value{"ns": wrapped})
-		got := ResolveCustomTags(specs, nil, nil, rl)
+		got := ResolveCustomTags(specs, nil, nil, rl, nil)
 		if len(got) != 1 || got[0].Str != "DEF" {
 			t.Errorf("null: got %+v, want one {m, DEF} (default)", got)
 		}
@@ -429,7 +430,7 @@ func TestResolveCustomTagsRouteMetadataMatrix(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataRoute, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
 		nsStruct := mustStruct(t, map[string]interface{}{"k": "V"})
 		rl := routeMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
-		got := ResolveCustomTags(specs, nil, nil, rl)
+		got := ResolveCustomTags(specs, nil, nil, rl, nil)
 		if len(got) != 1 || got[0].Str != "V" {
 			t.Errorf("present-non-empty: got %+v, want one {m, V}", got)
 		}
@@ -438,7 +439,7 @@ func TestResolveCustomTagsRouteMetadataMatrix(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataRoute, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
 		nsStruct := mustStruct(t, map[string]interface{}{"k": ""})
 		rl := routeMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
-		got := ResolveCustomTags(specs, nil, nil, rl)
+		got := ResolveCustomTags(specs, nil, nil, rl, nil)
 		if len(got) != 1 || got[0].Key != "m" || got[0].Str != "" {
 			t.Errorf("present-empty: got %+v, want one {m, \"\"} (present-empty EMITS \"\", NOT the default)", got)
 		}
@@ -446,7 +447,7 @@ func TestResolveCustomTagsRouteMetadataMatrix(t *testing.T) {
 	t.Run("absent-namespace-with-default", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataRoute, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
 		rl := routeMetaFunc(map[string]*structpb.Value{}) // absent
-		got := ResolveCustomTags(specs, nil, nil, rl)
+		got := ResolveCustomTags(specs, nil, nil, rl, nil)
 		if len(got) != 1 || got[0].Str != "DEF" {
 			t.Errorf("absent+default: got %+v, want one {m, DEF}", got)
 		}
@@ -454,7 +455,7 @@ func TestResolveCustomTagsRouteMetadataMatrix(t *testing.T) {
 	t.Run("absent-namespace-no-default-omits", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataRoute, MetaNamespace: "ns", MetaPath: []string{"k"}}}
 		rl := routeMetaFunc(map[string]*structpb.Value{}) // absent
-		got := ResolveCustomTags(specs, nil, nil, rl)
+		got := ResolveCustomTags(specs, nil, nil, rl, nil)
 		if len(got) != 0 {
 			t.Errorf("absent+no-default: got %+v, want OMITTED", got)
 		}
@@ -466,16 +467,260 @@ func TestResolveCustomTagsRouteMetadataMatrix(t *testing.T) {
 func TestResolveCustomTagsRouteMetadataNilLookup(t *testing.T) {
 	t.Run("nil-lookup-with-default", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataRoute, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
-		got := ResolveCustomTags(specs, nil, nil, nil)
+		got := ResolveCustomTags(specs, nil, nil, nil, nil)
 		if len(got) != 1 || got[0].Str != "DEF" {
 			t.Errorf("nil-lookup+default: got %+v, want one {m, DEF}", got)
 		}
 	})
 	t.Run("nil-lookup-no-default-omits", func(t *testing.T) {
 		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataRoute, MetaNamespace: "ns", MetaPath: []string{"k"}}}
-		got := ResolveCustomTags(specs, nil, nil, nil)
+		got := ResolveCustomTags(specs, nil, nil, nil, nil)
 		if len(got) != 0 {
 			t.Errorf("nil-lookup+no-default: got %+v, want OMITTED", got)
 		}
 	})
+}
+
+// hostMetaFunc builds a hostMetaLookup from a ns→*structpb.Value map. Shaped
+// exactly like routeMetaFunc (ONE arg, the WHOLE namespace struct) — the HOST
+// source is the selected upstream endpoint's
+// lb_endpoints[].metadata.filter_metadata[ns], so the resolve arm descends the
+// FULL MetaPath from it (RD-HOST-ARM, distinct from the REQUEST arm's
+// MetaPath[1:] Bucket-pre-keying artifact).
+func hostMetaFunc(m map[string]*structpb.Value) func(ns string) (*structpb.Value, bool) {
+	return func(ns string) (*structpb.Value, bool) {
+		v, ok := m[ns]
+		return v, ok
+	}
+}
+
+// TestResolveCustomTagsHostMetadataPathWalk drives the kindMetadataHost path
+// walk: a single-segment descent from the namespace struct, a multi-segment
+// nested descent, and an unresolvable segment that falls to the default/omit.
+// The HOST fake returns the WHOLE namespace struct (not pre-keyed to
+// MetaPath[0] like the REQUEST metaFunc) — a single-segment path ["k"] descends
+// ONE level from the namespace struct.
+func TestResolveCustomTagsHostMetadataPathWalk(t *testing.T) {
+	t.Run("single-segment", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"k"}}}
+		nsStruct := mustStruct(t, map[string]interface{}{"k": "v"})
+		hl := hostMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
+		got := ResolveCustomTags(specs, nil, nil, nil, hl)
+		if len(got) != 1 || got[0].Key != "m" || got[0].Str != "v" {
+			t.Errorf("single: got %+v, want one {m, v}", got)
+		}
+	})
+	t.Run("multi-segment", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"a", "b"}}}
+		nsStruct := mustStruct(t, map[string]interface{}{"a": map[string]interface{}{"b": "deep"}})
+		hl := hostMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
+		got := ResolveCustomTags(specs, nil, nil, nil, hl)
+		if len(got) != 1 || got[0].Str != "deep" {
+			t.Errorf("multi: got %+v, want one {m, deep}", got)
+		}
+	})
+	t.Run("unresolvable-segment-falls-to-default", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"MISSING"}, DefaultValue: "DEF", HasDefault: true}}
+		nsStruct := mustStruct(t, map[string]interface{}{"a": map[string]interface{}{"b": "deep"}})
+		hl := hostMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
+		got := ResolveCustomTags(specs, nil, nil, nil, hl)
+		if len(got) != 1 || got[0].Str != "DEF" {
+			t.Errorf("unresolvable: got %+v, want one {m, DEF} (default)", got)
+		}
+	})
+	t.Run("unresolvable-segment-no-default-omits", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"MISSING"}}}
+		nsStruct := mustStruct(t, map[string]interface{}{"a": map[string]interface{}{"b": "deep"}})
+		hl := hostMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
+		got := ResolveCustomTags(specs, nil, nil, nil, hl)
+		if len(got) != 0 {
+			t.Errorf("unresolvable-no-default: got %+v, want OMITTED", got)
+		}
+	})
+	// A multi-segment path whose MIDDLE hop is missing: proves the descent is a
+	// real walk, not a first-hop lookup.
+	t.Run("unresolvable-middle-falls-to-default", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"MISSING", "b"}, DefaultValue: "DEF", HasDefault: true}}
+		nsStruct := mustStruct(t, map[string]interface{}{"a": map[string]interface{}{"b": "deep"}})
+		hl := hostMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
+		got := ResolveCustomTags(specs, nil, nil, nil, hl)
+		if len(got) != 1 || got[0].Str != "DEF" {
+			t.Errorf("unresolvable-middle: got %+v, want one {m, DEF} (default)", got)
+		}
+	})
+	// The namespace struct's OWN single-segment field must resolve to the FIELD,
+	// never to the namespace struct itself — the discriminator against the
+	// REQUEST arm's MetaPath[1:] slice (RD-HOST-ARM). A [1:] descent would make
+	// this emit the serialized WHOLE struct {"k":"v"} instead of v.
+	t.Run("single-segment-is-the-field-not-the-namespace-struct", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"k"}}}
+		nsStruct := mustStruct(t, map[string]interface{}{"k": "v"})
+		hl := hostMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
+		got := ResolveCustomTags(specs, nil, nil, nil, hl)
+		if len(got) != 1 {
+			t.Fatalf("precondition: got %+v, want exactly one KV", got)
+		}
+		if got[0].Str == `{"k":"v"}` {
+			t.Errorf("resolved the WHOLE namespace struct %q — the arm descended MetaPath[1:] (the REQUEST slice), not the FULL MetaPath", got[0].Str)
+		}
+		if got[0].Str != "v" {
+			t.Errorf("single-segment: got %q, want %q (the FIELD, FULL-MetaPath descent)", got[0].Str, "v")
+		}
+	})
+}
+
+// TestResolveCustomTagsHostMetadataSerialize drives the P3 serialization table
+// for the HOST arm (a thin re-assert of the shared structpbValueToString path,
+// NOT a re-derivation): string→raw (no quotes); number→decimal; bool→true|false;
+// struct/list→compact JSON (json.Compact-compared EXACT — protojson's detrand
+// whitespace is non-deterministic, so the exact compact form is load-bearing);
+// NullValue→unresolvable (default/omit).
+func TestResolveCustomTagsHostMetadataSerialize(t *testing.T) {
+	cases := []struct {
+		name string
+		val  *structpb.Value
+		want string
+	}{
+		{"string-raw", structpb.NewStringValue("x"), "x"},
+		{"number-int", structpb.NewNumberValue(42), "42"},
+		{"number-float", structpb.NewNumberValue(3.14), "3.14"},
+		{"bool-true", structpb.NewBoolValue(true), "true"},
+		{"bool-false", structpb.NewBoolValue(false), "false"},
+		{"struct", mustStruct(t, map[string]interface{}{"a": "b"}), `{"a":"b"}`},
+		{"list", mustList(t, "x", "y", "z"), `["x","y","z"]`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"k"}}}
+			// Build the namespace struct with field "k" set to c.val directly
+			// (structpb.NewStruct cannot hold arbitrary *structpb.Value, so build
+			// the wrapping struct by hand via the Fields map).
+			wrapped := &structpb.Value{Kind: &structpb.Value_StructValue{StructValue: &structpb.Struct{
+				Fields: map[string]*structpb.Value{"k": c.val},
+			}}}
+			hl := hostMetaFunc(map[string]*structpb.Value{"ns": wrapped})
+			got := ResolveCustomTags(specs, nil, nil, nil, hl)
+			if len(got) != 1 || got[0].Str != c.want {
+				t.Errorf("%s: got %+v, want one {m, %q}", c.name, got, c.want)
+			}
+		})
+	}
+	// NullValue → boundary → default/omit (here: default).
+	t.Run("null-falls-to-default", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
+		wrapped := &structpb.Value{Kind: &structpb.Value_StructValue{StructValue: &structpb.Struct{
+			Fields: map[string]*structpb.Value{"k": structpb.NewNullValue()},
+		}}}
+		hl := hostMetaFunc(map[string]*structpb.Value{"ns": wrapped})
+		got := ResolveCustomTags(specs, nil, nil, nil, hl)
+		if len(got) != 1 || got[0].Str != "DEF" {
+			t.Errorf("null: got %+v, want one {m, DEF} (default)", got)
+		}
+	})
+}
+
+// TestResolveCustomTagsHostMetadataMatrix drives the P4 present/absent/default
+// matrix for the HOST arm (the request_header default rule, NOT the environment
+// rule): present-non-empty→emit; present-EMPTY (structpb "")→emit "" (NOT the
+// default); absent namespace+HasDefault→default; absent+no-default→omit.
+func TestResolveCustomTagsHostMetadataMatrix(t *testing.T) {
+	t.Run("present-non-empty-emits", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
+		nsStruct := mustStruct(t, map[string]interface{}{"k": "V"})
+		hl := hostMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
+		got := ResolveCustomTags(specs, nil, nil, nil, hl)
+		if len(got) != 1 || got[0].Str != "V" {
+			t.Errorf("present-non-empty: got %+v, want one {m, V}", got)
+		}
+	})
+	t.Run("present-empty-emits-empty", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
+		nsStruct := mustStruct(t, map[string]interface{}{"k": ""})
+		hl := hostMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
+		got := ResolveCustomTags(specs, nil, nil, nil, hl)
+		if len(got) != 1 || got[0].Key != "m" || got[0].Str != "" {
+			t.Errorf("present-empty: got %+v, want one {m, \"\"} (present-empty EMITS \"\", NOT the default — the request_header rule)", got)
+		}
+	})
+	t.Run("absent-namespace-with-default", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
+		hl := hostMetaFunc(map[string]*structpb.Value{}) // absent
+		got := ResolveCustomTags(specs, nil, nil, nil, hl)
+		if len(got) != 1 || got[0].Str != "DEF" {
+			t.Errorf("absent+default: got %+v, want one {m, DEF}", got)
+		}
+	})
+	t.Run("absent-namespace-no-default-omits", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"k"}}}
+		hl := hostMetaFunc(map[string]*structpb.Value{}) // absent
+		got := ResolveCustomTags(specs, nil, nil, nil, hl)
+		if len(got) != 0 {
+			t.Errorf("absent+no-default: got %+v, want OMITTED", got)
+		}
+	})
+	// A WRONG namespace resolves nothing even though the lookup holds a value —
+	// pins that MetaNamespace is the load-bearing key, not an ignored field.
+	t.Run("wrong-namespace-falls-to-default", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "OTHER", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
+		nsStruct := mustStruct(t, map[string]interface{}{"k": "V"})
+		hl := hostMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
+		got := ResolveCustomTags(specs, nil, nil, nil, hl)
+		if len(got) != 1 || got[0].Str != "DEF" {
+			t.Errorf("wrong-namespace: got %+v, want one {m, DEF} (namespace is load-bearing)", got)
+		}
+	})
+}
+
+// TestResolveCustomTagsHostMetadataNilLookup: a kindMetadataHost spec with a nil
+// hostMetaLookup falls to default / omit, no panic. nil-tolerance is a
+// defensive contract, not a production path — Task 4's three call sites always
+// pass picked.MetaLookup unconditionally, and picked.MetaLookup is a non-nil
+// method value even on the ZERO Endpoint (its closure returns (nil,false) via
+// the nil filterMetadata-map guard, distinct from this nil-lookup case).
+func TestResolveCustomTagsHostMetadataNilLookup(t *testing.T) {
+	t.Run("nil-lookup-with-default", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"k"}, DefaultValue: "DEF", HasDefault: true}}
+		got := ResolveCustomTags(specs, nil, nil, nil, nil)
+		if len(got) != 1 || got[0].Str != "DEF" {
+			t.Errorf("nil-lookup+default: got %+v, want one {m, DEF}", got)
+		}
+	})
+	t.Run("nil-lookup-no-default-omits", func(t *testing.T) {
+		specs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: []string{"k"}}}
+		got := ResolveCustomTags(specs, nil, nil, nil, nil)
+		if len(got) != 0 {
+			t.Errorf("nil-lookup+no-default: got %+v, want OMITTED", got)
+		}
+	})
+}
+
+// TestResolveCustomTagsHostEquivalentToRoute pins that the HOST arm is a FAITHFUL
+// clone of the ROUTE arm: the SAME namespace struct walked by the SAME MetaPath
+// through routeMetaLookup and through hostMetaLookup must yield the SAME KV. It
+// is the shared FULL-MetaPath rule that makes this hold — a [1:] descent on the
+// HOST side would break the multi-segment and single-segment rows.
+func TestResolveCustomTagsHostEquivalentToRoute(t *testing.T) {
+	paths := [][]string{{"k"}, {"a", "b"}, {"MISSING"}}
+	for _, p := range paths {
+		t.Run(strings.Join(p, "."), func(t *testing.T) {
+			nsStruct := mustStruct(t, map[string]interface{}{
+				"k": "v",
+				"a": map[string]interface{}{"b": "deep"},
+			})
+			routeSpecs := []CustomTagSpec{{Key: "m", Kind: kindMetadataRoute, MetaNamespace: "ns", MetaPath: p, DefaultValue: "DEF", HasDefault: true}}
+			hostSpecs := []CustomTagSpec{{Key: "m", Kind: kindMetadataHost, MetaNamespace: "ns", MetaPath: p, DefaultValue: "DEF", HasDefault: true}}
+			rl := routeMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
+			hl := hostMetaFunc(map[string]*structpb.Value{"ns": nsStruct})
+			gotRoute := ResolveCustomTags(routeSpecs, nil, nil, rl, nil)
+			gotHost := ResolveCustomTags(hostSpecs, nil, nil, nil, hl)
+			if len(gotRoute) != len(gotHost) {
+				t.Fatalf("precondition: len(route)=%d len(host)=%d, want equal (route=%+v host=%+v)", len(gotRoute), len(gotHost), gotRoute, gotHost)
+			}
+			for i := range gotRoute {
+				if gotRoute[i] != gotHost[i] {
+					t.Errorf("path %v: host[%d] = %+v, want the ROUTE result %+v", p, i, gotHost[i], gotRoute[i])
+				}
+			}
+		})
+	}
 }
