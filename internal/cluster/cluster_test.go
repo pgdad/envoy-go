@@ -939,3 +939,86 @@ func TestEndpoint_MetaLookup(t *testing.T) {
 		t.Errorf("nil-struct namespace MetaLookup(\"ns\") = (%v, %v), want (nil, false)", v, ok)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 73 Task 1 — Endpoint.clusterFilterMetadata retention + the
+// ClusterMetaLookup accessor (the CLUSTER analog of the phase-72 pair above)
+// ---------------------------------------------------------------------------
+
+// TestEndpoint_ClusterMetaLookup pins the accessor's OWN return contract (NOT a
+// span attribute — a span-routed assertion is vacuous here, PLAN §1.2 (b)/F5b):
+// a present namespace yields (non-nil, true) wrapping the WHOLE namespace
+// struct; an absent namespace, the ZERO Endpoint and a nil-valued namespace all
+// yield (nil, false) without panicking. Subtest (e) is the INDEPENDENCE pin: the
+// endpoint-level filterMetadata and the cluster-level clusterFilterMetadata are
+// SOURCE-DISTINCT retentions and must never cross.
+func TestEndpoint_ClusterMetaLookup(t *testing.T) {
+	st, err := structpb.NewStruct(map[string]any{"k": "v"})
+	if err != nil {
+		t.Fatalf("structpb.NewStruct: %v", err)
+	}
+	e := Endpoint{Host: "127.0.0.1", Port: 9001, clusterFilterMetadata: map[string]*structpb.Struct{"ns": st}}
+
+	// (a) present namespace → the whole namespace struct, wrapped.
+	v, ok := e.ClusterMetaLookup("ns")
+	if !ok {
+		t.Errorf("ClusterMetaLookup(\"ns\") ok = false, want true")
+	}
+	if v == nil {
+		t.Errorf("ClusterMetaLookup(\"ns\") value = nil, want a non-nil StructValue wrapper")
+	} else if got := v.GetStructValue().GetFields()["k"].GetStringValue(); got != "v" {
+		t.Errorf("ClusterMetaLookup(\"ns\") wrapped fields[k] = %q, want %q", got, "v")
+	}
+
+	// (b) absent namespace → (nil, false).
+	if v, ok := e.ClusterMetaLookup("absent"); v != nil || ok {
+		t.Errorf("ClusterMetaLookup(\"absent\") = (%v, %v), want (nil, false)", v, ok)
+	}
+
+	// (c) the ZERO Endpoint (the 5 span-capable local-reply sites carry it) →
+	// (nil, false), no panic on the nil map. NOTE this is the NIL-MAP mechanism;
+	// it is NOT the "a method value on the zero Endpoint is nil" claim — a method
+	// value on the zero Endpoint is NON-nil. Two mechanisms, one outcome.
+	var zero Endpoint
+	if v, ok := zero.ClusterMetaLookup("ns"); v != nil || ok {
+		t.Errorf("zero Endpoint ClusterMetaLookup(\"ns\") = (%v, %v), want (nil, false)", v, ok)
+	}
+
+	// (d) a namespace mapped to a nil *structpb.Struct → (nil, false) (the
+	// guard's own contract: structpb.NewStructValue(nil) is NON-nil).
+	nilNS := Endpoint{clusterFilterMetadata: map[string]*structpb.Struct{"ns": nil}}
+	if v, ok := nilNS.ClusterMetaLookup("ns"); v != nil || ok {
+		t.Errorf("nil-struct namespace ClusterMetaLookup(\"ns\") = (%v, %v), want (nil, false)", v, ok)
+	}
+
+	// (e) INDEPENDENCE — the two retentions are SOURCE-DISTINCT. One Endpoint
+	// carrying BOTH maps under the SAME namespace with DIFFERENT values: each
+	// accessor must return its OWN source. This is the only unit test that
+	// catches the two fields being crossed (Break B's target).
+	epSt, err := structpb.NewStruct(map[string]any{"who": "endpoint"})
+	if err != nil {
+		t.Fatalf("structpb.NewStruct(endpoint): %v", err)
+	}
+	clSt, err := structpb.NewStruct(map[string]any{"who": "cluster"})
+	if err != nil {
+		t.Fatalf("structpb.NewStruct(cluster): %v", err)
+	}
+	both := Endpoint{
+		Host:                  "127.0.0.1",
+		Port:                  9001,
+		filterMetadata:        map[string]*structpb.Struct{"shared.ns": epSt},
+		clusterFilterMetadata: map[string]*structpb.Struct{"shared.ns": clSt},
+	}
+	epV, epOK := both.MetaLookup("shared.ns")
+	if !epOK {
+		t.Errorf("independence: MetaLookup(\"shared.ns\") ok = false, want true")
+	} else if got := epV.GetStructValue().GetFields()["who"].GetStringValue(); got != "endpoint" {
+		t.Errorf("independence: MetaLookup(\"shared.ns\")[who] = %q, want %q (the ENDPOINT source)", got, "endpoint")
+	}
+	clV, clOK := both.ClusterMetaLookup("shared.ns")
+	if !clOK {
+		t.Errorf("independence: ClusterMetaLookup(\"shared.ns\") ok = false, want true")
+	} else if got := clV.GetStructValue().GetFields()["who"].GetStringValue(); got != "cluster" {
+		t.Errorf("independence: ClusterMetaLookup(\"shared.ns\")[who] = %q, want %q (the CLUSTER source)", got, "cluster")
+	}
+}

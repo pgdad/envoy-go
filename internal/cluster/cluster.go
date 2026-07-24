@@ -78,6 +78,16 @@ type Endpoint struct {
 	// ignores it.
 	filterMetadata map[string]*structpb.Struct
 
+	// clusterFilterMetadata retains the OWNING CLUSTER's RAW per-namespace static
+	// metadata (clusters[].metadata.filter_metadata), ALIASING the already-parsed
+	// proto map — zero new allocation. Added phase 73 so a CLUSTER-kind tracing
+	// custom_tag can address ANY namespace and walk a NESTED path. It rides the
+	// ENDPOINT rather than cluster.Cluster because the reference gates a
+	// CLUSTER-kind tag on the PICKED UPSTREAM HOST, not on the matched route
+	// (probed at the phase-73 SPEC). Every endpoint of one cluster shares the
+	// SAME map. NOT part of the dial identity: Addr() ignores it.
+	clusterFilterMetadata map[string]*structpb.Struct
+
 	// addr is the Addr() string precomputed at extractEndpoints time (the pick
 	// hot path — health scans, pool/hash keys — calls Addr() per host; caching
 	// removes the per-call formatting allocation). Empty for directly-constructed
@@ -110,6 +120,19 @@ func (e Endpoint) IsZero() bool { return e.Host == "" && e.Port == 0 }
 // (nil map → (nil,false)).
 func (e Endpoint) MetaLookup(ns string) (*structpb.Value, bool) {
 	st := e.filterMetadata[ns]
+	if st == nil {
+		return nil, false
+	}
+	return structpb.NewStructValue(st), true
+}
+
+// ClusterMetaLookup returns the OWNING CLUSTER's static metadata for the
+// namespace ns, wrapped as a structpb StructValue (or (nil,false) when the
+// cluster carries no metadata / the namespace is absent). The CLUSTER analog of
+// MetaLookup above; threaded as a method value at the three tracing emit sites.
+// Safe on the ZERO Endpoint (nil map → (nil,false)).
+func (e Endpoint) ClusterMetaLookup(ns string) (*structpb.Value, bool) {
+	st := e.clusterFilterMetadata[ns]
 	if st == nil {
 		return nil, false
 	}

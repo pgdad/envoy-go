@@ -777,3 +777,352 @@ func TestSpanEmit_ZeroPickedHostMetadata_FallsToDefault(t *testing.T) {
 		t.Errorf("zero picked, empty default_value: htag present (%q), want OMITTED", spanAttr(spans[0], "htag"))
 	}
 }
+
+// ── CLUSTER metadata custom_tag thread (Phase 73 T4) ─────────────────────────
+
+// clusterMetadataCustomTag builds a CLUSTER-kind metadata custom_tag reading
+// metadata_key.key==ns down the FULL path `segs` (>=1 segment; parse rejects an
+// empty path). defaultValue=="" ⇒ HasDefault==false ⇒ the tag is OMITTED
+// entirely when the lookup misses; a non-empty default is emitted instead (the
+// request_header default rule — a present-but-EMPTY value still emits "").
+func clusterMetadataCustomTag(tag, ns, defaultValue string, segs ...string) *typetracingv3.CustomTag {
+	path := make([]*metadatav3.MetadataKey_PathSegment, 0, len(segs))
+	for _, seg := range segs {
+		path = append(path, &metadatav3.MetadataKey_PathSegment{
+			Segment: &metadatav3.MetadataKey_PathSegment_Key{Key: seg},
+		})
+	}
+	return &typetracingv3.CustomTag{
+		Tag: tag,
+		Type: &typetracingv3.CustomTag_Metadata_{Metadata: &typetracingv3.CustomTag_Metadata{
+			Kind:         &metadatav3.MetadataKind{Kind: &metadatav3.MetadataKind_Cluster_{Cluster: &metadatav3.MetadataKind_Cluster{}}},
+			MetadataKey:  &metadatav3.MetadataKey{Key: ns, Path: path},
+			DefaultValue: defaultValue,
+		}},
+	}
+}
+
+// mkClusterMetadataEndpoint returns a REAL cluster.Endpoint carrying the OWNING
+// CLUSTER's clusters[].metadata.filter_metadata, built through the PRODUCTION
+// populate path: cluster.NewManager → Manager.Get → Cluster.PickEndpoint
+// (already exported; no dial). Endpoint.clusterFilterMetadata is UNEXPORTED, so
+// a package-hcm test cannot build one by struct literal, and minting a test
+// constructor would add a SECOND new exported symbol this row's envelope forbids
+// (exactly ONE: cluster.Endpoint.ClusterMetaLookup).
+//
+// ⚠️ The metadata block sits on the CLUSTER (a sibling of name:/type:), NOT on
+// lb_endpoints[] — that is the phase-72 HOST source and putting it there is the
+// source-relocation failure mode. The namespace is deliberately NOT "envoy.lb"
+// (ANY filter_metadata namespace is addressable) and the value is NESTED under
+// outer→inner (the CLUSTER arm descends the FULL MetaPath, not [1:]).
+func mkClusterMetadataEndpoint(t *testing.T) cluster.Endpoint {
+	t.Helper()
+	nsStruct, err := structpb.NewStruct(map[string]interface{}{
+		"outer": map[string]interface{}{"inner": "cluster-resolved-value"},
+	})
+	if err != nil {
+		t.Fatalf("structpb.NewStruct: %v", err)
+	}
+	bs := &bootstrapv3.Bootstrap{
+		StaticResources: &bootstrapv3.Bootstrap_StaticResources{
+			Clusters: []*clusterv3.Cluster{{
+				Name:                 "c_clustermeta",
+				ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+				LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+				ConnectTimeout:       durationpb.New(time.Second),
+				Metadata: &corev3.Metadata{
+					FilterMetadata: map[string]*structpb.Struct{"cluster.ns": nsStruct},
+				},
+				LoadAssignment: &endpointv3.ClusterLoadAssignment{
+					ClusterName: "c_clustermeta",
+					Endpoints: []*endpointv3.LocalityLbEndpoints{{
+						LbEndpoints: []*endpointv3.LbEndpoint{{
+							HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{
+								Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+									SocketAddress: &corev3.SocketAddress{
+										Address:       "127.0.0.1",
+										PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 1},
+									},
+								}},
+							}},
+						}},
+					}},
+				},
+			}},
+		},
+	}
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("cluster.NewManager: %v", err)
+	}
+	cl, ok := cm.Get("c_clustermeta")
+	if !ok {
+		t.Fatalf("Manager.Get(c_clustermeta): not found")
+	}
+	ep, err := cl.PickEndpoint()
+	if err != nil {
+		t.Fatalf("PickEndpoint: %v", err)
+	}
+	if _, found := ep.ClusterMetaLookup("cluster.ns"); !found {
+		t.Fatalf("precondition: picked endpoint carries no cluster.ns owning-cluster filter_metadata")
+	}
+	return ep
+}
+
+// clusterMetaFilter builds a *Filter whose tracing config carries ONE
+// CLUSTER-kind metadata custom_tag "ctag" reading cluster.ns → outer → inner,
+// with the supplied default_value.
+func clusterMetaFilter(t *testing.T, fe *fakeExporter, defaultValue string) *Filter {
+	t.Helper()
+	cfg, err := tracing.NewConfig(otelTracingProto(t, []*typetracingv3.CustomTag{
+		clusterMetadataCustomTag("ctag", "cluster.ns", defaultValue, "outer", "inner"),
+	}))
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+	return newTracingFilter(t, fe, cfg)
+}
+
+// TestSpanEmit_H1_ClusterMetadataCustomTag_ThreadLive proves the H1 call site
+// (accesslog_emit.go:57) threads picked.ClusterMetaLookup as the 6th
+// ResolveCustomTags argument: a CLUSTER-kind metadata custom_tag resolves its
+// value from the PICKED host's OWNING CLUSTER's static filter_metadata onto the
+// ingress span. A nil 6th argument would leave the tag OMITTED (no default) —
+// the resolved-value assertion discriminates (Break L / Break M).
+func TestSpanEmit_H1_ClusterMetadataCustomTag_ThreadLive(t *testing.T) {
+	fe := &fakeExporter{}
+	f := clusterMetaFilter(t, fe, "")
+	picked := mkClusterMetadataEndpoint(t)
+
+	req, _ := http.NewRequest("GET", "http://example.com/health", nil)
+	req.Proto = "HTTP/1.1"
+	req.Host = "example.com"
+
+	f.emitAccessLog(req, 200, 100, picked, time.Now(), nil, knownDecision(), nil, nil)
+
+	spans := fe.captured()
+	if len(spans) != 1 {
+		t.Fatalf("expected 1 span, got %d", len(spans))
+	}
+	if got := spanAttr(spans[0], "ctag"); got != "cluster-resolved-value" {
+		t.Errorf("H1 span attr ctag = %q, want cluster-resolved-value (picked.ClusterMetaLookup thread not live at accesslog_emit.go:57)", got)
+	}
+}
+
+// TestSpanEmit_H2_ClusterMetadataCustomTag_ThreadLive: the H2 mirror, proving
+// the SECOND call site (accesslog_emit.go:118) INDEPENDENTLY. A single shared
+// helper test would leave two of the three sites unproven — Break L (drop the
+// 6th arg at :57 only) is what checks that this independence is real.
+func TestSpanEmit_H2_ClusterMetadataCustomTag_ThreadLive(t *testing.T) {
+	fe := &fakeExporter{}
+	f := clusterMetaFilter(t, fe, "")
+	picked := mkClusterMetadataEndpoint(t)
+
+	req := h2.H2Request{Method: "GET", Path: "/health", Scheme: "https", Authority: "example.com"}
+
+	f.emitAccessLogH2(req, 200, 100, picked, time.Now(), nil, knownDecision(), nil, nil)
+
+	spans := fe.captured()
+	if len(spans) != 1 {
+		t.Fatalf("expected 1 span, got %d", len(spans))
+	}
+	if got := spanAttr(spans[0], "ctag"); got != "cluster-resolved-value" {
+		t.Errorf("H2 span attr ctag = %q, want cluster-resolved-value (picked.ClusterMetaLookup thread not live at accesslog_emit.go:118)", got)
+	}
+}
+
+// TestSpanEmit_H3_ClusterMetadataCustomTag_ThreadLive: the H3 mirror, proving
+// the THIRD call site (accesslog_emit.go:179) INDEPENDENTLY. ⚠️ :57 and :179 are
+// BYTE-IDENTICAL source lines (both use reqHeaderLookupH1(r)), so only a
+// per-site test distinguishes them.
+func TestSpanEmit_H3_ClusterMetadataCustomTag_ThreadLive(t *testing.T) {
+	fe := &fakeExporter{}
+	f := clusterMetaFilter(t, fe, "")
+	picked := mkClusterMetadataEndpoint(t)
+
+	req, _ := http.NewRequest("GET", "http://example.com/health", nil)
+	req.Proto = "HTTP/3.0"
+	req.Host = "example.com"
+
+	f.emitAccessLogH3(req, 200, 100, picked, time.Now(), nil, knownDecision(), nil, nil)
+
+	spans := fe.captured()
+	if len(spans) != 1 {
+		t.Fatalf("expected 1 span, got %d", len(spans))
+	}
+	if got := spanAttr(spans[0], "ctag"); got != "cluster-resolved-value" {
+		t.Errorf("H3 span attr ctag = %q, want cluster-resolved-value (picked.ClusterMetaLookup thread not live at accesslog_emit.go:179)", got)
+	}
+}
+
+// TestSpanEmit_ZeroPickedClusterMetadata_FallsToDefault pins the ZERO-Endpoint
+// arm for the CLUSTER kind: the 5 SPAN-CAPABLE local-reply sites
+// (connection.go:597/:699, h2dispatch.go:530, h3dispatch.go:280/:341 — all
+// post-Decide local replies) pass cluster.Endpoint{}, whose nil
+// clusterFilterMetadata map makes ClusterMetaLookup return (nil,false) WITHOUT
+// panicking. A CLUSTER tag there falls to default_value, and with an
+// empty/omitted default is OMITTED entirely (the request_header default rule).
+//
+// ⚠️ NOT "10 of 18" or "11 of 18": the other zero-Endpoint sites are PRE-Decide
+// (connection.go:330/:464, h2dispatch.go:313/:396, h3dispatch.go:130/:210) and
+// can never emit a span at all, so only 5 of the 12 span-capable sites are in
+// this arm.
+//
+// ⚠️ Asserted by PRESENCE, not `== ""`: the request_header default rule makes a
+// present-but-empty value emit "", so `== ""` cannot discriminate OMITTED from
+// emitted-as-empty.
+func TestSpanEmit_ZeroPickedClusterMetadata_FallsToDefault(t *testing.T) {
+	req, _ := http.NewRequest("GET", "http://example.com/health", nil)
+	req.Proto = "HTTP/1.1"
+	req.Host = "example.com"
+
+	// (a) non-empty default_value ⇒ the tag is emitted with the DEFAULT.
+	feDefault := &fakeExporter{}
+	fDefault := clusterMetaFilter(t, feDefault, "cfallback")
+	fDefault.emitAccessLog(req, 200, 100, cluster.Endpoint{}, time.Now(), nil, knownDecision(), nil, nil)
+	spans := feDefault.captured()
+	if len(spans) != 1 {
+		t.Fatalf("default arm: expected 1 span, got %d", len(spans))
+	}
+	if got := spanAttr(spans[0], "ctag"); got != "cfallback" {
+		t.Errorf("zero picked, default_value=cfallback: ctag = %q, want cfallback", got)
+	}
+
+	// (b) empty default_value ⇒ the tag is OMITTED entirely (presence check).
+	feOmit := &fakeExporter{}
+	fOmit := clusterMetaFilter(t, feOmit, "")
+	fOmit.emitAccessLog(req, 200, 100, cluster.Endpoint{}, time.Now(), nil, knownDecision(), nil, nil)
+	spans = feOmit.captured()
+	if len(spans) != 1 {
+		t.Fatalf("omit arm: expected 1 span, got %d", len(spans))
+	}
+	if spanHasAttr(spans[0], "ctag") {
+		t.Errorf("zero picked, empty default_value: ctag present (%q), want OMITTED", spanAttr(spans[0], "ctag"))
+	}
+}
+
+// mkDualMetadataEndpoint returns a REAL cluster.Endpoint whose OWNING CLUSTER
+// and whose OWN lb_endpoint both carry the SAME namespace+path
+// (dual.ns → outer → inner) with DIFFERENT values. Built through the same
+// production populate path (NewManager → Get → PickEndpoint).
+func mkDualMetadataEndpoint(t *testing.T) cluster.Endpoint {
+	t.Helper()
+	mk := func(v string) *structpb.Struct {
+		st, err := structpb.NewStruct(map[string]interface{}{
+			"outer": map[string]interface{}{"inner": v},
+		})
+		if err != nil {
+			t.Fatalf("structpb.NewStruct(%q): %v", v, err)
+		}
+		return st
+	}
+	bs := &bootstrapv3.Bootstrap{
+		StaticResources: &bootstrapv3.Bootstrap_StaticResources{
+			Clusters: []*clusterv3.Cluster{{
+				Name:                 "c_dualmeta",
+				ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+				LbPolicy:             clusterv3.Cluster_ROUND_ROBIN,
+				ConnectTimeout:       durationpb.New(time.Second),
+				Metadata: &corev3.Metadata{
+					FilterMetadata: map[string]*structpb.Struct{"dual.ns": mk("from-cluster")},
+				},
+				LoadAssignment: &endpointv3.ClusterLoadAssignment{
+					ClusterName: "c_dualmeta",
+					Endpoints: []*endpointv3.LocalityLbEndpoints{{
+						LbEndpoints: []*endpointv3.LbEndpoint{{
+							Metadata: &corev3.Metadata{
+								FilterMetadata: map[string]*structpb.Struct{"dual.ns": mk("from-host")},
+							},
+							HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{
+								Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+									SocketAddress: &corev3.SocketAddress{
+										Address:       "127.0.0.1",
+										PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 1},
+									},
+								}},
+							}},
+						}},
+					}},
+				},
+			}},
+		},
+	}
+	cm, err := cluster.NewManager(bs, stats.NewRegistry())
+	if err != nil {
+		t.Fatalf("cluster.NewManager: %v", err)
+	}
+	cl, ok := cm.Get("c_dualmeta")
+	if !ok {
+		t.Fatalf("Manager.Get(c_dualmeta): not found")
+	}
+	ep, err := cl.PickEndpoint()
+	if err != nil {
+		t.Fatalf("PickEndpoint: %v", err)
+	}
+	if _, found := ep.MetaLookup("dual.ns"); !found {
+		t.Fatalf("precondition: picked endpoint carries no dual.ns HOST filter_metadata")
+	}
+	if _, found := ep.ClusterMetaLookup("dual.ns"); !found {
+		t.Fatalf("precondition: picked endpoint carries no dual.ns CLUSTER filter_metadata")
+	}
+	return ep
+}
+
+// TestSpanEmit_ClusterVsHostMetadata_SourceDistinct pins the two ADJACENT,
+// IDENTICALLY-TYPED method values (picked.MetaLookup 5th, picked.ClusterMetaLookup
+// 6th) against being CROSSED at the emit call sites — a defect the COMPILER
+// CANNOT catch, since both are func(string) (*structpb.Value, bool).
+//
+// One config, one namespace+path (dual.ns → outer → inner), TWO tags: a HOST
+// tag and a CLUSTER tag. The endpoint's OWN metadata says "from-host"; its
+// OWNING CLUSTER's metadata says "from-cluster". Each span attribute must carry
+// its OWN source's value. Swapping the 5th and 6th arguments compiles clean,
+// passes vet and passes lint — this test is the ONLY guard (Break M2).
+//
+// Run at ALL THREE call sites, since a crossing could be introduced at one only.
+func TestSpanEmit_ClusterVsHostMetadata_SourceDistinct(t *testing.T) {
+	cfg, err := tracing.NewConfig(otelTracingProto(t, []*typetracingv3.CustomTag{
+		hostMetadataCustomTag("dual_host", "dual.ns", "", "outer", "inner"),
+		clusterMetadataCustomTag("dual_cluster", "dual.ns", "", "outer", "inner"),
+	}))
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+	picked := mkDualMetadataEndpoint(t)
+
+	r, _ := http.NewRequest("GET", "http://example.com/health", nil)
+	r.Proto = "HTTP/1.1"
+	r.Host = "example.com"
+	h2req := h2.H2Request{Method: "GET", Path: "/health", Scheme: "https", Authority: "example.com"}
+
+	for _, tc := range []struct {
+		name string
+		site string
+		emit func(f *Filter)
+	}{
+		{"H1", "accesslog_emit.go:57", func(f *Filter) {
+			f.emitAccessLog(r, 200, 100, picked, time.Now(), nil, knownDecision(), nil, nil)
+		}},
+		{"H2", "accesslog_emit.go:118", func(f *Filter) {
+			f.emitAccessLogH2(h2req, 200, 100, picked, time.Now(), nil, knownDecision(), nil, nil)
+		}},
+		{"H3", "accesslog_emit.go:179", func(f *Filter) {
+			f.emitAccessLogH3(r, 200, 100, picked, time.Now(), nil, knownDecision(), nil, nil)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fe := &fakeExporter{}
+			tc.emit(newTracingFilter(t, fe, cfg))
+			spans := fe.captured()
+			if len(spans) != 1 {
+				t.Fatalf("expected 1 span, got %d", len(spans))
+			}
+			if got := spanAttr(spans[0], "dual_host"); got != "from-host" {
+				t.Errorf("%s span attr dual_host = %q, want from-host (HOST/CLUSTER lookups crossed at %s?)", tc.name, got, tc.site)
+			}
+			if got := spanAttr(spans[0], "dual_cluster"); got != "from-cluster" {
+				t.Errorf("%s span attr dual_cluster = %q, want from-cluster (HOST/CLUSTER lookups crossed at %s?)", tc.name, got, tc.site)
+			}
+		})
+	}
+}

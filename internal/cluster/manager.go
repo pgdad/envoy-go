@@ -434,6 +434,18 @@ func buildCluster(c *clusterv3.Cluster, idx int, baseDir string) (*Cluster, erro
 	if err != nil {
 		return nil, err
 	}
+	// Phase 73: stamp the OWNING CLUSTER's static filter_metadata onto every
+	// endpoint, so a CLUSTER-kind tracing custom_tag resolves off the PICKED
+	// host (the reference's own gate). This MUST run before ANY load-balancer
+	// construction below: buildLeafLB retains the SLICE (aliasing this backing
+	// array) but newSubsetLB / newLocalityWeightedLB / newPriorityLB each copy
+	// each Endpoint BY VALUE, so a later populate would leave those three LB
+	// shapes carrying a zeroed field while round-robin silently stayed green.
+	if fm := c.GetMetadata().GetFilterMetadata(); len(fm) > 0 {
+		for i := range endpoints {
+			endpoints[i].clusterFilterMetadata = fm
+		}
+	}
 	if err := validatePanicThresholdRange(c, name); err != nil {
 		return nil, err
 	}

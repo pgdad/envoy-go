@@ -624,19 +624,21 @@ func TestNewConfigAcceptCustomTagMetadata_RequestAccept(t *testing.T) {
 	}
 }
 
-// TestNewConfigRejectCustomTagMetadata_RejectKinds: CLUSTER and an unset kind each
-// boot-reject with an ADR-0080-distinct substring (envoy-go-strict DEPARTURE — the
-// reference accepts these kinds). ROUTE was in this reject roster through phase 70 and
-// HOST through phase 71; phase 71 lifts ROUTE and phase 72 lifts HOST to accept arms
-// (TestNewConfigAcceptCustomTagMetadataRoute_Accept and
-// TestNewConfigAcceptCustomTagMetadataHost_Accept cover them now).
+// TestNewConfigRejectCustomTagMetadata_RejectKinds: an UNSET kind boot-rejects with
+// "kind required" (envoy-go-strict DEPARTURE — the reference PGV-rejects a fully-unset
+// `kind` too, but envoy-go also rejects the `metadata:` with-no-`kind` spelling). ROUTE
+// was in this reject roster through phase 70, HOST through phase 71 and CLUSTER through
+// phase 72; phase 71 lifts ROUTE, phase 72 lifts HOST and phase 73 lifts CLUSTER to
+// accept arms (TestNewConfigAcceptCustomTagMetadataRoute_Accept,
+// TestNewConfigAcceptCustomTagMetadataHost_Accept and
+// TestNewConfigAcceptCustomTagMetadataCluster_Accept cover them now). Every
+// MetadataKind is now ACCEPTED, so the unset kinds are ALL that remains here.
 func TestNewConfigRejectCustomTagMetadata_RejectKinds(t *testing.T) {
 	tests := []struct {
 		name    string
 		kind    *metadatav3.MetadataKind
 		wantSub string
 	}{
-		{"cluster", &metadatav3.MetadataKind{Kind: &metadatav3.MetadataKind_Cluster_{Cluster: &metadatav3.MetadataKind_Cluster{}}}, "cluster kind unsupported"},
 		{"unset-kind", nil, "kind required"},
 	}
 	for _, tc := range tests {
@@ -751,17 +753,19 @@ func TestNewConfigAcceptCustomTagMetadataRoute_Accept(t *testing.T) {
 	}
 }
 
-// TestNewConfigRejectCustomTagMetadataRoute_RejectKinds: CLUSTER and an unset kind
-// still boot-reject with an ADR-0080-distinct substring (envoy-go-strict DEPARTURE —
-// the reference accepts these kinds); ROUTE is now ACCEPTED (phase 71 lifts the
-// reject — see the Accept test above) and so is HOST (phase 72).
+// TestNewConfigRejectCustomTagMetadataRoute_RejectKinds: an UNSET kind still
+// boot-rejects with "kind required"; ROUTE is now ACCEPTED (phase 71 lifts the reject —
+// see the Accept test above), and so are HOST (phase 72) and CLUSTER (phase 73). The
+// two surviving unset-kind arms (config.go's `k == nil` and its `default:`) BOTH emit
+// "kind required", so the substring no longer distinguishes WHICH arm fired — a
+// documented boundary, deliberately not split (that would change landed error strings,
+// ADR-0080 territory).
 func TestNewConfigRejectCustomTagMetadataRoute_RejectKinds(t *testing.T) {
 	tests := []struct {
 		name    string
 		kind    *metadatav3.MetadataKind
 		wantSub string
 	}{
-		{"cluster", &metadatav3.MetadataKind{Kind: &metadatav3.MetadataKind_Cluster_{Cluster: &metadatav3.MetadataKind_Cluster{}}}, "cluster kind unsupported"},
 		{"unset-kind", nil, "kind required"},
 	}
 	for _, tc := range tests {
@@ -866,6 +870,20 @@ func TestCustomTagKindMetadataHostConstValue(t *testing.T) {
 	}
 }
 
+// TestCustomTagKindMetadataClusterConstValue pins kindMetadataCluster's VALUE at 6 —
+// it is APPENDED to the customTagKind iota block, never INSERTED. An insert would
+// silently renumber kindMetadataHost (and every later kind) and recompile clean,
+// failing nowhere else in the suite; this assertion plus the HOST/ROUTE pins above are
+// the only mechanical guard.
+func TestCustomTagKindMetadataClusterConstValue(t *testing.T) {
+	if kindMetadataCluster != 6 {
+		t.Errorf("kindMetadataCluster = %d, want 6 (APPENDED after kindMetadataHost, never inserted)", kindMetadataCluster)
+	}
+	if kindMetadataHost != 5 {
+		t.Errorf("kindMetadataHost = %d, want 5 (unchanged by the phase-73 append)", kindMetadataHost)
+	}
+}
+
 // TestNewConfigAcceptCustomTagMetadataHost_Accept: a HOST-kind metadata tag parses
 // into a CustomTagSpec carrying the namespace (metadata_key.key), the FULL
 // pre-extracted path segment keys, and the default (HasDefault from a non-empty
@@ -952,6 +970,102 @@ func TestNewConfigCustomTagMetadataHostFirstWinsDedup(t *testing.T) {
 	}
 	if got := cfg.CustomTags[0]; got.Key != "dup" || got.Kind != kindMetadataHost || got.MetaNamespace != "ns" {
 		t.Errorf("CustomTags[0] = %+v, want the FIRST (metadata host ns)", got)
+	}
+}
+
+// clusterMetaKind builds a CLUSTER MetadataKind (the newly-accepted kind, phase 73 —
+// the FOURTH and LAST MetadataKind).
+func clusterMetaKind() *metadatav3.MetadataKind {
+	return &metadatav3.MetadataKind{Kind: &metadatav3.MetadataKind_Cluster_{Cluster: &metadatav3.MetadataKind_Cluster{}}}
+}
+
+// TestNewConfigAcceptCustomTagMetadataCluster_Accept: a CLUSTER-kind metadata tag
+// parses into a CustomTagSpec carrying the namespace (metadata_key.key), the FULL
+// pre-extracted path segment keys, and the default (HasDefault from a non-empty
+// default_value — the request_header idiom, cloned from the HOST arm). The TWO-segment
+// path is load-bearing: it is what a [1:] slip at the parse boundary would break.
+func TestNewConfigAcceptCustomTagMetadataCluster_Accept(t *testing.T) {
+	tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+	tr.CustomTags = []*typetracingv3.CustomTag{
+		customTagMetadata("t", clusterMetaKind(), "ns", []string{"a", "b"}, "d"),
+	}
+	cfg, err := NewConfig(tr)
+	if err != nil {
+		t.Fatalf("NewConfig accept metadata cluster: unexpected err %v", err)
+	}
+	if len(cfg.CustomTags) != 1 {
+		t.Fatalf("CustomTags len = %d, want 1", len(cfg.CustomTags))
+	}
+	got := cfg.CustomTags[0]
+	if got.Key != "t" || got.Kind != kindMetadataCluster || got.MetaNamespace != "ns" ||
+		!reflect.DeepEqual(got.MetaPath, []string{"a", "b"}) || got.DefaultValue != "d" || !got.HasDefault {
+		t.Errorf("CustomTags[0] = %+v, want metadata cluster {t,ns,[a b],d,HasDefault}", got)
+	}
+}
+
+// TestNewConfigRejectCustomTagMetadataCluster_RejectStructural: an empty namespace, an
+// empty path, and an empty path segment each boot-reject for a CLUSTER-kind tag
+// (PGV-PARITY — the reference boot-rejects these too, unchanged from REQUEST/ROUTE/HOST).
+func TestNewConfigRejectCustomTagMetadataCluster_RejectStructural(t *testing.T) {
+	tests := []struct {
+		name    string
+		tag     *typetracingv3.CustomTag
+		wantSub string
+	}{
+		{"empty-namespace", customTagMetadata("m", clusterMetaKind(), "", []string{"a"}, ""), "empty namespace"},
+		{"empty-path", customTagMetadata("m", clusterMetaKind(), "ns", nil, ""), "empty path"},
+		{"empty-path-segment", customTagMetadata("m", clusterMetaKind(), "ns", []string{""}, ""), "empty path segment"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+			tr.CustomTags = []*typetracingv3.CustomTag{tc.tag}
+			got, err := NewConfig(tr)
+			if err == nil {
+				t.Fatalf("NewConfig(%s) err = nil, want reject; got %+v", tc.name, got)
+			}
+			if got != nil {
+				t.Fatalf("NewConfig(%s) returned non-nil config on reject: %+v", tc.name, got)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("NewConfig(%s) err = %q, want substring %q", tc.name, err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestNewConfigAcceptCustomTagMetadataCluster_HasDefaultFalseWhenEmpty: a CLUSTER tag
+// with an empty default_value → HasDefault==false (the request_header idiom).
+func TestNewConfigAcceptCustomTagMetadataCluster_HasDefaultFalseWhenEmpty(t *testing.T) {
+	tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+	tr.CustomTags = []*typetracingv3.CustomTag{customTagMetadata("t", clusterMetaKind(), "ns", []string{"a"}, "")}
+	cfg, err := NewConfig(tr)
+	if err != nil {
+		t.Fatalf("NewConfig accept metadata cluster: unexpected err %v", err)
+	}
+	if got := cfg.CustomTags[0]; got.Kind != kindMetadataCluster || got.DefaultValue != "" || got.HasDefault {
+		t.Errorf("CustomTags[0] = %+v, want metadata cluster with HasDefault==false, empty default", got)
+	}
+}
+
+// TestNewConfigCustomTagMetadataClusterFirstWinsDedup: a CLUSTER metadata tag placed
+// FIRST reserves its key slot — a later same-key literal tag is dropped (SPEC-62 §11
+// arms C/D). The stored spec is the FIRST (metadata cluster).
+func TestNewConfigCustomTagMetadataClusterFirstWinsDedup(t *testing.T) {
+	tr := otelProvider(t, envoyGrpcOTel("c", "svc"))
+	tr.CustomTags = []*typetracingv3.CustomTag{
+		customTagMetadata("dup", clusterMetaKind(), "ns", []string{"a"}, ""),
+		customTagLiteral("dup", "LIT-VAL"),
+	}
+	cfg, err := NewConfig(tr)
+	if err != nil {
+		t.Fatalf("NewConfig metadata-cluster-dedup: unexpected err %v", err)
+	}
+	if len(cfg.CustomTags) != 1 {
+		t.Fatalf("CustomTags len = %d, want 1 (first-wins dedup)", len(cfg.CustomTags))
+	}
+	if got := cfg.CustomTags[0]; got.Key != "dup" || got.Kind != kindMetadataCluster || got.MetaNamespace != "ns" {
+		t.Errorf("CustomTags[0] = %+v, want the FIRST (metadata cluster ns)", got)
 	}
 }
 

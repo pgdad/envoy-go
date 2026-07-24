@@ -41,9 +41,22 @@ import (
 // succeeds. That second source is the phase-72 named departure B2; POST-acquire
 // failures forward the REAL endpoint and resolve normally. Either way, a ZERO
 // picked makes kindMetadataHost specs use default / omit.
+// A kindMetadataCluster spec yields the serialized static metadata value of the
+// OWNING CLUSTER of the selected upstream endpoint at its namespace+path
+// (clusterMetaLookup, same present-empty EMITS "" default rule), likewise
+// descending the FULL MetaPath from the WHOLE namespace struct clusterMetaLookup
+// returns (the same one-arg shape as routeMetaLookup / hostMetaLookup, NOT
+// metaLookup's two-arg pre-keyed one). The source is
+// clusters[].metadata.filter_metadata[ns], stamped onto every Endpoint at
+// cluster-build time, so a CLUSTER-kind tag is gated on the PICKED HOST exactly
+// as the reference gates it — not on the matched route. clusterMetaLookup may be
+// nil (no cluster lookup available), and picked may be the ZERO Endpoint for the
+// same two reasons as kindMetadataHost above (a CLUSTER-kind tag is the FIFTH
+// consumer of the phase-72 departure B2). Either way, a ZERO picked makes
+// kindMetadataCluster specs use default / omit.
 // The returned []KV has unique keys (the specs were deduped at parse), so
 // BuildServerSpan's upsert only ever overrides a colliding BUILT-IN.
-func ResolveCustomTags(specs []CustomTagSpec, headerLookup func(string) ([]string, bool), metaLookup func(ns, key string) (*structpb.Value, bool), routeMetaLookup func(ns string) (*structpb.Value, bool), hostMetaLookup func(ns string) (*structpb.Value, bool)) []KV {
+func ResolveCustomTags(specs []CustomTagSpec, headerLookup func(string) ([]string, bool), metaLookup func(ns, key string) (*structpb.Value, bool), routeMetaLookup func(ns string) (*structpb.Value, bool), hostMetaLookup func(ns string) (*structpb.Value, bool), clusterMetaLookup func(ns string) (*structpb.Value, bool)) []KV {
 	if len(specs) == 0 {
 		return nil
 	}
@@ -145,6 +158,34 @@ func ResolveCustomTags(specs []CustomTagSpec, headerLookup func(string) ([]strin
 			var ok bool
 			if hostMetaLookup != nil {
 				v, ok = hostMetaLookup(s.MetaNamespace)
+			}
+			if ok {
+				v, ok = descend(v, s.MetaPath) // FULL path, NOT s.MetaPath[1:]
+			}
+			if ok {
+				if str, emit := structpbValueToString(v); emit {
+					out = append(out, KV{Key: s.Key, Str: str})
+					continue
+				}
+			}
+			if s.HasDefault {
+				out = append(out, KV{Key: s.Key, Str: s.DefaultValue})
+			} // else omit (append nothing)
+		case kindMetadataCluster:
+			// Mirror kindMetadataHost exactly: the CLUSTER source yields the WHOLE
+			// namespace struct (the OWNING cluster's
+			// clusters[].metadata.filter_metadata[ns], stamped onto every Endpoint at
+			// cluster-build time), so descend the FULL MetaPath (the [1:] slice is a
+			// REQUEST-only Bucket-pre-keying artifact). clusterMetaLookup may be nil,
+			// and picked may be the ZERO Endpoint — at the 5 span-capable local-reply
+			// sites, and ALSO at the post-decision upstream emit sites whenever the
+			// upstream ACQUIRE failed (the phase-72 departure B2, of which a
+			// CLUSTER-kind tag is the FIFTH consumer). POST-acquire failures forward
+			// the REAL endpoint and resolve normally. → default / omit.
+			var v *structpb.Value
+			var ok bool
+			if clusterMetaLookup != nil {
+				v, ok = clusterMetaLookup(s.MetaNamespace)
 			}
 			if ok {
 				v, ok = descend(v, s.MetaPath) // FULL path, NOT s.MetaPath[1:]

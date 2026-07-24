@@ -1,0 +1,257 @@
+# Phase 73 fixture 0117-tracing-custom-tags-metadata-cluster expectations
+# (ADR-0019 — prose; the driver is the enforcer via AssertStats; this file is
+# documentation). Cloned from 0116-tracing-custom-tags-metadata-host (the OTLP
+# tracing custom_tags HOST metadata chassis) with the static metadata block
+# RELOCATED from the cluster's lb_endpoints[0] onto the CLUSTER itself — and
+# with the single backend cluster SPLIT IN TWO. Exercises the phase-73 CLUSTER
+# `metadata` custom_tags source (ADR-0295) — the FOURTH and LAST `metadata`
+# MetadataKind, after REQUEST (phase 70, 0114), ROUTE (phase 71, 0115) and HOST
+# (phase 72, 0116).
+#
+# ## TWO CLUSTERS — what this fixture PROVES that 0116 could not
+#
+# 0116 carried a single cluster with a single lb_endpoint, so it could not
+# distinguish "the SELECTED source's metadata" from "the ONLY source's" / "the
+# FIRST source's". This fixture is built to settle that positively:
+#
+#   c_backend_a and c_backend_b point at the SAME single HTTPFixedBody backend
+#   host:port and are byte-identical EXCEPT for `name:`,
+#   `load_assignment.cluster_name:` and ONE metadata value. Two path-prefix
+#   routes select between them. ONE cl_hit tag, on ONE HCM, therefore emits TWO
+#   DIFFERENT values in the SAME run — "v-cluster-a-0117" on every /a span and
+#   "v-cluster-b-0117" on every /b span, on BOTH sides. That is a positive,
+#   executed proof that the CLUSTER-kind resolve reads the SELECTED cluster's
+#   metadata. No limitation is confessed here; the two-cluster design removes it.
+#
+# Because the selection is by PATH and each cluster carries exactly ONE
+# lb_endpoint, the pick is deterministic and NO load-balancer spread enters the
+# assertion (reference_round_robin_offset_randomized never engages), while
+# BackendCount stays 1 (reference_differential_backendcount_min_one).
+#
+# Topology (single-listener plaintext H1; ONE HTTPFixedBody backend; driver-owned
+# in-process OTLP TraceService gRPC receiver):
+#   l_test (hcm_local) — one downstream HTTP/1.1 listener; TWO routes:
+#                          prefix "/a" -> cluster c_backend_a
+#                          prefix "/b" -> cluster c_backend_b
+#                        Neither route carries any metadata (that is 0115's
+#                        ROUTE source) and neither cluster's lb_endpoints[]
+#                        carries any (that is 0116's HOST source) — both are
+#                        deliberately absent so a leftover route/endpoint source
+#                        cannot mask the CLUSTER source (breaks P and R).
+#                        Each cluster instead carries a STATIC metadata block
+#                        that is a SIBLING of `name:`/`type:` on the Cluster
+#                        message:
+#                          - name: c_backend_a
+#                            type: STRICT_DNS      # STATIC on envoy-go
+#                            metadata:
+#                              filter_metadata:
+#                                envoy.test:
+#                                  cl_k: v-cluster-a-0117
+#                        (and cl_k: v-cluster-b-0117 on c_backend_b), retained
+#                        at cluster-build time on
+#                        cluster.Endpoint.clusterFilterMetadata by the
+#                        buildCluster populate loop in
+#                        internal/cluster/manager.go — placed BEFORE all LB
+#                        construction, since three of the four LB shapes copy
+#                        each Endpoint BY VALUE — and read back via
+#                        (cluster.Endpoint).ClusterMetaLookup threaded as the
+#                        6th ResolveCustomTags argument from the SELECTED
+#                        endpoint at
+#                        internal/filter/hcm/accesslog_emit.go:57/:118/:179.
+#                        The gate is therefore the PICKED HOST, not the matched
+#                        route — exactly as the reference gates it
+#                        (reference_cluster_tag_gated_on_pick_not_route). NO
+#                        writer/Lua filter — both sides read the IDENTICAL
+#                        static cluster config. HCM carries a `tracing` block
+#                        (OpenTelemetry provider, service_name "0117",
+#                        random_sampling 100%) naming c_otlp_collector —
+#                        exporting one OTLP Span per completed request. The
+#                        `tracing` block carries TWO CLUSTER `metadata`
+#                        custom_tags:
+#                          cl_hit     — metadata_key {key: envoy.test,
+#                                       path:[cl_k]}, default_value
+#                                       "unused-default-0117" → resolves to the
+#                                       OWNING cluster's static value
+#                                       (default NEVER used).
+#                          cl_default — metadata_key {key: envoy.test,
+#                                       path:[absent_k]}, default_value
+#                                       "fallback-0117" → the path is UNSET on
+#                                       BOTH clusters → emits "fallback-0117".
+#   c_backend_a /      — the SAME HTTPFixedBody subprocess
+#   c_backend_b          ("backend:v1/fixed\n" = 17 bytes) behind two clusters.
+#                        EXACTLY ONE lb_endpoint each ⇒ deterministic pick.
+#   c_otlp_collector   — driver-owned in-process TraceService receiver
+#                        (test/helpers/otlptrace/) on a driver-allocated stable
+#                        port, bound 0.0.0.0:<port> so the reference container
+#                        (host.docker.internal) AND the subject (127.0.0.1) both
+#                        reach it. http2_protocol_options:{} + plaintext h2c.
+#                        It carries NO metadata block.
+#
+# Reference Envoy contrib-v1.37.2 (STRICT_DNS via host.docker.internal) vs
+# envoy-go (STATIC, in-process). Unlike 0116 the metadata sits on the CLUSTER
+# rather than on the endpoint, so DNS resolution is not in the metadata path at
+# all — strictly easier than 0116.
+#
+# ## PER-PATH SPAN PARTITIONING — mechanism and evidence
+#
+# The assertion is "each span carries ITS OWN cluster's value", so every span
+# must be attributable to the path that produced it.
+#
+#   NOT upstream_cluster. 0116 asserts it assertAttrPresent ONLY, because
+#   envoy-go emits it EMPTY (reference_tracing_upstream_cluster_framework_gap).
+#   Re-confirmed live by this fixture's own dump: the reference emits
+#   upstream_cluster="c_backend_a"/"c_backend_b" while envoy-go emits "" on
+#   every span. It therefore carries no cross-side information.
+#
+#   USED: the `http.url` span attribute, by SUFFIX match. Confirmed live on
+#   BOTH sides before any assertion was written against it (FIXTURE_0117_DUMP=1):
+#   every span on both sides renders http.url as exactly
+#   "http://trace.example/a" or "http://trace.example/b", partitioning 6/6 with
+#   ZERO unclassified spans on each side. The driver still uses a SUFFIX test
+#   rather than equality, because 0116 declined to assert http.url by value
+#   (scheme/host encoding is not contractually pinned).
+#
+#   The partition SIZES are Fatalf PRECONDITIONS in the driver: an
+#   unclassifiable span, or a partition that is not 6/6, fails before the value
+#   assertions run, so a broken partition can never silently turn them into dead
+#   code.
+#
+# ## STRING VALUES ONLY (reference_structpb_tag_cross_side_string_only)
+#
+# A struct-valued or numeric metadata value is NOT cross-side comparable: the
+# reference serializes multi-key structs in an ARBITRARY key order (Go always
+# sorts), scalar-vs-nested numbers use DIFFERENT reference renderers, and
+# top-level scalar numbers render at ~6 significant digits on the reference
+# (biting from 1000000 → 1e+06) vs full precision in Go. Envoy's YAML loader
+# additionally coerces any non-integer scalar to a string. All three asserted
+# values here are plain strings.
+#
+# ## The namespace is "envoy.test", NOT "envoy.lb"
+#
+# envoy.lb is not a privileged namespace
+# (reference_envoy_lb_namespace_not_privileged) and the phase-38 envoy.lb
+# scalar projection could not serve a CLUSTER tag anyway. This fixture is the
+# cross-side proof that a CLUSTER-kind custom_tag addresses an ARBITRARY
+# filter_metadata namespace: the reference DOES resolve "envoy.test" (the cl_hit
+# VALUE-equality assertion below is green on the reference side).
+#
+# ## Workload
+#
+# Each side fires 12 requests, SPLIT ACROSS THE TWO PATHS (6 + 6):
+#   per path: 4 PLAIN GETs (no inbound trace context; random_sampling 100% ⇒
+#             each is a fresh locally-sampled span) + 2 CONTINUATION requests
+#             (+ Traceparent: 00-aaa...aaa-bbb...bbb-01; the proxy CONTINUES the
+#             inbound trace, keeping the inbound trace-id and setting
+#             parent_span_id to the inbound parent span id).
+#   Host: trace.example, UA: trace-probe/1 on every request.
+# The total is held at 12 (0116's value) deliberately, so the span-count and
+# spans_sent assertions stay consistent
+# (reference_fixture_workload_constant_desync).
+# Each cluster's static metadata is the SAME on every request to it (both
+# prongs, both sides — it is config, not per-request state), so every /a span
+# carries the same cl_hit value and every /b span carries the other. The driver
+# POLLS the receiver's Count() to >= 12 (poll-to-converge; never a fixed sleep).
+# Per-side separation: the receiver is Reset() before each drive.
+#
+# ## Framing NOT asserted
+#
+# The cross-side assertion is on the per-span PAYLOAD aggregated across all
+# received spans — NOT the Export-call count / batch sizes / connection count /
+# flush cadence (reference_streaming_sink_differential_framing).
+#
+# ## Asserted (cross-side EXACT on the STABLE per-span subset, both sides)
+#
+#   len(spans) == 12   (zero-span pass is vacuous — proves decode ran on BOTH sides)
+#   Every span:
+#     name                        == "ingress"
+#     kind                        == SPAN_KIND_SERVER (= 2)
+#     StartTimeUnixNano           != 0  (presence + ordering, not value)
+#     EndTimeUnixNano             != 0
+#     StartTimeUnixNano           < EndTimeUnixNano
+#     attrs["http.method"]        == "GET"
+#     attrs["component"]          == "proxy"
+#     attrs["downstream_cluster"] == "-"
+#     attrs["response_flags"]     == "-"
+#     attrs["http.status_code"]   == "200" (normalized: int or string form accepted)
+#     attrs["request_size"]       == "0"
+#     attrs["response_size"]      == "17"  (HTTPFixedBody 17-byte body — the same
+#                                           fixed body on EITHER path)
+#     attrs["http.url"]           PRESENT (and, separately, the PARTITION key —
+#                                          matched by SUFFIX, not by value)
+#     attrs["http.protocol"]      PRESENT
+#     attrs["user_agent"]         PRESENT
+#     attrs["guid:x-request-id"]  KEY PRESENT (value varies — UNasserted)
+#     attrs["upstream_cluster"]   KEY PRESENT (value UNasserted — framework gap)
+#     attrs["upstream_cluster.name"] KEY PRESENT (value UNasserted — framework gap)
+#     attrs["cl_default"]         == "fallback-0117" (KEY + VALUE, cross-side
+#                                             EXACT — metadata_key {envoy.test →
+#                                             absent_k} is UNSET on BOTH clusters
+#                                             → the default_value is emitted; the
+#                                             absent-path default rule.)
+#   Partitioned by path (6 spans each, cross-side EXACT by VALUE):
+#     /a spans: attrs["cl_hit"]   == "v-cluster-a-0117"
+#     /b spans: attrs["cl_hit"]   == "v-cluster-b-0117"
+#                                 (the OWNING cluster's static
+#                                  clusters[].metadata.filter_metadata value,
+#                                  resolved via metadata_key {envoy.test →
+#                                  cl_k}. The configured default_value
+#                                  "unused-default-0117" is NEVER used. This
+#                                  pair of VALUE-equalities is simultaneously
+#                                  the cluster-metadata-SERVED proof, the
+#                                  SELECTED-not-ONLY proof, and the
+#                                  non-"envoy.lb"-namespace cross-side proof.)
+#   Continuation prong (4 spans where trace_id == contTraceID; 2 per path):
+#     trace_id     == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (the fixed inbound trace-id)
+#     parent_span_id == bbbbbbbbbbbbbbbb               (the fixed inbound parent id)
+#   Resource.attributes:
+#     service.name == "0117"   (cross-side EXACT on VALUE)
+#
+# PLUS the subject-side flat /stats counters:
+#   tracing.opentelemetry.spans_sent    == 12
+#   tracing.opentelemetry.spans_dropped == 0
+#
+# ## UNasserted (vary side-to-side / impl-specific)
+#
+#   trace_id / span_id VALUES (except the continuation prong trace_id).
+#   start/end time VALUES — non-deterministic.
+#   x-request-id / peer.address / node_id / zone VALUES.
+#   upstream_cluster / upstream_cluster.name VALUES — framework gap.
+#   http.url VALUE — matched by SUFFIX for partitioning only, never by equality.
+#   Export-call count / per-call batch sizes / connection count — framing.
+#   telemetry.sdk.* resource attrs / ScopeSpans.scope.name+version — impl-specific.
+#
+# ## NOT covered here (a NAMED departure, scoped out)
+#
+# The reference resolves a CLUSTER tag at LOAD-BALANCER PICK TIME, exactly as it
+# does a HOST tag (reference_cluster_tag_gated_on_pick_not_route): a
+# picked-but-unreachable endpoint still contributes its owning cluster's
+# metadata to the span, while envoy-go carries the ZERO Endpoint on every
+# upstream-ACQUIRE failure sub-path (circuit-breaker 503, pool-overflow 503,
+# connect-failure H1 503 / H2 502, and the defensive H2 grant-race 503), so a
+# CLUSTER tag falls to default_value/omit THERE. NOT "on any failure":
+# POST-acquire failures are PARITY — the H1 upstream-write and read-response
+# 502s and the H2 RoundTrip 502 return the REAL picked endpoint, so a CLUSTER
+# tag resolves normally from that endpoint's owning cluster. This fixture drives
+# only SUCCESSFUL upstream requests (200 on every probe), so neither arm is
+# exercised here — the zero-Endpoint arm is pinned by unit tests (the
+# zero-picked test at T4) and deliberately deferred to its own row.
+#
+# ## Cross-refs
+#
+# phase 73 SPEC §8 D-CTMC-* + ADR-0295 (CLUSTER metadata custom_tags parse +
+# per-request resolve out of the SELECTED upstream endpoint's owning cluster's
+# static clusters[].metadata + span-emit upsert) + phase 72 HOST metadata (0116,
+# ADR-0294) + phase 71 ROUTE metadata (0115, ADR-0293) + phase 70 REQUEST
+# metadata (0114, ADR-0292) + phase 63 environment (0106, ADR-0284) + phase 62
+# request_header (0105, ADR-0283) + phase 59 literal (0102, ADR-0277) + phase
+# 46.1b OTLP span emission (0087, ADR-0260) +
+# reference_cluster_tag_gated_on_pick_not_route +
+# reference_envoy_lb_namespace_not_privileged +
+# reference_tracing_upstream_cluster_framework_gap +
+# reference_streaming_sink_differential_framing +
+# reference_differential_grpc_receiver_driver_owned +
+# reference_concurrency_differential_release_barrier +
+# reference_structpb_tag_cross_side_string_only +
+# reference_fixture_workload_constant_desync +
+# reference_differential_backendcount_min_one +
+# reference_round_robin_offset_randomized.

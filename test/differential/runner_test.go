@@ -141,6 +141,7 @@ import (
 	_ "github.com/pgdad/envoy-go/test/fixtures/0114-tracing-custom-tags-metadata/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0115-tracing-custom-tags-metadata-route/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0116-tracing-custom-tags-metadata-host/driver"
+	_ "github.com/pgdad/envoy-go/test/fixtures/0117-tracing-custom-tags-metadata-cluster/driver"
 	"github.com/pgdad/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

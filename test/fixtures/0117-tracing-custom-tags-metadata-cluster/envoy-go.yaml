@@ -1,0 +1,169 @@
+# envoy-go bootstrap for fixture 0117-tracing-custom-tags-metadata-cluster.
+#
+# Functionally equivalent to envoy.yaml modulo:
+#   - cluster type: STATIC (envoy-go convention per ADR-0002) vs STRICT_DNS.
+#   - cluster endpoint addresses: 127.0.0.1 (envoy-go runs on the host loopback)
+#     vs host.docker.internal (reference Envoy runs in a Docker container).
+#   - admin/listener ports independently allocated by the runner.
+# The two clusters' `metadata:` blocks themselves are BYTE-IDENTICAL to
+# envoy.yaml's.
+#
+# Single-listener plaintext H1 topology, cloned from
+# 0116-tracing-custom-tags-metadata-host with the metadata block RELOCATED from
+# the cluster's lb_endpoints[0] onto the CLUSTER itself, and with the single
+# cluster SPLIT IN TWO so the fixture DISCRIMINATES the SELECTED cluster from
+# the ONLY cluster.
+#
+# phase 73: TWO clusters — c_backend_a and c_backend_b — point at the SAME
+# single HTTPFixedBody backend host:port and differ ONLY in their
+# `metadata.filter_metadata` block (a SIBLING of `name:`/`type:` on the Cluster
+# message, NOT on lb_endpoints[]):
+#   c_backend_a  metadata.filter_metadata.envoy.test.cl_k = v-cluster-a-0117
+#   c_backend_b  metadata.filter_metadata.envoy.test.cl_k = v-cluster-b-0117
+# Two path-prefix routes select between them: "/a" -> c_backend_a, "/b" ->
+# c_backend_b. Routing is by PATH, so the selection is deterministic and no LB
+# spread enters the assertion.
+#
+# The owning cluster's raw per-namespace static metadata is retained on
+# cluster.Endpoint.clusterFilterMetadata at cluster-build time (the buildCluster
+# populate loop in internal/cluster/manager.go, placed before ALL LB
+# construction) and read back through (cluster.Endpoint).ClusterMetaLookup,
+# threaded as the 6th ResolveCustomTags argument from the SELECTED endpoint at
+# the three span-emit sites (internal/filter/hcm/accesslog_emit.go:57/:118/:179)
+# — i.e. gated on the PICKED HOST, exactly as the reference gates it. NO writer
+# is needed — both sides read the IDENTICAL static cluster config, so the
+# resolved value is cross-side EXACT. The `tracing` block carries TWO CLUSTER
+# `metadata` custom_tags:
+#   cl_hit     — metadata_key {key: envoy.test, path:[cl_k]} -> resolves to the
+#                OWNING cluster's static value (v-cluster-a-0117 on /a,
+#                v-cluster-b-0117 on /b); default_value UNUSED.
+#   cl_default — metadata_key {key: envoy.test, path:[absent_k]} -> the path is
+#                UNSET on BOTH clusters -> emits "fallback-0117".
+#
+# The namespace is "envoy.test", NOT "envoy.lb": the phase-38 envoy.lb scalar
+# projection (Endpoint.Metadata, the subset-LB dimension) is a DIFFERENT,
+# byte-unchanged field, and envoy.lb is not a privileged namespace
+# (reference_envoy_lb_namespace_not_privileged). CLUSTER-kind custom_tags
+# address ANY namespace.
+#
+# Templating: rendered by the driver's mustRender() at SubjectConfig time.
+# Substitution keys:
+#   {{.AdminPort}}    — admin endpoint port (runner-allocated).
+#   {{.ListenerPort}} — l_test listener port (runner-allocated).
+#   {{.BackendPort}}  — HTTPFixedBody backend port (runner-allocated, loopback).
+#                       BOTH backend clusters use the SAME port.
+#   {{.OTLPPort}}     — driver-owned OTLP receiver port (driver-allocated; pre-bound
+#                       on 0.0.0.0:<port> before the subject starts).
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+static_resources:
+  listeners:
+    - name: l_test
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.ListenerPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: hcm_local
+                tracing:
+                  provider:
+                    name: envoy.tracers.opentelemetry
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.config.trace.v3.OpenTelemetryConfig
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: c_otlp_collector
+                      service_name: "0117"
+                  random_sampling:
+                    value: 100
+                  custom_tags:
+                  - tag: cl_hit
+                    metadata:
+                      kind:
+                        cluster: {}
+                      metadata_key:
+                        key: envoy.test
+                        path:
+                        - key: cl_k
+                      default_value: unused-default-0117
+                  - tag: cl_default
+                    metadata:
+                      kind:
+                        cluster: {}
+                      metadata_key:
+                        key: envoy.test
+                        path:
+                        - key: absent_k
+                      default_value: fallback-0117
+                route_config:
+                  name: rc_test
+                  virtual_hosts:
+                    - name: vh_test
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/a" }
+                          route: { cluster: c_backend_a }
+                        - match: { prefix: "/b" }
+                          route: { cluster: c_backend_b }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # c_backend_a / c_backend_b: the SAME HTTPFixedBody subprocess (17-byte fixed
+    # body) on host loopback, reached through two clusters that are identical
+    # EXCEPT for `name:`, `load_assignment.cluster_name:` and the CLUSTER-level
+    # metadata value. The `metadata:` block is a SIBLING of `name:`/`type:`; it
+    # is NOT on lb_endpoints[] (that is 0116's HOST source). Single-endpoint per
+    # cluster => the LB pick is deterministic.
+    - name: c_backend_a
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      metadata:
+        filter_metadata:
+          envoy.test:
+            cl_k: v-cluster-a-0117
+      load_assignment:
+        cluster_name: c_backend_a
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.BackendPort}} }
+    - name: c_backend_b
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      metadata:
+        filter_metadata:
+          envoy.test:
+            cl_k: v-cluster-b-0117
+      load_assignment:
+        cluster_name: c_backend_b
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.BackendPort}} }
+    # c_otlp_collector: driver-owned in-process OTLP TraceService gRPC receiver on
+    # host loopback. MANDATORY http2_protocol_options: {} for gRPC framing.
+    # Plaintext h2c — no TLS (D-OTLP-RECEIVER). No metadata block.
+    - name: c_otlp_collector
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: c_otlp_collector
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.OTLPPort}} }
