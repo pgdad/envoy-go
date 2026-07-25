@@ -170,7 +170,15 @@ never cross-side string equality (`reference_differential_reference_parses_full_
   fail_verify_no_cert}` on TLS-bearing listeners, so the driver's `AssertStats`
   pins all three to exactly `1` on **both** sides (one per arm), scraped from
   `/stats/prometheus`. Still out of scope: `ssl.connection_error` (envoy-go's
-  `other` outcome increments nothing — a named departure). Never assert
+  `other` outcome increments nothing — a named departure) and
+  **`ssl.no_certificate`** — that name DOES exist as of phase 75 and IS asserted
+  cross-side, but **at `0110-tls-require-client-cert-false`, not here**: this
+  fixture runs `require_client_certificate: true`, under which a no-cert
+  connection is REJECTED (`ssl.fail_verify_no_cert`) and never reaches the
+  success-path annotation, so `ssl.no_certificate` reads **0 on every arm,
+  structurally**. Pinning it here would document a vacuous `0 == 0` as coverage;
+  `0110` is `require=false` and carries the discriminating non-zero
+  (`no_certificate=1` against `handshake=2`). Never assert
   `/listeners` or `total_listeners_active`; never treat a docker-proxy accept as
   listener liveness.
 - **SDS stream framing** and the `sds.<secret>.*` counters — impl-specific; only

@@ -172,14 +172,19 @@ type listenerRuntime struct {
 	// 06.1 metric fields (per SPEC §6 — listener-scope only). Allocated by
 	// registerListenerMetrics at Start time (post-bind, pre-Freeze) and
 	// Inc/Dec'd from the accept-loop hot path. The two cx metrics are
-	// registered for EVERY listener; the three ssl.* counters are registered
+	// registered for EVERY listener; the four ssl.* counters are registered
 	// only when rt.tlsMode is set (phase 74 — TLS-chains-only, matching the
-	// reference), so on a plaintext listener the three pointers stay NIL.
+	// reference), so on a plaintext listener all four pointers stay NIL.
 	downstreamCxTotal   *stats.Counter
 	downstreamCxActive  *stats.Gauge
 	sslHandshake        *stats.Counter // phase 74: successful downstream TLS handshakes
 	sslFailVerifyError  *stats.Counter // phase 74: client cert presented, CHAIN VERIFICATION failed
 	sslFailVerifyNoCert *stats.Counter // phase 74: no client cert where one was required
+	// sslNoCertificate is phase 75's SUCCESS-PATH annotation: a COMPLETED
+	// handshake that presented no client certificate. It is NOT a synonym for
+	// sslFailVerifyNoCert (a FAILED handshake) — the two are disjoint by
+	// construction, one living on each side of the HandshakeContext error check.
+	sslNoCertificate *stats.Counter // phase 75: completed handshake, no client cert presented
 	// 08.2 (Task 5) drain fast-path field. Field-local (not chasing back through
 	// *Manager) to minimize hot-path indirection per ADR-0094.
 	dm *drain.Manager
@@ -355,7 +360,8 @@ func normalizeAddr(addr string) string {
 // configured with port 0 don't collide on the same registered name pre-bind).
 // Pre-Freeze (Task 12 owns the Freeze call after the admin server is up).
 //
-// The two cx metrics are unconditional. The three phase-74 ssl.* counters are
+// The two cx metrics are unconditional. The three phase-74 ssl.* counters plus
+// the one phase-75 ssl.* counter (ssl.no_certificate — four in total) are all
 // gated on rt.tlsMode, matching the reference, which registers listener.<addr>.ssl.*
 // on TLS-bearing chains ONLY (a plaintext listener carries zero ssl.* names while
 // carrying 15+ other zero-valued names in the same scope — probed at the phase-74
@@ -379,11 +385,25 @@ func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
 		rt.sslHandshake = r.NewCounter(prefix + "ssl.handshake")
 		rt.sslFailVerifyError = r.NewCounter(prefix + "ssl.fail_verify_error")
 		rt.sslFailVerifyNoCert = r.NewCounter(prefix + "ssl.fail_verify_no_cert")
+		rt.sslNoCertificate = r.NewCounter(prefix + "ssl.no_certificate")
 	}
 }
 
 // handshakeOutcome classifies a downstream TLS handshake result into the three
-// counted buckets plus a fourth that counts NOTHING.
+// counted buckets plus a fourth that counts NOTHING. It is an ERROR-PATH
+// taxonomy: the classifier is consumed at exactly one site (the handshake-error
+// branch, see the switch below serveConnection's step (6)) and never sees a
+// successful handshake.
+//
+// ⚠️ "three counted buckets" counts OUTCOMES, not ssl.* COUNTERS — the listener
+// scope carries FOUR ssl.* counters as of phase 75. Phase 75 added
+// ssl.no_certificate WITHOUT adding a handshakeOutcome variant, and that is
+// deliberate: no_certificate is a SUCCESS-path annotation, Inc'd after the error
+// branch has already returned, entirely OUTSIDE the classifyHandshakeErr switch.
+// It is booked on a COMPLETED handshake that presented no client certificate,
+// which is the exact complement of outcomeNoCert (a REJECTED handshake). Adding
+// a handshakeOutcome variant for it — or routing it through this classifier at
+// all — is a design error for that row.
 //
 // ⚠️ outcomeVerifyError means "certificate CHAIN VERIFICATION failed" — NOT
 // "client cert rejected". A cert/private-key mismatch and a malformed DER never
@@ -1275,6 +1295,12 @@ func (rt *listenerRuntime) serveConnection(ctx context.Context, raw net.Conn) {
 		}
 		// phase 74: a COMPLETED downstream TLS handshake.
 		rt.sslHandshake.Inc()
+		// phase 75 (ADR-0297): ...and whether it presented a client certificate.
+		// UNCONDITIONAL on client-auth mode — the reference books this on a one-way
+		// TLS listener that never sends a CertificateRequest (SPEC §3.1, wire-proven).
+		if len(tlsConn.ConnectionState().PeerCertificates) == 0 {
+			rt.sslNoCertificate.Inc()
+		}
 		dispatchConn = tlsConn
 	}
 

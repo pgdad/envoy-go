@@ -157,6 +157,9 @@
 #
 #   (c) CROSS-SIDE, at the STAT layer (the driver's AssertStats, runner step 10):
 #       listener.<addr>.ssl.{handshake,fail_verify_error,fail_verify_no_cert}
+#       — THREE names, deliberately; the phase-75 ssl.no_certificate is NOT in
+#       this roster (see the UNasserted section: require=true holds it at 0 on
+#       every arm, so a value pin here would be a vacuous 0 == 0) —
 #       each read exactly 1 on BOTH sides, scraped from /stats/prometheus and
 #       keyed on the metric NAME with envoy_listener_address IGNORED (the two
 #       sides normalize the listener address differently — the reference keeps
@@ -198,8 +201,17 @@
 #   fail_verify_error,fail_verify_no_cert} on TLS-bearing listeners, so leg (c)
 #   above pins all three CROSS-SIDE. Still UNasserted from that family:
 #   ssl.connection_error (envoy-go's `other` handshake outcome increments nothing —
-#   a NAMED departure, not an omission) and the ssl.ciphers/curves/versions
-#   breakdowns. The accept/reject CONTRAST remains the primary proof obligation and
+#   a NAMED departure, not an omission), the ssl.ciphers/curves/versions
+#   breakdowns, and ssl.no_certificate. That last name DOES exist as of phase 75
+#   and IS asserted CROSS-SIDE — at 0110-tls-require-client-cert-false, NOT here.
+#   This fixture runs require_client_certificate: true on BOTH sides
+#   (envoy-go.yaml / envoy.yaml), so a no-cert connection is REJECTED and booked
+#   to ssl.fail_verify_no_cert; it never reaches the success-path no-cert
+#   annotation, which therefore reads 0 on EVERY arm, structurally. A value pin
+#   here would document a vacuous 0 == 0 as coverage. 0110 is the require=false
+#   fixture and carries the discriminating non-zero (no_certificate=1 against
+#   handshake=2), which is also the only thing that separates its two ACCEPTING
+#   arms. The accept/reject CONTRAST remains the primary proof obligation and
 #   is strictly STRONGER than a subject-only stat — it is cross-side, and it now has
 #   a cross-side STAT beside it. Never assert /listeners or total_listeners_active,
 #   and never treat a docker-proxy accept as listener liveness (SPEC §8: S2/S3

@@ -227,11 +227,19 @@ func TestHelpText_AccessLogDropped(t *testing.T) {
 // entry prom.go falls back to the metric name itself, degrading /stats/prometheus
 // to "# HELP envoy_listener_ssl_handshake envoy_listener_ssl_handshake" — that
 // self-equality is the degradation signature asserted below.
+//
+// ⚠️ wantNames is HAND-LISTED and there is NO REVERSE DIRECTION — nothing walks
+// helpText demanding every envoy_listener_ssl_* key appear here. Landing a fifth
+// ssl.* helpText entry without extending this slice leaves it SILENTLY
+// UNGUARDED (EXECUTED at the phase-75 PLAN: with the phase-75 entry present and
+// this slice left at three, the whole package stayed GREEN). Any future ssl.*
+// leaf MUST be appended here in the same commit that adds its helpText entry.
 func TestHelpText_ListenerSSLHandshakeOutcomes(t *testing.T) {
 	wantNames := []string{
 		"envoy_listener_ssl_handshake",
 		"envoy_listener_ssl_fail_verify_error",
 		"envoy_listener_ssl_fail_verify_no_cert",
+		"envoy_listener_ssl_no_certificate",
 	}
 	for _, n := range wantNames {
 		got, ok := helpText[n]

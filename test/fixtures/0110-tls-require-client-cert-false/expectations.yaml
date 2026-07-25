@@ -137,6 +137,31 @@
 #   (b) CROSS-SIDE, byte-exact (the runner's CompareBytes):
 #       the two sides emit identical streams.
 #
+#   (c) CROSS-SIDE, at the STAT layer (the driver's AssertStats, runner step 10):
+#       listener.<addr>.ssl.{handshake,no_certificate,fail_verify_error,
+#       fail_verify_no_cert} read exactly 2 / 1 / 1 / 0 on BOTH sides —
+#       handshake=2 (arms 1 and 3 BOTH complete a handshake), no_certificate=1
+#       (arm 3 ONLY — the success-path no-cert annotation, phase 75),
+#       fail_verify_error=1 (arm 2's FORCED-SEND untrusted cert),
+#       fail_verify_no_cert=0 (never: at require=false a withheld cert is
+#       HONORED, not rejected). Scraped from /stats/prometheus and keyed on the
+#       metric NAME with envoy_listener_address IGNORED (the two sides normalize
+#       the listener address differently — the reference binds 0.0.0.0 and keeps
+#       dots, envoy-go binds the IPv6 wildcard and strips the brackets while
+#       mapping both ':' and '.' to '_' — but both hoist it into a LABEL, so the
+#       metric NAME is cross-side identical; the 0005 precedent).
+#       ssl.no_certificate=1 against ssl.handshake=2 is the DISCRIMINATOR this
+#       leg adds over legs (a)/(b): arms 1 and 3 BOTH accept, so no byte
+#       observable can separate them.
+#       The ABSENT check is separate from the value check: a counter that fails
+#       to REGISTER would read 0 == 0 and pass vacuously. On THIS fixture the
+#       counter it genuinely protects is ssl.fail_verify_no_cert (want 0, Inc'd
+#       on no arm) — NOT ssl.no_certificate, which IS Inc'd on arm 3, so deleting
+#       its registration SIGSEGVs the subject long before AssertStats runs.
+#       Two preconditions guard vacuity per side (Fatalf): downstream_cx_total > 0
+#       (the accept path ran) and ssl.handshake > 0 (the TLS path itself ran —
+#       downstream_cx_total alone is NOT a decode-ran guard on the reference).
+#
 #   Because exactly ONE structurally-valid stream exists, (a) strictly subsumes
 #   (b) for this fixture: any deviation on either side trips (a) first. (b) is
 #   retained as the harness-standard cross-side leg.
@@ -163,16 +188,31 @@
 #   arm records only the normalized verdict token `rejected` (the 0045 closeOK
 #   idiom; reference_differential_reference_parses_full_message).
 #
-#   The ssl.* stat family. Observed live on the reference, but envoy-go emits NO
-#   ssl.* stats whatsoever. A verdict StatsAsserter is therefore INFEASIBLE
-#   (inherits PLAN-65 C3). A PRE-EXISTING framework gap. The accept/reject CONTRAST
-#   discharges the proof obligation and is strictly STRONGER than a subject-only
-#   stat — it is cross-side. Never assert /listeners or total_listeners_active, and
+#   The ssl.* stat family is NO LONGER unasserted — phase 75 RETIRED that boundary,
+#   and the old clause ("envoy-go emits NO ssl.* stats whatsoever … a verdict
+#   StatsAsserter is therefore INFEASIBLE") was true up to phase 74 and is FALSE at
+#   this tip: envoy-go now registers listener.<addr>.ssl.{handshake,no_certificate,
+#   fail_verify_error,fail_verify_no_cert} on TLS-bearing listeners, so leg (c)
+#   above pins all four CROSS-SIDE (2 / 1 / 1 / 0). Still UNasserted from that
+#   family: ssl.connection_error (envoy-go's `other` handshake outcome increments
+#   nothing — a NAMED departure, not an omission) and the
+#   ssl.ciphers/curves/versions breakdowns. The accept/reject CONTRAST remains the
+#   primary proof obligation and is strictly STRONGER than a subject-only stat — it
+#   is cross-side, and it now has a cross-side STAT beside it. On THIS fixture the
+#   stat is more than a companion, and this is the sharper thing 0110 can say that
+#   0111 cannot: the accept/reject contrast CANNOT distinguish arm 1 from arm 3 —
+#   at require=false BOTH are ACCEPTED — whereas ssl.no_certificate=1 against
+#   ssl.handshake=2 does. Never assert /listeners or total_listeners_active, and
 #   never treat a docker-proxy accept as listener liveness.
 #
 #   SDS stream framing (VersionInfo/Nonce/request-count/ACK cadence —
 #   impl-specific; only the DELIVERED CA's EFFECT is asserted).
-#   The sds.<secret>.* stat counters (no StatsAsserter).
+#   The sds.<secret>.* stat counters (NOT asserted by this fixture's StatsAsserter,
+#   which is CONFINED to listener.<addr>.ssl.* — DriveSubject hard-stops both SDS
+#   receivers before step 10, so the sds.* and cluster.sds_cluster.* scopes are
+#   reconnecting against a closed port while AssertStats runs). The boundary itself
+#   is UNCHANGED: these counters remain unasserted. Only the "(no StatsAsserter)"
+#   parenthetical is corrected — the fixture HAS one as of phase 75.
 #
 # Cross-refs: phase 67 SPEC §10 + §3.7 (forced-send) + §3.3/§3.5 (fetch-failure
 #             characterization) + ADR-0019 + ADR-0289 +

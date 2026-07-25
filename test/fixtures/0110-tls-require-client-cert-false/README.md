@@ -157,8 +157,22 @@ records only the stable token `rejected`.
 ## Coverage boundaries (named, unasserted)
 
 - The **alert text** — normalized to `rejected` (above).
-- **No `ssl.*` stats** — envoy-go emits none, so a verdict `StatsAsserter` is
-  infeasible (inherits PLAN-65 C3); a pre-existing framework gap. Never assert
+- **`ssl.*` stats are now ASSERTED CROSS-SIDE** (phase 75 — this boundary is
+  RETIRED; the old *"envoy-go emits none, so a verdict `StatsAsserter` is
+  infeasible"* text was true up to phase 74 and is FALSE at this tip). envoy-go
+  registers `listener.<addr>.ssl.{handshake,no_certificate,fail_verify_error,
+  fail_verify_no_cert}` on TLS-bearing listeners, so the driver's `AssertStats`
+  pins all four to exactly `handshake=2`, `no_certificate=1`,
+  `fail_verify_error=1`, `fail_verify_no_cert=0` on **both** sides, scraped from
+  `/stats/prometheus` (measured live, identical on reference and subject, with
+  `downstream_cx_total=3`). `no_certificate=1` against `handshake=2` is the
+  DISCRIMINATOR the byte observable cannot supply: arms 1 and 3 **both** accept
+  at `require=false`, so the accept/reject verdict cannot tell them apart.
+  Still out of scope: `ssl.connection_error` (envoy-go's `other` handshake
+  outcome increments nothing — a named departure) and the
+  `ssl.ciphers/curves/versions` breakdowns.
+- **Listener-liveness proxies** — an INDEPENDENT boundary, unaffected by the
+  retirement above and still LIVE. Never assert
   `/listeners` or `total_listeners_active`; never treat a docker-proxy accept as
   listener liveness.
 - **SDS stream framing** and the `sds.<secret>.*` counters — impl-specific; only

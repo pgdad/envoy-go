@@ -1933,11 +1933,12 @@ func TestNewManager_HCMBuildErrorWrapsAsListenerFilter(t *testing.T) {
 // TestListenerManager_AllocatesTwoMetricsPerListener, and this doc rewritten,
 // because both the old name and the old prose claimed the loop registers
 // "exactly the 2" — which stopped being true once a TLS-bearing listener also
-// began carrying the three `listener.<addr>.ssl.*` counters. The body never
-// asserted the count, so the false claim lived only in the name and the
+// began carrying the phase-74 `listener.<addr>.ssl.*` counters (three then,
+// four as of phase 75's ssl.no_certificate). The body never asserted the
+// count, so the false claim lived only in the name and the
 // comment and produced no red when the ssl.* family landed; this is a
 // deliberate documentation fix, not a test fix. The exact ssl.* NAME SET is
-// pinned by TestListenerMetrics_TLSListenerRegistersExactlyThreeSSLNames, and
+// pinned by TestListenerMetrics_TLSListenerRegistersExactlyFourSSLNames, and
 // its absence on a plaintext listener by
 // TestListenerMetrics_PlaintextListenerRegistersNoSSLNames.
 //
@@ -1984,16 +1985,18 @@ func TestListenerManager_AllocatesBaseListenerMetrics(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase-74 Task 2: the three listener-scope ssl.* counters — registration is
-// gated on rt.tlsMode ALONE (no kind check), so a TLS listener carries exactly
-// three ssl.* names and a plaintext listener carries none.
+// Phase-74 Task 2 (extended by phase 75): the listener-scope ssl.* counters —
+// registration is gated on rt.tlsMode ALONE (no kind check), so a TLS listener
+// carries exactly FOUR ssl.* names (the three phase-74 handshake-outcome
+// counters plus phase 75's ssl.no_certificate) and a plaintext listener carries
+// none.
 // ---------------------------------------------------------------------------
 
 // listenerSSLNames returns the ssl.* metric names registered at the given
 // listener's scope, sorted. It asserts on the NAME SET, not on a cardinality:
 // the landed precedent (internal/statssink/registration_test.go:26, one of
 // five, all routing through a countMetrics helper that never inspects
-// m.Name()) counts via reg.Walk and WOULD PASS WITH ALL THREE NAMES
+// m.Name()) counts via reg.Walk and WOULD PASS WITH ALL FOUR NAMES
 // MISSPELLED.
 func listenerSSLNames(reg *stats.Registry, addr string) []string {
 	prefix := "listener." + normalizeAddr(addr) + ".ssl."
@@ -2016,11 +2019,16 @@ func listenerMetricNames(reg *stats.Registry) map[string]bool {
 	return out
 }
 
-// TestListenerMetrics_TLSListenerRegistersExactlyThreeSSLNames pins the EXACT
-// SPELLING of all three phase-74 names on a TLS-bearing listener. A count-only
-// assertion is insufficient — see listenerSSLNames' doc — so this compares the
-// whole sorted name set with reflect.DeepEqual.
-func TestListenerMetrics_TLSListenerRegistersExactlyThreeSSLNames(t *testing.T) {
+// TestListenerMetrics_TLSListenerRegistersExactlyFourSSLNames pins the EXACT
+// SPELLING of all three phase-74 names plus phase 75's ssl.no_certificate on a
+// TLS-bearing listener. A count-only assertion is insufficient — see
+// listenerSSLNames' doc — so this compares the whole sorted name set with
+// reflect.DeepEqual.
+//
+// ⚠️ `want` must be in SORTED order: listenerSSLNames sort.Strings'es its
+// result, so DeepEqual against an unsorted want fails on ORDER even when the SET
+// is right. "ssl.no_certificate" collates LAST of the four, so it appends.
+func TestListenerMetrics_TLSListenerRegistersExactlyFourSSLNames(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
 	ts := mkDownstreamTSInline(t, testAlphaCertPEM, testAlphaKeyPEM)
@@ -2050,6 +2058,7 @@ func TestListenerMetrics_TLSListenerRegistersExactlyThreeSSLNames(t *testing.T) 
 		prefix + "ssl.fail_verify_error",
 		prefix + "ssl.fail_verify_no_cert",
 		prefix + "ssl.handshake",
+		prefix + "ssl.no_certificate",
 	}
 	got := listenerSSLNames(reg, addr)
 	if !reflect.DeepEqual(got, want) {
@@ -2123,7 +2132,7 @@ func TestListenerMetrics_PlaintextListenerRegistersNoSSLNames(t *testing.T) {
 // Break E (the gate dropped) and it STAYED GREEN: both predicates are set at
 // BUILD time (manager.go:692 and :562), entirely upstream of
 // registerListenerMetrics, so neither one can observe a registration bug. Only
-// the three field pointers — non-nil iff tlsMode — actually witness the
+// the four field pointers — non-nil iff tlsMode — actually witness the
 // invariant whose violation is a PRODUCTION CRASH.
 func TestListenerMetrics_GateMatchesInc(t *testing.T) {
 	// (a) a mixed TLS+plaintext listener is REJECTED at build time — this is
@@ -2149,7 +2158,8 @@ func TestListenerMetrics_GateMatchesInc(t *testing.T) {
 	})
 
 	// (b) a TLS listener: rt.tlsMode == true AND every chainInfo has
-	//     tlsCfg != nil AND all THREE counter fields are NON-NIL.
+	//     tlsCfg != nil AND all FOUR counter fields are NON-NIL (three phase-74
+	//     outcomes + phase 75's sslNoCertificate).
 	t.Run("tls_listener", func(t *testing.T) {
 		cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 		filter := mkTcpProxyFilter(t, "c_echo")
@@ -2197,10 +2207,19 @@ func TestListenerMetrics_GateMatchesInc(t *testing.T) {
 		if rt.sslFailVerifyNoCert == nil {
 			t.Error("TLS listener: rt.sslFailVerifyNoCert is NIL — Inc would panic the serveConnection goroutine")
 		}
+		// phase 75: the fourth pointer. This assertion is the ONLY thing that
+		// turns "registration deleted while the Inc remains" from a PROCESS
+		// CRASH in a background goroutine (which fails no test and is reported
+		// as a package-level panic with a confusing sync/atomic stack) into a
+		// NAMED test failure — (*stats.Counter).Inc has no nil check and
+		// serveConnection has no recover().
+		if rt.sslNoCertificate == nil {
+			t.Error("TLS listener: rt.sslNoCertificate is NIL — Inc would panic the serveConnection goroutine")
+		}
 	})
 
 	// (c) a plaintext listener: rt.tlsMode == false AND every chainInfo has
-	//     tlsCfg == nil AND all THREE counter fields are NIL. The nil fields
+	//     tlsCfg == nil AND all FOUR counter fields are NIL. The nil fields
 	//     are BY DESIGN — the Inc sites sit inside `if selected.tlsCfg != nil`
 	//     and are therefore unreachable here; do not add nil guards.
 	t.Run("plaintext_listener", func(t *testing.T) {
@@ -2246,6 +2265,12 @@ func TestListenerMetrics_GateMatchesInc(t *testing.T) {
 		}
 		if rt.sslFailVerifyNoCert != nil {
 			t.Error("plaintext listener: rt.sslFailVerifyNoCert is NON-NIL — the rt.tlsMode gate did not hold")
+		}
+		// phase 75: the fourth pointer must be NIL here too — ssl.no_certificate
+		// is registered inside the SAME rt.tlsMode block, so a separate gate (or
+		// an accidentally ungated registration) shows up right here.
+		if rt.sslNoCertificate != nil {
+			t.Error("plaintext listener: rt.sslNoCertificate is NON-NIL — the rt.tlsMode gate did not hold")
 		}
 	})
 }
@@ -4461,35 +4486,85 @@ func startMutualTLSListener(t *testing.T, pki handshakeTestPKI) (*stats.Registry
 	return reg, ls[0].Addr
 }
 
+// sslLeafRoster is the COMPLETE set of ssl.* leaf names registered at a
+// TLS-bearing listener's scope: the three phase-74 handshake outcomes plus
+// phase 75's ssl.no_certificate. assertSSLCrossProduct partitions this roster
+// into the arm's expected movers and its expected non-movers, so adding a leaf
+// here automatically extends the NEGATIVE half of all four call sites.
+//
+// ⚠️ These are BARE LEAF names. The exact-set SPELLING pins
+// (TestListenerMetrics_TLSListenerRegistersExactlyFourSSLNames,
+// TestQUICListener_RegistersSSLNamesAtZero) keep their own FULLY-QUALIFIED
+// literals and must NEVER be refactored onto this roster: a shared roster would
+// let ONE misspelling satisfy the spelling pin and this helper simultaneously.
+var sslLeafRoster = []string{"handshake", "fail_verify_error", "fail_verify_no_cert", "no_certificate"}
+
 // assertSSLCrossProduct is the CROSS-PRODUCT assertion every increment test
-// owes (reference_probe_must_discriminate): the named counter reaches exactly
-// 1 AND the other two are exactly 0. Without the negative half, Break B
-// (exchanging the verifyError and noCert case bodies) would fire in all three
-// tests and prove nothing about WHICH arm routed WHERE.
+// owes (reference_probe_must_discriminate): every NAMED counter reaches exactly
+// 1 AND every UNNAMED counter in sslLeafRoster is exactly 0. Without the
+// negative half, Break B (exchanging the verifyError and noCert case bodies)
+// would fire in all three phase-74 tests and prove nothing about WHICH arm
+// routed WHERE.
+//
+// ⚠️ wantSuffixes is VARIADIC, not a single suffix. Phase 74 shipped this as a
+// ONE-HOT assertion (`wantSuffix string`), which cannot express phase 75's
+// positive arm: a completed one-way-TLS handshake legitimately moves BOTH
+// ssl.handshake AND ssl.no_certificate. Variadic is the minimal change that
+// preserves all three landed call sites BYTE-FOR-BYTE (a one-arg call still
+// compiles) while letting the new arm name two movers.
+//
+// ⚠️⚠️ THE NEGATIVE HALF IS THIS ROW'S PRIMARY GUARD, NOT BOOKKEEPING. Adding
+// "no_certificate" to sslLeafRoster is the ONLY thing in the repo that catches
+// an UNCONDITIONAL Inc (a phase-75 predicate with its len(PeerCertificates)==0
+// guard removed): it makes THIS test — the phase-74 mTLS SUCCESS arm, which
+// presents a trusted client cert — assert that no_certificate stayed 0 while a
+// handshake completed. Proven at the phase-75 PLAN: with the guard deleted AND
+// this roster left at three leaves, the ENTIRE package is GREEN. The phase-75
+// positive arm does NOT catch it — an unconditional Inc still leaves
+// no_certificate at 1 on the arm that wants 1.
 //
 // serveConnection runs in a per-connection goroutine, so the Inc LAGS the
 // client's Handshake() return — the positive half POLLS, it never sleeps. The
 // negative half reads once, via counterValue, which t.Errorf's on an ABSENT
-// name rather than returning a silent 0.
-func assertSSLCrossProduct(t *testing.T, reg *stats.Registry, addr, wantSuffix string) {
+// name rather than returning a silent 0 (pollCounter would return a silent 0).
+func assertSSLCrossProduct(t *testing.T, reg *stats.Registry, addr string, wantSuffixes ...string) {
 	t.Helper()
-	prefix := "listener." + normalizeAddr(addr) + ".ssl."
-	if got := pollCounter(t, reg, prefix+wantSuffix, 1, 3*time.Second); got != 1 {
-		t.Errorf("%s = %d, want 1", prefix+wantSuffix, got)
+	if len(wantSuffixes) == 0 {
+		// PRECONDITION, not a property: a zero-suffix call has no positive half
+		// at all, so its all-zeros negative half would pass VACUOUSLY even with
+		// every Inc point deleted.
+		t.Fatalf("assertSSLCrossProduct called with no wantSuffixes — the positive half would be vacuous")
 	}
-	for _, s := range []string{"handshake", "fail_verify_error", "fail_verify_no_cert"} {
-		if s == wantSuffix {
+	want := map[string]bool{}
+	for _, s := range wantSuffixes {
+		want[s] = true
+	}
+	prefix := "listener." + normalizeAddr(addr) + ".ssl."
+	for _, s := range wantSuffixes {
+		if got := pollCounter(t, reg, prefix+s, 1, 3*time.Second); got != 1 {
+			t.Errorf("%s = %d, want 1", prefix+s, got)
+		}
+	}
+	for _, s := range sslLeafRoster {
+		if want[s] {
 			continue
 		}
 		if v := counterValue(t, reg, prefix+s); v != 0 {
-			t.Errorf("%s = %d, want 0 — only %s may move on this arm", prefix+s, v, wantSuffix)
+			t.Errorf("%s = %d, want 0 — only %v may move on this arm", prefix+s, v, wantSuffixes)
 		}
 	}
 }
 
 // TestServeConnection_SSLHandshakeIncrements: a client presenting a leaf signed
 // by the listener's trusted CA completes the handshake, so the SUCCESS Inc
-// fires and neither failure counter moves.
+// fires and NO other ssl.* leaf in sslLeafRoster moves.
+//
+// ⚠️⚠️ This test is PHASE 75's DISCRIMINATING BREAK SITE, not phase 74's alone.
+// Because the client DOES present a certificate, its negative half asserts
+// ssl.no_certificate == 0 while a handshake COMPLETES — the only shape in the
+// repo that can detect a phase-75 Inc with its len(PeerCertificates) == 0 guard
+// removed. Phase 75's own positive arm cannot: an unconditional Inc still leaves
+// no_certificate at 1 there. See assertSSLCrossProduct's doc comment.
 func TestServeConnection_SSLHandshakeIncrements(t *testing.T) {
 	pki := mkTestPKI(t)
 	reg, addr := startMutualTLSListener(t, pki)
@@ -4557,9 +4632,102 @@ func TestServeConnection_SSLFailVerifyNoCertIncrements(t *testing.T) {
 	assertSSLCrossProduct(t, reg, addr, "fail_verify_no_cert")
 }
 
+// startOneWayTLSListener is startMutualTLSListener's ONE-WAY sibling: same
+// single-chain / no-FilterChainMatch / tcp_proxy-to-echo shape, but the
+// transport socket is mkDownstreamTSInline (server cert only — NO validation
+// context, NO require_client_certificate), so the server never sends a
+// CertificateRequest and a certificate-less client handshake SUCCEEDS.
+//
+// ⚠️ This helper exists because startMutualTLSListener CANNOT supply phase 75's
+// positive arm: mkDownstreamTSMutualTLS sets require_client_certificate: true
+// PLUS a trusted_ca, which yields stdtls.RequireAndVerifyClientCert
+// (internal/tls/config.go:65), so a no-cert client's handshake FAILS and books
+// ssl.fail_verify_no_cert instead of ever reaching the success fall-through.
+//
+// mkTLSChain(nil, ...) leaves FilterChainMatch nil ⇒ this is the DEFAULT chain
+// ⇒ no tls_inspector listener filter is needed. mkDownstreamTSInline takes
+// string PEMs while handshakeTestPKI holds []byte, hence the conversions.
+func startOneWayTLSListener(t *testing.T, pki handshakeTestPKI) (*stats.Registry, string) {
+	t.Helper()
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", startEchoBackend(t))
+	ts := mkDownstreamTSInline(t, string(pki.serverCertPEM), string(pki.serverKeyPEM))
+	l := mkTLSListener("l_ssl_oneway", "127.0.0.1", 0, []*listenerv3.FilterChain{
+		mkTLSChain(nil, ts, mkTcpProxyFilter(t, "c_echo")),
+	})
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	reg := stats.NewRegistry()
+	mgr, err := NewManager(boot, cm, reg, testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("listener.NewManager (one-way TLS): %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("listener.Start (one-way TLS): %v", err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	ls := mgr.Listeners()
+	if len(ls) != 1 {
+		t.Fatalf("Listeners() len = %d, want 1", len(ls))
+	}
+	return reg, ls[0].Addr
+}
+
+// TestServeConnection_SSLNoCertificateIncrements is phase 75's POSITIVE arm and
+// the ONLY test in the repo that asserts ssl.no_certificate MOVES. Every other
+// ssl.* test asserts it does NOT — so without this test a registered-but-never-
+// Inc'd sslNoCertificate field would pass the entire landed suite.
+//
+// The listener is ONE-WAY TLS: no validation context, no
+// require_client_certificate, therefore no CertificateRequest on the wire. The
+// client presents NO certificate and the handshake SUCCEEDS, so serveConnection
+// reaches the success fall-through with ConnectionState().PeerCertificates
+// empty — the exact predicate under test.
+//
+// ⚠️ TWO counters move here: ssl.handshake (phase 74) AND ssl.no_certificate
+// (phase 75). That is why assertSSLCrossProduct had to stop being one-hot. Both
+// failure counters must stay 0: this is a SUCCESSFUL handshake, and
+// ssl.no_certificate is NOT a synonym for ssl.fail_verify_no_cert.
+//
+// ⚠️ This arm is NOT the row's discriminating break. It catches a MISSING Inc
+// and a MODE-GATED Inc; it CANNOT catch an UNCONDITIONAL Inc, because an
+// unconditional Inc still leaves no_certificate at 1 here. The guard for that is
+// the negative half of TestServeConnection_SSLHandshakeIncrements, via
+// sslLeafRoster. Neither substitutes for the other.
+func TestServeConnection_SSLNoCertificateIncrements(t *testing.T) {
+	pki := mkTestPKI(t)
+	reg, addr := startOneWayTLSListener(t, pki)
+
+	// NOTE: no Certificates and no GetClientCertificate — a genuinely
+	// certificate-less client. Against a one-way listener there is nothing to
+	// withhold (reference_go_client_cert_withholding does not apply: the server
+	// sends no CertificateRequest at all), so this is not a polite-withholding
+	// artifact but the wire shape the reference books the counter on.
+	conn, err := stdtls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", addr, &stdtls.Config{
+		ServerName: "localhost", // mkTestPKI's server leaf CN/SAN
+		RootCAs:    pki.serverRoots,
+		MinVersion: stdtls.VersionTLS12,
+	})
+	if err != nil {
+		// PRECONDITION: if the handshake did not complete, serveConnection never
+		// reached the success fall-through and every assertion below is vacuous.
+		t.Fatalf("precondition: certificate-less client TLS dial against a ONE-WAY listener must succeed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// NON-VACUITY: prove the handshake really COMPLETED, not merely that a
+	// socket opened.
+	if cs := conn.ConnectionState(); !cs.HandshakeComplete {
+		t.Fatalf("precondition: client-side HandshakeComplete = false")
+	}
+
+	assertSSLCrossProduct(t, reg, addr, "handshake", "no_certificate")
+}
+
 // TestServeConnection_PlaintextListenerIncrementsNoSSL is Break C's target.
-// A plaintext listener's three ssl.* pointers are NIL (T2's rt.tlsMode gate),
-// so keeping both Inc points inside `if selected.tlsCfg != nil` is not a style
+// A plaintext listener's four ssl.* pointers are NIL (T2's rt.tlsMode gate),
+// so keeping every ssl.* Inc point inside `if selected.tlsCfg != nil` is not a style
 // choice: (*stats.Counter).Inc has NO nil check and internal/listener has NO
 // recover(), so an ssl Inc on a plaintext connection is a nil-pointer PANIC in
 // the serveConnection GOROUTINE — a process crash, not a test failure.

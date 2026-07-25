@@ -445,12 +445,14 @@ func escapeLabelValue(s string) string {
 // helpText maps a Prometheus name to a static English description per
 // BRAINSTORM §4.5. Per Rule SN6, HELP text is NOT byte-equal to Envoy's HELP
 // text — the differential equivalence claim is on values + label keys + types
-// only. Of the 14 entries, the first 10 cover the 13 unique Prometheus names
+// only. Of the 15 entries, the first 10 cover the 13 unique Prometheus names
 // emitted by 06.1 (the four _Nxx counters per HCM and per cluster collapse to
 // envoy_http_downstream_rq_xx and envoy_cluster_upstream_rq_xx respectively per
-// Rule SN4); one is an 06.2 backpressure counter; and the last three are the
-// phase-74 listener-scope TLS handshake outcomes, whose three-dot source names
-// (listener.<addr>.ssl.<outcome>) flatten under SN3 to address-free residuals
+// Rule SN4); one is an 06.2 backpressure counter; the next three are the
+// phase-74 listener-scope TLS handshake outcomes; and the last is phase 75's
+// listener-scope ssl.no_certificate — a SUCCESS-PATH annotation, not a member of
+// the outcome trichotomy. All four ssl.* entries have three-dot source names
+// (listener.<addr>.ssl.<leaf>) that flatten under SN3 to address-free residuals
 // plus an envoy_listener_address label. A name absent from this map emits its
 // own name as its HELP text (prom.go), so every emitted name wants an entry.
 var helpText = map[string]string{
@@ -469,4 +471,6 @@ var helpText = map[string]string{
 	"envoy_listener_ssl_handshake":           "Total successful downstream TLS handshakes on the listener.",
 	"envoy_listener_ssl_fail_verify_error":   "Downstream TLS handshakes failed because client certificate chain verification failed.",
 	"envoy_listener_ssl_fail_verify_no_cert": "Downstream TLS handshakes failed because no client certificate was presented where one was required.",
+
+	"envoy_listener_ssl_no_certificate": "Successful downstream TLS handshakes in which the client presented no certificate.",
 }

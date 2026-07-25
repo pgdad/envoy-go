@@ -15,11 +15,15 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log"
+	"math"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
@@ -609,5 +613,231 @@ func mustRender(tpl string, data map[string]any) string {
 	return buf.String()
 }
 
-// Compile-time interface assertion.
+// --- fixture.StatsAsserter (phase 75): the CROSS-SIDE ssl.* counter leg ---
+
+// AssertStats is the runner's step-10 stats leg (ADR-0062). It scrapes
+// /stats/prometheus on BOTH sides and pins the FOUR listener-scope ssl.* counters
+// to their exact per-side values, then cross-side: the three phase-74
+// handshake-outcome counters plus the phase-75 SUCCESS-PATH annotation
+// ssl.no_certificate — the FIRST cross-side assertion of that name.
+//
+// ⚠️ The phase-75 name is what makes this fixture's counter layer DISCRIMINATING
+// where the accept/reject contrast is not. Arms 1 and 3 BOTH accept, so the byte
+// observable cannot tell them apart; ssl.handshake=2 against ssl.no_certificate=1
+// can, because only arm 3 completed its handshake without presenting a cert.
+//
+// Shape A (scrape ONCE, ABSOLUTE counts, no baseline delta): nothing pre-moves
+// l_rccf's ssl.* counters. AssertStats runs at step 10, strictly after both Drives
+// and CompareBytes; reference readiness polls admin 9901 (not the TLS port),
+// subject readiness parses a stdout sentinel, and startSubjectWithRetry restarts
+// with a FRESH process (stats reset). The three arms of driveSide are therefore
+// the ONLY connections l_rccf ever sees ⇒ deterministically 3 accepts / 2 handshake
+// successes / 1 rejection per side.
+//
+// ⚠️ The assertion is deliberately CONFINED to listener.<addr>.ssl.* . It must not
+// reach into the sds.* or cluster.sds_cluster.* scopes: DriveSubject hard-stops
+// both SDS receivers before step 10, so those scopes are reconnecting against a
+// closed port while this runs and are inherently unstable.
+//
+// Keying: the two sides normalize the listener address DIFFERENTLY in the flat
+// stat name, so a flat /stats comparison is impossible by name. The reference
+// binds 0.0.0.0 and yields `listener.0.0.0.0_10446.ssl.handshake`; envoy-go binds
+// the IPv6 WILDCARD, and normalizeAddr strips the brackets and maps BOTH ':' and
+// '.' to '_', so `[::]:<runner-allocated-port>` becomes `___<port>` — NOT
+// `0_0_0_0_<port>`. BOTH sides hoist the address into the `envoy_listener_address`
+// LABEL and leave the metric NAME address-free, so the NAME is cross-side
+// IDENTICAL and only the label differs — key on the name and IGNORE the label
+// (the 0005/driver.go:537 precedent for envoy_listener_downstream_cx_total).
+// Measured at the phase-75 PLAN:
+//
+//	reference | envoy_listener_ssl_no_certificate{envoy_listener_address="0.0.0.0_10446"} 1
+//	subject   | envoy_listener_ssl_no_certificate{envoy_listener_address="___20016"} 1
+func (d *rccfDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr string) {
+	t.Helper()
+
+	// The two scrapes are PRECONDITIONS, not properties -> Fatalf
+	// (reference_fatalf_makes_assertions_unreachable).
+	ref, err := scrapeProm(refAdminAddr)
+	if err != nil {
+		t.Fatalf("scrape ref /stats/prometheus: %v", err)
+	}
+	subj, err := scrapeProm(subjAdminAddr)
+	if err != nil {
+		t.Fatalf("scrape subj /stats/prometheus: %v", err)
+	}
+
+	// PRECONDITION 1 — the accept path ran (the 0097/0111 shape). If a side never
+	// ACCEPTED a connection on l_rccf, every assertion below is vacuous — a broken
+	// PRECONDITION, so Fatalf.
+	if ref["envoy_listener_downstream_cx_total"] == 0 {
+		t.Fatalf("reference did NOT accept on l_rccf: envoy_listener_downstream_cx_total == 0")
+	}
+	if subj["envoy_listener_downstream_cx_total"] == 0 {
+		t.Fatalf("subject did NOT accept on l_rccf: envoy_listener_downstream_cx_total == 0")
+	}
+
+	// PRECONDITION 2 — the TLS path itself ran. ⚠️ downstream_cx_total > 0 is NOT
+	// a sufficient decode-ran guard for ssl.* ON THE REFERENCE. Envoy C++'s
+	// tcp_proxy dials the upstream at ACCEPT time, before any TLS byte is read, so
+	// an instantly-refused upstream tears the downstream connection down
+	// MID-handshake: downstream_cx_total still increments while the ENTIRE ssl.*
+	// family stays silent. EXECUTED at the phase-75 PLAN: with the reference
+	// cluster pointed at 127.0.0.1:1 the reference yields four honest zeros with
+	// downstream_cx_total == 3.
+	//
+	// ⚠️ envoy-go does NOT share this hazard: serveConnection completes the
+	// handshake at step (6) and only dispatches to the network chain at step (7),
+	// so ssl.* is accounted STRICTLY BEFORE the upstream dial — the subject's
+	// numbers were BYTE-IDENTICAL under a refused upstream. The guard is kept
+	// per-side anyway, because a cross-side fixture is only as strong as its
+	// weaker side.
+	//
+	// ⚠️ Its UNIQUE contribution is narrower than it looks: the three non-zero
+	// rows would fail as value mismatches anyway. What only this guard does is
+	// stop the want: 0 row from passing vacuously, and turn three cryptic
+	// mismatches into ONE named diagnosis.
+	if ref["envoy_listener_ssl_handshake"] == 0 {
+		t.Fatalf("ref: TLS decode did NOT run — envoy_listener_ssl_handshake == 0 while "+
+			"envoy_listener_downstream_cx_total == %d", ref["envoy_listener_downstream_cx_total"])
+	}
+	if subj["envoy_listener_ssl_handshake"] == 0 {
+		t.Fatalf("subj: TLS decode did NOT run — envoy_listener_ssl_handshake == 0 while "+
+			"envoy_listener_downstream_cx_total == %d", subj["envoy_listener_downstream_cx_total"])
+	}
+
+	// fixture.TB has EXACTLY Errorf/Fatalf/Helper — no Logf, no Cleanup
+	// (reference_fixture_tb_has_no_logf). Diagnostics go through log.Printf.
+	for _, s := range []struct {
+		side string
+		m    map[string]uint64
+	}{{"reference", ref}, {"subject", subj}} {
+		log.Printf("0110 AssertStats: %s ssl.handshake=%d ssl.no_certificate=%d ssl.fail_verify_error=%d ssl.fail_verify_no_cert=%d (downstream_cx_total=%d)",
+			s.side, s.m["envoy_listener_ssl_handshake"], s.m["envoy_listener_ssl_no_certificate"],
+			s.m["envoy_listener_ssl_fail_verify_error"], s.m["envoy_listener_ssl_fail_verify_no_cert"],
+			s.m["envoy_listener_downstream_cx_total"])
+	}
+
+	names := []string{
+		"envoy_listener_ssl_handshake",
+		"envoy_listener_ssl_no_certificate",
+		"envoy_listener_ssl_fail_verify_error",
+		"envoy_listener_ssl_fail_verify_no_cert",
+	}
+	want := map[string]uint64{
+		"envoy_listener_ssl_handshake":           2, // arms 1 AND 3 both complete a handshake
+		"envoy_listener_ssl_no_certificate":      1, // arm 3 ONLY — the discriminator vs handshake=2
+		"envoy_listener_ssl_fail_verify_error":   1, // arm 2, the FORCED-SEND untrusted cert
+		"envoy_listener_ssl_fail_verify_no_cert": 0, // never: at require=false no-cert is HONORED
+	}
+	for _, n := range names {
+		refVal, refOK := ref[n]
+		subjVal, subjOK := subj[n]
+		// ⚠️ THE ABSENT CHECK IS SEPARATE FROM THE VALUE CHECK, and it `continue`s.
+		// A counter that fails to REGISTER reads as 0 == 0 through a single-value
+		// lookup and would pass VACUOUSLY. (The 0055/driver.go:655-669 map-plus-
+		// continue shape. Note 0005's struct-snapshot parser defaults ABSENT names
+		// to zero — exactly the vacuity being guarded against here.)
+		//
+		// ⚠️ The counter this genuinely protects on THIS fixture is
+		// ssl.fail_verify_no_cert. It is registered here but Inc'd on NONE of the
+		// three arms (arm 2 books fail_verify_error), so deleting its registration
+		// is SILENT and a single-value lookup reads 0 == 0 and passes. It is NOT
+		// ssl.no_certificate: that one IS Inc'd, on arm 3, so deleting ITS
+		// registration nil-pointer-SIGSEGVs the subject subprocess and the run dies
+		// at structuralCheck before AssertStats ever executes (EXECUTED, phase-75
+		// PLAN F4 — the absent branch never fires for an Inc'd counter).
+		if !refOK {
+			t.Errorf("ref: %s ABSENT from /stats/prometheus", n)
+			continue
+		}
+		if !subjOK {
+			t.Errorf("subj: %s ABSENT from /stats/prometheus", n)
+			continue
+		}
+		if refVal != want[n] {
+			t.Errorf("ref %s = %d, want %d", n, refVal, want[n])
+		}
+		if subjVal != want[n] {
+			t.Errorf("subj %s = %d, want %d", n, subjVal, want[n])
+		}
+		// ⚠️ ENTAILED, and kept deliberately as a labeled REDUNDANT tripwire: given
+		// ABSOLUTE want values this cannot fire unless one of the two checks above
+		// already did. It is three lines, it survives a future refactor to per-side
+		// want values, and it makes the cross-side claim legible at the call site —
+		// but it is NOT an independently-firing property.
+		if refVal != subjVal {
+			t.Errorf("cross-side mismatch %s: ref=%d subj=%d", n, refVal, subjVal)
+		}
+	}
+}
+
+// scrapeProm issues GET http://<addr>/stats/prometheus and returns a map keyed by
+// the metric NAME with the `{...}` label set STRIPPED ENTIRELY — the
+// `envoy_listener_address` label is DELIBERATELY ignored, because the two sides
+// normalize the listener address differently and the subject's port is
+// runner-allocated per run. Values collide-SUM: there is only one listener here,
+// so no collision occurs, but summing makes the address-agnostic keying EXPLICIT
+// rather than accidental. Handles the labeled, bare and trailing-timestamp line
+// variants (the 0055 scrapeProm + 0005 parseMetricLine shapes).
+func scrapeProm(adminAddr string) (map[string]uint64, error) {
+	url := "http://" + adminAddr + "/stats/prometheus"
+	resp, err := http.Get(url) //nolint:gosec // fixed admin URL, test-only
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+	}
+	var body bytes.Buffer
+	if _, err := body.ReadFrom(resp.Body); err != nil {
+		return nil, fmt.Errorf("read %s body: %w", url, err)
+	}
+
+	out := map[string]uint64{}
+	for _, line := range strings.Split(body.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		var name, rest string
+		if open := strings.IndexByte(line, '{'); open >= 0 {
+			closeIdx := strings.LastIndexByte(line, '}')
+			if closeIdx < open {
+				continue // malformed: no closing brace
+			}
+			name = line[:open]
+			rest = strings.TrimSpace(line[closeIdx+1:])
+		} else {
+			sp := strings.IndexByte(line, ' ')
+			if sp < 0 {
+				continue
+			}
+			name = line[:sp]
+			rest = strings.TrimSpace(line[sp+1:])
+		}
+		// Strip an optional trailing timestamp ("<value> <timestamp>").
+		if sp := strings.IndexByte(rest, ' '); sp >= 0 {
+			rest = rest[:sp]
+		}
+		// ParseFloat, not ParseUint: the exposition format permits float values,
+		// and histogram lines can carry nan/inf. Non-finite and negative values are
+		// skipped rather than converted (uint64(NaN) is undefined).
+		v, err := strconv.ParseFloat(rest, 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			continue
+		}
+		out[name] += uint64(v)
+	}
+	return out, nil
+}
+
+// Compile-time interface assertions. ⚠️ The StatsAsserter one is MANDATORY:
+// runner_test.go:1347 dispatches via a SILENT type assertion — no else branch, no
+// log, no skip message — so a signature typo (*testing.T instead of fixture.TB, a
+// returned error, swapped parameter order, a misspelled method name) makes
+// ok == false and the whole assertion NEVER RUNS, while the compiler, go vet AND
+// golangci-lint all stay quiet — a renamed method leaves the fixture GREEN with
+// the whole stats leg silently gone.
 var _ fixture.Driver = (*rccfDriver)(nil)
+var _ fixture.StatsAsserter = (*rccfDriver)(nil)
