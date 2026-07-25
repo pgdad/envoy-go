@@ -219,6 +219,35 @@ func TestHelpText_AccessLogDropped(t *testing.T) {
 	}
 }
 
+// TestHelpText_ListenerSSLHandshakeOutcomes pins HELP text for the phase-74
+// listener-scope TLS handshake outcome counters. These are the project's first
+// three-dot listener names: SN3 flattening turns listener.<addr>.ssl.handshake
+// into the residual name listener.ssl.handshake plus an envoy_listener_address
+// label, so the Prometheus base names are address-free. Without a helpText
+// entry prom.go falls back to the metric name itself, degrading /stats/prometheus
+// to "# HELP envoy_listener_ssl_handshake envoy_listener_ssl_handshake" — that
+// self-equality is the degradation signature asserted below.
+func TestHelpText_ListenerSSLHandshakeOutcomes(t *testing.T) {
+	wantNames := []string{
+		"envoy_listener_ssl_handshake",
+		"envoy_listener_ssl_fail_verify_error",
+		"envoy_listener_ssl_fail_verify_no_cert",
+	}
+	for _, n := range wantNames {
+		got, ok := helpText[n]
+		if !ok {
+			t.Errorf("helpText missing entry for %q", n)
+			continue
+		}
+		if got == "" {
+			t.Errorf("helpText[%q] is empty", n)
+		}
+		if got == n {
+			t.Errorf("helpText[%q] = %q, which equals the metric name (HELP degraded to the name)", n, got)
+		}
+	}
+}
+
 // SN9 tests (phase 11 / ADR-0118): local_ratelimit filter-specific tag-extractor.
 
 func TestFlattenToProm_SN9_BasicStatPrefix(t *testing.T) {

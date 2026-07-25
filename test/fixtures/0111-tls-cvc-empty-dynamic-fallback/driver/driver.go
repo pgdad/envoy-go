@@ -18,11 +18,15 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log"
+	"math"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
@@ -72,13 +76,22 @@ type clientCertMode int
 const (
 	// sendForced installs GetClientCertificate so the arm's cert is written to
 	// the wire REGARDLESS of the server's advertised acceptable-CA list
-	// (reference_go_client_cert_withholding). RD3: at require=true the forced-send
-	// is NOT the observable's discriminator (a polite dial yields the same
-	// `untrusted=rejected`, and a permissive union pool advertises CA_B so the
-	// polite client would send client_B too). It is retained so the untrusted arm
-	// actually EXERCISES verify-and-reject against the fallback pool rather than
-	// collapsing into a no-cert duplicate of the `none` arm, and to keep both sides
-	// symmetric. Do NOT claim forced-send flips the observable here.
+	// (reference_go_client_cert_withholding).
+	//
+	// RD3, AS REVISED BY PHASE 74 — the disclaimer INVERTS between the two layers:
+	//
+	//   AT THE BYTE OBSERVABLE it still holds. At require=true the forced-send is
+	//   NOT the discriminator: a polite dial yields the same `untrusted=rejected`
+	//   (a withheld client_B is rejected for no-cert), and a permissive CA_A∪CA_B
+	//   union pool ADVERTISES CA_B so the polite client would send client_B too.
+	//   Do NOT claim forced-send flips the BYTE observable here — it does not.
+	//
+	//   AT THE ssl.* COUNTER LAYER it is LOAD-BEARING. Arms 2 and 3 hit DIFFERENT
+	//   counters — fail_verify_error vs fail_verify_no_cert — and without the
+	//   forced send arm 2 DEGRADES INTO arm 3: fail_verify_error falls to 0 and
+	//   fail_verify_no_cert rises to 2, while CompareBytes stays green. Phase 74's
+	//   Break H demonstrates exactly that. So forced-send is no longer "retained
+	//   for symmetry": AssertStats depends on it.
 	sendForced clientCertMode = iota
 	// sendNone presents NO client certificate — neither Certificates nor
 	// GetClientCertificate is set. At require=true this is REJECTED with TLS alert
@@ -414,8 +427,9 @@ func (d *edfDriver) driveSide(ctx context.Context, side, addr string) ([]byte, e
 	}
 
 	// Arm 2 (untrusted, negative): client_B chains to a FOREIGN CA_B, FORCED-SEND
-	// (RD3 — retained so the arm EXERCISES verify-and-reject and stays symmetric
-	// cross-side; NOT because it flips the require=true observable). The server
+	// (RD3 as revised by phase 74 — at the BYTE layer it does not flip the
+	// require=true observable, but at the ssl.* COUNTER layer it is LOAD-BEARING:
+	// without it this arm degrades into arm 3's fail_verify_no_cert). The server
 	// verifies against the fallback pool {CA_A} and REJECTS. This UPPER-BOUNDS the
 	// fallback pool: a CA_A∪CA_B union would ACCEPT client_B.
 	if _, err := d.mtlsEcho(ctx, addr, sendForced, d.clientB, []byte(probePayload)); err != nil {
@@ -612,5 +626,175 @@ func mustRender(tpl string, data map[string]any) string {
 	return buf.String()
 }
 
-// Compile-time interface assertion.
+// --- fixture.StatsAsserter (phase 74): the CROSS-SIDE ssl.* counter leg ---
+
+// AssertStats is the runner's step-10 stats leg (ADR-0062). It scrapes
+// /stats/prometheus on BOTH sides and pins the three phase-74 listener-scope
+// handshake-outcome counters to their exact per-side values, then cross-side.
+//
+// Shape A (scrape ONCE, ABSOLUTE counts, no baseline delta): nothing pre-moves
+// l_edf's ssl.* counters. AssertStats runs at step 10, strictly after both Drives
+// and CompareBytes; reference readiness polls admin 9901 (not the TLS port),
+// subject readiness parses a stdout sentinel, and startSubjectWithRetry restarts
+// with a FRESH process (stats reset). The three arms of driveSide are therefore
+// the ONLY connections l_edf ever sees ⇒ deterministically 3 accepts / 1 handshake
+// success / 2 rejections per side.
+//
+// ⚠️ The assertion is deliberately CONFINED to listener.<addr>.ssl.* . It must not
+// reach into the sds.* or cluster.sds_cluster.* scopes: DriveSubject hard-stops
+// both SDS receivers before step 10, so those scopes are reconnecting against a
+// closed port while this runs and are inherently unstable.
+//
+// Keying: the two sides normalize the listener address DIFFERENTLY in the flat
+// stat name (reference `listener.0.0.0.0_10447.ssl.handshake` vs envoy-go
+// `listener.0_0_0_0_<runner-allocated-port>.ssl.handshake`), so a flat /stats
+// comparison is impossible by name. BOTH sides hoist the address into the
+// `envoy_listener_address` LABEL and leave the metric NAME address-free, so the
+// name is cross-side IDENTICAL — key on the name and IGNORE the label (the
+// 0005/driver.go:537 precedent for envoy_listener_downstream_cx_total).
+func (d *edfDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr string) {
+	t.Helper()
+
+	// The two scrapes are PRECONDITIONS, not properties -> Fatalf
+	// (reference_fatalf_makes_assertions_unreachable).
+	ref, err := scrapeProm(refAdminAddr)
+	if err != nil {
+		t.Fatalf("scrape ref /stats/prometheus: %v", err)
+	}
+	subj, err := scrapeProm(subjAdminAddr)
+	if err != nil {
+		t.Fatalf("scrape subj /stats/prometheus: %v", err)
+	}
+
+	// Decode-ran guard (the 0097 shape). If the reference never ACCEPTED a
+	// connection on l_edf, every assertion below is vacuous — a broken
+	// PRECONDITION, so Fatalf.
+	if ref["envoy_listener_downstream_cx_total"] == 0 {
+		t.Fatalf("reference did NOT accept on l_edf: envoy_listener_downstream_cx_total == 0")
+	}
+
+	// fixture.TB has EXACTLY Errorf/Fatalf/Helper — no Logf, no Cleanup
+	// (reference_fixture_tb_has_no_logf). Diagnostics go through log.Printf.
+	for _, s := range []struct {
+		side string
+		m    map[string]uint64
+	}{{"reference", ref}, {"subject", subj}} {
+		log.Printf("0111 AssertStats: %s ssl.handshake=%d ssl.fail_verify_error=%d ssl.fail_verify_no_cert=%d (downstream_cx_total=%d)",
+			s.side, s.m["envoy_listener_ssl_handshake"], s.m["envoy_listener_ssl_fail_verify_error"],
+			s.m["envoy_listener_ssl_fail_verify_no_cert"], s.m["envoy_listener_downstream_cx_total"])
+	}
+
+	names := []string{
+		"envoy_listener_ssl_handshake",
+		"envoy_listener_ssl_fail_verify_error",
+		"envoy_listener_ssl_fail_verify_no_cert",
+	}
+	want := map[string]uint64{
+		"envoy_listener_ssl_handshake":           1, // arm 1, the trusted client cert
+		"envoy_listener_ssl_fail_verify_error":   1, // arm 2, the FORCED-SEND untrusted cert
+		"envoy_listener_ssl_fail_verify_no_cert": 1, // arm 3, no client cert
+	}
+	for _, n := range names {
+		refVal, refOK := ref[n]
+		subjVal, subjOK := subj[n]
+		// ⚠️ THE ABSENT CHECK IS SEPARATE FROM THE VALUE CHECK, and it `continue`s.
+		// For a row whose entire purpose is ADDING counters this is the single most
+		// important guard in the fixture: a counter that fails to REGISTER reads as
+		// 0 == 0 and would pass VACUOUSLY. (The 0055/driver.go:655-669 map-plus-
+		// continue shape. Note 0005's struct-snapshot parser defaults ABSENT names
+		// to zero — exactly the vacuity being guarded against here.)
+		if !refOK {
+			t.Errorf("ref: %s ABSENT from /stats/prometheus", n)
+			continue
+		}
+		if !subjOK {
+			t.Errorf("subj: %s ABSENT from /stats/prometheus", n)
+			continue
+		}
+		if refVal != want[n] {
+			t.Errorf("ref %s = %d, want %d", n, refVal, want[n])
+		}
+		if subjVal != want[n] {
+			t.Errorf("subj %s = %d, want %d", n, subjVal, want[n])
+		}
+		// ⚠️ ENTAILED, and kept deliberately as a labeled REDUNDANT tripwire: given
+		// ABSOLUTE want values this cannot fire unless one of the two checks above
+		// already did. It is three lines, it survives a future refactor to per-side
+		// want values, and it makes the cross-side claim legible at the call site —
+		// but it is NOT an independently-firing property.
+		if refVal != subjVal {
+			t.Errorf("cross-side mismatch %s: ref=%d subj=%d", n, refVal, subjVal)
+		}
+	}
+}
+
+// scrapeProm issues GET http://<addr>/stats/prometheus and returns a map keyed by
+// the metric NAME with the `{...}` label set STRIPPED ENTIRELY — the
+// `envoy_listener_address` label is DELIBERATELY ignored, because the two sides
+// normalize the listener address differently and the subject's port is
+// runner-allocated per run. Values collide-SUM: there is only one listener here,
+// so no collision occurs, but summing makes the address-agnostic keying EXPLICIT
+// rather than accidental. Handles the labeled, bare and trailing-timestamp line
+// variants (the 0055 scrapeProm + 0005 parseMetricLine shapes).
+func scrapeProm(adminAddr string) (map[string]uint64, error) {
+	url := "http://" + adminAddr + "/stats/prometheus"
+	resp, err := http.Get(url) //nolint:gosec // fixed admin URL, test-only
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+	}
+	var body bytes.Buffer
+	if _, err := body.ReadFrom(resp.Body); err != nil {
+		return nil, fmt.Errorf("read %s body: %w", url, err)
+	}
+
+	out := map[string]uint64{}
+	for _, line := range strings.Split(body.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		var name, rest string
+		if open := strings.IndexByte(line, '{'); open >= 0 {
+			closeIdx := strings.LastIndexByte(line, '}')
+			if closeIdx < open {
+				continue // malformed: no closing brace
+			}
+			name = line[:open]
+			rest = strings.TrimSpace(line[closeIdx+1:])
+		} else {
+			sp := strings.IndexByte(line, ' ')
+			if sp < 0 {
+				continue
+			}
+			name = line[:sp]
+			rest = strings.TrimSpace(line[sp+1:])
+		}
+		// Strip an optional trailing timestamp ("<value> <timestamp>").
+		if sp := strings.IndexByte(rest, ' '); sp >= 0 {
+			rest = rest[:sp]
+		}
+		// ParseFloat, not ParseUint: the exposition format permits float values,
+		// and histogram lines can carry nan/inf. Non-finite and negative values are
+		// skipped rather than converted (uint64(NaN) is undefined).
+		v, err := strconv.ParseFloat(rest, 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			continue
+		}
+		out[name] += uint64(v)
+	}
+	return out, nil
+}
+
+// Compile-time interface assertions. ⚠️ The StatsAsserter one is MANDATORY:
+// runner_test.go:1347 dispatches via a SILENT type assertion — no else branch, no
+// log, no skip message — so a signature typo (*testing.T instead of fixture.TB, a
+// returned error, swapped parameter order, a misspelled method name) makes
+// ok == false and the whole assertion NEVER RUNS, while the compiler, go vet AND
+// golangci-lint all stay quiet — a renamed method leaves the fixture GREEN with
+// the whole stats leg silently gone.
 var _ fixture.Driver = (*edfDriver)(nil)
+var _ fixture.StatsAsserter = (*edfDriver)(nil)

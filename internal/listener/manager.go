@@ -169,11 +169,17 @@ type listenerRuntime struct {
 	// per-connection peekerConn (previously the fixed-4096 NewPeekerConn made
 	// larger configured sizes silently ineffective).
 	lfPeekBufSize int
-	// 06.1 metric fields (per SPEC §6 — listener-scope only, 2 metrics per
-	// listener). Allocated by registerListenerMetrics at Start time (post-bind,
-	// pre-Freeze) and Inc/Dec'd from the accept-loop hot path.
-	downstreamCxTotal  *stats.Counter
-	downstreamCxActive *stats.Gauge
+	// 06.1 metric fields (per SPEC §6 — listener-scope only). Allocated by
+	// registerListenerMetrics at Start time (post-bind, pre-Freeze) and
+	// Inc/Dec'd from the accept-loop hot path. The two cx metrics are
+	// registered for EVERY listener; the three ssl.* counters are registered
+	// only when rt.tlsMode is set (phase 74 — TLS-chains-only, matching the
+	// reference), so on a plaintext listener the three pointers stay NIL.
+	downstreamCxTotal   *stats.Counter
+	downstreamCxActive  *stats.Gauge
+	sslHandshake        *stats.Counter // phase 74: successful downstream TLS handshakes
+	sslFailVerifyError  *stats.Counter // phase 74: client cert presented, CHAIN VERIFICATION failed
+	sslFailVerifyNoCert *stats.Counter // phase 74: no client cert where one was required
 	// 08.2 (Task 5) drain fast-path field. Field-local (not chasing back through
 	// *Manager) to minimize hot-path indirection per ADR-0094.
 	dm *drain.Manager
@@ -342,16 +348,91 @@ func normalizeAddr(addr string) string {
 	return strings.NewReplacer(":", "_", ".", "_", "[", "", "]", "").Replace(addr)
 }
 
-// registerListenerMetrics allocates the 2 listener-scope metrics per SPEC §6
-// and stores the pointers on rt for the accept-loop hot path. Called once per
-// listener at Start time, after net.Listen resolves the configured port (so
-// the metric name reflects the actual bound address, and so two listeners
+// registerListenerMetrics allocates the listener-scope metrics per SPEC §6 and
+// stores the pointers on rt for the accept-loop hot path. Called once per
+// listener at Start time, after net.Listen resolves the configured port (so the
+// metric name reflects the actual bound address, and so two listeners
 // configured with port 0 don't collide on the same registered name pre-bind).
 // Pre-Freeze (Task 12 owns the Freeze call after the admin server is up).
+//
+// The two cx metrics are unconditional. The three phase-74 ssl.* counters are
+// gated on rt.tlsMode, matching the reference, which registers listener.<addr>.ssl.*
+// on TLS-bearing chains ONLY (a plaintext listener carries zero ssl.* names while
+// carrying 15+ other zero-valued names in the same scope — probed at the phase-74
+// SPEC, after first proving that plain /stats does render zeros).
+//
+// ⚠️ The gate is rt.tlsMode ALONE — there is deliberately NO kind check. The
+// reference registers the full ssl.* family on a QUIC listener at boot and NEVER
+// moves it (ssl.handshake: 0 after five successful HTTP/3 connections;
+// connection_error: 0 on a failure arm where the TCP comparator in the same
+// process and the same scrape fired), so envoy-go doing the same is EXACT
+// PARITY, and gating QUIC out would be the DEPARTURE. This is sufficient for
+// QUIC by construction: startQUIC hard-errors when the chain carries no TLS
+// config (quic.go:33-36), so every QUIC listener that boots has tlsMode == true.
+// Do NOT re-express this as "has a TCP-style TLS transport socket" — that form
+// would wrongly exclude QuicDownstreamTransport.
 func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
 	prefix := "listener." + normalizeAddr(rt.addr) + "."
 	rt.downstreamCxTotal = r.NewCounter(prefix + "downstream_cx_total")
 	rt.downstreamCxActive = r.NewGauge(prefix + "downstream_cx_active")
+	if rt.tlsMode {
+		rt.sslHandshake = r.NewCounter(prefix + "ssl.handshake")
+		rt.sslFailVerifyError = r.NewCounter(prefix + "ssl.fail_verify_error")
+		rt.sslFailVerifyNoCert = r.NewCounter(prefix + "ssl.fail_verify_no_cert")
+	}
+}
+
+// handshakeOutcome classifies a downstream TLS handshake result into the three
+// counted buckets plus a fourth that counts NOTHING.
+//
+// ⚠️ outcomeVerifyError means "certificate CHAIN VERIFICATION failed" — NOT
+// "client cert rejected". A cert/private-key mismatch and a malformed DER never
+// reach certs[0].Verify() inside crypto/tls and land in outcomeOther, which
+// increments nothing. The reference books those under ssl.connection_error; that
+// asymmetry is a NAMED DEPARTURE (ADR-0296, BEHAVIOR_CONTRACT B5).
+//
+// ⚠️ The no-cert arm is matched by STRING. crypto/tls exports four error TYPES
+// and ZERO error VALUES, so there is no sentinel to compare against. The text is
+// produced at exactly one site (processCertsFromClient, handshake_server.go:940,
+// reached from :703 for <=TLS 1.2 and handshake_server_tls13.go:1056 for TLS 1.3),
+// which is why it is version-invariant — but that is an argument, not a promise.
+// TestClassifyHandshakeErr constructs this error by running a LIVE handshake, so
+// a toolchain that rewords the message turns that test red. Do NOT "simplify" it
+// to a hand-written string; that would delete the tripwire.
+//
+// ⚠️ Accuracy is CONDITIONAL on the handshake ctx carrying no deadline: a firing
+// ctx REPLACES the real error via the named-return override at
+// crypto/tls/conn.go:1541-1546. Today the ctx reaching HandshakeContext is
+// cmd/envoy-go/main.go:339's cancel-only signal.NotifyContext — the one
+// production context.WithTimeout under internal/listener/
+// (listenerfilter/pipeline.go:43) cannot escape, because Pipeline.Run returns
+// only an error and serveConnection never rebinds ctx. Any future row that adds
+// a handshake deadline re-opens this.
+type handshakeOutcome int
+
+const (
+	outcomeOK handshakeOutcome = iota
+	outcomeVerifyError
+	outcomeNoCert
+	outcomeOther
+)
+
+// noClientCertErrText is crypto/tls's bare errors.New for "the client was asked
+// for a certificate and sent none" (handshake_server.go:964, go1.26.5).
+const noClientCertErrText = "tls: client didn't provide a certificate"
+
+func classifyHandshakeErr(err error) handshakeOutcome {
+	if err == nil {
+		return outcomeOK
+	}
+	var cve *stdtls.CertificateVerificationError
+	if errors.As(err, &cve) {
+		return outcomeVerifyError
+	}
+	if err.Error() == noClientCertErrText {
+		return outcomeNoCert
+	}
+	return outcomeOther
 }
 
 // validateQUICOptions strict-rejects the udp_listener_config.quic_options tuning
@@ -1003,7 +1084,8 @@ func (m *Manager) Start(ctx context.Context) error {
 		// Stop can nil-write it) and pass it as a parameter to acceptLoop. Earlier
 		// versions read rt.netLn from inside the goroutine, which raced with
 		// Stop's nil-out under the race detector — surfaced by Task 10's
-		// AllocatesTwoMetricsPerListener test which Start+Stop's a listener
+		// AllocatesBaseListenerMetrics test (renamed at phase 74 from
+		// AllocatesTwoMetricsPerListener) which Start+Stop's a listener
 		// without any intervening real-traffic delay.
 		ln := rt.netLn
 		go rt.acceptLoop(ctx, ln)
@@ -1176,10 +1258,23 @@ func (rt *listenerRuntime) serveConnection(ctx context.Context, raw net.Conn) {
 	if selected.tlsCfg != nil {
 		tlsConn := stdtls.Server(pkConn, selected.tlsCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			// phase 74: book the outcome before logging. `err` is scoped to this
+			// if-init, so this is the only place it is in scope.
+			// outcomeOther deliberately increments NOTHING — the reference books
+			// those under ssl.connection_error, a name this row does not land.
+			// That asymmetry is a NAMED DEPARTURE (ADR-0296, BEHAVIOR_CONTRACT B5).
+			switch classifyHandshakeErr(err) {
+			case outcomeVerifyError:
+				rt.sslFailVerifyError.Inc()
+			case outcomeNoCert:
+				rt.sslFailVerifyNoCert.Inc()
+			}
 			log.Printf("listener %q: handshake: %v", rt.name, err)
 			_ = pkConn.Close()
 			return
 		}
+		// phase 74: a COMPLETED downstream TLS handshake.
+		rt.sslHandshake.Inc()
 		dispatchConn = tlsConn
 	}
 

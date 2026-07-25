@@ -97,17 +97,23 @@ server's verdict on the client cert arrives *after* the client's `Handshake()` h
 already returned. The dial is inlined in the driver because neither
 `helpers.TLSServedLeaf` nor `helpers.TLSRoundTrip` can present a client cert.
 
-## Why FORCED-SEND on the untrusted arm (RD3 — NOT the require=true discriminator)
+## Why FORCED-SEND on the untrusted arm (RD3 — layer-dependent, revised by phase 74)
 
-At `require=true` the forced-send is **not** the observable's discriminator: a
-*polite* dial yields the same `untrusted=rejected` (a withheld `client_B` is
-rejected for no-cert), and a permissive `CA_A∪CA_B` union pool **advertises** `CA_B`
-so a polite client would send `client_B` too — the union hazard is caught in **both**
-send-modes. Forced-send is **retained** (`reference_go_client_cert_withholding`) so
-the untrusted arm actually **exercises verify-and-reject** against the fallback pool
-rather than collapsing into a no-cert duplicate of the `none` arm, and to keep both
-sides symmetric cross-side. It is **not** claimed to flip the require=true observable
-— it does not.
+**At the BYTE observable, RD3 still holds.** At `require=true` the forced-send is
+**not** the byte observable's discriminator: a *polite* dial yields the same
+`untrusted=rejected` (a withheld `client_B` is rejected for no-cert), and a
+permissive `CA_A∪CA_B` union pool **advertises** `CA_B` so a polite client would send
+`client_B` too — the union hazard is caught in **both** send-modes. Do **not** claim
+forced-send flips the byte observable here; it does not.
+
+**At the `ssl.*` COUNTER layer it INVERTS, and forced-send is LOAD-BEARING.** Arms 2
+and 3 hit **different** counters — `ssl.fail_verify_error` (chain verification
+failed) vs `ssl.fail_verify_no_cert` (no cert presented) — so without the forced send
+arm 2 **degrades into** arm 3: `fail_verify_error` falls to **0** and
+`fail_verify_no_cert` rises to **2**, while `CompareBytes` stays green. Phase 74's
+**Break H** makes this executable (a `sendPolite` mode on the untrusted arm, subject
+side only). So forced-send (`reference_go_client_cert_withholding`) is no longer
+merely *retained for symmetry*: the `StatsAsserter` below depends on it.
 
 ## Served-this-arm precondition (SPEC §8 stale-server trap)
 
@@ -159,8 +165,12 @@ never cross-side string equality (`reference_differential_reference_parses_full_
 ## Coverage boundaries (named, unasserted)
 
 - The **alert text** — normalized to `rejected` (above).
-- **No `ssl.*` stats** — envoy-go emits none, so a verdict `StatsAsserter` is
-  infeasible (inherits PLAN-65 C3); a pre-existing framework gap. Never assert
+- **`ssl.*` stats are now ASSERTED CROSS-SIDE** (phase 74 — this boundary is
+  RETIRED). envoy-go registers `listener.<addr>.ssl.{handshake,fail_verify_error,
+  fail_verify_no_cert}` on TLS-bearing listeners, so the driver's `AssertStats`
+  pins all three to exactly `1` on **both** sides (one per arm), scraped from
+  `/stats/prometheus`. Still out of scope: `ssl.connection_error` (envoy-go's
+  `other` outcome increments nothing — a named departure). Never assert
   `/listeners` or `total_listeners_active`; never treat a docker-proxy accept as
   listener liveness.
 - **SDS stream framing** and the `sds.<secret>.*` counters — impl-specific; only

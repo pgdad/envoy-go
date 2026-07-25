@@ -6,7 +6,7 @@
 
 - **PLAN done** (2026-07-24; flipped only AFTER the §Adversarial-pass record below was populated from the verifiers' actual reports — writing "done" over an open gate is the exact class this stage's own V2 caught in an earlier draft). The **9-task SINGLE-FLAT-ROW TDD spine (T1–T9)** landed; every SPEC §3/§7/§8/§9/§11/§12/§14 anchor RE-DERIVED at `ab13fc19` by four read-only agents plus controller re-verification. Docs-only: `PLAN.md` + `PROGRESS.md` are the ONLY two files in the phase-directory delta — **ZERO production `.go`; ROADMAP and DECISIONS UNTOUCHED; row 74 STAYS `in-progress`.** Worktree `.worktrees/phase-74-plan` off master `ab13fc19`, branch `phase-74-plan`. Sentinel re-run MECHANICALLY TWICE (worktree + landed master post-push): does **NOT** fire; `stop` NOT created. Counts UNCHANGED (fixtures 119 · fuzzers 55 · BackendKind 38 · stat surface 1201 · DECISIONS tail ADR-0296 PROPOSED). **Next → the phase-74 IMPL.**
 
-- **IMPL** — *(pending; populate at the IMPL close)*
+- **IMPL done** (2026-07-24). **ROW 74 FLIPS `in-progress` → `done`** at the T8/T9 six-gate (ADR-0106, the SOLE leg — a SINGLE FLAT ROW). Worktree `.worktrees/phase-74-impl` off master `f1221a4a` (the phase-74 PLAN squash), branch `phase-74-impl`. **Nine subagent-driven tasks, nine local commits, squashed at close.** All T1–T9 landed; **all TWELVE breaks run, every one with its predicted outcome** (Break F, the one declared *must not fire*, did not fire). Six-gate FULLY GREEN incl. the **full 119-fixture differential (402s)** and `go test ./... -race`. Stat surface **1201 → 1204**; +0 fixtures (119) · +0 fuzzers (55) · +0 BackendKinds (38) · +0 modules · **+0 PRODUCTION imports** · ZERO new packages · **ZERO new exported symbols** (asserted by `go doc -all` set-diff, not by inspection). ADR-0296 COMPLETED IN PLACE (PROPOSED → COMPLETE; tail stays ADR-0296, next-free ADR-0297); ADR-0286 §Consequences C3 corrected via the indented `:16901`-form blockquote. Sentinel re-run MECHANICALLY TWICE (worktree + landed master post-push): **does NOT fire; `stop` NOT created** — check (1) went SILENT as predicted, but (2) ⇒ **3** and (3) prints `NEVER OPENED: gRPC/Runtime/WASM`. **Next → the phase-75 BRAINSTORM** (roller SELF-PICKS).
 
 ## Adversarial-pass record (PLAN §1.4)
 
@@ -95,4 +95,79 @@
 
 # IMPL record
 
-*(populated at the phase-74 IMPL close — per-task outcome, the break ledger with every break's ACTUAL firing assertion, PLAN refutations found by execution, and the six-gate results)*
+*(populated at the phase-74 IMPL close from what the tasks ACTUALLY reported — never predicted. Every break below was RUN; every firing set is the observed one, not the PLAN's forecast.)*
+
+## Task ledger — ACTUAL
+
+| Task | Commit | Result |
+|---|---|---|
+| **T1** classifier | `c0892f57` | Red: `undefined: handshakeOutcome` / `outcomeOK` / `outcomeNoCert` / `outcomeVerifyError` (build failure). Green in **0.008s** with the loopback `connPair` — the PLAN's own figure, reproduced. Live no-cert string confirmed at BOTH TLS versions; live untrusted arm is a `*tls.CertificateVerificationError` with `len(UnverifiedCertificates)==1`; the no-cert arm is NOT a CVE. **+0 production imports** (one hunk, `@@ -354,6 +354,59 @@`, no import block). |
+| **T2** fields + `rt.tlsMode` gate + NAME-SET guard | `37951982` | **Two-stage red** (see F-2 below). Gate is `rt.tlsMode` **ALONE**. Field block gofmt-aligned on paste. D7 rename landed with the full `:1918-1934` doc rewrite. |
+| **T3** QUIC registration test | `1b413d84` | PASS on arrival (as designed — the break is what makes it evidence). `quic.go` sha256 `071cb7a5…0edb` — **identical to master**. Only the cx COUNTER asserted; the gauge half left honestly unpinned. |
+| **T4** the two Inc points | `e56e2087` | Red: all three counters at 0 (assertion-level, no staging needed). `-race` green. One hunk, no import block. |
+| **T5** `helpText` ×3 | `64e37e7d` | Red: three `helpText missing entry for …`. Entry count **11 → 14**, derived mechanically. |
+| **T6** `0111` cross-side `StatsAsserter` | `f632945b` | **PASS. The reference emitted `handshake=1 fail_verify_error=1 fail_verify_no_cert=1`, `downstream_cx_total=3` — matching the subject EXACTLY.** The cross-side leg is real; the subject-only fallback was **not** needed and was never taken. `envoy-go.yaml` sha256 unchanged. Fixtures stay **119**. |
+| **T7** BEHAVIOR_CONTRACT B1–B8 | `dc245426` | 5730 → 5744 lines (+14). Gates: `1201` ⇒ **1** · `1201` at `NR<4980` ⇒ **0** · `1204` ⇒ **3** · `\b1200\b` ⇒ **10** (was 13). The ten historically-correct `1200`s untouched. |
+| **T8** six-gate | *(no commit)* | **ALL GREEN.** `gofmt -l .` silent · `go vet ./...` · `go build ./...` · `go mod tidy -diff` EMPTY · `git diff master -- go.mod go.sum` EMPTY · `golangci-lint run ./...` · **full differential `ok 402.512s`, 119 subtests, 119 PASS, 0 SKIP, 0 FAIL** (fixture-dir set ↔ subtest set `comm -3` EMPTY). `-race`: `./internal/listener ./internal/stats` green; `./... -race` green on re-run (one pre-existing flake, evidenced below). `go list -deps ./internal/listener`: **439 packages both sides, diff IDENTICAL**. sha256 roster: **569 files checked, 0 mismatches**; EDIT ∩ GATED = **EMPTY**. |
+| **T9** ADR-0296 + C3 + ROADMAP + close | `71ca7d7f` | ADR-0296 `### Decision` **0 before / 1 after**, `### Consequences` likewise; STATUS PROPOSED → COMPLETE; footer RETAINED; tail stays **ADR-0296**, `^## ADR-0297` ⇒ **0**. C3 blockquote indentation `cat -A`-verified byte-identical to `:16901`. Row 74 → `done`. |
+
+## Break ledger — ALL TWELVE RUN, every one as predicted
+
+| Break | Predicted | **ACTUAL** |
+|---|---|---|
+| **A** `other` → `verifyError` | 5 rows fire | **FIRED, exactly 5**, names matching the PLAN's list exactly; the four cert-ish rows and `_TLS12` stayed green. |
+| **F** hand-written string — **MUST NOT FIRE** | stays green | **DID NOT FIRE.** Green with the const mutated one character — the demonstration that the hand-written form is self-consistent and therefore worthless. |
+| **F′** mutate the const, LIVE construction | 2 rows fire | **FIRED**, exactly the TLS-1.3 and TLS-1.2 live no-cert rows. F+F′ is a real cross-product. |
+| **E** gate dropped | plaintext fires, TLS stays green | **FIRED.** ⚠️ **And `GateMatchesInc` fired EXCLUSIVELY through the three counter-pointer assertions** — the `tlsMode`/`tlsCfg` predicates printed nothing and `/tls_listener` passed outright. **V1-M2 reproduced and confirmed: the pointer half is load-bearing; the build-time-predicate version would have stayed green.** |
+| **E′** misspell one name | name-set fires | **FIRED.** Counterfactual recorded: the misspelled slice still has **length 3**, so a `len(got)!=3` or `countMetrics`-style cardinality guard — the landed `statssink` precedent — **would have been GREEN**. |
+| **D** ADD the refuted `kind != kindQUIC` gate — **the row's DISTINGUISHING break** | QUIC (1) fires; TLS + plaintext green | **FIRED, and assertion (1) — the `reflect.DeepEqual` NAME SET — is the FIRST and discriminating failure.** The three `counter … is not registered` lines from `counterValue` appeared as predicted. `driveH3`'s precondition SUCCEEDED, so the break did not fire by killing the drive. |
+| **E, second half** | plaintext fires; QUIC must NOT | **Plaintext fired; QUIC stayed PASS.** The two tests are **not entangled** — the stop-condition was not triggered. |
+| **B** swap the two failure arms | exactly 2 of 3 | **FIRED in EXACTLY TWO of three**, success arm green — and **both halves of each cross-product fired** (the `= 0, want 1` positive AND the `= 1, want 0` negative), which is the discriminating signature. |
+| **C** Inc outside the TLS block | PROCESS CRASH | **CRASHED, with the exact predicted stack:** `sync/atomic.(*Uint64).Add` → **`stats.(*Counter).Inc` `counter.go:22`** → **`listener.(*listenerRuntime).serveConnection` `manager.go:1283`** (the relocated Inc itself), `created by …acceptLoop`. F3 confirmed verbatim. |
+| **C′** non-crashing variant | only if C is ambiguous | **NOT RUN, NOT NEEDED** — the panic frame IS the Inc site and `-run` isolated the crashing test, so attribution was never ambiguous. Running it would have replaced a stronger proof with a weaker one. |
+| **G** break one asserted counter | stats assertion fires | **FIRED**, and it is the STATS assertion (`ref/subj envoy_listener_ssl_fail_verify_error = 1, want 2`) — **no `CompareBytes` hex dump anywhere**. |
+| **G′** the dispatch break | fixture stays green | **STAYED GREEN — THE FINDING.** With the method renamed the two `0111 AssertStats:` log lines vanished entirely: hard proof the assertion never ran. Restoring only the method name (leaving `var _` commented) went RED ⇒ **`var _ fixture.StatsAsserter` is a TRIPWIRE, not the dispatch mechanism.** ⚠️ **Substituted — see below.** |
+| **H** `sendPolite` on the untrusted arm, subject side only | `fail_verify_error` → 0, `fail_verify_no_cert` → 2 | **FIRED, exactly as predicted**: subject `handshake=1 fail_verify_error=0 fail_verify_no_cert=2`; four assertions fired; **`CompareBytes` stayed GREEN.** The executable proof that the RD3 forced-send disclaimer **INVERTS at the counter layer**. |
+
+**One substitution, with its rationale — and the rationale is itself a claim, so it is stated for review.** **The PLAN's literal Break G′ is VACUOUS.** As written (rename the method, leave `want` at the *passing* value 1) a green result is consistent with BOTH "the assertion never ran" AND "the assertion ran and passed" — it discriminates nothing, which is the exact `reference_probe_must_discriminate` failure. **The PLAN's own parenthetical for G′ applies recursively to G′ itself.** Substitution: run G′ **stacked on Break G** (`want: 2`, i.e. a *failing* assertion) so green can only mean "never invoked", then restore only the method name for the other half. Result is a clean 2×2: broken-and-renamed ⇒ green; broken-and-named ⇒ red.
+
+## PLAN/SPEC claims REFUTED BY EXECUTION at this stage
+
+1. **The check-(1) BLIND-SPOT figure was stale in the PLAN itself** — it recorded *"104 table rows, 102 matched, TWO misses"*. Re-derived at the IMPL tip: **106 data rows, 102 matched, FOUR misses** — `| 00 | bootstrap | — |` (em-dash column), `| 04 | http-1.1 |` (dotted slug), and **`28.1a`/`28.1b`** (the `^\| [0-9.]+ \|` id field cannot match a letter suffix). All four are `done`, so no current impact — **but the PLAN had dropped two the phase-73 close already knew about, which is exactly the failure the "RE-DERIVE, never copy" instruction on that figure exists to prevent.**
+2. **A FIFTH stale claim in the row-74 ROADMAP cell**, beyond the PLAN's roster of four: the cell repeats the whole-file `grep 'VerifyPeerCertificate\|handshake-error callback' ⇒ 0`, which is now **3** (all three hits are sentences quoting the phrase in order to refute it). Corrected in the same form as the ¶3 defect.
+3. **The PLAN's own "+0 production imports" gate command is UNRELIABLE.** `git diff master -- … | grep -E '^\+' | grep -E '^\+\s*(_|[a-z]+ )?"'` returns **3 hits and exits 0** — all false positives (T5's three `helpText` map-literal lines). Anyone gating on the exit code would read a PASS as a FAIL. The decisive checks are the hunk headers (no hunk touches either import block) and a direct extracted-import-block diff (IDENTICAL, 31 / 6 lines).
+4. **The PLAN's in-code comment for T6 was false**: *"V2 verified it [the cross-side check] stays green under both Break G and Break H."* Under Break H the cross-side check **DID fire, twice**. The clause was not copied into the driver.
+5. **T2's predicted red is UNREACHABLE IN ONE STEP** (F-2). `GateMatchesInc`'s pointer assertions — added by the PLAN's own adversarial pass — reference `rt.ssl*` fields that Step 2 creates, so the whole test binary fails to COMPILE and no assertion runs. A two-stage red (compile failure → add fields only → assertion-level red) was executed so the promised evidence was actually obtained. **A single-stage execution would have recorded a build failure as if it were the assertion red.**
+6. **A THIRD stale-comment site in the PRODUCTION file** that the D6/F5 roster missed (F-1): `manager.go` carried `"surfaced by Task 10's AllocatesTwoMetricsPerListener test"`, which the T2 rename would have left dangling. Fixed in place.
+7. **A FOURTH RD3 site** the PLAN's three-site list missed: the arm-2 inline comment in `driveSide` (`0111/driver.go:416-420`), which also said forced-send is *"NOT because it flips the require=true observable"*. Left standing it would have contradicted the three revised sites.
+8. **Anchor drift within the row itself.** T1–T3 grew `manager.go` by ~180 lines, so every PLAN `file:line` for T4 onward was stale: `HandshakeContext` `:1178` → **`:1260`**; the mixed-chain reject `:516-525` → **`:575`**; `tlsMode` set `:639` → **`:692`**; `tlsCfg` set `:510` → **`:562`**; the launch-loop `kindQUIC` `continue` `:997-1001` → **`:1078-1082`** (and a second, earlier bind-loop `continue` at `:1044-1054` the PLAN never named); `normalizeAddr` `:342` → **`:347-349`**. ⚠️ **The T2 and T4 commit messages were taken from the PLAN verbatim as instructed and therefore carry the STALE `:516-525` / `:639` / `:1178` / `:1183` anchors.** Recorded rather than rewritten.
+9. **Break F's "NAMED SUBSTITUTION (do not re-derive it)" did not apply** — in the landed layout the table row still consumes `liveNoCertErr`, so no `declared and not used` occurred and no binding deletion was needed. V1 hit it "deterministically"; the canonical tree does not.
+10. **T5's old doc comment was internally inconsistent** before this row touched it: *"The 11 entries cover the 13 unique Prometheus names emitted by 06.1 … plus one 06.2 backpressure counter"* — 11 total minus the one 06.2 counter leaves **10** entries covering 13 names (the SN4 collapse). The rewrite states the split explicitly rather than propagating it.
+11. **PLAN import forecasts were incomplete**: `fmt` (not just `reflect`) was absent from `quic_test.go`; the `0111` driver also needed `log` and `math` beyond the forecast `net/http`/`strconv`.
+
+## Two fresh hazards this IMPL discovered (not in any phase-74 document)
+
+- **`io.Copy(conn, conn)` is not a usable in-test echo backend.** `*net.TCPConn` implements `io.ReaderFrom`, so `io.Copy` splices the socket into itself and the echo never returns; the plaintext round trip died on an i/o timeout **at the backend**, which reads as a proxy bug. Proven with a direct-to-backend probe before blaming the proxy. Replaced with an explicit read/write loop.
+- **T1's PKI presents a LEAF-ONLY client chain deliberately** — unlike the copy-source `0111/driver.go:255-257`, which appends the issuing CA. Appending it would make `len(cve.UnverifiedCertificates) == 2` and fire T1's own `want 1` assertion. A future editor must not "fix" the chain to match the driver.
+
+## The one `-race` failure, and why it is PRE-EXISTING — evidence, not assertion
+
+`internal/boot` `TestSDSEndToEnd_FetchFailure_BootFailsClosed/silent_SDS_server…` failed once under the full `go test ./... -race` run (`boot error = "… recv response: rpc error: code = DeadlineExceeded …", want it to mention the initial-fetch timeout`), and the whole-suite re-run was green (125 `ok`, **0 `DATA RACE`** in both runs).
+
+1. **Isolate-re-run: green 3/3** (`-run` alone `-count=1`, `-count=5`, whole package).
+2. **REPRODUCED ON MASTER** — in the main checkout on `master`, `-count=20` under 48 CPU burners on 32 cores failed **3/20 with the byte-identical error string**. A reproduction, not an inference.
+3. The file is byte-identical to master and `internal/boot/**` is on the sha256 roster with 0 mismatches.
+4. Mechanism: `initial_fetch_timeout: 0.2s` — the exact 200 ms budget the indexed flake documents; under load the gRPC dial+recv eats it, so the error arrives as `DeadlineExceeded` on `recv response` rather than the provider's `initial fetch timed out` classification.
+
+⚠️ **This WIDENS the indexed memory rather than matching it.** `reference_sds_init_fetch_timeout_dial_budget_flake` names `internal/xds` `TestProvider_FetchInitialCertificate_Timeout`; what fired here is a **different test in a different package** sharing the **same 200 ms-budget mechanism** — a second, previously-unindexed instance. It now also has a **reproducible master-side recipe** (48 burners, `-count=20`, ~15% hit rate), which the original entry explicitly lacked.
+
+None of the other listed flakes (`internal/cluster` `-race`, the full-suite startup `subject ready: EOF`, `internal/httpclient`, `internal/filter/hcm/h2`) fired in either run.
+
+## Envelope — audited in TWO SEPARATE CATEGORIES
+
+- **PRODUCTION: +0 imports — CONFIRMED** two ways (hunk headers; extracted import-block diff IDENTICAL). **ZERO new exported symbols** — `go doc -all ./internal/listener` and `./internal/stats` diffed against master: **IDENTICAL, 146 / 293 lines.** ZERO new packages. `go.mod`/`go.sum` byte-unchanged ⇒ **+0 modules**.
+- **TEST: 15 additions, permitted and enumerated.** `manager_test.go` +9 (`crypto/ecdsa`, `crypto/elliptic`, `crypto/rand`, `crypto/x509/pkix`, `encoding/pem`, `errors`, `math/big`, `reflect`, `sort`) · `quic_test.go` +2 (`fmt`, `reflect`) · `name_test.go` **+0** · `0111/driver/driver.go` +4 (`log`, `math`, `net/http`, `strconv`).
+
+## Counts at exit — re-run MECHANICALLY in the worktree, never copied
+
+fixtures **119** (+0) · fuzzers **55** (+0) · **stat surface 1201 → 1204 (+3)** · BackendKind tail **38** (+0; a TAIL VALUE — the file declares 39 constants, 0–38) · go.mod modules **2** (lineage figure; the single `go.mod` requires 67) · DECISIONS tail **ADR-0296 COMPLETE**, next-free **ADR-0297** · ZERO new packages · ZERO new exported symbols.

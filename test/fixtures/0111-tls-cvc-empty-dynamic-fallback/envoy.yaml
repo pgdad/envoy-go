@@ -21,8 +21,10 @@
 # The observable is the driver's normalized accept/reject verdict over THREE arms
 # (client_A chaining to the inline default CA_A / fallback anchor — accepted;
 # client_B chaining to a FOREIGN CA_B, FORCED-SEND — rejected; NO client cert —
-# rejected) — NOT the served leaf identity and NOT a stat (envoy-go emits no ssl.*
-# family; see README).
+# rejected) — NOT the served leaf identity. Since phase 74 that verdict is
+# ADDITIONALLY cross-checked at the COUNTER layer: the driver's AssertStats pins
+# listener.<addr>.ssl.{handshake,fail_verify_error,fail_verify_no_cert} to exactly
+# 1 each on BOTH sides (see README).
 #
 # node: {id, cluster} is REQUIRED — SDS boot-fails without it.
 #

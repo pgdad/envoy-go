@@ -2,11 +2,20 @@ package listener
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	stdtls "crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -1908,15 +1917,29 @@ func TestNewManager_HCMBuildErrorWrapsAsListenerFilter(t *testing.T) {
 	}
 }
 
-// TestListenerManager_AllocatesTwoMetricsPerListener verifies the listener-side
-// per-listener metric-allocation loop registers exactly the 2 listener-scope
-// metrics from SPEC §6 (`listener.<addr>.downstream_cx_total` counter,
+// TestListenerManager_AllocatesBaseListenerMetrics verifies the listener-side
+// per-listener metric-allocation loop registers the BASE listener-scope metrics
+// from SPEC §6 (`listener.<addr>.downstream_cx_total` counter,
 // `listener.<addr>.downstream_cx_active` gauge) on the supplied Registry at
-// boot time. The address segment is the bound (post-resolve) bind address
+// boot time. Those two are registered for EVERY listener regardless of
+// transport. The address segment is the bound (post-resolve) bind address
 // normalized per the planner-pinned `strings.NewReplacer(":", "_", ".", "_")`
-// shape so that the resulting name has exactly three top-level dot-segments
+// shape so that the resulting cx name has exactly three top-level dot-segments
 // (`listener.<addr>.<rest>`) — necessary for `flattenToProm`'s SN3 single-dot
 // split to extract the address as a label.
+//
+// ⚠️ This test is deliberately PRESENCE-ONLY and asserts NOTHING about the
+// total number of listener-scope metrics. It was renamed at phase 74 from
+// TestListenerManager_AllocatesTwoMetricsPerListener, and this doc rewritten,
+// because both the old name and the old prose claimed the loop registers
+// "exactly the 2" — which stopped being true once a TLS-bearing listener also
+// began carrying the three `listener.<addr>.ssl.*` counters. The body never
+// asserted the count, so the false claim lived only in the name and the
+// comment and produced no red when the ssl.* family landed; this is a
+// deliberate documentation fix, not a test fix. The exact ssl.* NAME SET is
+// pinned by TestListenerMetrics_TLSListenerRegistersExactlyThreeSSLNames, and
+// its absence on a plaintext listener by
+// TestListenerMetrics_PlaintextListenerRegistersNoSSLNames.
 //
 // PLAN-deviation note: the PLAN's example test code walks the Registry directly
 // after NewManager. The implementation registers at Start time (post-bind)
@@ -1925,7 +1948,7 @@ func TestNewManager_HCMBuildErrorWrapsAsListenerFilter(t *testing.T) {
 // `:0` would collide on the same registered name pre-resolve. The test calls
 // Start before walking — which is also what the differential fixture (Task 14)
 // does, so the test mirrors the production scrape ordering.
-func TestListenerManager_AllocatesTwoMetricsPerListener(t *testing.T) {
+func TestListenerManager_AllocatesBaseListenerMetrics(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	boot := mkBoot(0, []*listenerv3.Listener{
 		mkListener("l_h1", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
@@ -1958,6 +1981,273 @@ func TestListenerManager_AllocatesTwoMetricsPerListener(t *testing.T) {
 			t.Errorf("missing listener.<addr>%s metric (seen=%v)", w, seen)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase-74 Task 2: the three listener-scope ssl.* counters — registration is
+// gated on rt.tlsMode ALONE (no kind check), so a TLS listener carries exactly
+// three ssl.* names and a plaintext listener carries none.
+// ---------------------------------------------------------------------------
+
+// listenerSSLNames returns the ssl.* metric names registered at the given
+// listener's scope, sorted. It asserts on the NAME SET, not on a cardinality:
+// the landed precedent (internal/statssink/registration_test.go:26, one of
+// five, all routing through a countMetrics helper that never inspects
+// m.Name()) counts via reg.Walk and WOULD PASS WITH ALL THREE NAMES
+// MISSPELLED.
+func listenerSSLNames(reg *stats.Registry, addr string) []string {
+	prefix := "listener." + normalizeAddr(addr) + ".ssl."
+	var out []string
+	reg.Walk(func(m stats.Metric) {
+		if strings.HasPrefix(m.Name(), prefix) {
+			out = append(out, m.Name())
+		}
+	})
+	sort.Strings(out)
+	return out
+}
+
+// listenerMetricNames returns every metric name registered on reg, as a set.
+// Used by the ssl.* tests to prove the walk is not vacuous (the two
+// pre-existing downstream_cx_* names must still be there).
+func listenerMetricNames(reg *stats.Registry) map[string]bool {
+	out := map[string]bool{}
+	reg.Walk(func(m stats.Metric) { out[m.Name()] = true })
+	return out
+}
+
+// TestListenerMetrics_TLSListenerRegistersExactlyThreeSSLNames pins the EXACT
+// SPELLING of all three phase-74 names on a TLS-bearing listener. A count-only
+// assertion is insufficient — see listenerSSLNames' doc — so this compares the
+// whole sorted name set with reflect.DeepEqual.
+func TestListenerMetrics_TLSListenerRegistersExactlyThreeSSLNames(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	ts := mkDownstreamTSInline(t, testAlphaCertPEM, testAlphaKeyPEM)
+	l := mkTLSListener("l_ssl_names", "127.0.0.1", 0, []*listenerv3.FilterChain{
+		mkTLSChain([]string{"alpha.envoy-go.test"}, ts, filter),
+	})
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	reg := stats.NewRegistry()
+	mgr, err := NewManager(boot, cm, reg, testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("listener.NewManager: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("listener.Start: %v", err)
+	}
+	defer mgr.Stop()
+
+	ls := mgr.Listeners()
+	if len(ls) != 1 {
+		t.Fatalf("Listeners() len = %d, want 1", len(ls))
+	}
+	addr := ls[0].Addr
+	prefix := "listener." + normalizeAddr(addr) + "."
+	want := []string{
+		prefix + "ssl.fail_verify_error",
+		prefix + "ssl.fail_verify_no_cert",
+		prefix + "ssl.handshake",
+	}
+	got := listenerSSLNames(reg, addr)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ssl name set = %v, want %v", got, want)
+	}
+
+	// ...and the two pre-existing names are UNDISTURBED (this row is additive).
+	all := listenerMetricNames(reg)
+	for _, n := range []string{prefix + "downstream_cx_total", prefix + "downstream_cx_active"} {
+		if !all[n] {
+			t.Errorf("pre-existing metric %q is missing", n)
+		}
+	}
+}
+
+// TestListenerMetrics_PlaintextListenerRegistersNoSSLNames is the INVERTED
+// guard: registration is TLS-chains-only, matching the reference (SPEC §3.3,
+// settled by a one-container/two-listener/one-scrape probe after the
+// zero-visibility confound was eliminated first).
+//
+// ⚠️ This assertion is GREEN BEFORE the change too — it only becomes evidence
+// under Break E (the rt.tlsMode gate dropped), which is what proves it can go
+// red at all.
+func TestListenerMetrics_PlaintextListenerRegistersNoSSLNames(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	boot := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_plain_ssl", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
+	}, nil)
+	reg := stats.NewRegistry()
+	mgr, err := NewManager(boot, cm, reg, testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("listener.NewManager: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("listener.Start: %v", err)
+	}
+	defer mgr.Stop()
+
+	ls := mgr.Listeners()
+	if len(ls) != 1 {
+		t.Fatalf("Listeners() len = %d, want 1", len(ls))
+	}
+	addr := ls[0].Addr
+	if got := listenerSSLNames(reg, addr); len(got) != 0 {
+		t.Errorf("plaintext listener registered ssl names %v, want none", got)
+	}
+
+	// ...while it DOES carry its two cx names — proving the walk is not vacuous.
+	prefix := "listener." + normalizeAddr(addr) + "."
+	all := listenerMetricNames(reg)
+	for _, n := range []string{prefix + "downstream_cx_total", prefix + "downstream_cx_active"} {
+		if !all[n] {
+			t.Errorf("plaintext listener is missing %q — the walk is vacuous", n)
+		}
+	}
+}
+
+// TestListenerMetrics_GateMatchesInc pins the invariant that makes the whole
+// design safe: the REGISTRATION gate (rt.tlsMode) and the Inc guard
+// (selected.tlsCfg != nil) are EQUIVALENT, because a listener is all-TLS or
+// all-plaintext and never both (manager.go:575, ADR-0033 cl.5/ADR-0078 cl.5).
+// If they ever diverge the failure mode is a NIL-POINTER PANIC in the
+// serveConnection GOROUTINE — *stats.Counter.Inc has no nil guard
+// (internal/stats/counter.go) and internal/listener has no recover() — i.e. a
+// process crash, not a wrong count. That is why this is its own test.
+//
+// ⚠️ THE POINTER ASSERTIONS ARE THE LOAD-BEARING HALF, and without them this
+// test is decorative. V1 executed the tlsMode-vs-tlsCfg-only version under
+// Break E (the gate dropped) and it STAYED GREEN: both predicates are set at
+// BUILD time (manager.go:692 and :562), entirely upstream of
+// registerListenerMetrics, so neither one can observe a registration bug. Only
+// the three field pointers — non-nil iff tlsMode — actually witness the
+// invariant whose violation is a PRODUCTION CRASH.
+func TestListenerMetrics_GateMatchesInc(t *testing.T) {
+	// (a) a mixed TLS+plaintext listener is REJECTED at build time — this is
+	//     what makes "all-TLS or all-plaintext" an invariant rather than a
+	//     hope, and hence what makes the two gates equivalent at all.
+	t.Run("mixed_rejected_at_build", func(t *testing.T) {
+		cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+		filter := mkTcpProxyFilter(t, "c_echo")
+		ts := mkDownstreamTSInline(t, testAlphaCertPEM, testAlphaKeyPEM)
+		l := mkTLSListener("l_gate_mixed", "127.0.0.1", 0, []*listenerv3.FilterChain{
+			mkTLSChain([]string{"alpha.envoy-go.test"}, ts, filter), // TLS
+			mkTLSChain([]string{"beta.envoy-go.test"}, nil, filter), // plaintext
+		})
+		boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+		_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+		if err == nil {
+			t.Fatal("expected a build-time error for mixed TLS/plaintext chains, got nil")
+		}
+		const wantSub = "mixed TLS and plaintext chains on one listener"
+		if !strings.Contains(err.Error(), wantSub) {
+			t.Errorf("error %q does not contain %q", err.Error(), wantSub)
+		}
+	})
+
+	// (b) a TLS listener: rt.tlsMode == true AND every chainInfo has
+	//     tlsCfg != nil AND all THREE counter fields are NON-NIL.
+	t.Run("tls_listener", func(t *testing.T) {
+		cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+		filter := mkTcpProxyFilter(t, "c_echo")
+		ts := mkDownstreamTSInline(t, testAlphaCertPEM, testAlphaKeyPEM)
+		l := mkTLSListener("l_gate_tls", "127.0.0.1", 0, []*listenerv3.FilterChain{
+			mkTLSChain([]string{"alpha.envoy-go.test"}, ts, filter),
+		})
+		boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+		mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+		if err != nil {
+			t.Fatalf("listener.NewManager: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := mgr.Start(ctx); err != nil {
+			t.Fatalf("listener.Start: %v", err)
+		}
+		defer mgr.Stop()
+
+		if len(mgr.runtimes) != 1 {
+			t.Fatalf("runtimes len = %d, want 1", len(mgr.runtimes))
+		}
+		rt := mgr.runtimes[0]
+		if !rt.tlsMode {
+			t.Errorf("TLS listener: rt.tlsMode = false, want true")
+		}
+		if len(rt.chainByName) == 0 {
+			t.Fatal("TLS listener: chainByName is empty — the tlsCfg assertion would be vacuous")
+		}
+		for n, ci := range rt.chainByName {
+			if ci.tlsCfg == nil {
+				t.Errorf("TLS listener: chain %q has tlsCfg == nil", n)
+			}
+		}
+		if rt.defaultChain != nil && rt.defaultChain.tlsCfg == nil {
+			t.Error("TLS listener: defaultChain has tlsCfg == nil")
+		}
+		// THE LOAD-BEARING HALF.
+		if rt.sslHandshake == nil {
+			t.Error("TLS listener: rt.sslHandshake is NIL — Inc would panic the serveConnection goroutine")
+		}
+		if rt.sslFailVerifyError == nil {
+			t.Error("TLS listener: rt.sslFailVerifyError is NIL — Inc would panic the serveConnection goroutine")
+		}
+		if rt.sslFailVerifyNoCert == nil {
+			t.Error("TLS listener: rt.sslFailVerifyNoCert is NIL — Inc would panic the serveConnection goroutine")
+		}
+	})
+
+	// (c) a plaintext listener: rt.tlsMode == false AND every chainInfo has
+	//     tlsCfg == nil AND all THREE counter fields are NIL. The nil fields
+	//     are BY DESIGN — the Inc sites sit inside `if selected.tlsCfg != nil`
+	//     and are therefore unreachable here; do not add nil guards.
+	t.Run("plaintext_listener", func(t *testing.T) {
+		cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+		boot := mkBoot(0, []*listenerv3.Listener{
+			mkListener("l_gate_plain", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
+		}, nil)
+		mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+		if err != nil {
+			t.Fatalf("listener.NewManager: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := mgr.Start(ctx); err != nil {
+			t.Fatalf("listener.Start: %v", err)
+		}
+		defer mgr.Stop()
+
+		if len(mgr.runtimes) != 1 {
+			t.Fatalf("runtimes len = %d, want 1", len(mgr.runtimes))
+		}
+		rt := mgr.runtimes[0]
+		if rt.tlsMode {
+			t.Errorf("plaintext listener: rt.tlsMode = true, want false")
+		}
+		if len(rt.chainByName) == 0 {
+			t.Fatal("plaintext listener: chainByName is empty — the tlsCfg assertion would be vacuous")
+		}
+		for n, ci := range rt.chainByName {
+			if ci.tlsCfg != nil {
+				t.Errorf("plaintext listener: chain %q has tlsCfg != nil", n)
+			}
+		}
+		if rt.defaultChain != nil && rt.defaultChain.tlsCfg != nil {
+			t.Error("plaintext listener: defaultChain has tlsCfg != nil")
+		}
+		// THE LOAD-BEARING HALF.
+		if rt.sslHandshake != nil {
+			t.Error("plaintext listener: rt.sslHandshake is NON-NIL — the rt.tlsMode gate did not hold")
+		}
+		if rt.sslFailVerifyError != nil {
+			t.Error("plaintext listener: rt.sslFailVerifyError is NON-NIL — the rt.tlsMode gate did not hold")
+		}
+		if rt.sslFailVerifyNoCert != nil {
+			t.Error("plaintext listener: rt.sslFailVerifyNoCert is NON-NIL — the rt.tlsMode gate did not hold")
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -3726,5 +4016,607 @@ func TestAcceptLoopBacksOffOnPersistentAcceptError(t *testing.T) {
 	rt.acceptLoop(context.Background(), ln)
 	if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
 		t.Errorf("acceptLoop returned after %v; want >= ~155ms of accumulated backoff (hot-spin regression)", elapsed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase-74 handshake-outcome classifier tests
+// ---------------------------------------------------------------------------
+
+// handshakeTestPKI builds a fresh in-process ECDSA P-256 PKI for the
+// handshake-outcome tests. internal/listener's existing corpus has a CA
+// CERTIFICATE (testCAPEM) but NOT its private key, and no client certificate at
+// all, so a mutual-TLS arm cannot be assembled from it (PLAN-74 F1). Shape
+// follows internal/tls/config_test.go:42-80 and
+// test/fixtures/0111-tls-cvc-empty-dynamic-fallback/driver/driver.go:193-260.
+type handshakeTestPKI struct {
+	caCertPEM, caKeyPEM         []byte             // trusted anchor
+	serverCertPEM, serverKeyPEM []byte             // leaf signed by the trusted CA
+	clientTrusted               stdtls.Certificate // chains to caCertPEM  -> accepted
+	clientUntrusted             stdtls.Certificate // chains to a FOREIGN CA -> fail_verify_error
+	serverRoots                 *x509.CertPool     // verifies the proxy's leaf
+}
+
+// hsSerial returns a random 128-bit certificate serial.
+func hsSerial(t *testing.T) *big.Int {
+	t.Helper()
+	n, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatalf("generate serial: %v", err)
+	}
+	return n
+}
+
+// hsCertPEM PEM-encodes a DER certificate.
+func hsCertPEM(der []byte) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// hsKeyPEM PKCS#8-marshals and PEM-encodes an ECDSA private key.
+func hsKeyPEM(t *testing.T, key *ecdsa.PrivateKey) []byte {
+	t.Helper()
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal private key: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+}
+
+// hsCA generates a self-signed ECDSA P-256 CA.
+func hsCA(t *testing.T, cn string) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate CA key (%s): %v", cn, err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          hsSerial(t),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create CA cert (%s): %v", cn, err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse CA cert (%s): %v", cn, err)
+	}
+	return cert, key
+}
+
+// hsLeaf generates an ECDSA P-256 leaf signed by parent.
+func hsLeaf(t *testing.T, cn string, parent *x509.Certificate, parentKey *ecdsa.PrivateKey,
+	eku []x509.ExtKeyUsage, dnsNames []string,
+) ([]byte, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate leaf key (%s): %v", cn, err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: hsSerial(t),
+		Subject:      pkix.Name{CommonName: cn},
+		DNSNames:     dnsNames,
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  eku,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, parentKey)
+	if err != nil {
+		t.Fatalf("create leaf cert (%s): %v", cn, err)
+	}
+	return der, key
+}
+
+// hsClientKeyPair builds a ready-to-present LEAF-ONLY client keypair
+// (ExtKeyUsage ClientAuth) signed by ca. The chain deliberately carries the leaf
+// ALONE so that a verification failure yields exactly one entry in
+// CertificateVerificationError.UnverifiedCertificates.
+func hsClientKeyPair(t *testing.T, cn string, ca *x509.Certificate, caKey *ecdsa.PrivateKey) stdtls.Certificate {
+	t.Helper()
+	der, key := hsLeaf(t, cn, ca, caKey, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, nil)
+	cert, err := stdtls.X509KeyPair(hsCertPEM(der), hsKeyPEM(t, key))
+	if err != nil {
+		t.Fatalf("build client keypair (%s): %v", cn, err)
+	}
+	return cert
+}
+
+// mkTestPKI generates: CA_A, a server leaf signed by A, a client leaf signed by
+// A (trusted), a FOREIGN CA_B, and a client leaf signed by B (untrusted).
+func mkTestPKI(t *testing.T) handshakeTestPKI {
+	t.Helper()
+
+	caA, caAKey := hsCA(t, "envoy-go phase-74 test CA A")
+	srvDER, srvKey := hsLeaf(t, "localhost", caA, caAKey,
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, []string{"localhost"})
+
+	caB, caBKey := hsCA(t, "envoy-go phase-74 FOREIGN CA B")
+
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(hsCertPEM(caA.Raw)) {
+		t.Fatalf("AppendCertsFromPEM(CA_A) returned false")
+	}
+
+	return handshakeTestPKI{
+		caCertPEM:       hsCertPEM(caA.Raw),
+		caKeyPEM:        hsKeyPEM(t, caAKey),
+		serverCertPEM:   hsCertPEM(srvDER),
+		serverKeyPEM:    hsKeyPEM(t, srvKey),
+		clientTrusted:   hsClientKeyPair(t, "trusted-client", caA, caAKey),
+		clientUntrusted: hsClientKeyPair(t, "untrusted-client", caB, caBKey),
+		serverRoots:     roots,
+	}
+}
+
+// connPair returns a connected pair of net.Conns over LOOPBACK TCP.
+//
+// ⚠️ net.Pipe() MUST NOT be used here. It is synchronous and unbuffered, so in
+// the RequireAndVerifyClientCert no-cert arm the server blocks writing alert 116
+// out of processCertsFromClient while the client is still blocked mid-Write on
+// the remainder of its second flight — neither side reads and the test hangs to
+// the package panic timeout with NO failing assertion (PLAN-74 V1-S1).
+func connPair(t *testing.T) (client, server net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen loopback: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	type accepted struct {
+		c   net.Conn
+		err error
+	}
+	ch := make(chan accepted, 1)
+	go func() {
+		c, aerr := ln.Accept()
+		ch <- accepted{c, aerr}
+	}()
+
+	cli, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial loopback: %v", err)
+	}
+	a := <-ch
+	if a.err != nil {
+		_ = cli.Close()
+		t.Fatalf("accept loopback: %v", a.err)
+	}
+	t.Cleanup(func() {
+		_ = cli.Close()
+		_ = a.c.Close()
+	})
+	return cli, a.c
+}
+
+// clientCertMode selects what the test client presents when the server asks for
+// a certificate.
+type clientCertMode int
+
+const (
+	// noClientCert: the client sends NO certificate at all.
+	noClientCert clientCertMode = iota
+	// untrustedClientCert: the client FORCE-SENDS a leaf signed by the foreign
+	// CA. ⚠️ Without the forced send (GetClientCertificate) crypto/tls would
+	// silently withhold the cert because the server's CertificateRequest does
+	// not name CA_B, and this arm would degrade into noClientCert — the two
+	// table rows would stop discriminating (reference_go_client_cert_withholding).
+	untrustedClientCert
+)
+
+// liveHandshakeErr drives a REAL in-process TLS handshake over a loopback TCP
+// pair with ClientAuth=RequireAndVerifyClientCert and returns the SERVER-side
+// handshake error. version==0 leaves the stdlib default (TLS 1.3).
+//
+// ⚠️ context.Background() is passed to HandshakeContext, never a WithTimeout
+// ctx: a firing ctx REPLACES the real outcome via the named-return override at
+// crypto/tls/conn.go:1541-1546 and every arm would classify outcomeOther.
+func liveHandshakeErr(t *testing.T, pki handshakeTestPKI, mode clientCertMode, version uint16) error {
+	t.Helper()
+
+	srvCert, err := stdtls.X509KeyPair(pki.serverCertPEM, pki.serverKeyPEM)
+	if err != nil {
+		t.Fatalf("build server keypair: %v", err)
+	}
+	clientCAs := x509.NewCertPool()
+	if !clientCAs.AppendCertsFromPEM(pki.caCertPEM) {
+		t.Fatalf("AppendCertsFromPEM(client CAs) returned false")
+	}
+
+	scfg := &stdtls.Config{
+		Certificates: []stdtls.Certificate{srvCert},
+		ClientAuth:   stdtls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAs,
+	}
+	ccfg := &stdtls.Config{
+		RootCAs:    pki.serverRoots,
+		ServerName: "localhost",
+	}
+	if version != 0 {
+		scfg.MinVersion, scfg.MaxVersion = version, version
+		ccfg.MinVersion, ccfg.MaxVersion = version, version
+	}
+	if mode == untrustedClientCert {
+		cert := pki.clientUntrusted
+		ccfg.GetClientCertificate = func(*stdtls.CertificateRequestInfo) (*stdtls.Certificate, error) {
+			return &cert, nil
+		}
+	}
+
+	cliRaw, srvRaw := connPair(t)
+	errCh := make(chan error, 1)
+	go func() {
+		s := stdtls.Server(srvRaw, scfg)
+		errCh <- s.HandshakeContext(context.Background())
+		_ = s.Close()
+	}()
+
+	c := stdtls.Client(cliRaw, ccfg)
+	_ = c.HandshakeContext(context.Background())
+	_ = c.Close()
+
+	serr := <-errCh
+	if serr == nil {
+		t.Fatalf("live handshake (mode=%d, version=%#04x) SUCCEEDED; want a server-side error", mode, version)
+	}
+	return serr
+}
+
+// TestClassifyHandshakeErr is the row's classification table. The no-cert case
+// is CONSTRUCTED BY RUNNING A LIVE IN-PROCESS HANDSHAKE, never by writing the
+// string: crypto/tls exports zero error VALUES, so a string match is forced and
+// a hand-written string would sail through a toolchain that reworded it.
+func TestClassifyHandshakeErr(t *testing.T) {
+	pki := mkTestPKI(t)
+
+	// (a) the LIVE no-cert error — the tripwire.
+	liveNoCertErr := liveHandshakeErr(t, pki, noClientCert, 0)
+	// (b) the LIVE untrusted-cert error, forced-send.
+	liveVerifyErr := liveHandshakeErr(t, pki, untrustedClientCert, 0)
+
+	cases := []struct {
+		name string
+		err  error
+		want handshakeOutcome
+	}{
+		{"nil", nil, outcomeOK},
+		{"live no-cert (TLS 1.3)", liveNoCertErr, outcomeNoCert},
+		{"live untrusted cert", liveVerifyErr, outcomeVerifyError},
+		{"wrapped CVE", fmt.Errorf("listener: %w", &stdtls.CertificateVerificationError{}), outcomeVerifyError},
+		{"unrelated error", errors.New("connection reset by peer"), outcomeOther},
+		{"io.EOF", io.EOF, outcomeOther},
+		{"cert/key mismatch shape", errors.New("tls: invalid signature by the client certificate: ECDSA verification failure"), outcomeOther},
+		{"malformed DER shape", errors.New("tls: failed to parse client certificate: x509: malformed certificate"), outcomeOther},
+		{"ctx deadline", context.DeadlineExceeded, outcomeOther},
+	}
+	for _, tc := range cases {
+		if got := classifyHandshakeErr(tc.err); got != tc.want {
+			t.Errorf("classifyHandshakeErr(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// NON-VACUITY, proven not asserted: the two live errors must be DISTINCT
+	// texts, and the untrusted one must carry exactly one unverified cert.
+	if liveNoCertErr.Error() == liveVerifyErr.Error() {
+		t.Fatalf("the two live arms produced the SAME error text %q — the table is vacuous", liveNoCertErr)
+	}
+	var cve *stdtls.CertificateVerificationError
+	if !errors.As(liveVerifyErr, &cve) {
+		t.Fatalf("live untrusted arm is not a *tls.CertificateVerificationError: %T", liveVerifyErr)
+	}
+	if n := len(cve.UnverifiedCertificates); n != 1 {
+		t.Errorf("CVE.UnverifiedCertificates length = %d, want 1", n)
+	}
+
+	// The no-cert arm must NOT be a CVE — that is what makes errors.As a TOTAL
+	// discriminator rather than a partial one.
+	if errors.As(liveNoCertErr, &cve) {
+		t.Errorf("live no-cert arm unexpectedly matched *tls.CertificateVerificationError")
+	}
+}
+
+// TestClassifyHandshakeErr_TLS12 repeats the two live arms with the client and
+// server both pinned to TLS 1.2, proving the classification is version-invariant.
+// This is the arm that refutes any alert-code-derived implementation: the same
+// no-cert input emits alert 40 at TLS 1.2 and 116 at TLS 1.3 (SPEC §3.5 ALERTMAP).
+func TestClassifyHandshakeErr_TLS12(t *testing.T) {
+	pki := mkTestPKI(t)
+
+	liveNoCertErr := liveHandshakeErr(t, pki, noClientCert, stdtls.VersionTLS12)
+	liveVerifyErr := liveHandshakeErr(t, pki, untrustedClientCert, stdtls.VersionTLS12)
+
+	if got := classifyHandshakeErr(liveNoCertErr); got != outcomeNoCert {
+		t.Errorf("TLS1.2 live no-cert = %v, want outcomeNoCert", got)
+	}
+	if got := classifyHandshakeErr(liveVerifyErr); got != outcomeVerifyError {
+		t.Errorf("TLS1.2 live untrusted cert = %v, want outcomeVerifyError", got)
+	}
+	if liveNoCertErr.Error() == liveVerifyErr.Error() {
+		t.Fatalf("the two TLS1.2 live arms produced the SAME error text %q — the arms are vacuous", liveNoCertErr)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase-74 Task 4: the two Inc points in serveConnection. Each arm drives a
+// REAL handshake against a REAL Start'ed listener and then polls the registry.
+// ---------------------------------------------------------------------------
+
+// mkDownstreamTSMutualTLS builds a downstream transport socket configured for
+// MANDATORY mutual TLS: require_client_certificate: true PLUS an inline
+// common_tls_context.validation_context.trusted_ca.
+//
+// ⚠️ mkDownstreamTSRequireClientCert (:653) is NOT reusable here (PLAN-74 F2):
+// it carries require_client_certificate WITHOUT a trusted_ca, which the phase-67
+// / ADR-0289 anchorless-validation-context rule REJECTS AT BOOT ("require needs
+// an anchor", internal/tls/config.go:68). A test reusing it would fail inside
+// NewManager and never reach a handshake at all. Both fields together are what
+// yields stdtls.RequireAndVerifyClientCert (internal/tls/config.go:65).
+func mkDownstreamTSMutualTLS(t *testing.T, certPEM, keyPEM, caPEM []byte) *corev3.TransportSocket {
+	t.Helper()
+	inner := &tlsv3.DownstreamTlsContext{
+		RequireClientCertificate: wrapperspb.Bool(true),
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			TlsCertificates: []*tlsv3.TlsCertificate{{
+				CertificateChain: &corev3.DataSource{
+					Specifier: &corev3.DataSource_InlineBytes{InlineBytes: certPEM},
+				},
+				PrivateKey: &corev3.DataSource{
+					Specifier: &corev3.DataSource_InlineBytes{InlineBytes: keyPEM},
+				},
+			}},
+			ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+				ValidationContext: &tlsv3.CertificateValidationContext{
+					TrustedCa: &corev3.DataSource{
+						Specifier: &corev3.DataSource_InlineBytes{InlineBytes: caPEM},
+					},
+				},
+			},
+		},
+	}
+	a, err := anypb.New(inner)
+	if err != nil {
+		t.Fatalf("anypb.New DownstreamTlsContext (mutual TLS): %v", err)
+	}
+	return &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.tls",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: a},
+	}
+}
+
+// startEchoBackend stands up a tiny TCP echo server and returns its port, so
+// the tcp_proxy terminal has a live upstream. The ssl.* Inc points sit BEFORE
+// serveNetworkChain, so a dead upstream would not change the counters — the
+// live backend is what lets the plaintext arm drive an observable ROUND TRIP.
+func startEchoBackend(t *testing.T) uint32 {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo backend listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				// An explicit read/write loop, NOT io.Copy(conn, conn):
+				// *net.TCPConn implements io.ReaderFrom, so io.Copy would splice
+				// the socket into ITSELF and never deliver the echo.
+				buf := make([]byte, 256)
+				for {
+					n, rerr := conn.Read(buf)
+					if n > 0 {
+						if _, werr := conn.Write(buf[:n]); werr != nil {
+							return
+						}
+					}
+					if rerr != nil {
+						return
+					}
+				}
+			}(c)
+		}
+	}()
+	return uint32(ln.Addr().(*net.TCPAddr).Port)
+}
+
+// startMutualTLSListener boots and Starts a single-chain listener whose only
+// filter chain is mandatory-mTLS + tcp_proxy, and returns the registry and the
+// bound address. The chain carries NO FilterChainMatch, so it is the DEFAULT
+// chain and no tls_inspector is needed to select it.
+func startMutualTLSListener(t *testing.T, pki handshakeTestPKI) (*stats.Registry, string) {
+	t.Helper()
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", startEchoBackend(t))
+	ts := mkDownstreamTSMutualTLS(t, pki.serverCertPEM, pki.serverKeyPEM, pki.caCertPEM)
+	l := mkTLSListener("l_ssl_inc", "127.0.0.1", 0, []*listenerv3.FilterChain{
+		mkTLSChain(nil, ts, mkTcpProxyFilter(t, "c_echo")),
+	})
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	reg := stats.NewRegistry()
+	mgr, err := NewManager(boot, cm, reg, testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("listener.NewManager (mutual TLS): %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("listener.Start (mutual TLS): %v", err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	ls := mgr.Listeners()
+	if len(ls) != 1 {
+		t.Fatalf("Listeners() len = %d, want 1", len(ls))
+	}
+	return reg, ls[0].Addr
+}
+
+// assertSSLCrossProduct is the CROSS-PRODUCT assertion every increment test
+// owes (reference_probe_must_discriminate): the named counter reaches exactly
+// 1 AND the other two are exactly 0. Without the negative half, Break B
+// (exchanging the verifyError and noCert case bodies) would fire in all three
+// tests and prove nothing about WHICH arm routed WHERE.
+//
+// serveConnection runs in a per-connection goroutine, so the Inc LAGS the
+// client's Handshake() return — the positive half POLLS, it never sleeps. The
+// negative half reads once, via counterValue, which t.Errorf's on an ABSENT
+// name rather than returning a silent 0.
+func assertSSLCrossProduct(t *testing.T, reg *stats.Registry, addr, wantSuffix string) {
+	t.Helper()
+	prefix := "listener." + normalizeAddr(addr) + ".ssl."
+	if got := pollCounter(t, reg, prefix+wantSuffix, 1, 3*time.Second); got != 1 {
+		t.Errorf("%s = %d, want 1", prefix+wantSuffix, got)
+	}
+	for _, s := range []string{"handshake", "fail_verify_error", "fail_verify_no_cert"} {
+		if s == wantSuffix {
+			continue
+		}
+		if v := counterValue(t, reg, prefix+s); v != 0 {
+			t.Errorf("%s = %d, want 0 — only %s may move on this arm", prefix+s, v, wantSuffix)
+		}
+	}
+}
+
+// TestServeConnection_SSLHandshakeIncrements: a client presenting a leaf signed
+// by the listener's trusted CA completes the handshake, so the SUCCESS Inc
+// fires and neither failure counter moves.
+func TestServeConnection_SSLHandshakeIncrements(t *testing.T) {
+	pki := mkTestPKI(t)
+	reg, addr := startMutualTLSListener(t, pki)
+
+	conn, err := stdtls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", addr, &stdtls.Config{
+		ServerName:   "localhost",
+		RootCAs:      pki.serverRoots,
+		Certificates: []stdtls.Certificate{pki.clientTrusted},
+		MinVersion:   stdtls.VersionTLS12,
+	})
+	if err != nil {
+		t.Fatalf("trusted-client TLS dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	assertSSLCrossProduct(t, reg, addr, "handshake")
+}
+
+// TestServeConnection_SSLFailVerifyErrorIncrements: a client FORCE-SENDING a
+// leaf signed by a FOREIGN CA fails chain verification server-side.
+//
+// ⚠️ GetClientCertificate is load-bearing (reference_go_client_cert_withholding):
+// the server's CertificateRequest advertises only CA_A's DN, so a polite Go
+// client would WITHHOLD the CA_B leaf and this arm would silently degrade into
+// the no-cert arm. The cross-product's `fail_verify_no_cert == 0` half asserts
+// the non-degradation DIRECTLY.
+func TestServeConnection_SSLFailVerifyErrorIncrements(t *testing.T) {
+	pki := mkTestPKI(t)
+	reg, addr := startMutualTLSListener(t, pki)
+
+	untrusted := pki.clientUntrusted
+	conn, err := stdtls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", addr, &stdtls.Config{
+		ServerName: "localhost",
+		RootCAs:    pki.serverRoots,
+		GetClientCertificate: func(*stdtls.CertificateRequestInfo) (*stdtls.Certificate, error) {
+			return &untrusted, nil
+		},
+		MinVersion: stdtls.VersionTLS12,
+	})
+	// The client-side outcome is version-dependent (at TLS 1.3 the client's
+	// Handshake returns before the server's alert arrives), so it is NOT
+	// asserted; the server-side counter is the observable under test.
+	if err == nil {
+		defer func() { _ = conn.Close() }()
+	}
+
+	assertSSLCrossProduct(t, reg, addr, "fail_verify_error")
+}
+
+// TestServeConnection_SSLFailVerifyNoCertIncrements: a client presenting NO
+// certificate against require_client_certificate: true.
+func TestServeConnection_SSLFailVerifyNoCertIncrements(t *testing.T) {
+	pki := mkTestPKI(t)
+	reg, addr := startMutualTLSListener(t, pki)
+
+	conn, err := stdtls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", addr, &stdtls.Config{
+		ServerName: "localhost",
+		RootCAs:    pki.serverRoots,
+		MinVersion: stdtls.VersionTLS12,
+	})
+	if err == nil {
+		defer func() { _ = conn.Close() }()
+	}
+
+	assertSSLCrossProduct(t, reg, addr, "fail_verify_no_cert")
+}
+
+// TestServeConnection_PlaintextListenerIncrementsNoSSL is Break C's target.
+// A plaintext listener's three ssl.* pointers are NIL (T2's rt.tlsMode gate),
+// so keeping both Inc points inside `if selected.tlsCfg != nil` is not a style
+// choice: (*stats.Counter).Inc has NO nil check and internal/listener has NO
+// recover(), so an ssl Inc on a plaintext connection is a nil-pointer PANIC in
+// the serveConnection GOROUTINE — a process crash, not a test failure.
+//
+// ⚠️ This test is GREEN ON ARRIVAL. Break C is what makes it evidence.
+func TestServeConnection_PlaintextListenerIncrementsNoSSL(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", startEchoBackend(t))
+	boot := mkBoot(0, []*listenerv3.Listener{
+		mkListener("l_plain_inc", "127.0.0.1", 0, mkTcpProxyFilter(t, "c_echo")),
+	}, nil)
+	reg := stats.NewRegistry()
+	mgr, err := NewManager(boot, cm, reg, testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("listener.NewManager: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("listener.Start: %v", err)
+	}
+	defer mgr.Stop()
+
+	ls := mgr.Listeners()
+	if len(ls) != 1 {
+		t.Fatalf("Listeners() len = %d, want 1", len(ls))
+	}
+	addr := ls[0].Addr
+
+	// One PLAIN TCP round trip through the tcp_proxy terminal to the echo
+	// backend — this is what forces serveConnection all the way past the
+	// (absent) TLS block and into serveNetworkChain.
+	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		t.Fatalf("plaintext dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("plaintext write: %v", err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("plaintext read-back: %v", err)
+	}
+	if string(buf) != "ping" {
+		t.Errorf("echo round trip = %q, want %q", buf, "ping")
+	}
+
+	// NON-VACUITY: the connection really was accepted and served.
+	if got := pollCounter(t, reg, "listener."+normalizeAddr(addr)+".downstream_cx_total", 1, 3*time.Second); got != 1 {
+		t.Errorf("downstream_cx_total = %d, want 1", got)
+	}
+	// ...and no ssl.* name exists at this listener's scope at all, so there was
+	// nothing for serveConnection to Inc.
+	if got := listenerSSLNames(reg, addr); len(got) != 0 {
+		t.Errorf("plaintext listener ssl name set = %v, want empty", got)
 	}
 }
