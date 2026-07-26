@@ -91,7 +91,31 @@ Check (3) fails SAFE by construction: a future family whose rows use a slug not 
 
 ## What THIS session does — the phase-77 BRAINSTORM
 
-One stage per session. **SELF-PICK a new subject** (smallest defensible candidate first, weighed against the now-elevated value of clearing a check-(3) blocker), **re-derive every candidate's cost at THIS tip rather than inheriting it**, write `docs/envoy-go/phases/77-<slug>/BRAINSTORM.md` recording **the pick AND the rejected alternatives with the evidence that settled each**, and **REGISTER the new row in `ROADMAP.md` as `in-progress`** — which re-opens sentinel check (1). ⚠️ **Check your new row's id/slug/"after" cell against check (1)'s FOUR-miss blind spot** (em-dash, dot-in-slug, letter suffix) so the row is actually visible to the check that is supposed to track it.
+One stage per session. **SELF-PICK a new subject** (smallest defensible candidate first, weighed against the now-elevated value of clearing a check-(3) blocker), **re-derive every candidate's cost at THIS tip rather than inheriting it**, write `docs/envoy-go/phases/77-<slug>/BRAINSTORM.md` recording **the pick AND the rejected alternatives with the evidence that settled each**, and **REGISTER the new row in `ROADMAP.md` as `in-progress`** — which re-opens sentinel check (1).
+
+### Registering the new row — the mechanics, re-derived at master `191e72e6`
+
+⚠️ **This is the first registration in the project's history performed from a state where EVERY row is already `done`.** There is no in-flight row to pattern-match against, so the mechanics are spelled out rather than left to imitation. **Re-derive each of these yourself before using it** — they are true at `191e72e6` and this file is not evidence (`feedback_brief_citations_not_evidence`).
+
+- **Row id is `77`.** The table's last data row is **`| 76 | lb-ring-hash-spread-margin | 75 | done |`** at **`ROADMAP.md:138`**, immediately followed by a blank line, a `---`, and `## Feature Families (09+)`. **Insert row 77 directly after `:138`, inside the table** — not after the `---`, which would put it outside the table and make it invisible to all three checks.
+- **The "after" cell is `76`.** Every row carries its predecessor there.
+- ⚠️ **Check your new row against check (1)'s FOUR-miss blind spot BEFORE trusting the check to track it.** The regex is `^\| [0-9.]+ \| [a-z0-9-]+ \| [0-9.,  ]* \| (planned|in-progress|blocked|done[^|]*)`. It cannot match an **em-dash** in the "after" cell, a **dot** inside the slug, or a **letter suffix** on the row id. `77` and a plain `[a-z0-9-]+` slug are safe — **but verify by running the regex against your own new line in isolation**, exactly as the phase-76 IMPL did to prove check (1)'s silence was genuine. A row the check cannot see reads as `done` forever.
+
+### ⚠️ Check (3)'s marker phrase: a legitimate USE vs the gaming MENTION that fired at the phase-76 BRAINSTORM
+
+This distinction decides whether the recommended pick actually clears its blocker, and **getting it wrong is costly in BOTH directions**. Re-derived at this tip:
+
+```sh
+grep -oE '[A-Za-z0-9/-]+-family row' docs/envoy-go/ROADMAP.md | sort | uniq -c | sort -rn
+```
+⇒ **Observability 50 · Network-filters 9 · xDS 8 · Load-balancing 8 · Upstream-robustness 5 · Operational-tooling 3 · HTTP/3 2 · HTTP-filters 1** — and **gRPC, Runtime and WASM: ZERO.** That zero is *exactly* why check (3) names those three.
+
+⇒ **The marker phrase is not forbidden. It is how eight families legitimately record that they are open.** The rule is about *truthfulness*, not about the string:
+
+- **LEGITIMATE USE — write it.** If your row genuinely delivers work inside that family's chartered scope, its summary **should** say `<Family>-family row`, and check (3) then correctly stops naming that family. **If the Runtime family opening is the pick, the row summary saying `Runtime-family row` is a legitimate use and the blocker is genuinely cleared.**
+- **GAMING MENTION — never write it.** Writing the phrase for a family the row does **not** actually deliver, or quoting it while *discussing* the check, silently satisfies the grep without doing the work. **This fired LIVE at the phase-76 BRAINSTORM**, twice in one commit: row 76's draft quoted the gRPC marker *inside the sentence explaining why quoting it would be gaming* — and check (3) came back with **gRPC silently GONE**. **`grep` cannot tell a mention from a use**, so the *only* safeguard is that you meant it.
+- **The honesty test:** would the family's charter be materially advanced by this row? Read the charter in full first — `fault.abort.grpc_status` fails this test for gRPC (that charter is bridge · gRPC-Web · JSON transcoding · interop conformance), which is why three stages of documents agreeing it "opens the gRPC family" were still wrong.
+- ⚠️ **If you open a family whose slug is NOT in check (3)'s list above, add its slug to that list in this file** — otherwise the check keeps passing over it and fails *unsafe* for that family.
 
 **Stage-close mechanics (a BRAINSTORM):** STATE §Current rolled **IN PLACE** (lifecycle **DONE → 1**; §Recent re-capped at FIVE **with its PREAMBLE updated** — the ADR-0288 rule). `DECISIONS.md` is normally BYTE-UNTOUCHED at a BRAINSTORM. `next-prompt.txt` rolled to **the phase-77 SPEC**.
 
