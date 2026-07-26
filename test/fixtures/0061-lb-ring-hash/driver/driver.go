@@ -8,9 +8,9 @@
 // end-to-end proof of Tasks 3-6 (the source_ip hash_policy → WithHashKey →
 // ringHashLB pick → affinity).
 //
-// The driver binds outgoing connections to source IPs 127.0.0.2..5 (via
+// The driver binds outgoing connections to source IPs 127.0.0.2..17 (via
 // net.Dialer.LocalAddr — feasible on host loopback, SPEC §11.8), 16 connections
-// per source IP = 64 total (the 0059/0060 conservation target). It drives the
+// per source IP = 256 total (the 0059/0060 conservation target). It drives the
 // workload against each side and asserts:
 //
 //   - byte-equivalence of the echoed payload (the runner's CompareBytes gate —
@@ -20,7 +20,7 @@
 //     (D-S36-4): every subject per-backend count ≡ 0 mod 16 (affinity — one source
 //     IP → one key → one ring point → one backend, so each source IP contributes
 //     all 16 or 0 to a given backend) AND >= 2 backends nonzero (spread). The
-//     REFERENCE is Docker-NAT'd to ONE gateway source IP → single-key pin → all 64
+//     REFERENCE is Docker-NAT'd to ONE gateway source IP → single-key pin → all 256
 //     on ONE backend, so it is asserted on conservation only (cross-side host
 //     identity INFEASIBLE — AMEND-RH8 / reference_differential_hash_key_cross_side_
 //     infeasible);
@@ -75,9 +75,9 @@ const (
 
 	clusterName = "c_echo"
 
-	sourceIPs  = 4                      // 127.0.0.2 .. 127.0.0.5
+	sourceIPs  = 16                     // 127.0.0.2 .. 127.0.0.17
 	burstPerIP = 16                     // connections per source IP
-	totalConns = sourceIPs * burstPerIP // 64 — the conservation target
+	totalConns = sourceIPs * burstPerIP // 256 — the conservation target
 
 	// readEchoTimeout bounds each per-conn echo read.
 	readEchoTimeout = 2 * time.Second
@@ -179,8 +179,8 @@ static_resources:
 `, subjAdminPort, subjListenerPort, backendPorts[0], backendPorts[1], backendPorts[2])
 }
 
-// drive opens burstPerIP connections from each of the 4 source IPs (bound via
-// net.Dialer.LocalAddr 127.0.0.2..5 — feasible on host loopback, SPEC §11.8),
+// drive opens burstPerIP connections from each of the 16 source IPs (bound via
+// net.Dialer.LocalAddr 127.0.0.2..17 — feasible on host loopback, SPEC §11.8),
 // does one echo round-trip per conn, and closes so upstream_cx_active quiesces
 // before AssertStats. SHARED by both DriveReference and DriveSubject: the payloads
 // are identical → the echoed bytes are byte-equal across the two proxies. The
@@ -267,9 +267,21 @@ func (ringHashDriver) ProbeAdmin(ctx context.Context, refAdminAddr, subjAdminAdd
 // AssertDistribution: SUBJECT-SIDE affinity (every per-backend count is a multiple
 // of burstPerIP — the consistent-hash invariant: one source IP → one key → one ring
 // point → one backend, so each source IP contributes all 16 or 0 to each backend) +
-// SPREAD (>= 2 distinct backends nonzero). DETERMINISTIC/EXACT — not a σ-band
-// (reference_differential_band_sigma_margin governs RNG bands; affinity is not one).
-// The REFERENCE is Docker-NAT'd to one source IP → all 64 on ONE backend; it is
+// SPREAD (>= 2 distinct backends nonzero). AFFINITY (and conservation) is
+// DETERMINISTIC/EXACT — not a σ-band (reference_differential_band_sigma_margin
+// governs RNG bands; affinity is not one). SPREAD is NOT: it is PROBABILISTIC. The
+// ring is keyed on each backend's EPHEMERAL-PORT address, which the harness
+// re-allocates per run, so every run draws a fresh random 3-way partition and
+// P(collapse) <= 3^(1-sourceIPs) = 7.0e-8 at sourceIPs=16 — a 5.27σ-equivalent
+// margin (ADR-0298). That figure is ANALYTIC/EXTRAPOLATED, NOT measured: K=16 is
+// unmeasurable at feasible scale (expected count 0.014 over 2e5 draws; 0/200000
+// bounds the rate at ~1.5e-5 only). And 3^(1-K) is a CONSERVATIVE UPPER BOUND, not
+// "the" probability — measured/analytic is 0.949 at K=4 and 0.689 at K=8. The bound
+// is measured at those K by TestRingHash_EphemeralPortRing_KeyCollapseRate in
+// internal/cluster, which this package's TestSourceIPsLinkedToCollapseFixtureK pins
+// to THIS fixture's sourceIPs.
+//
+// The REFERENCE is Docker-NAT'd to one source IP → all 256 on ONE backend; it is
 // asserted on conservation only (single-key pin — AMEND-RH8 /
 // reference_differential_hash_key_cross_side_infeasible). Its real proof is byte-
 // equiv + the cross-side stats.
@@ -305,11 +317,11 @@ func (ringHashDriver) AssertDistribution(refCounts, subjCounts []uint64) error {
 	return nil
 }
 
-// AssertStats (post-drain): SPEC §7 — cross-equal upstream_cx_total==64 +
+// AssertStats (post-drain): SPEC §7 — cross-equal upstream_cx_total==256 +
 // membership_total==3 + upstream_cx_active==0 (quiesced) + the THREE ring_hash_lb
 // gauges (size==1026 / min_hashes_per_host==342 / max_hashes_per_host==342 — they
 // depend ONLY on ring-config + host COUNT, NOT addresses, so they ARE cross-equal);
-// PER-SIDE upstream_rq_total (ref=64 — tcp_proxy charges rq-per-cx; subj=0 —
+// PER-SIDE upstream_rq_total (ref=256 — tcp_proxy charges rq-per-cx; subj=0 —
 // envoy-go's tcpproxy path NEVER calls IncUpstreamRqTotal, the 0059/0060 boundary).
 func (ringHashDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr string) {
 	t.Helper()
@@ -361,7 +373,7 @@ func (ringHashDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr stri
 	}
 
 	// Per-side upstream_rq_total (NOT cross-equal). The reference's tcp_proxy charges
-	// one rq per cx (rq-per-cx) → 64; envoy-go's tcpproxy path never Inc's
+	// one rq per cx (rq-per-cx) → 256; envoy-go's tcpproxy path never Inc's
 	// upstream_rq_total → 0.
 	const rqKey = "cluster." + clusterName + ".upstream_rq_total"
 	if got := ref[rqKey]; got != totalConns {
