@@ -226,10 +226,13 @@ Two agents worked the §11.1(A) audit question at the same tip. One **sampled** 
 
 One agent's cleanup ran `docker ps | grep contrib-v1.37.2 | xargs docker kill` and killed **three containers belonging to concurrently-running sibling agents** — its own `--rm` containers had already self-terminated, so every container it actually killed was someone else's. `reference_parallel_subagents_private_scratch` covers scratch *directories*; **it does not cover docker containers, ports, or any other machine-global namespace.** Parallel agents must tear down **by their own container NAME**, never by an `ancestor`/image filter. The controller's own probes were removed by name for exactly this reason.
 
-### 11.6 ⚠️ A MEMORY CORRECTION, VERIFIED
+### 11.6 ⚠️ A "MEMORY CORRECTION" THAT WAS ITSELF WRONG — AND THE CONTROLLER PUBLISHED IT BEFORE CHECKING
 
-`reference_differential_fixture_three_registration_gates` records a **runner branch** as one of three registration gates. **At this tip there is no per-fixture branch** — dispatch is `discoverFixtures` (`runner_test.go:187`) plus `fixture.DriverRegistry[fx]` (`:193`). A `switch` branch is needed only for a new **BackendKind** (`:272`). The memory is corrected.
+An agent reported that `reference_differential_fixture_three_registration_gates` records a **runner branch** as one of its three gates, and that no such branch exists at this tip. The controller confirmed the *code* half by grep (`fx == "` returns nothing; dispatch is `discoverFixtures` at `runner_test.go:187` plus `fixture.DriverRegistry[fx]` at `:193`, and a `switch` branch is needed only for a new **BackendKind** at `:272`) — **and shipped the "correction" into two documents without reading the memory it claimed to correct.**
 
+**The memory text says no such thing.** Its three gates are (1) the directory, (2) `RegisterFixture` with the name equal to the directory, (3) the blank import in `runner_test.go`. **All three are accurate at this tip.** The word *branch* comes from a NEIGHBOURING memory, `reference_differential_fixture_dispatch_constraint`, where it means a **dispatch MODE** — the if/return chain selecting reference-less XOR boot-reject XOR cross-side — **not a per-fixture name branch**. That memory is also correct as written.
+
+⚠️ **So the grep result is consistent with BOTH memories being right, and it was read as evidence that one was wrong.** A negative grep for a thing no document ever claimed is not a refutation of anything. `reference_a_drift_correction_is_itself_a_claim` names exactly this; the controller had the rule, cited it elsewhere in this very document, and still applied a correction it had not re-derived. **The memories are UNCHANGED and both stand.**
 ---
 
 ## 12. Stage-close mechanics (this BRAINSTORM; the CONTROLLER executes these)
