@@ -121,45 +121,58 @@ type alsDriver struct {
 	subjEntries []*dataaccesslogv3.HTTPAccessLogEntry
 }
 
-// allocateALSPort reserves a free TCP port for the ALS receiver via
-// Listen+Close. Idempotent — returns the same port on subsequent calls. Does
-// NOT start the server. Mirrors the 0021 allocateAuthPort idiom.
+// allocateALSPort returns the port the ALS receiver is bound to, starting the
+// receiver on first call. Idempotent — returns the same port on subsequent
+// calls.
 func (d *alsDriver) allocateALSPort() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.alsPort != 0 {
-		return d.alsPort
-	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		panic(fmt.Sprintf("driver: allocate ALS port: %v", err))
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
-	d.alsPort = port
-	return port
+	d.ensureServerLocked()
+	return d.alsPort
 }
 
-// ensureServer starts the in-process AccessLogService receiver bound to
-// 0.0.0.0:<alsPort> (so BOTH the reference container via host.docker.internal
-// AND the subject via 127.0.0.1 can dial it). Idempotent — a second call is a
-// no-op while the server runs. Called at ReferenceBootstrap time so the
-// receiver is live before either proxy starts its ALS gRPC stream.
+// ensureServer starts the in-process AccessLogService receiver. Idempotent — a
+// second call is a no-op while the server runs. Called at ReferenceBootstrap
+// time so the receiver is live before either proxy starts its ALS gRPC stream.
 func (d *alsDriver) ensureServer() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.ensureServerLocked()
+}
+
+// ensureServerLocked binds the receiver on 0.0.0.0 with an OS-assigned
+// ephemeral port (so BOTH the reference container via host.docker.internal AND
+// the subject via 127.0.0.1 can dial it) and records the port the kernel
+// actually handed out. Caller must hold d.mu.
+//
+// The port comes from the LIVE listener rather than from an earlier
+// Listen+Close reservation. Reserve-then-rebind left a window in which any
+// other listener in this test binary — the runner allocates ports for ~100
+// fixtures in one process, and the kernel draws ephemeral ports from the same
+// range — could take the port first, and the receiver's failed bind then
+// panicked and killed the whole differential run. Probing on 127.0.0.1 while
+// binding on 0.0.0.0 also under-detected conflicts: a port free on loopback is
+// not necessarily free on the wildcard address.
+func (d *alsDriver) ensureServerLocked() {
 	if d.srv != nil {
 		return
 	}
-	if d.alsPort == 0 {
-		panic("driver: ensureServer called before allocateALSPort")
-	}
-	addr := fmt.Sprintf("0.0.0.0:%d", d.alsPort)
-	srv, err := accessloggrpc.NewAtAddr(addr)
+	srv, err := accessloggrpc.NewAtAddr("0.0.0.0:0")
 	if err != nil {
-		panic(fmt.Sprintf("driver: start ALS receiver on %s: %v", addr, err))
+		panic(fmt.Sprintf("driver: start ALS receiver: %v", err))
+	}
+	_, portStr, err := net.SplitHostPort(srv.Addr())
+	if err != nil {
+		srv.Close()
+		panic(fmt.Sprintf("driver: parse ALS receiver address %q: %v", srv.Addr(), err))
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		srv.Close()
+		panic(fmt.Sprintf("driver: parse ALS receiver port %q: %v", portStr, err))
 	}
 	d.srv = srv
+	d.alsPort = port
 }
 
 // --- fixture.Driver (required) ---
