@@ -42,7 +42,7 @@ If ANY check prints output, the sentinel does NOT fire: proceed with the stage b
 
 Check (3) fails SAFE by construction: a future family whose rows use a slug not listed above reads as "never opened", which BLOCKS `stop` rather than falsely triggering it. A false "not done" costs one wasted session; a false "done" ends the project early. When you open a new family, add its row-summary slug here.
 
-**SENTINEL RE-RUN MECHANICALLY 2026-07-27 at the phase-77 PLAN. It does NOT fire. `stop` was NOT created and MUST NOT be.** ⚠️ **Re-run it yourself anyway and record what YOU see** — a prior run's result is not evidence for the current tip. ACTUAL output, recorded rather than predicted:
+**SENTINEL RE-RUN MECHANICALLY 2026-07-27 at the phase-77 PLAN, and RE-RUN AGAIN at the post-correction tip `e4c2828d` — byte-identical output both times. It does NOT fire. `stop` was NOT created and MUST NOT be.** ⚠️ **Re-run it yourself anyway and record what YOU see** — a prior run's result is not evidence for the current tip. ACTUAL output, recorded rather than predicted:
 - **(1) `NOT DONE: row 77`** — live since the BRAINSTORM; **it is silenced at the phase-77 IMPL**, which is precisely when a false "done" would matter most.
 - **(2) FOUR under the old matcher, FIVE under the broadened one above.** ⚠️ **BOTH ARE CORRECT — do NOT "fix" either count down.** Sites: `:187`, `:197`, `:207`, `:213` (long form) and **`:221`** (the Operational-tooling short form).
 - **(3) `NEVER OPENED: gRPC` and `NEVER OPENED: WASM`** — `Runtime` is legitimately GONE, cleared by row 77. (The `WASM` line remains a ROADMAP **bookkeeping artifact** — `internal/wasm/` is a substantially-built wazero host and rows 25/25.1/25.2/25.3 are all `done` — deliberately LEFT AS-IS.)
