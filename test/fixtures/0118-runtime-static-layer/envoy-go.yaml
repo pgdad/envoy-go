@@ -1,0 +1,135 @@
+# envoy-go bootstrap for fixture 0118-runtime-static-layer.
+#
+# Functionally equivalent to envoy.yaml modulo the project's standing deltas:
+#   - cluster type: STATIC (ADR-0002) vs STRICT_DNS;
+#   - endpoint address 127.0.0.1 (envoy-go runs on the host loopback) vs
+#     host.docker.internal (the reference runs in a Docker container);
+#   - no dns_lookup_family;
+#   - admin and listener ports independently allocated by the runner.
+#
+# ⚠️ THE `layered_runtime` BLOCK BELOW IS BYTE-IDENTICAL TO envoy.yaml's. That is
+# the whole point of the row: both sides read the SAME four-arm static layer and
+# must publish the SAME two gauges. Any edit here must be mirrored there.
+#
+# Phase 77 — the layered_runtime STATIC LAYER consumer, asserted STATS-ONLY on
+# runtime.num_keys / runtime.num_layers. The topology is the MINIMUM that boots
+# and binds: one plaintext TCP listener front-ending one TCP echo backend. No
+# request semantics are driven; the whole observable is the gauge pair scraped
+# by the driver's AssertStats. BackendCount stays 1 because the runner
+# t.Fatalf's on 0 (reference_differential_backendcount_min_one).
+#
+# ⚠️ THE VALUES ARE SCRAPED FROM THE FLAT /stats ENDPOINT, NOT /stats/prometheus
+# — a FINDING, not a style choice. envoy-go registers both gauges with the
+# correct values (`runtime.num_keys: 6` / `runtime.num_layers: 2` on /stats) but
+# its PROMETHEUS renderer SILENTLY DROPS them: internal/stats.ExtractTags
+# recognizes no `runtime.` top-level segment and internal/stats.WriteProm skips
+# any metric whose name fails to flatten. The reference publishes them on BOTH
+# endpoints. The driver pins that asymmetry symmetrically in
+# assertPrometheusExpositionDeparture. See README.md.
+#
+# ⚠️ STATS ONLY — the reference's admin /runtime BODY is non-deterministic in
+# four independent ways (per-request JSON key order, a per-process Struct
+# debug-string marker, a leaked DebugString for empty-map values, and a
+# non-deterministic within-layer collision winner), so a body comparison is
+# unrunnable. The gauges are immune. ProbeAdmin returns /ready only.
+#
+# ## THE FOUR ARMS, and what each discriminates
+#
+#   Arm A — `ov.key`, declared in BOTH L1 and L2. UNION vs per-layer SUM.
+#           ⚠️ THE OVERLAP IS LOAD-BEARING: remove L2's re-declaration and SUM
+#           == UNION and the arm goes VACUOUS while still passing.
+#           ⚠️ The literal '.' is NOT re-split — internal/runtime's flatten()
+#           joins path segments with '.' but never splits a field NAME on one.
+#           Contributes 1 key.
+#   Arm B — `nest.mid.{leaf1,leaf2}`: unbounded-depth leaf flattening. 2 keys.
+#   Arm C — `frac: {numerator, foo, bar}`: the LEXICAL termination rule, a
+#           SINGLE lowercase `numerator` beside two unrelated siblings. A
+#           pair-matching implementation recurses and yields 3; the real rule
+#           (terminatorNumerator OR terminatorDenominator, exact, case-SENSITIVE,
+#           either alone, at any depth, values NEVER inspected) yields 1.
+#           Spelling the full pair would pass against BOTH and discriminate
+#           nothing. 1 key.
+#   Arm D — `emp: {e1: {}, e2: {}}`: the SECOND termination branch. An EMPTY
+#           Struct is a COUNTED LEAF — 2 keys, not 0.
+#
+# 1 + 2 + 1 + 2 = 6 distinct keys across 2 declared layers.
+#
+# ⚠️ SMALL INTEGERS AND SHORT STRINGS ONLY — the reference renders in-int32
+# integers through a 6-significant-digit %g. This fixture asserts no VALUES, but
+# large or float literals would make any future value assertion unreproducible.
+#
+# ⚠️ envoy-go publishes 2 runtime.* names (runtime.num_keys, runtime.num_layers,
+# both registered UNCONDITIONALLY by internal/bootstrap's setRuntimeStats) where
+# the reference publishes 9. The project asserts NAMED SUBSETS cross-side, never
+# full-set equality (reference_stats_sink_emits_used_only).
+#
+# ⚠️ THIS ROW REJECTS THREE SIBLING oneof ARMS THE REFERENCE ACCEPTS —
+# disk_layer, admin_layer and rtds_layer. Those are DEPARTURES, not parity. See
+# README.md.
+#
+# Templating: rendered by the driver's mustRender() at SubjectConfig time.
+# Substitution keys:
+#   {{.AdminPort}}    — admin endpoint port (runner-allocated).
+#   {{.ListenerPort}} — l_test listener port (runner-allocated).
+#   {{.BackendPort}}  — TCP echo backend port (runner-allocated, loopback).
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+layered_runtime:
+  layers:
+    - name: L1
+      static_layer:
+        # Arm A — the UNION-vs-per-layer-SUM discriminator. ⚠️ THE OVERLAP IS
+        # LOAD-BEARING: L2 re-declares this key. Remove it and SUM == UNION and
+        # arm A goes VACUOUS while still passing.
+        # ⚠️ The literal '.' is NOT re-split by either side (measured).
+        ov.key: "from_L1"
+        # Arm B — unbounded-depth leaf flattening. 2 keys.
+        nest:
+          mid:
+            leaf1: 1
+            leaf2: 2
+        # Arm C — the LEXICAL termination rule. A SINGLE lowercase `numerator`
+        # alongside unrelated siblings: a pair-matching implementation gives 3
+        # here, the real rule gives 1. Spelling the full {numerator,denominator}
+        # pair would pass against BOTH and discriminate nothing.
+        # ⚠️ The VALUES are never inspected — do not add validation here.
+        frac:
+          numerator: 25
+          foo: 2
+          bar: 3
+        # Arm D — the SECOND termination branch. An empty Struct is a COUNTED
+        # LEAF: 2 keys, not 0. No prior document recorded this branch, and the
+        # inherited three-arm pin set could not have detected its absence.
+        emp:
+          e1: {}
+          e2: {}
+    - name: L2
+      static_layer:
+        ov.key: "from_L2"
+
+static_resources:
+  listeners:
+    - name: l_test
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.ListenerPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: c_echo
+
+  clusters:
+    # c_echo: the runner-owned host-side TCP echo backend on loopback.
+    - name: c_echo
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_echo
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.BackendPort}} }

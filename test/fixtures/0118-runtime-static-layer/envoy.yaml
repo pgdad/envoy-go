@@ -1,0 +1,159 @@
+# Reference Envoy bootstrap for fixture 0118-runtime-static-layer.
+#
+# Phase 77 — the layered_runtime STATIC LAYER consumer, asserted STATS-ONLY on
+# the two runtime gauges runtime.num_keys / runtime.num_layers.
+#
+# The topology is deliberately the MINIMUM that boots and binds: one plaintext
+# TCP listener front-ending one TCP echo backend. This fixture drives NO request
+# semantics — the whole observable is the gauge pair scraped by the driver's
+# AssertStats. BackendCount stays 1 because the runner t.Fatalf's on 0
+# (reference_differential_backendcount_min_one), not because any byte flows
+# through it.
+#
+# ⚠️ THE VALUES ARE SCRAPED FROM THE FLAT /stats ENDPOINT, NOT /stats/prometheus
+# — a FINDING, not a style choice. envoy-go registers both gauges with the
+# correct values but its PROMETHEUS renderer SILENTLY DROPS them:
+# internal/stats.ExtractTags recognizes no `runtime.` top-level segment and
+# internal/stats.WriteProm skips any metric whose name fails to flatten. The
+# reference publishes them on BOTH endpoints. The driver pins that asymmetry
+# symmetrically in assertPrometheusExpositionDeparture. See README.md.
+#
+# ⚠️ STATS ONLY — the admin /runtime BODY is NOT comparable, in four independent
+# ways, all measured on the pinned reference image at the phase-77 PLAN:
+#   1. the JSON key order is randomized PER REQUEST;
+#   2. the Struct debug-string marker is randomized PER PROCESS (8 distinct
+#      strings across 13 fresh processes);
+#   3. an empty-map value renders as a leaked non-deterministic DebugString and
+#      STILL counts as a key;
+#   4. the WITHIN-LAYER collision winner is non-deterministic (~40/60 over 18
+#      fresh processes), so any fixture asserting a final_value is unrunnable.
+# All four contaminate the BODY only. The two gauges are immune, which is why
+# this fixture routes through fixture.StatsAsserter and ProbeAdmin returns
+# /ready only.
+#
+# ## THE FOUR ARMS OF THE static_layer BLOCK, and what each discriminates
+#
+#   Arm A — `ov.key`, declared in BOTH L1 and L2. The UNION-vs-per-layer-SUM
+#           discriminator. ⚠️ THE OVERLAP IS LOAD-BEARING: remove L2's
+#           re-declaration and the per-layer SUM equals the UNION, so an
+#           implementation that adds per-layer counts instead of unioning them
+#           still reads 6 and the arm goes VACUOUS WHILE STILL PASSING.
+#           ⚠️ The literal '.' in `ov.key` is NOT re-split by either side
+#           (measured cross-side) — it is ONE key whose name contains a dot.
+#           Contributes 1 key.
+#   Arm B — `nest.mid.{leaf1,leaf2}`. Unbounded-depth leaf flattening: the
+#           flattener descends until it hits a scalar, joining path segments
+#           with '.'. Contributes 2 keys.
+#   Arm C — `frac: {numerator, foo, bar}`. The LEXICAL termination rule. A
+#           SINGLE lowercase `numerator` alongside two UNRELATED siblings: an
+#           implementation matching the {numerator,denominator} PAIR recurses
+#           here and yields 3; the real rule terminates and yields 1. Spelling
+#           the full pair would pass against BOTH implementations and
+#           discriminate NOTHING. ⚠️ The VALUES are never inspected — a
+#           FractionalPercent parse/validation here would REJECT configs the
+#           reference ACCEPTS. Contributes 1 key.
+#   Arm D — `emp: {e1: {}, e2: {}}`. The SECOND termination branch. An EMPTY
+#           Struct is a COUNTED LEAF, not zero keys: this yields `emp.e1` and
+#           `emp.e2`, i.e. 2 keys, NOT 0. No document before the phase-77 SPEC
+#           recorded this branch, and the inherited three-arm pin set could not
+#           have detected its absence. Contributes 2 keys.
+#
+# Measured on the pinned reference image, fresh container per arm, three runs
+# per arm: the four isolation arms contribute 1 + 2 + 1 + 2 and the COMBINED
+# config (this one) reads num_keys=6 / num_layers=2 on all three runs. The arms
+# sum EXACTLY to the combined total, so no contribution is mis-attributed.
+#
+# ⚠️ SMALL INTEGERS AND SHORT STRINGS ONLY. The reference renders in-int32-range
+# integers through a 6-significant-digit %g (2147483647 -> 2.14748e+09, and
+# 1000000 / 1000001 BOTH -> 1e+06), out-of-int32 integers and all floats
+# verbatim, and its YAML and JSON front-ends DISAGREE (4.0 -> "4.0" vs "4").
+# This fixture asserts no VALUES — but a config using large or float literals
+# would make any future value assertion unreproducible.
+#
+# ⚠️ envoy-go publishes 2 runtime.* names where this reference publishes 9. The
+# project asserts NAMED SUBSETS cross-side, never full-set equality
+# (reference_stats_sink_emits_used_only), so that creates no divergence here.
+# Note also that runtime.load_success and runtime.override_dir_not_exists BOTH
+# read 1 on the reference even with NO layered_runtime block at all, so NEITHER
+# is usable as a "a static layer actually loaded" precondition. The driver's
+# separate ABSENT check plus num_layers == 2 is the honest substitute.
+#
+# ⚠️ THIS ROW REJECTS THREE SIBLING oneof ARMS THAT THE REFERENCE ACCEPTS.
+# disk_layer, admin_layer and rtds_layer all boot cleanly on this image; envoy-go
+# rejects each with a byte-stable "bootstrap: ..." message. Those are DEPARTURES,
+# not parity — see README.md.
+#
+# Templating: rendered by the driver's mustRender() at ReferenceBootstrap time.
+# Substitution keys:
+#   {{.AdminPort}}    — admin endpoint port (hard-coded 9901 by the driver; the
+#                       harness hard-wires and maps 9901/tcp).
+#   {{.ListenerPort}} — l_test in-container port (10118 per the "10<fixture
+#                       index>" family convention: 0114->10114 ... 0117->10117).
+#   {{.BackendHost}}  — TCP echo backend host (host.docker.internal, ADR-0010).
+#   {{.BackendPort}}  — TCP echo backend port (runner-allocated).
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+layered_runtime:
+  layers:
+    - name: L1
+      static_layer:
+        # Arm A — the UNION-vs-per-layer-SUM discriminator. ⚠️ THE OVERLAP IS
+        # LOAD-BEARING: L2 re-declares this key. Remove it and SUM == UNION and
+        # arm A goes VACUOUS while still passing.
+        # ⚠️ The literal '.' is NOT re-split by either side (measured).
+        ov.key: "from_L1"
+        # Arm B — unbounded-depth leaf flattening. 2 keys.
+        nest:
+          mid:
+            leaf1: 1
+            leaf2: 2
+        # Arm C — the LEXICAL termination rule. A SINGLE lowercase `numerator`
+        # alongside unrelated siblings: a pair-matching implementation gives 3
+        # here, the real rule gives 1. Spelling the full {numerator,denominator}
+        # pair would pass against BOTH and discriminate nothing.
+        # ⚠️ The VALUES are never inspected — do not add validation here.
+        frac:
+          numerator: 25
+          foo: 2
+          bar: 3
+        # Arm D — the SECOND termination branch. An empty Struct is a COUNTED
+        # LEAF: 2 keys, not 0. No prior document recorded this branch, and the
+        # inherited three-arm pin set could not have detected its absence.
+        emp:
+          e1: {}
+          e2: {}
+    - name: L2
+      static_layer:
+        ov.key: "from_L2"
+
+static_resources:
+  listeners:
+    - name: l_test
+      address: { socket_address: { address: 0.0.0.0, port_value: {{.ListenerPort}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: c_echo
+
+  clusters:
+    # c_echo: the runner-owned host-side TCP echo backend, reached via
+    # host.docker.internal from the reference Envoy container per ADR-0010.
+    # STRICT_DNS so the container resolves the bridge host alias; V4_ONLY per
+    # the established fixture precedent.
+    - name: c_echo
+      type: STRICT_DNS
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_echo
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{.BackendHost}}, port_value: {{.BackendPort}} }

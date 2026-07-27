@@ -62,19 +62,42 @@ dynamic_resources:
 	}
 }
 
-func TestBootstrap_ReusesLoad_RejectsLayeredRuntime(t *testing.T) {
+func TestBootstrap_ReusesLoad_AcceptsStaticLayer(t *testing.T) {
+	// ⚠️ REPLACES TestBootstrap_ReusesLoad_RejectsLayeredRuntime. Its fixture
+	// (name: static_layer + static_layer: {}) is exactly the arm phase 77
+	// legalizes, so the old test would have died at t.Fatal.
 	yaml := sampleValidBootstrap + `
 layered_runtime:
   layers:
     - name: static_layer
       static_layer: {}
 `
+	if err := Bootstrap(strings.NewReader(yaml), t.TempDir(), false); err != nil {
+		t.Fatalf("Bootstrap: got %v, want nil for a static_layer bootstrap", err)
+	}
+}
+
+func TestBootstrap_ReusesLoad_RejectsRtdsLayer(t *testing.T) {
+	// The public-package sibling of the roster. rtds_layer is chosen because it
+	// is the arm whose silent acceptance would be WORST — a config asking for
+	// DYNAMIC runtime served STATIC values.
+	// ⚠️ This asserts the "bootstrap: " prefix, which NEITHER pre-existing
+	// validate/ reject test did (R9).
+	yaml := sampleValidBootstrap + `
+layered_runtime:
+  layers:
+    - name: L1
+      rtds_layer: {name: rtds, rtds_config: {resource_api_version: V3}}
+`
 	err := Bootstrap(strings.NewReader(yaml), t.TempDir(), false)
 	if err == nil {
-		t.Fatal("Bootstrap: want error for layered_runtime, got nil")
+		t.Fatal("Bootstrap: want error for rtds_layer, got nil")
 	}
-	if !strings.Contains(err.Error(), "layered_runtime") {
-		t.Errorf("error should name layered_runtime: %q", err.Error())
+	if !strings.HasPrefix(err.Error(), "bootstrap: ") {
+		t.Errorf("error prefix: got %q, want to start with %q", err.Error(), "bootstrap: ")
+	}
+	if !strings.Contains(err.Error(), "rtds_layer") {
+		t.Errorf("error should name rtds_layer: %q", err.Error())
 	}
 }
 

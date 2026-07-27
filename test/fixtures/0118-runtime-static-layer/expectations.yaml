@@ -1,0 +1,216 @@
+# Phase 77 fixture 0118-runtime-static-layer expectations.
+#
+# ⚠️ ADR-0019: THIS FILE IS 100% COMMENT PROSE AND IS READ BY ZERO GO CODE. The
+# DRIVER is the enforcer — every proposition below is asserted by
+# driver/driver.go's AssertStats. It is kept for consistency with the other 119
+# fixtures. DO NOT ENCODE BEHAVIOR HERE: nothing in this file can fail.
+#
+# ============================================================================
+# WHAT THIS ROW PINS
+# ============================================================================
+#
+# The phase-77 `layered_runtime` STATIC LAYER consumer, cross-side, asserted
+# STATS ONLY on two gauges scraped from the FLAT /stats endpoint:
+#
+#     runtime.num_keys:   6      # the UNION of the two layers' key sets
+#     runtime.num_layers: 2      # L1 + L2, the DECLARED layer count
+#
+# Both sides must publish BOTH names and BOTH values. The reference numbers are
+# MEASURED, not extrapolated: the exact shipped `layered_runtime` block was
+# booted on the pinned reference image with a FRESH CONTAINER PER ARM and THREE
+# RUNS PER ARM. The combined config read 6 / 2 on all three runs; the four
+# isolation arms contributed 1 / 2 / 1 / 2 and summed EXACTLY to the combined
+# total, so no arm's contribution is mis-attributed and there is no cross-arm
+# interaction. A single-key positive control (1 / 1) and a
+# no-`layered_runtime` baseline (0 / 0) bracket the readout, so a stuck-red AND
+# a stuck-constant gauge would both have been visible.
+#
+# ============================================================================
+# ⚠️ FINDING — envoy-go's /stats/prometheus SILENTLY OMITS BOTH GAUGES
+# ============================================================================
+#
+# The phase-77 PLAN §1.3 specified /stats/prometheus as the assertion endpoint,
+# on the strength of the REFERENCE's measured line shape. EXECUTED at Task 7,
+# against the shipped config, on both sides:
+#
+#   side       endpoint            result
+#   reference  /stats              runtime.num_keys: 6   runtime.num_layers: 2
+#   reference  /stats/prometheus   envoy_runtime_num_keys{} 6 / ...num_layers{} 2
+#   subject    /stats              runtime.num_keys: 6   runtime.num_layers: 2
+#   subject    /stats/prometheus   *** BOTH NAMES ABSENT ***
+#
+# The gauges ARE registered on the subject and DO carry the correct values. The
+# PROMETHEUS RENDERER drops them: internal/stats.ExtractTags recognizes only the
+# top-level segments cluster./http./listener./server. (plus the hoisting
+# prefixes rbac./mongo./redis./thrift./...) and returns
+#   stats: name "runtime.num_keys" has no recognized top-level segment
+# for anything else — and internal/stats.WriteProm's Walk callback SILENTLY
+# SKIPS a metric whose flattenToProm errors ("skip malformed names
+# (defense-in-depth; should not occur)"). Nothing logs, nothing errors.
+# `runtime.` was never added to that dispatch when the gauges landed.
+#
+# Consequences, both acted on by the driver:
+#   1. THE VALUE ASSERTIONS READ THE FLAT /stats ENDPOINT. Sound cross-side HERE
+#      specifically because the two names carry NO address and NO dynamic
+#      segment, so the internal name is cross-side IDENTICAL — the hazard behind
+#      reference_listener_stat_scope_cross_side_divergence (which forces
+#      listener stats through /stats/prometheus, where the address is a LABEL)
+#      does not arise. Asserting /stats/prometheus as the PLAN specified would
+#      have left this row PERMANENTLY RED for a reason unrelated to
+#      layered_runtime.
+#   2. THE DEPARTURE ITSELF IS PINNED, SYMMETRICALLY, by
+#      assertPrometheusExpositionDeparture — prose alone would not hold it. The
+#      REFERENCE must keep publishing both prometheus names (nothing else would
+#      catch a regression there now); the SUBJECT must still be missing both.
+#      ⚠️ THE DAY internal/stats LEARNS A `runtime.` SEGMENT, THIS ROW GOES RED
+#      ON PURPOSE — the signal to move the value assertions back onto
+#      /stats/prometheus and delete that function.
+#
+# The fix — teaching ExtractTags a `runtime.` passthrough — is a change to a
+# shared, byte-gated component with its own name-mapping tests and is NOT part
+# of this fixture's scope.
+#
+# REFERENCE prometheus line shape — NO labels, each sample preceded by its own
+# # TYPE line (this is what the departure pin asserts on the reference side):
+#     # TYPE envoy_runtime_num_keys gauge
+#     envoy_runtime_num_keys{} 6
+#     # TYPE envoy_runtime_num_layers gauge
+#     envoy_runtime_num_layers{} 2
+# ⚠️ A hand-rolled `grep -c` on either name returns 2 per scrape because of the
+# `# TYPE` line. scrapeProm skips `#` lines, so that bites only a shell gate.
+#
+# ============================================================================
+# THE FOUR ARMS, AND WHAT EACH DISCRIMINATES
+# ============================================================================
+#
+#   Arm A — `ov.key`, declared in BOTH L1 ("from_L1") and L2 ("from_L2").
+#           Contributes 1 key.
+#           DISCRIMINATES: the UNION from the per-layer SUM. An implementation
+#           that ADDS per-layer key counts instead of unioning them reads 7.
+#           It also pins that a literal '.' inside a field NAME is NOT re-split
+#           by either side — `ov.key` is ONE key whose name contains a dot.
+#
+#   Arm B — `nest: {mid: {leaf1: 1, leaf2: 2}}`. Contributes 2 keys.
+#           DISCRIMINATES: unbounded-depth leaf flattening — descend until a
+#           scalar, joining path segments with '.' -> `nest.mid.leaf1`,
+#           `nest.mid.leaf2`.
+#
+#   Arm C — `frac: {numerator: 25, foo: 2, bar: 3}`. Contributes 1 key.
+#           DISCRIMINATES: the LEXICAL termination rule. A SINGLE lowercase
+#           `numerator` beside two UNRELATED siblings. An implementation
+#           matching the {numerator, denominator} PAIR recurses here and yields
+#           3; the real rule terminates and yields 1. Spelling the full pair
+#           would pass against BOTH implementations and discriminate NOTHING.
+#           The rule is: `numerator` OR `denominator`, lowercase, exact,
+#           case-SENSITIVE, either ALONE, at any depth, and the VALUES ARE
+#           NEVER INSPECTED — a FractionalPercent parse or validation here
+#           would REJECT configs the reference ACCEPTS.
+#
+#   Arm D — `emp: {e1: {}, e2: {}}`. Contributes 2 keys.
+#           DISCRIMINATES: the SECOND termination branch. An EMPTY Struct is a
+#           COUNTED LEAF, not zero keys — this yields `emp.e1` and `emp.e2`,
+#           i.e. 2, NOT 0. No document before the phase-77 SPEC recorded this
+#           branch, and the inherited three-arm pin set could not have detected
+#           its absence.
+#
+#   1 + 2 + 1 + 2 = 6 distinct keys across 2 declared layers.
+#
+# ============================================================================
+# ⚠️ THE L1/L2 `ov.key` OVERLAP IS LOAD-BEARING
+# ============================================================================
+#
+# Remove L2's re-declaration and every key becomes unique, so the per-layer SUM
+# equals the UNION. Arm A then goes VACUOUS WHILE STILL PASSING: a build that
+# adds per-layer counts reads 6 and this fixture stays GREEN. The overlap is the
+# ONLY thing in the config that separates the two semantics. Do not "simplify"
+# it away.
+#
+# ============================================================================
+# ⚠️ THIS ROW REJECTS THREE SIBLING oneof ARMS THE REFERENCE ACCEPTS
+# ============================================================================
+#
+# `layered_runtime.layers[].layer_specifier` is a four-arm oneof. On the pinned
+# reference image, disk_layer, admin_layer and rtds_layer ALL unmarshal AND BOOT
+# CLEANLY. envoy-go accepts `static_layer` ONLY and rejects the other three with
+# byte-stable "bootstrap: ..." messages.
+#
+#   arm            reference        envoy-go
+#   static_layer   boots            ACCEPTED   <- the only arm this fixture uses
+#   disk_layer     BOOTS CLEANLY    rejected
+#   admin_layer    BOOTS CLEANLY    rejected
+#   rtds_layer     BOOTS CLEANLY    rejected
+#
+# ⚠️ These are DEPARTURES, NOT PARITY. The earlier reject roster's founding
+# premise — that the reference also refused these arms — was REFUTED by probe.
+# They are rejected as a deliberate scope decision (row 77 ships no disk, admin
+# or RTDS runtime layer). The roster also rejects an empty `layers` list, an
+# empty layer `name`, a duplicate layer name, an unset `layer_specifier`, and
+# list- or null-valued static-layer leaves. This fixture exercises ONLY the
+# accepted arm; the nine reject arms are pinned at the unit level in
+# internal/bootstrap.
+#
+# ============================================================================
+# ⚠️ STATS ONLY — the /runtime admin BODY is not comparable
+# ============================================================================
+#
+# ProbeAdmin returns /ready ONLY. The runner's compareAdminResponses compares
+# the body BYTE-EXACT, and the reference's /runtime body fails that in four
+# independent ways, all measured on the pinned image:
+#   1. the JSON key order is randomized PER REQUEST;
+#   2. the Struct debug-string marker is randomized PER PROCESS — 8 distinct
+#      strings across 13 fresh processes;
+#   3. an empty-map value renders as a leaked, non-deterministic DebugString and
+#      STILL counts as a key;
+#   4. the WITHIN-LAYER collision winner is non-deterministic (~40/60 over 18
+#      fresh processes), so any fixture asserting a final_value is unrunnable.
+# All four contaminate the BODY only; the two gauges are immune.
+#
+# ============================================================================
+# ⚠️ NO PRECONDITION IS AVAILABLE FROM THE OTHER runtime.* NAMES
+# ============================================================================
+#
+# runtime.load_success and runtime.override_dir_not_exists BOTH read 1 on the
+# reference even with NO `layered_runtime` block at all, so NEITHER is a "a
+# static layer actually loaded" guard. A diff of the no-block baseline against
+# the combined config over the whole envoy_runtime_* block shows ONLY the two
+# gauge lines differ. The driver's honest substitute is the SEPARATE ABSENT
+# CHECK — which `continue`s, so a gauge that failed to REGISTER cannot pass
+# vacuously as 0 == 0 through a single-value lookup — plus num_layers == 2.
+#
+# ============================================================================
+# ⚠️ envoy-go PUBLISHES 2 runtime.* NAMES; THE REFERENCE PUBLISHES 9
+# ============================================================================
+#
+# Measured on the pinned image: admin_overrides_active,
+# deprecated_feature_seen_since_process_start, deprecated_feature_use,
+# load_error, load_success, num_keys, num_layers, override_dir_exists,
+# override_dir_not_exists. envoy-go publishes num_keys and num_layers only.
+#
+# The project asserts NAMED SUBSETS cross-side, never full-set equality
+# (reference_stats_sink_emits_used_only), so the asymmetry creates no divergence
+# here. A future row asserting full runtime.* name-set equality WILL fail, and
+# correctly so.
+#
+# ============================================================================
+# TOPOLOGY
+# ============================================================================
+#
+#   l_test  — one plaintext TCP listener front-ending one TCP echo backend via
+#             tcp_proxy. DriveReference/DriveSubject open and immediately close
+#             ONE connection, so CompareBytes has a defined (empty) result on
+#             both sides and the listener is proved BOUND. No request semantics
+#             are driven; the whole observable is the gauge pair.
+#   c_echo  — the runner-owned host-side TCP echo backend. STRICT_DNS at
+#             host.docker.internal on the reference (ADR-0010), STATIC at
+#             127.0.0.1 on the subject (ADR-0002).
+#
+#   BackendCount() is 1 because the runner t.Fatalf's on 0
+#   (reference_differential_backendcount_min_one), NOT because any byte flows
+#   through it. Default TCPEcho kind => +0 BackendKinds.
+#
+# ⚠️ SMALL INTEGERS AND SHORT STRINGS ONLY in the static layer. The reference
+# renders in-int32-range integers through a 6-significant-digit %g (2147483647
+# -> 2.14748e+09; 1000000 and 1000001 BOTH -> 1e+06), out-of-int32 integers and
+# all floats verbatim, and its YAML and JSON front-ends DISAGREE (4.0 -> "4.0"
+# vs "4"). This fixture asserts no VALUES — but large or float literals would
+# make any future value assertion unreproducible.

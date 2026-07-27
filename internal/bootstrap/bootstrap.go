@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -176,9 +177,11 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	structpb "google.golang.org/protobuf/types/known/structpb"
 	"gopkg.in/yaml.v3"
 
 	"github.com/pgdad/envoy-go/internal/accesslog"
+	"github.com/pgdad/envoy-go/internal/runtime"
 	"github.com/pgdad/envoy-go/internal/stats"
 )
 
@@ -540,13 +543,92 @@ type Bootstrap struct {
 	// handler reads this for the command_line_options.config_path field.
 	// Test code that does not exercise /server_info may leave this field empty.
 	ConfigPath string
+	// Runtime is the flattened, precedence-collapsed static-layer key space
+	// parsed from layered_runtime (phase 77, ADR-0299). Non-nil for EVERY
+	// successfully-loaded bootstrap, including one with no layered_runtime
+	// block at all — in that case it is a zero Snapshot (0 keys, 0 layers), so
+	// the two gauges register and publish 0 unconditionally, matching the
+	// reference, which emits both names at 0 in the absent arm (measured).
+	Runtime *runtime.Snapshot
 }
+
+// -----------------------------------------------------------------------------
+// PARSE-REJECT byte-stable wordings for the phase-77 layered_runtime arms
+// (SPEC §6 + ADR-0299). Pinned byte-exact at bootstrap_test.go::
+// TestParseRejectConstants_ByteStable, whose roster-size guard makes a silent
+// deletion fail. Every prefix is "bootstrap: " per the Load doc contract.
+//
+// ⚠️ SCOPE: this block is the FIRST named-reject-constant discipline in
+// internal/bootstrap. The package's other 47 inline fmt.Errorf("bootstrap: …")
+// arms are NOT converted by this row.
+//
+// ⚠️ Arms 1, 2, 3 and 9 are envoy-go DEPARTURES: the reference ACCEPTS those
+// configs (measured against contrib-v1.37.2, phase-77 SPEC §1.1 / §3.2).
+// -----------------------------------------------------------------------------
+const (
+	// Arm 1: layers[].disk_layer set. DEPARTURE — the reference accepts it and
+	// loads keys from the directory.
+	parseRejectDiskLayer = "bootstrap: layered_runtime.layers.disk_layer is not supported; use layered_runtime.layers.static_layer"
+
+	// Arm 2: layers[].admin_layer set. DEPARTURE — the reference accepts it.
+	// envoy-go ships no POST /runtime_modify, so the layer could never gain a key.
+	parseRejectAdminLayer = "bootstrap: layered_runtime.layers.admin_layer is not supported; use layered_runtime.layers.static_layer"
+
+	// Arm 3: layers[].rtds_layer set. DEPARTURE, and the most important of the
+	// three: silently ignoring it means a config asking for DYNAMIC runtime
+	// quietly gets STATIC values — a wrong answer rather than a loud failure.
+	parseRejectRtdsLayer = "bootstrap: layered_runtime.layers.rtds_layer is not supported; use layered_runtime.layers.static_layer"
+
+	// Arm 4: layers[].layer_specifier unset. Parity (the reference rejects via
+	// PGV). ⚠️ GetLayerSpecifier() returns a nil INTERFACE, so a bare type
+	// switch takes `default`; parseLayeredRuntime uses an explicit `case nil`.
+	parseRejectLayerSpecifierUnset = "bootstrap: layered_runtime.layers.layer_specifier is required"
+
+	// Arm 5: layers[].name empty. Parity (PGV: value length must be >= 1).
+	parseRejectLayerNameEmpty = "bootstrap: layered_runtime.layers.name is required"
+
+	// Arm 6: two layers with the same name. Parity — but the reference's check
+	// is a HAND-WRITTEN loader check, not PGV ("Duplicate layer name: L1").
+	// protojson accepts duplicates and retains both layers (EXECUTED).
+	parseRejectDuplicateLayerName = "bootstrap: layered_runtime.layers.name %q is duplicated"
+
+	// Arm 7: a static_layer value that is a LIST. Parity — the reference's
+	// loader rejects with "Invalid runtime entry value for <key>".
+	parseRejectStaticLayerValueList = "bootstrap: layered_runtime.layers.static_layer: value for key %q is a list; runtime values must be scalar or a nested map"
+
+	// Arm 8: a static_layer value that is NULL (null / ~ / bare-empty — one
+	// case). Parity. ⚠️ The *structpb.Value is NON-NIL with kind
+	// *structpb.Value_NullValue; a `v == nil` guard never fires.
+	parseRejectStaticLayerValueNull = "bootstrap: layered_runtime.layers.static_layer: value for key %q is null; runtime values must be scalar or a nested map"
+
+	// Arm 9: layered_runtime present with ZERO declared layers. DEPARTURE.
+	// The reference synthesizes a genuinely writable admin layer (num_keys
+	// 0 -> 1 -> 3 across two runtime_modify writes, measured). envoy-go
+	// rejects the EXPLICIT admin_layer at arm 2; accepting the IMPLICIT form
+	// would be incoherent, and reporting num_layers: 1 for a layer that can
+	// never gain a key would be a false stat.
+	// ⚠️ `layered_runtime: {}` and `layered_runtime: {layers: []}` are
+	// INDISTINGUISHABLE after unmarshal (EXECUTED), so one predicate covers both.
+	parseRejectLayeredRuntimeNoLayers = "bootstrap: layered_runtime.layers is empty; zero declared layers requests an implicit admin layer, which is not supported; use layered_runtime.layers with a static_layer"
+)
+
+// The two phase-77 runtime gauges. ⚠️ Both are BOOT-FIXED where the reference's
+// are LIVE (its num_keys moves under POST /runtime_modify); row 77 ships no
+// write path, so on a boot-only comparison the two agree. Both pass
+// stats.NamePattern — EXECUTED with negative controls ("runtime." and
+// "runtime.num-keys" are both rejected by stats.IsValidName).
+const (
+	runtimeNumKeysStat   = "runtime.num_keys"
+	runtimeNumLayersStat = "runtime.num_layers"
+)
 
 // Load parses r as YAML (upstream Envoy's YAML shape), converts to JSON, and
 // unmarshals into an Envoy v3 Bootstrap proto. Unknown fields at any depth
-// cause an error (ADR-0016). The phase-01 unsupported surfaces
-// dynamic_resources and layered_runtime cause an error even though the proto
-// itself defines them. The returned *Bootstrap also carries a freshly
+// cause an error (ADR-0016). The phase-01 unsupported surface
+// dynamic_resources causes an error even though the proto itself defines it;
+// layered_runtime is accepted for its static_layer arm only (phase 77,
+// ADR-0299) and rejected arm-by-arm otherwise. The returned *Bootstrap also
+// carries a freshly
 // allocated, non-Frozen *stats.Registry on its `Stats` field (SPEC §12 #2).
 //
 // Every error returned by Load begins with "bootstrap: ".
@@ -565,9 +647,6 @@ func Load(r io.Reader) (*Bootstrap, error) {
 	if _, ok := generic["dynamic_resources"]; ok {
 		return nil, fmt.Errorf("bootstrap: dynamic_resources not supported in phase 01 (see SPEC §2)")
 	}
-	if _, ok := generic["layered_runtime"]; ok {
-		return nil, fmt.Errorf("bootstrap: layered_runtime not supported in phase 01 (see SPEC §2)")
-	}
 	jsonBytes, err := json.Marshal(generic)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: to json: %w", err)
@@ -584,7 +663,126 @@ func Load(r io.Reader) (*Bootstrap, error) {
 	if err := parseStatsSinks(bs, result); err != nil {
 		return nil, err
 	}
+	if err := parseLayeredRuntime(bs, result); err != nil {
+		return nil, err
+	}
 	return result, nil
+}
+
+// parseLayeredRuntime walks bootstrap.layered_runtime, rejects every arm the
+// nine-constant roster covers, and builds result.Runtime from the accepted
+// static layers. It is called UNCONDITIONALLY: with no layered_runtime block
+// it stores a zero Snapshot so the two gauges publish 0, matching the
+// reference's absent arm.
+//
+// ⚠️ THE ROSTER AND THE LIFT ARE ONE CHANGE (reference_lifted_reject_hidden_
+// enforcement). The wholesale pre-check this replaced stood in front of FOUR
+// oneof arms; three of them unmarshal cleanly and would be SILENTLY ACCEPTED
+// without the switch below.
+func parseLayeredRuntime(bs *bootstrapv3.Bootstrap, result *Bootstrap) error {
+	lr := bs.GetLayeredRuntime()
+	if lr == nil {
+		result.Runtime = runtime.NewSnapshot(nil)
+		setRuntimeStats(result)
+		return nil
+	}
+	layers := lr.GetLayers()
+	if len(layers) == 0 {
+		// Arm 9. Covers BOTH `layered_runtime: {}` and `layers: []` — they are
+		// indistinguishable after unmarshal (EXECUTED).
+		return errors.New(parseRejectLayeredRuntimeNoLayers)
+	}
+
+	seenNames := make(map[string]struct{}, len(layers))
+	fieldMaps := make([]map[string]*structpb.Value, 0, len(layers))
+	for _, l := range layers {
+		name := l.GetName()
+		if name == "" {
+			return errors.New(parseRejectLayerNameEmpty) // Arm 5
+		}
+		if _, dup := seenNames[name]; dup {
+			return fmt.Errorf(parseRejectDuplicateLayerName, name) // Arm 6
+		}
+		seenNames[name] = struct{}{}
+
+		// ⚠️ An UNSET oneof yields a nil INTERFACE, so a bare switch takes
+		// `default` and would mislabel it (EXECUTED). `case nil` is explicit.
+		// ⚠️ The wrapper type names are ASYMMETRIC: StaticLayer has no trailing
+		// underscore; the other three DO. The un-suffixed forms are the nested
+		// MESSAGE types, so getting this wrong is an "impossible type switch
+		// case" compile error, not a silent miss.
+		switch spec := l.GetLayerSpecifier().(type) {
+		case nil:
+			return errors.New(parseRejectLayerSpecifierUnset) // Arm 4
+		case *bootstrapv3.RuntimeLayer_StaticLayer:
+			fields := spec.StaticLayer.GetFields()
+			if err := checkStaticLayerValues(fields); err != nil {
+				return err // Arms 7, 8
+			}
+			fieldMaps = append(fieldMaps, fields)
+		case *bootstrapv3.RuntimeLayer_DiskLayer_:
+			return errors.New(parseRejectDiskLayer) // Arm 1
+		case *bootstrapv3.RuntimeLayer_AdminLayer_:
+			return errors.New(parseRejectAdminLayer) // Arm 2
+		case *bootstrapv3.RuntimeLayer_RtdsLayer_:
+			return errors.New(parseRejectRtdsLayer) // Arm 3
+		default:
+			return errors.New(parseRejectLayerSpecifierUnset)
+		}
+	}
+	result.Runtime = runtime.NewSnapshot(fieldMaps)
+	setRuntimeStats(result)
+	return nil
+}
+
+// setRuntimeStats registers and publishes the two runtime gauges. It is called
+// from BOTH of parseLayeredRuntime's success returns — the accept path and the
+// `lr == nil` early return — so the names are present UNCONDITIONALLY and a
+// name-set assertion does not depend on the config.
+//
+// ⚠️ Deliberately NOT a `defer`: a defer would also fire on the nine reject
+// paths, registering gauges on a bootstrap that is about to be discarded and
+// making the name-set assertion depend on reject ordering.
+//
+// Registration is pre-Freeze and Load allocates a FRESH stats.NewRegistry()
+// per call, so no two Load calls share a registry and double-registration is
+// impossible by construction; bs.Stats.Freeze() happens later, in
+// cmd/envoy-go/main.go.
+func setRuntimeStats(result *Bootstrap) {
+	result.Stats.NewGauge(runtimeNumKeysStat).Set(int64(result.Runtime.NumKeys()))
+	result.Stats.NewGauge(runtimeNumLayersStat).Set(int64(result.Runtime.NumLayers()))
+}
+
+// checkStaticLayerValues rejects list and null leaf values at any depth (arms
+// 7 and 8). The reference's loader rejects both with "Invalid runtime entry
+// value for <key>"; the wording is not comparable cross-side (its debug marker
+// rotates per process), so envoy-go pins its own.
+//
+// ⚠️ Recursion here mirrors flatten's TERMINATION rules exactly: a Struct that
+// terminates flattening is a LEAF and its interior is never inspected, because
+// the reference performs ZERO validation there — {numerator: "notanumber",
+// denominator: NOTANENUM} boots cleanly. Validating inside a terminated struct
+// would REJECT configs the reference ACCEPTS.
+func checkStaticLayerValues(fields map[string]*structpb.Value) error {
+	if _, ok := fields["numerator"]; ok {
+		return nil
+	}
+	if _, ok := fields["denominator"]; ok {
+		return nil
+	}
+	for name, v := range fields {
+		switch kind := v.GetKind().(type) {
+		case *structpb.Value_ListValue:
+			return fmt.Errorf(parseRejectStaticLayerValueList, name)
+		case *structpb.Value_NullValue:
+			return fmt.Errorf(parseRejectStaticLayerValueNull, name)
+		case *structpb.Value_StructValue:
+			if err := checkStaticLayerValues(kind.StructValue.GetFields()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // parseStatsSinks reads the top-level stats_flush_interval (default 5s) and the

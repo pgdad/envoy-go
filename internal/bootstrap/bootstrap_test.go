@@ -2,11 +2,14 @@ package bootstrap
 
 import (
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"google.golang.org/protobuf/encoding/protojson"
+
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 const sampleBootstrap = `
@@ -79,19 +82,155 @@ dynamic_resources:
 	}
 }
 
-func TestLoad_RejectsLayeredRuntime(t *testing.T) {
+// TestLoad_AcceptsStaticLayer is the phase-77 lift. Before this row Load
+// rejected any bootstrap containing the key layered_runtime; it now accepts
+// the static_layer arm and builds a Snapshot.
+//
+// ⚠️ This REPLACES TestLoad_RejectsLayeredRuntime, whose fixture (name:
+// static_layer + static_layer: {}) is exactly the arm being legalized.
+func TestLoad_AcceptsStaticLayer(t *testing.T) {
 	yaml := sampleBootstrap + `
 layered_runtime:
   layers:
     - name: static_layer
       static_layer: {}
 `
-	_, err := Load(strings.NewReader(yaml))
-	if err == nil {
-		t.Fatal("Load: want error for layered_runtime, got nil")
+	bs, err := Load(strings.NewReader(yaml))
+	if err != nil {
+		t.Fatalf("Load: want nil error for a static_layer bootstrap, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "layered_runtime") {
-		t.Errorf("error should name layered_runtime: %q", err.Error())
+	if bs.Runtime == nil {
+		t.Fatal("Load: Runtime snapshot is nil for a static_layer bootstrap")
+	}
+	if got := bs.Runtime.NumLayers(); got != 1 {
+		t.Errorf("NumLayers() = %d, want 1", got)
+	}
+	// An EMPTY static_layer declares a layer with no keys. flatten emits the
+	// degenerate empty-root key; NewSnapshot drops it. So 0, not 1.
+	if got := bs.Runtime.NumKeys(); got != 0 {
+		t.Errorf("NumKeys() = %d, want 0 (an empty static_layer has no keys)", got)
+	}
+}
+
+func TestLoad_AcceptsStaticLayer_Populated(t *testing.T) {
+	// The four-arm shape fixture 0118 ships. Reference-measured 6 / 2.
+	yaml := sampleBootstrap + `
+layered_runtime:
+  layers:
+    - name: L1
+      static_layer:
+        ov.key: "from_L1"
+        nest: {mid: {leaf1: 1, leaf2: 2}}
+        frac: {numerator: 25, foo: 2, bar: 3}
+        emp: {e1: {}, e2: {}}
+    - name: L2
+      static_layer:
+        ov.key: "from_L2"
+`
+	bs, err := Load(strings.NewReader(yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := bs.Runtime.NumLayers(); got != 2 {
+		t.Errorf("NumLayers() = %d, want 2", got)
+	}
+	if got := bs.Runtime.NumKeys(); got != 6 {
+		t.Errorf("NumKeys() = %d, want 6 (reference-measured over 3 fresh boots)", got)
+	}
+}
+
+// TestLoad_LayeredRuntimeRejectArms covers all NINE arms of the roster. Each
+// arm asserts the "bootstrap: " prefix AND a naming substring — the asymmetry
+// R9 found (only one of the four pre-existing guards checked the prefix) is
+// closed here for every new arm.
+//
+// ⚠️ Substring matching only, never == on the whole message: envoy-go's own
+// protojson error carries a `line L:C` derived from the MARSHALED JSON, whose
+// keys json.Marshal SORTS, so that column shifts whenever any other key in the
+// document changes (measured: 1:32 / 1:21 / 1:74 / 1:2 for the same unknown key).
+func TestLoad_LayeredRuntimeRejectArms(t *testing.T) {
+	cases := []struct {
+		name     string
+		tail     string
+		contains string
+	}{
+		{"Arm01_DiskLayer", `
+layered_runtime:
+  layers:
+    - name: L1
+      disk_layer: {symlink_root: /srv/runtime, subdirectory: current}
+`, "disk_layer"},
+		{"Arm02_AdminLayer", `
+layered_runtime:
+  layers:
+    - name: L1
+      admin_layer: {}
+`, "admin_layer"},
+		{"Arm03_RtdsLayer", `
+layered_runtime:
+  layers:
+    - name: L1
+      rtds_layer: {name: rtds, rtds_config: {resource_api_version: V3}}
+`, "rtds_layer"},
+		{"Arm04_LayerSpecifierUnset", `
+layered_runtime:
+  layers:
+    - name: L1
+`, "layer_specifier"},
+		{"Arm05_LayerNameEmpty", `
+layered_runtime:
+  layers:
+    - name: ""
+      static_layer: {k: 1}
+`, "name"},
+		{"Arm06_DuplicateLayerName", `
+layered_runtime:
+  layers:
+    - name: L1
+      static_layer: {a: 1}
+    - name: L1
+      static_layer: {b: 2}
+`, "duplicated"},
+		{"Arm07_ValueIsList", `
+layered_runtime:
+  layers:
+    - name: L1
+      static_layer: {k.list: [1, 2, 3]}
+`, "is a list"},
+		{"Arm08_ValueIsNull", `
+layered_runtime:
+  layers:
+    - name: L1
+      static_layer: {k.null: null}
+`, "is null"},
+		// Arm 9 has TWO spellings that are indistinguishable after unmarshal.
+		// Both must reject; both are listed so a predicate that only covers one
+		// is caught.
+		{"Arm09_NoLayersField", `
+layered_runtime: {}
+`, "is empty"},
+		{"Arm09b_EmptyLayersList", `
+layered_runtime:
+  layers: []
+`, "is empty"},
+	}
+	if len(cases) != 10 {
+		t.Fatalf("reject-arm roster: expected 10 rows (9 arms, arm 9 spelled twice); got %d", len(cases))
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(strings.NewReader(sampleBootstrap + tc.tail))
+			if err == nil {
+				t.Fatalf("%s: Load returned nil error; want a reject", tc.name)
+			}
+			if !strings.HasPrefix(err.Error(), "bootstrap: ") {
+				t.Errorf("%s: error prefix: got %q, want to start with %q", tc.name, err.Error(), "bootstrap: ")
+			}
+			if !strings.Contains(err.Error(), tc.contains) {
+				t.Errorf("%s: error should contain %q: %q", tc.name, tc.contains, err.Error())
+			}
+		})
 	}
 }
 
@@ -3127,6 +3266,255 @@ func TestGraphiteStatsdSink_Rejects(t *testing.T) {
 				if !strings.Contains(err.Error(), sub) {
 					t.Errorf("error should contain %q: %q", sub, err.Error())
 				}
+			}
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// TestParseRejectConstants_ByteStable pins the byte-exact wording for each of
+// the NINE phase-77 layered_runtime PARSE-REJECT arms (SPEC §6).
+// Any drift requires a lockstep SPEC §6 + ADR-0299 edit per the ADR-0044
+// atomic-edit discipline.
+//
+// ⚠️ THREE OF THE NINE ARE DELIBERATE DEPARTURES, not parity: the reference
+// ACCEPTS disk_layer, admin_layer and rtds_layer (measured, phase-77 SPEC
+// §1.1). They are rejected because silently ignoring rtds_layer means a config
+// asking for DYNAMIC runtime quietly gets STATIC values.
+//
+// ⚠️ NO CROSS-SIDE WORDING ASSERTION IS POSSIBLE OR ATTEMPTED. The reference's
+// PGV messages carry a proto DebugString whose redaction marker ROTATES across
+// process starts (8 distinct strings measured in 13 fresh processes at the
+// phase-77 PLAN), and its unknown-field message varies in whitespace AND in its
+// near-L:C offsets across runs of the SAME file. envoy-go pins its OWN wording
+// internally and never compares wording cross-side.
+// -----------------------------------------------------------------------------
+func TestParseRejectConstants_ByteStable(t *testing.T) {
+	cases := []struct {
+		name string
+		got  string
+		want string
+	}{
+		// Arms 1-3: the sibling oneof arms. DEPARTURES — the reference accepts these.
+		{"Arm01_DiskLayer", parseRejectDiskLayer,
+			"bootstrap: layered_runtime.layers.disk_layer is not supported; use layered_runtime.layers.static_layer"},
+		{"Arm02_AdminLayer", parseRejectAdminLayer,
+			"bootstrap: layered_runtime.layers.admin_layer is not supported; use layered_runtime.layers.static_layer"},
+		{"Arm03_RtdsLayer", parseRejectRtdsLayer,
+			"bootstrap: layered_runtime.layers.rtds_layer is not supported; use layered_runtime.layers.static_layer"},
+		// Arms 4-6: parity. The reference rejects these too (4-5 via PGV, 6 via a
+		// hand-written loader check).
+		{"Arm04_LayerSpecifierUnset", parseRejectLayerSpecifierUnset,
+			"bootstrap: layered_runtime.layers.layer_specifier is required"},
+		{"Arm05_LayerNameEmpty", parseRejectLayerNameEmpty,
+			"bootstrap: layered_runtime.layers.name is required"},
+		{"Arm06_DuplicateLayerName", parseRejectDuplicateLayerName,
+			"bootstrap: layered_runtime.layers.name %q is duplicated"},
+		// Arms 7-8: parity. The reference's loader rejects both with
+		// "Invalid runtime entry value for <key>".
+		{"Arm07_StaticLayerValueList", parseRejectStaticLayerValueList,
+			"bootstrap: layered_runtime.layers.static_layer: value for key %q is a list; runtime values must be scalar or a nested map"},
+		{"Arm08_StaticLayerValueNull", parseRejectStaticLayerValueNull,
+			"bootstrap: layered_runtime.layers.static_layer: value for key %q is null; runtime values must be scalar or a nested map"},
+		// Arm 9: DEPARTURE. The reference ACCEPTS this and synthesizes a
+		// writable admin layer; envoy-go ships no write path, so a gauge
+		// counting an unreachable layer would be a false stat.
+		{"Arm09_NoLayers", parseRejectLayeredRuntimeNoLayers,
+			"bootstrap: layered_runtime.layers is empty; zero declared layers requests an implicit admin layer, which is not supported; use layered_runtime.layers with a static_layer"},
+	}
+
+	// Roster size: 9. The TENTH candidate arm (more than one admin_layer) is
+	// DROPPED AS UNREACHABLE — envoy-go rejects admin_layer outright at arm 2,
+	// so a second one can never be reached and the row would be untestable.
+	// ⚠️ This guard is the wasm variant (compiled_config_test.go:159-161);
+	// admission_control has none, so deleting a row there is silent.
+	if len(cases) != 9 {
+		t.Fatalf("TestParseRejectConstants_ByteStable: expected 9 rows (10 candidate arms − 1 DROPPED as unreachable); got %d", len(cases))
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Fatalf("%s = %q; want %q", tc.name, tc.got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseRejectConstants_AllCarryPrefix is the invariant Load's doc comment
+// states and that only ONE of the four pre-existing reject tests checked.
+func TestParseRejectConstants_AllCarryPrefix(t *testing.T) {
+	all := []string{
+		parseRejectDiskLayer, parseRejectAdminLayer, parseRejectRtdsLayer,
+		parseRejectLayerSpecifierUnset, parseRejectLayerNameEmpty,
+		parseRejectDuplicateLayerName, parseRejectStaticLayerValueList,
+		parseRejectStaticLayerValueNull, parseRejectLayeredRuntimeNoLayers,
+	}
+	if len(all) != 9 {
+		t.Fatalf("prefix roster: expected 9 constants, got %d", len(all))
+	}
+	for _, s := range all {
+		if !strings.HasPrefix(s, "bootstrap: ") {
+			t.Errorf("reject constant lacks the %q prefix: %q", "bootstrap: ", s)
+		}
+	}
+}
+
+// registeredStatNames walks r and returns every registered metric name, sorted.
+// ⚠️ (*stats.Registry) has NO Names() method — Walk is the only introspection
+// seam (re-confirmed at the phase-77 PLAN: `grep -rn '\.Names()'` ⇒ zero hits).
+func registeredStatNames(r *stats.Registry) []string {
+	var out []string
+	r.Walk(func(m stats.Metric) { out = append(out, m.Name()) })
+	sort.Strings(out)
+	return out
+}
+
+// containsName reports whether the sorted name slice carries n.
+func containsName(names []string, n string) bool {
+	for _, s := range names {
+		if s == n {
+			return true
+		}
+	}
+	return false
+}
+
+// gaugeValueByName walks r for a metric named n, type-asserts it to
+// *stats.Gauge and returns its current value. The second return distinguishes
+// "registered and zero" from "never registered" — without it the `absent` row
+// of TestStatDelta_GaugeValues would pass vacuously on 0 == 0.
+func gaugeValueByName(r *stats.Registry, n string) (int64, bool) {
+	var (
+		got int64
+		ok  bool
+	)
+	r.Walk(func(m stats.Metric) {
+		if m.Name() != n {
+			return
+		}
+		if g, isGauge := m.(*stats.Gauge); isGauge {
+			got, ok = g.Load(), true
+		}
+	})
+	return got, ok
+}
+
+// TestStatDelta_LayeredRuntimeRegistersExactlyTwo pins the phase-77 stat
+// envelope: EXACTLY two new names, and EXACTLY these two.
+//
+// ⚠️ ASSERT THE DELTA, NEVER THE TOTAL. BEHAVIOR_CONTRACT's ledger chain has
+// TWO discontinuities (1198→1200, documented only in prose; and 1200→1201,
+// documented NOWHERE), so the absolute 1205 → 1207 rides an unaudited gap. The
+// +2 is what this row can prove.
+//
+// ⚠️ ASSERT THE NAME SET, NEVER THE COUNT. A count-only guard passes a build
+// that registers two stats with both names WRONG (EXECUTED at the phase-77
+// PLAN §1.7: `runtime.keys` / `runtime.layers` — two in, two out — PASSES).
+func TestStatDelta_LayeredRuntimeRegistersExactlyTwo(t *testing.T) {
+	base, err := Load(strings.NewReader(sampleBootstrap))
+	if err != nil {
+		t.Fatalf("Load (no layered_runtime): %v", err)
+	}
+	withLR, err := Load(strings.NewReader(sampleBootstrap + `
+layered_runtime:
+  layers:
+    - name: L1
+      static_layer: {a: 1}
+`))
+	if err != nil {
+		t.Fatalf("Load (with layered_runtime): %v", err)
+	}
+
+	// The gauges register UNCONDITIONALLY, so both registries carry them and
+	// the name sets are IDENTICAL. That is the property: presence does not
+	// depend on the config.
+	baseNames := registeredStatNames(base.Stats)
+	lrNames := registeredStatNames(withLR.Stats)
+	if len(baseNames) != len(lrNames) {
+		t.Errorf("name-set size differs with/without layered_runtime: %d vs %d", len(baseNames), len(lrNames))
+	}
+
+	want := []string{"runtime.num_keys", "runtime.num_layers"}
+	for _, n := range want {
+		if !containsName(baseNames, n) {
+			t.Errorf("%q ABSENT from a bootstrap with NO layered_runtime; the gauges must register unconditionally", n)
+		}
+		if !containsName(lrNames, n) {
+			t.Errorf("%q ABSENT from a bootstrap WITH layered_runtime", n)
+		}
+	}
+
+	// The DELTA: exactly two names beginning with "runtime.", no more.
+	var got []string
+	for _, n := range lrNames {
+		if strings.HasPrefix(n, "runtime.") {
+			got = append(got, n)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("runtime.* name set = %v (%d), want %v (%d)", got, len(got), want, len(want))
+		return
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("runtime.* name[%d] = %q, want %q (full: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// TestStatDelta_GaugeValues pins what the two gauges PUBLISH, looked up by
+// NAME so a rename is caught here too rather than reading a Go field that
+// still exists.
+func TestStatDelta_GaugeValues(t *testing.T) {
+	cases := []struct {
+		name              string
+		tail              string
+		wantKeys, wantLay int64
+	}{
+		{"absent", ``, 0, 0},
+		{"one_layer_one_key", `
+layered_runtime:
+  layers:
+    - name: L1
+      static_layer: {a: 1}
+`, 1, 1},
+		{"the_0118_shape", `
+layered_runtime:
+  layers:
+    - name: L1
+      static_layer:
+        ov.key: "from_L1"
+        nest: {mid: {leaf1: 1, leaf2: 2}}
+        frac: {numerator: 25, foo: 2, bar: 3}
+        emp: {e1: {}, e2: {}}
+    - name: L2
+      static_layer:
+        ov.key: "from_L2"
+`, 6, 2},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			bs, err := Load(strings.NewReader(sampleBootstrap + tc.tail))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			gotKeys, okKeys := gaugeValueByName(bs.Stats, "runtime.num_keys")
+			gotLay, okLay := gaugeValueByName(bs.Stats, "runtime.num_layers")
+			// ⚠️ The absent-check is SEPARATE and the value check sits in the
+			// `else`: an unregistered gauge would otherwise read 0 == 0 and
+			// pass vacuously on the `absent` row.
+			if !okKeys {
+				t.Errorf("runtime.num_keys not registered")
+			} else if gotKeys != tc.wantKeys {
+				t.Errorf("runtime.num_keys = %d, want %d", gotKeys, tc.wantKeys)
+			}
+			if !okLay {
+				t.Errorf("runtime.num_layers not registered")
+			} else if gotLay != tc.wantLay {
+				t.Errorf("runtime.num_layers = %d, want %d", gotLay, tc.wantLay)
 			}
 		})
 	}

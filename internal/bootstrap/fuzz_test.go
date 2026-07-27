@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -73,10 +74,33 @@ func FuzzBootstrapLoad(f *testing.F) {
 	// Deeply nested YAML.
 	nested := bytes.Repeat([]byte("- "), 200)
 	f.Add(nested)
+	// Phase 77: the layered_runtime static-layer arm, carrying all four
+	// flattening shapes so mutation explores the reject roster and both
+	// termination branches.
+	f.Add([]byte(sampleBootstrap + `
+layered_runtime:
+  layers:
+    - name: L1
+      static_layer:
+        ov.key: "from_L1"
+        nest: {mid: {leaf1: 1, leaf2: 2}}
+        frac: {numerator: 25, foo: 2, bar: 3}
+        emp: {e1: {}, e2: {}}
+    - name: L2
+      static_layer:
+        ov.key: "from_L2"
+`))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Load MUST NOT panic. Any input returns either (*Bootstrap, nil) or
 		// (nil, err starting with "bootstrap: ").
-		_, _ = Load(bytes.NewReader(data))
+		//
+		// ⚠️ Before phase 77 this discarded both returns, so the stated
+		// invariant was never checked — a panic-only guard under a comment
+		// claiming more. The assertion below is what makes the comment true.
+		_, err := Load(bytes.NewReader(data))
+		if err != nil && !strings.HasPrefix(err.Error(), "bootstrap: ") {
+			t.Fatalf("error lacks the %q prefix: %v", "bootstrap: ", err)
+		}
 	})
 }
