@@ -18,7 +18,7 @@
 
 Every figure below was produced at this PLAN's own tip (`b2dba137`) by execution — one LIVE reference probe fleet (**43 fresh containers**, image id verified per boot), one Go-execution agent in a throwaway worktree, one read-only gate/anchor agent, each with **private scratch**, plus controller re-derivation. **None is carried from the SPEC.**
 
-**Three of this controller's own predictions were REFUTED.** They are stated first, because a prediction a probe merely restates is worthless.
+**Three of this controller's own predictions were REFUTED** — and, separately, **this stage published one REFUTATION OF ITS OWN THAT WAS ITSELF WRONG** (§1.9), corrected in a follow-up commit. Both are stated first, because a prediction a probe merely restates is worthless, and a refutation nobody re-derived is worth less than that.
 
 ### 1.1 ⚠️ THE HEADLINE — THE SPEC'S OWN DISCRIMINATION INSTRUCTION IS UNACHIEVABLE AS STATED, AND THE FIXTURE CANNOT CARRY THE BREAK ROSTER
 
@@ -189,11 +189,26 @@ Byte-length proof that arg2 is discarded: `runtime alone = 285` · `runtime+boot
 
 ⚠️ **AND A NEW, ELEVENTH BROKEN-GATE SHAPE, found in this stage's own first draft.** `internal/runtime` currently has **zero** exported symbols. A naive `printf '%s\n' "$cur"` against a 0-byte baseline emits a stray newline and **the gate goes RED on an untouched tree**. A `+0 exported symbols` gate over an empty package must be built and green-armed **before** it is trusted. The shipped form writes the lister's stdout straight to a temp file. Baselines at this tip: `internal/runtime` **0** exported symbols · `internal/bootstrap` **11**.
 
-### 1.9 ⚠️ `BEHAVIOR_CONTRACT.md:1857`'s TWO STALE `+20` CITES DO NOT EXIST
+### 1.9 ⚠️ `BEHAVIOR_CONTRACT.md:1857`'s TWO STALE CITES ARE **REAL** — AND THIS CONTROLLER'S FIRST "REFUTATION" OF THEM WAS A CATEGORY ERROR
 
-Router item 16 and SPEC §13 item 8 both schedule a fix for *"`BEHAVIOR_CONTRACT.md:1857`'s two stale `+20` cites, plus two more in the same file"*. **REFUTED by re-derivation.** Line `:1857` is the QUIC-parity paragraph and carries no `+20`. Repo-wide the file has exactly **two** `+20` occurrences, at `:5697` and `:5730`, and **both are phase enumerations** (`phases 18+19+20+21`) — i.e. `+20` meaning *"plus phase 20"*, not a delta anchor. **There is no `+20` stat/count anchor in the file at all.**
+Router item 16 and SPEC §13 item 8 both schedule a fix for *"`BEHAVIOR_CONTRACT.md:1857`'s two stale `+20` cites, plus two more in the same file"*.
 
-⇒ **that deferral is STRUCK, not carried forward.** §5 records the strike so the next stage does not re-inherit it.
+⚠️ **THIS PLAN'S FIRST PASS RECORDED THAT AS REFUTED. THE REFUTATION WAS WRONG, AND IT WAS WRONG IN AN INSTRUCTIVE WAY.** The probe was asked for *"the two stale `+20` cites"* and it **grepped for the literal string `+20`**, found only two phase enumerations (`phases 18+19+20+21` at `:5697`/`:5730`), and reported *"no such anchor exists"*. **`+20` in the claim is not a token in the document — it is the SIZE OF A DRIFT.** The probe answered a different question than the claim asked, and this controller accepted the answer because it was confidently phrased and arrived with commands attached.
+
+**RE-DERIVED CORRECTLY, by resolving each cite against the code it names:**
+
+| cite at `:1857` | claims to be | ACTUALLY is | real site | drift |
+|---|---|---|---|---|
+| `internal/listener/manager.go:1078-1082` | the accept-loop launch loop's `continue` on `rt.kind == kindQUIC` | the **bind-failure UNWIND block** (`for j := 0; j < i; j++ { m.runtimes[j].closeBind() }`) | **`:1098`** | **+20** |
+| `internal/listener/manager.go:1044-1054` | the bind loop doing likewise | the tail of a helper plus `Start`'s **doc comment** | **`:1064`** | **+20** |
+
+**Both cites have drifted +20, and the first now lands on code that does not support the claim at all** — it is the unwind path, not a QUIC skip. `internal/listener/quic.go:84-85` and `:109`, cited in the same paragraph, **still resolve correctly**.
+
+⚠️ **What makes this worth the space: the paragraph those cites support is a SETTLED, PROBE-BACKED QUIC PARITY DETERMINATION** that explicitly warns *"Do not restate this as an envoy-go gap; that reading was the phase-74 SPEC's own first hypothesis and it was REFUTED by probe."* A future session auditing that determination chases `:1078-1082`, finds an unwind block, and either re-opens a settled question or "corrects" it wrongly.
+
+⇒ **the deferral is REINSTATED, not struck** (§5 item 15). ⚠️ **The *"plus two more in the same file"* half is UNVERIFIED** — this pass resolved only the two cites at `:1857`. Do not report it as either confirmed or refuted.
+
+⚠️ **THE TRANSFERABLE LESSON, and it cost a wrong entry in a pushed commit: a REFUTATION MUST ANSWER THE CLAIM AS STATED.** Grepping for a literal token does not test a claim about *drift*; a range check does not test a claim about *content*. `reference_probe_must_discriminate` says a probe must distinguish the hypotheses — this probe discriminated perfectly between "the string `+20` is present" and "it is absent", and that was **the wrong pair of hypotheses.** ⚠️ **And an agent's confident REFUTATION is exactly as much a claim as the thing it refutes** (`reference_a_drift_correction_is_itself_a_claim`) — this one arrived with commands and outputs attached, which is what made it persuasive and is not what makes it true.
 
 ### 1.10 Other corrections this PLAN owes forward
 
@@ -1977,9 +1992,11 @@ Each gains: *the `layered_runtime` reject is **partially lifted at phase 77** �
 
 `grep -n '1205'` must return exactly **3** before the edit (`:831`, `:847`, `:5004`) — re-derive. ⚠️ **`:847` also carries a stale `115-dir` figure against an actual 119, going to 120.** Fix it to `120-dir` in the same edit, or leave it and say why in `PROGRESS.md` — **do not silently carry it**.
 
-- [ ] **Step 4: DO NOT look for `+20` cites near `:1857`**
+- [ ] **Step 4: fix the two drifted cites at `:1857` — with SYMBOL anchors, not new line numbers**
 
-**REFUTED at this PLAN (§1.9).** `:1857` is the QUIC-parity paragraph. The file's only two `+20` occurrences are at `:5697` and `:5730` and both mean *"plus phase 20"*. **There is no `+20` anchor to fix.** This step exists so the next reader does not re-inherit the instruction.
+**REAL, and re-derived at this PLAN (§1.9).** `internal/listener/manager.go:1078-1082` (cited as the accept-loop `kindQUIC` `continue`) is actually the **bind-failure unwind block**; the real site is **`:1098`**. `:1044-1054` (cited as the bind loop) is a doc comment; the real site is **`:1064`**. **Both drifted +20.**
+
+Replace each with a **symbol anchor** (name the function and the condition) so a future +20 cannot recur. ⚠️ **Re-resolve both against the code at YOUR tip before editing** — this row does not touch `internal/listener/`, so they should still read `:1098` / `:1064`, but a cite is only correct at the tip that reads it. ⚠️ **`quic.go:84-85` and `:109` in the same paragraph still resolve correctly — leave them.** ⚠️ The *"plus two more in the same file"* half is **UNVERIFIED**; either resolve them or say so.
 
 - [ ] **Step 5: Verify + commit**
 
@@ -2148,8 +2165,7 @@ Each with the control observed (`mkdir …/0119-fake` ⇒ 121; a throwaway `func
 13. **`internal/bootstrap`'s other 47 inline `fmt.Errorf("bootstrap: …")` arms** — this row introduces the named-constant discipline for its own nine only.
 14. **`internal/statssink`'s four *"stays 1200 / 1196"* prose sites**, stale since phase 49.
 
-### ⚠️ STRUCK, not deferred
-**`BEHAVIOR_CONTRACT.md:1857`'s "two stale `+20` cites, plus two more in the same file"** — **REFUTED at this PLAN (§1.9). No such anchor exists anywhere in the file.** Router item 16 and SPEC §13 item 8 both carry it; **both are wrong and it must not be re-inherited.**
+15. **`BEHAVIOR_CONTRACT.md:1857`'s two stale cites — REAL, REINSTATED, and now RESOLVED to their true sites (§1.9).** `internal/listener/manager.go:1078-1082` and `:1044-1054` have **both drifted +20**; the real sites are **`:1098`** and **`:1064`**, and the first cite now lands on the **bind-failure unwind block**. **Fix by replacing the line numbers with SYMBOL anchors** so they cannot drift again. ⚠️ The *"plus two more in the same file"* half is **UNVERIFIED** — do not report it either way. ⚠️ **This PLAN's first pass wrongly STRUCK this deferral on a category-error refutation; the strike is withdrawn.**
 
 ### The banked next subject — re-cost before adopting
 **`fault.abort.grpc_status`, ~7-9 tasks / +0 on every envelope axis.** `abortEnabled` is set only inside the `HttpStatus` type switch, so a `grpc_status` variant fires **no abort at all**. A 4-arm probe found the reference branches on the request **`content-type`**, returns HTTP **200** in every arm, and emits `grpc-status`/`grpc-message` as response **HEADERS not trailers** — which retires the framework blocker. ⚠️ **It is an HTTP-filters-family row and does NOT open the gRPC family**; the contrary claim's provenance is a **ROUTING LABEL** in row 09's summary, and **reading a filing label as a charter is the error.**
@@ -2193,15 +2209,15 @@ The full-suite startup flake (`subject ready: EOF` **and** `bind: address alread
 | §8.3 the four arms | T7 | ⚠️ **the arms SHIP; the instruction that a break be identifiable from the gauge is WITHDRAWN as impossible (§1.1)** |
 | §8.3 the fifth (`%g`) arm | **not scheduled** | as the SPEC recommends — recorded in §5 item 9 |
 | §8.4 construction constraints | T7 | `BackendCount()` = 1, three registration gates, prose-only expectations |
-| §9 behavior-contract map | T9 | ⚠️ **the `+20` site does NOT exist** |
+| §9 behavior-contract map | T9 | ⚠️ **the two `:1857` cites ARE stale (+20 each); a first-pass "refutation" of them was a category error (§1.9)** |
 | §10 the task spine | T1-T12 | 12 tasks (T2 folded into T1; T10/T11 split out) |
 | §11 edit roster | §3 | + `internal/runtime/doc.go` **deleted** rather than left stale |
 | §12 sentinel | T12 | narrows nothing; **and the shipped check (1) is replaced — §1.2** |
-| §13 deferrals | §5 | 14 carried, **1 STRUCK** |
+| §13 deferrals | §5 | **15 carried, 0 struck** — item 15 was wrongly struck mid-stage and is REINSTATED (§1.9) |
 | §14 ADR-0299 | T12 | §Consequences must record §1.1 |
 | §15 exit counts | §4 G8 | |
 
-**Gaps found and closed:** the SPEC's §8.3 discrimination instruction (impossible — §1.1) · its §5 collision check (missed a method — §1.4) · its §10 T7 guard class (blind to renames — §1.7) · its §13 item 8 (the target does not exist — §1.9).
+**Gaps found and closed:** the SPEC's §8.3 discrimination instruction (impossible — §1.1) · its §5 collision check (missed a method — §1.4) · its §10 T7 guard class (blind to renames — §1.7).
 
 **Gap found and NOT closed:** SPEC §3.4's empty-string semantics are settled but **unexercised by anything this row ships**. Adding an empty-string key to the fixture would add one key to `num_keys` and change every measured number for a property no cross-side assertion can see (`layer_values` renders present-but-empty byte-identically to absent). **Deliberately not added**; §5 item 3 carries it.
 

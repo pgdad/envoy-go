@@ -44,7 +44,7 @@ Companion to `PLAN.md`. The PLAN half below is written at the PLAN stage; the `#
 - **§1.5 — the oneof wrapper type names are asymmetric.** `RuntimeLayer_StaticLayer` has no trailing underscore; `_DiskLayer_`, `_AdminLayer_`, `_RtdsLayer_` do. The un-suffixed forms are the nested MESSAGE types, so a switch drafted from memory is an `impossible type switch case`.
 - **§1.6 — an unset oneof takes `default`**, so `case nil` must be explicit; and `layered_runtime: {}` vs `{layers: []}` are **indistinguishable after unmarshal**, so arm 9 is one predicate covering two spellings.
 - **§1.7 — the landed `countMetrics` stat-guard idiom is BLIND to a rename** (proved: two in, two out, both names wrong ⇒ PASS). **T5 ships a name-set guard.**
-- **§1.9 — `BEHAVIOR_CONTRACT.md:1857`'s `+20` cites DO NOT EXIST.** The deferral is **STRUCK**, not carried.
+- **§1.9 — `BEHAVIOR_CONTRACT.md:1857`'s two stale cites are REAL**, both drifted **+20** (real sites `manager.go:1098` and `:1064`; the first cite lands on the **bind-failure unwind block**). ⚠️ **This stage's first pass wrongly REFUTED them and STRUCK the deferral; the strike is WITHDRAWN.** See the second self-correction below.
 - **§1.10 — the `1200 → 1201` ledger step is documented nowhere in `BEHAVIOR_CONTRACT.md`.** Assert the delta; the absolute rides an unaudited gap.
 
 ## Broken-gate count: EIGHT → ELEVEN
@@ -86,9 +86,21 @@ fixtures **119** (tail `0117`, next-free **0118**) · fuzzers **55** · internal
 | T11 gates | **PLANNED** — G1-G5, G10-partial RAN here |
 | T12 ADR-0299 + row 77 → `done` + the fixed check (1) | **PLANNED** |
 
-## A controller self-correction, recorded rather than quietly amended
+## TWO controller self-corrections, recorded rather than quietly amended
+
+### (1) The four-arm delta design
 
 This stage's first design tuned the four fixture arms to give breakage deltas of `+1 / −1 / +2 / −2` and asserted, in the PLAN's own headline, that the SPEC's discrimination requirement was thereby satisfied. **The prototype run refuted it in the same session.** The error was not arithmetic — the arithmetic was right for the model. The model was wrong: it treated the four arms as independently breakable when two of them are reached through the same recursive descent. **The correction is architectural, not numerical**, and it is why the roster moved to the unit layer. A design that survives only because nobody ran it is not a design.
+
+### (2) A published refutation that was itself wrong — caught AFTER the commit landed
+
+§1.9 originally reported `BEHAVIOR_CONTRACT.md:1857`'s two stale cites as **REFUTED — "no such anchor exists"** — and STRUCK the deferral. **That was wrong, and it shipped.** The probe was asked for *"the two stale `+20` cites"* and **grepped for the literal string `+20`**; but `+20` in the claim is **the SIZE OF A DRIFT, not a token in the document**. Resolving each cite against the code it names shows both have drifted **+20** — `manager.go:1078-1082` is cited as the accept-loop `kindQUIC` `continue` and is actually the **bind-failure unwind block** (real site `:1098`), and `:1044-1054` is a doc comment (real site `:1064`).
+
+**Why it got through:** the refutation arrived with commands and outputs attached, which is what made it persuasive, and is not what makes it true. `reference_probe_must_discriminate` was satisfied — the probe discriminated perfectly between *"the string `+20` is present"* and *"it is absent"*. **It was the wrong pair of hypotheses.**
+
+**The transferable rule: a REFUTATION MUST ANSWER THE CLAIM AS STATED.** Grepping a literal token does not test a claim about drift; a range check does not test a claim about content. And an agent's confident refutation is exactly as much a claim as the thing it refutes.
+
+**Disposition:** the deferral is REINSTATED as §5 item 15, T9 Step 4 now fixes the cites with **symbol anchors**, and the *"plus two more in the same file"* half is recorded as **UNVERIFIED** rather than resolved in either direction.
 
 ## Worktree / discipline notes
 
