@@ -8,6 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net"
 	"net/http"
@@ -1047,5 +1050,453 @@ static_resources:
 	var exitErr3 *exec.ExitError
 	if !errors.As(err3, &exitErr3) || exitErr3.ExitCode() != 2 {
 		t.Fatalf("unknown --mode: got err=%v, want *exec.ExitError with exit code 2 (out=%s)", err3, out3)
+	}
+}
+
+// bootPanicVisibleDeadline bounds the trigger process. MEASURED: on a tree
+// carrying the phase-78 fix the binary panics and dies in 0.009-0.011 s wall
+// (5 consecutive runs), so this is ~2700x headroom and exists only to bound a
+// REGRESSION, never a healthy run. On the pre-fix tree the same process runs
+// until the deadline kills it, having printed ZERO bytes.
+const bootPanicVisibleDeadline = 30 * time.Second
+
+// bootPanicTriggerYAML renders the ONLY config-reachable in-window boot panic:
+// two HTTP connection managers on DISTINCT listener addresses sharing one
+// stat_prefix, so the second chain's `http.<prefix>.downstream_rq_total`
+// counter collides in the stats registry.
+//
+// Every element is load-bearing and a probe's INPUT is a claim:
+//   - DISTINCT addresses: two listeners on the SAME address die at
+//     `bind: address already in use` (exit 1) BEFORE registration runs, because
+//     registerListenerMetrics runs post-bind.
+//   - >=1 cluster: a `clusters: []` bootstrap dies at
+//     `cluster: zero clusters in bootstrap`, which is a BROKEN ARM, not a result.
+//   - a stats_sinks[] entry: it makes statsFlusher non-nil so the flusher
+//     goroutine and the `flusherDone` wait actually exist. The statsd sink is UDP
+//     and needs no live receiver.
+//   - an http_filters[] router: the HCM rejects a chain with zero http filters
+//     before it ever registers a counter.
+func bootPanicTriggerYAML(adminPort, listenerAPort, listenerBPort, statsdPort, backendPort int, statPrefixA, statPrefixB string) string {
+	return fmt.Sprintf(`admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: %d }
+stats_sinks:
+  - name: envoy.stat_sinks.statsd
+    typed_config:
+      "@type": type.googleapis.com/envoy.config.metrics.v3.StatsdSink
+      address:
+        socket_address: { protocol: UDP, address: 127.0.0.1, port_value: %d }
+      prefix: p78
+stats_flush_interval: 0.5s
+static_resources:
+  listeners:
+    - name: l_a
+      address: { socket_address: { address: 127.0.0.1, port_value: %d } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: %s
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: r_a
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response: { status: 200, body: { inline_string: "a" } }
+    - name: l_b
+      address: { socket_address: { address: 127.0.0.1, port_value: %d } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: %s
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: r_b
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response: { status: 200, body: { inline_string: "b" } }
+  clusters:
+    - name: c_unused
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: c_unused
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: %d }
+`, adminPort, statsdPort, listenerAPort, statPrefixA, listenerBPort, statPrefixB, backendPort)
+}
+
+// TestMain_BootPanicIsVisible is the phase-78 black-box guard (ADR-0300): a
+// panic unwinding through main() during boot must be VISIBLE — it must kill the
+// process, print the panic and print a goroutine dump. Before phase 78 the
+// shutdown defer that waits on `<-flusherDone` was registered at the TOP of a
+// 68-line boot window while the channel was only closed at the BOTTOM, so any
+// in-window panic unwound into a permanent block and the process HUNG with ZERO
+// bytes on both streams.
+//
+// THE ASSERTION IS A CONJUNCTION, and each half has an EXECUTED counter-example
+// (SPEC 78 R5, PLAN 78 SS1.2) — do not weaken any of it:
+//   - exit status alone is BLIND: through this exact harness shape a HEALTHY
+//     boot and a HUNG boot are byte-identical on every status observable —
+//     ctx.Err() is DeadlineExceeded, the run error is `signal: killed` and
+//     ExitCode() is -1 on BOTH. They differ only in OUTPUT.
+//   - output alone is satisfied by a PRINT-THEN-HANG build: recover(), print the
+//     exact panic text, then block forever. Every string assertion passes while
+//     the process never dies.
+//   - output VOLUME is satisfied by NOISE: on the broken tree the still-running
+//     flush ticker writes 500-1300 bytes of `statsd udp write failed` lines to
+//     stderr while hanging. Assert the panic TEXT, never a byte count.
+//
+// So the hang is detected from the DEADLINE STATE (ctx.Err() ==
+// context.DeadlineExceeded), NOT from an exit code. exec.CommandContext's default
+// cancel action is Process.Kill (SIGKILL) and MUST NOT be changed to SIGTERM: a
+// SIGTERM cancels the server ctx, which releases the very wait that is hanging,
+// so a SIGTERM-based harness cannot falsify this contract at all — it reads a
+// hang as "printed, just slow" (measured: exit 124 at 8.006 s WITH the panic
+// text present).
+//
+// TRIGGER DEPENDENCY — this test's trigger is the ONLY config-reachable
+// in-window panic in the tree, and there is NO fallback. It reaches the panic at
+// internal/stats/registry.go:107 ("stats: duplicate metric registration")
+// through the HCM per-filter counter registration in internal/filter/hcm/config.go
+// (prefix derivation `prefix := "http." + statPrefix + "."` at :352; the five
+// `registry.NewCounter(prefix + ...)` calls at :358-362, of which
+// `downstream_rq_total` at :358 is the one that collides).
+// If a future row makes duplicate registration a get-or-create (reference
+// parity) or a clean config reject, this test goes RED — that is intended.
+// RE-POINT THE TRIGGER; DO NOT RELAX THE ASSERTION. A guard that stops
+// triggering must fail loudly, never pass vacuously.
+func TestMain_BootPanicIsVisible(t *testing.T) {
+	bin := buildBinaryOrSkip(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "boot-panic-trigger.yaml")
+	// The SAME stat_prefix on both chains is the trigger. Distinct addresses.
+	cfg := bootPanicTriggerYAML(
+		freeTCPPort(t), freeTCPPort(t), freeTCPPort(t), freeTCPPort(t), freeTCPPort(t),
+		"dup_prefix", "dup_prefix",
+	)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), bootPanicVisibleDeadline)
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, bin, "-c", cfgPath)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+
+	// LEG 1 — THE PROCESS DID NOT HANG. Sole t.Fatalf in this test: after a hang
+	// there is no output left to assert on, and every later leg would report a
+	// second, derived failure for one defect.
+	if ctx.Err() == context.DeadlineExceeded {
+		// stdout is the discriminator between the two ways this leg goes red:
+		// ZERO bytes means the phase-78 defect is back (a panic swallowed by a
+		// blocking defer in main()'s boot window — see the <-flusherDone wait in
+		// cmd/envoy-go/main.go); the `envoy-go ... ready` sentinels mean the
+		// process booted HEALTHILY, i.e. the trigger stopped triggering and must
+		// be RE-POINTED (see this test's doc comment).
+		t.Fatalf("BOOT DID NOT TERMINATE within %v: stdout=%d bytes %q, stderr=%d bytes, run error=%v; "+
+			"zero stdout => a boot-window panic is being swallowed by a blocking defer; "+
+			"a ready sentinel on stdout => the trigger no longer panics and must be re-pointed",
+			bootPanicVisibleDeadline, stdout.Len(), firstLineOf(stdout.String()), stderr.Len(), runErr)
+	}
+
+	// LEG 2 — Go's unrecovered-panic exit status is exactly 2. t.Errorf, not
+	// Fatalf, so legs 3 and 4 are not dead code.
+	var exitErr *exec.ExitError
+	switch {
+	case runErr == nil:
+		t.Errorf("exit status: got 0 (process exited cleanly), want 2 (unrecovered panic); stderr=%q", stderr.String())
+	case errors.As(runErr, &exitErr):
+		if got := exitErr.ExitCode(); got != 2 {
+			t.Errorf("exit status: got %d, want 2 (unrecovered panic); run error=%v; stderr=%q", got, runErr, stderr.String())
+		}
+	default:
+		t.Errorf("exit status: run failed without an *exec.ExitError: %v", runErr)
+	}
+
+	// LEG 3 — stderr NAMES the panic. This is what pins the guard to a real
+	// defect rather than to "something went wrong", and it is what a byte-count
+	// assertion cannot do: the hanging tree emits hundreds of bytes of unrelated
+	// statsd write-failure noise.
+	const wantPanic = `stats: duplicate metric registration`
+	if !strings.Contains(stderr.String(), wantPanic) {
+		t.Errorf("stderr does not name the panic: want a line containing %q; got %d bytes:\n%s",
+			wantPanic, stderr.Len(), stderr.String())
+	}
+
+	// LEG 4 — stderr carries Go's panic dump: the `panic:` header AND at least
+	// one goroutine stack. A recover-and-log build satisfies leg 3 but not this.
+	if !strings.Contains(stderr.String(), "panic: ") {
+		t.Errorf("stderr lacks the %q header (a recovered-and-reprinted panic is not a panic dump); got %d bytes:\n%s",
+			"panic: ", stderr.Len(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "goroutine ") {
+		t.Errorf("stderr lacks a goroutine dump (want a %q frame header); got %d bytes:\n%s",
+			"goroutine ", stderr.Len(), stderr.String())
+	}
+}
+
+// firstLineOf returns s up to (not including) the first newline. Used to keep
+// the boot-hang failure message short while still showing whether the subject
+// printed a ready sentinel.
+func firstLineOf(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// ---------------------------------------------------------------------------
+// Phase 78 (ADR-0300) — the two STRUCTURAL arms of the boot-panic-visibility
+// guard. They are structural because there is no config-reachable POST-anchor
+// panic to drive a behavioral one: the only config-reachable boot-window panic
+// trigger (duplicate stat_prefix -> internal/stats/registry.go:107, registered
+// at internal/filter/hcm/config.go:352-362) fires inside boot.Construct, i.e.
+// PRE-anchor, and a pre-anchor panic is fixed by the relocation alone. The
+// behavioral guard therefore PASSES on a tree that still hangs post-anchor
+// (EXECUTED, PLAN 78 T3); these two arms are what closes that gap.
+// ---------------------------------------------------------------------------
+
+// bootPanicVisibilityMainGo parses cmd/envoy-go/main.go and returns its AST plus
+// the FileSet needed to turn token.Pos into line numbers. The path is resolved
+// from THIS source file via runtime.Caller (the same technique as pkiFixture0002)
+// rather than from the process working directory, so the arms are correct no
+// matter how the test binary is invoked.
+func bootPanicVisibilityMainGo(t *testing.T) (*token.FileSet, *ast.File, string) {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed — cannot locate main.go")
+	}
+	path := filepath.Join(filepath.Dir(thisFile), "main.go")
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	return fset, f, path
+}
+
+// isFlusherDoneReceive reports whether n is the expression `<-flusherDone`.
+func isFlusherDoneReceive(n ast.Node) bool {
+	u, ok := n.(*ast.UnaryExpr)
+	if !ok || u.Op != token.ARROW {
+		return false
+	}
+	id, ok := u.X.(*ast.Ident)
+	return ok && id.Name == "flusherDone"
+}
+
+// isFlusherDoneClose reports whether n is the call `close(flusherDone)`.
+func isFlusherDoneClose(n ast.Node) bool {
+	c, ok := n.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	fn, ok := c.Fun.(*ast.Ident)
+	if !ok || fn.Name != "close" || len(c.Args) != 1 {
+		return false
+	}
+	arg, ok := c.Args[0].(*ast.Ident)
+	return ok && arg.Name == "flusherDone"
+}
+
+// TestBootPanicVisibility_FlusherDoneWaitIsAfterEveryClose is phase-78 structural
+// arm 2: every `<-flusherDone` receive in main.go must sit at a line strictly
+// GREATER than every `close(flusherDone)` call.
+//
+// Why it is red-on-regression: the phase-78 defect is a `defer func(){ <-flusherDone
+// ... }()` registered ~70 lines BEFORE anything closes flusherDone. Every panic
+// unwinding through main() in that window blocks forever on a channel that nothing
+// has closed, producing a zero-byte silent hang. Moving the receive after both
+// close sites is exactly what makes the boot window panic-visible, and that is a
+// pure source-ORDER property, which is why this arm is structural.
+//
+// ⚠️ This arm is NOT sufficient on its own — it is GREEN on the naively-relocated
+// tree, which still hangs. See the companion arm
+// TestBootPanicVisibility_FlusherDoneWaitIsPrecededByCancel.
+//
+// Anti-vacuity: a structural test that finds nothing and says nothing is GREEN for
+// the wrong reason. Both counts are asserted non-zero BEFORE the ordering leg, and
+// the two zero cases are reported separately so a rename of flusherDone can never
+// masquerade as a pass.
+func TestBootPanicVisibility_FlusherDoneWaitIsAfterEveryClose(t *testing.T) {
+	fset, f, path := bootPanicVisibilityMainGo(t)
+
+	var receiveLines, closeLines []int
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch {
+		case isFlusherDoneReceive(n):
+			receiveLines = append(receiveLines, fset.Position(n.Pos()).Line)
+		case isFlusherDoneClose(n):
+			closeLines = append(closeLines, fset.Position(n.Pos()).Line)
+		}
+		return true
+	})
+
+	// Anti-vacuity legs — never a silent pass.
+	if len(receiveLines) == 0 {
+		t.Fatalf("%s: found ZERO `<-flusherDone` receive expressions (closes found: %v) — "+
+			"the phase-78 boot-panic-visibility guard is VACUOUS; if flusherDone was "+
+			"renamed, re-point this arm at the new name, do NOT delete it", path, closeLines)
+	}
+	if len(closeLines) == 0 {
+		t.Fatalf("%s: found ZERO `close(flusherDone)` calls (receives found: %v) — "+
+			"the phase-78 boot-panic-visibility guard is VACUOUS; if flusherDone was "+
+			"renamed, re-point this arm at the new name, do NOT delete it", path, receiveLines)
+	}
+
+	// Ordering leg.
+	maxClose := closeLines[0]
+	for _, l := range closeLines {
+		if l > maxClose {
+			maxClose = l
+		}
+	}
+	for _, r := range receiveLines {
+		if r <= maxClose {
+			t.Errorf("%s:%d: `<-flusherDone` occurs at or before the last "+
+				"`close(flusherDone)` (line %d; all closes: %v). A defer that waits on "+
+				"flusherDone before anything can close it turns EVERY panic in the boot "+
+				"window into a zero-byte silent hang (phase 78 / ADR-0300). Move the "+
+				"waiting defer below the close(flusherDone) if/else.",
+				path, r, maxClose, closeLines)
+		}
+	}
+	t.Logf("%s: `<-flusherDone` receives at %v; `close(flusherDone)` calls at %v", path, receiveLines, closeLines)
+}
+
+// TestBootPanicVisibility_FlusherDoneWaitIsPrecededByCancel is phase-78 structural
+// arm 3 (D-BPV-GUARD-COVERAGE): inside the deferred function literal that waits on
+// flusherDone, a call to cancel() must appear BEFORE the receive.
+//
+// Why arm 2 is not enough. Relocating the waiting defer past the close sites makes
+// it the LAST-registered defer in main(), hence the FIRST to run in LIFO — ahead of
+// `defer cancel()`. Its wait is released only when statsFlusher.Start(ctx) returns,
+// which requires ctx to be CANCELED. So on the naively-relocated tree a panic in
+// the new post-anchor window still hangs (EXECUTED: exit 137 under a SIGKILL
+// deadline, zero panic bytes) while arm 2 is GREEN, because the receive line is
+// genuinely below every close line. The cancel() first in the body is what makes
+// the wait unable to outlive an unwinding main(); context.CancelFunc is idempotent,
+// so the normal signal path is byte-identical (measured: 12/12 arms, 152 datagrams
+// / 5888 bytes on a live receiver, identical across trees).
+//
+// THIS ARM PINS ONE SHAPE, DELIBERATELY. A bounded `select { case <-flusherDone:
+// case <-time.After(d): }` and a trailing sibling `defer cancel()` both also work
+// behaviorally, and both go RED here. That is intended: accepting a second shape
+// would make this arm reason about registration order across sibling statements,
+// which is exactly the reasoning that failed and produced the moved hang. If a
+// later row deliberately switches, it must EDIT this arm — a visible, reviewable
+// act — rather than have it silently accept a second shape.
+//
+// Anti-vacuity: not finding the deferred wait at all is a t.Fatalf, never a pass.
+func TestBootPanicVisibility_FlusherDoneWaitIsPrecededByCancel(t *testing.T) {
+	fset, f, path := bootPanicVisibilityMainGo(t)
+
+	deferredWaits := 0
+	guarded := 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		d, ok := n.(*ast.DeferStmt)
+		if !ok {
+			return true
+		}
+		lit, ok := d.Call.Fun.(*ast.FuncLit)
+		if !ok || lit.Body == nil {
+			return true
+		}
+		// The receive must be in THIS literal's own body — not in a nested
+		// literal, which would be a different frame with different unwind rules.
+		var recvPos token.Pos = token.NoPos
+		for _, stmt := range lit.Body.List {
+			ast.Inspect(stmt, func(m ast.Node) bool {
+				if recvPos == token.NoPos && isFlusherDoneReceive(m) {
+					recvPos = m.Pos()
+				}
+				return recvPos == token.NoPos
+			})
+			if recvPos != token.NoPos {
+				break
+			}
+		}
+		if recvPos == token.NoPos {
+			return true
+		}
+		deferredWaits++
+
+		// Two positions are tracked, not one, so the "no cancel() at all" and the
+		// "cancel() present but AFTER the receive" regressions fire DISTINCT
+		// messages. Both are red, but they are different mistakes and a shared
+		// message would let one masquerade as the other in a break test.
+		beforePos, afterPos := token.NoPos, token.NoPos
+		ast.Inspect(lit.Body, func(m ast.Node) bool {
+			c, ok := m.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			id, ok := c.Fun.(*ast.Ident)
+			if !ok || id.Name != "cancel" || len(c.Args) != 0 {
+				return true
+			}
+			if c.Pos() < recvPos {
+				if beforePos == token.NoPos {
+					beforePos = c.Pos()
+				}
+			} else if afterPos == token.NoPos {
+				afterPos = c.Pos()
+			}
+			return true
+		})
+		if beforePos == token.NoPos {
+			where := "there is NO cancel() call in this literal at all"
+			if afterPos != token.NoPos {
+				where = fmt.Sprintf("the only cancel() call is at line %d, AFTER the receive, "+
+					"where it is unreachable during the hang", fset.Position(afterPos).Line)
+			}
+			t.Errorf("%s:%d: the deferred `<-flusherDone` wait is NOT preceded by a "+
+				"`cancel()` call inside the same function literal — %s. Relocating this "+
+				"defer below the close(flusherDone) sites makes it LAST-registered hence "+
+				"FIRST in LIFO — ahead of `defer cancel()` — so on a panic path nothing "+
+				"ever fires ctx.Done(), statsFlusher.Start(ctx) never returns, flusherDone "+
+				"is never closed, and the panic is swallowed into a zero-byte hang exactly "+
+				"as before (phase 78 / ADR-0300). Put cancel() FIRST in this body.",
+				path, fset.Position(recvPos).Line, where)
+			return true
+		}
+		guarded++
+		t.Logf("%s: deferred `<-flusherDone` at line %d is preceded by `cancel()` at line %d",
+			path, fset.Position(recvPos).Line, fset.Position(beforePos).Line)
+		return true
+	})
+
+	// Anti-vacuity leg — never a silent pass.
+	if deferredWaits == 0 {
+		t.Fatalf("%s: found ZERO deferred function literals containing a `<-flusherDone` "+
+			"receive — the phase-78 coverage arm is VACUOUS. If the wait moved or "+
+			"flusherDone was renamed, re-point this arm; do NOT delete it.", path)
+	}
+	if guarded != deferredWaits {
+		t.Errorf("%s: %d of %d deferred flusherDone waits are cancel()-guarded", path, guarded, deferredWaits)
 	}
 }

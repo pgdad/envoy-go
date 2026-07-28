@@ -195,11 +195,12 @@ func main() {
 	// of the four sink kinds is present, reusing the hoisted dialer for metrics_service.
 	// The *statssink.MetricsServiceSink does NOT satisfy accesslog.Sink
 	// (Submit(batch []*dto.MetricFamily) vs Submit(r any)), so the sinks are
-	// collected in their OWN statsSinks slice + closed via a dedicated defer.
+	// collected in their OWN statsSinks slice + closed via a dedicated defer that
+	// is registered BELOW, after both close(flusherDone) branches (phase 78).
 	// The Flusher is BUILT here (pre-Freeze) but Start()ed only AFTER
 	// bs.Stats.Freeze() so the Walk snapshot is over the frozen registry
-	// (D-MS-FLUSH-INERT: when both config slices are empty, statsFlusher stays nil
-	// and NO flush goroutine starts — byte-stability).
+	// (D-MS-FLUSH-INERT: when ALL FIVE stats-sink config slices tested below are
+	// empty, statsFlusher stays nil and NO flush goroutine starts — byte-stability).
 	var statsFlusher *statssink.Flusher
 	var statsSinks []statssink.Sink
 	flusherDone := make(chan struct{})
@@ -286,21 +287,6 @@ func main() {
 		}
 		statsFlusher = statssink.NewFlusher(bs.Stats, bs.FlushInterval, statsSinks)
 	}
-	// LIFO: this runs in the shutdown drain AFTER the server ctx is canceled (the
-	// cancel() defer is registered later, so it runs first). We WAIT on flusherDone
-	// before closing the sink channels: cancel() fires ctx.Done(), this defer blocks
-	// on <-flusherDone, the Flusher's Start loop finishes any in-progress flushOnce
-	// (its last Submit goes to the still-OPEN channel) then returns and closes
-	// flusherDone, and only THEN do we Close() the sinks (close their channels). This
-	// enforces the sink contract (no Submit after Close) and prevents a flush-tick /
-	// Close race from sending on a closed channel. Each Close() drains the in-flight
-	// stream (CloseAndRecv) + closes the gRPC conn.
-	defer func() {
-		<-flusherDone // wait for the Flusher goroutine to stop Submitting before closing the sink channels
-		for _, s := range statsSinks {
-			_ = s.Close()
-		}
-	}()
 	// Phase 46.1b (ADR-0260): flush-and-stop the OTLP trace exporter goroutines on
 	// shutdown. In LIFO order this runs AFTER lm.Stop() (so listeners are stopped
 	// and no new spans are generated) but BEFORE the access-log sinks close. The
@@ -323,10 +309,15 @@ func main() {
 	// /listeners, /server_info per ADR-0085) can read live cluster +
 	// listener state. The constructor must be called before bs.Stats.Freeze()
 	// because admin allocates the server.live gauge at New time (SPEC §5.4 +
-	// §12 #3). Defers are LIFO; the order here is:
-	//   1. defer sinks-close (above) — flushes access logs last
-	//   2. defer admSrv.Close() — closes admin first, before sinks
-	//   3. defer lm.Stop()        — shuts listeners after admin
+	// §12 #3). Defers are LIFO, so registration order is the REVERSE of execution
+	// order. Post-phase-78 the full main() defer chain EXECUTES in this order:
+	//   1. the stats-sink close — registered LAST, below the close(flusherDone)
+	//      branches; cancels ctx, waits for the Flusher, closes the stats sinks
+	//   2. lm.Stop()                  — stops the listeners
+	//   3. cancel()                   — idempotent; already called by (1)
+	//   4. admSrv.Close()             — closes the admin server
+	//   5. tracingProvider.CloseAll() — flushes and stops the trace exporters
+	//   6. the access-log sinks close — flushes access logs LAST
 	// 08.1 SPEC does not mandate a strict ordering across these resources;
 	// the move from pre-lm to post-lm is the LBP-1 cost (cluster + listener
 	// must exist before admin can introspect them).
@@ -365,10 +356,38 @@ func main() {
 		// close(flusherDone) when Start returns so the shutdown sink-close defer
 		// (which waits on <-flusherDone) closes the sink channels only AFTER the
 		// flush loop has stopped Submitting (no send-on-closed-channel race).
+		// Start returns when ctx is canceled — on the normal path by the signal,
+		// and on a panic-unwind path by that defer's OWN leading cancel().
 		go func() { defer close(flusherDone); statsFlusher.Start(ctx) }() // ticker loop; stops on ctx.Done() at shutdown
 	} else {
-		close(flusherDone) // no flusher: unblock the sink-close defer immediately
+		close(flusherDone) // no flusher: pre-closed so the defer below never blocks
 	}
+	// LIFO: registered LAST in main(), so this runs FIRST in the shutdown drain —
+	// ahead of lm.Stop(), cancel(), admSrv.Close() and tracingProvider.CloseAll(). It
+	// is registered HERE, below BOTH close(flusherDone) branches, so that a panic
+	// unwinding through main() earlier in boot can never arm a receive on a channel
+	// that nothing has yet been started to close (phase 78 / ADR-0300).
+	//
+	// Because it now runs BEFORE the deferred cancel() rather than after it, the body
+	// must cancel the server ctx ITSELF — that is what the leading cancel() is for.
+	// context.CancelFunc is idempotent, so on the normal <-ctx.Done() shutdown path it
+	// is a no-op; on the panic path it is the ONLY thing that can release the wait,
+	// and without it the process hangs forever having printed nothing.
+	//
+	// The sink contract (no Submit after Close) is unchanged and the mechanism is the
+	// same, only self-driven: cancel() fires ctx.Done(), the Flusher's Start loop
+	// finishes any in-progress flushOnce (its last Submit goes to the still-OPEN
+	// channel) then returns and closes flusherDone, and only THEN do we Close() the
+	// sinks (close their channels). This enforces the sink contract and prevents a
+	// flush-tick / Close race from sending on a closed channel. Each Close() drains
+	// the in-flight stream (CloseAndRecv) + closes the gRPC conn.
+	defer func() {
+		cancel()      // release the wait: a panic must never leave this blocked on a flusher
+		<-flusherDone // wait for the Flusher goroutine to stop Submitting before closing the sink channels
+		for _, s := range statsSinks {
+			_ = s.Close()
+		}
+	}()
 
 	// Per-listener ready sentinels + terminal sentinel (ADR-0026).
 	for _, info := range lm.Listeners() {
@@ -390,7 +409,8 @@ func main() {
 		log.Print("drain rendezvous: timeout fired (best-effort)")
 	}
 	// Per planner-time decision 9: explicit cm.Drain() call after rendezvous,
-	// before deferred-stop chain runs (LIFO: lm.Stop, admSrv.Close, sinks-close).
+	// before the deferred-stop chain runs (LIFO EXECUTION order: stats-sink close,
+	// lm.Stop, cancel, admSrv.Close, tracing close, access-log sinks close).
 	// Best-effort upstream-pool close per ADR-0096.
 	cm.Drain()
 	// Existing deferred-stop chain runs as the function unwinds.

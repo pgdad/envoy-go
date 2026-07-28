@@ -871,10 +871,22 @@ The `custom_tags` field is now PARTIALLY consumed: the `literal` `CustomTag` typ
 
 **No new fuzzer (D-VALIDATE-FUZZER).** Every input `internal/boot.Construct`/`validate.Bootstrap` consumes has already passed `bootstrap.Load`'s untrusted-YAML-parse boundary (covered by the existing bootstrap-config fuzzers); the construction-tail code operates on an already-validated `*bootstrap.Bootstrap` struct, not raw untrusted bytes.
 
+### Boot-failure visibility (per phase 78 ADR-0300)
+
+*Introduced by phase 78 — a MAINTENANCE row on the boot sequence SHARED by `--mode validate` and normal boot. It changes no wire behavior, no stat, and no public API; it is documented here because its subject is the pair of entry paths this section already covers.*
+
+**A panic unwinding through `main()` during boot is always visible (D-BOOT-PANIC-VISIBLE).** A panic raised anywhere in the boot window — construction, admin-server creation, listener start, stats-registry freeze — kills the process with exit status **2** and prints Go's panic dump (the `panic:` header plus the goroutine stacks) to stderr. It does NOT hang. The mechanism is structural rather than a `recover`: the shutdown defer that waits on the stats-flusher done channel is registered **below** every close of that channel, and it **cancels the server context as the first statement of its own body**, so its wait cannot outlive an unwinding `main`. Relocating that defer alone does not carry the property — a defer whose wait is satisfied by ANOTHER defer is order-coupled, and moving either one silently re-points the coupling; the in-body release is what bounds the wait. ⚠️ The contract is stated over ANY panic, explicit or runtime-implicit (a nil dereference, an index-range violation, a failed type assertion, a nil-map write): any enumeration of `panic(` call sites is structurally incomplete at the point of use and is NOT what this row promises.
+
+**The two boot-failure mechanisms, and their DIFFERENT exit codes.** (1) `log.Fatalf` → `os.Exit(1)` with a one-line message on stderr — the config-parse, construction, access-log-open and bind errors (admin listener and data listeners alike). `os.Exit` **skips every deferred call**, so this class was never reachable by the defect above and phase 78 changes **nothing** about it. (2) an unrecovered panic → exit status **2** with the `panic:` header and a goroutine dump. The `--mode validate` handler's own exit codes (`0` valid / `1` invalid / `2` usage) are documented above and are likewise unchanged.
+
+**Entry-path symmetry.** `--mode validate` and a normal boot report the same panic the same way. Before this row they diverged: the SAME config, the SAME panic, raised from the SAME line, printed in full on the validate path (~2.5 kB on stderr, exit status 2) and swallowed into a zero-byte silent hang on the normal-boot path — the process neither crashed nor served, with exit status, stderr, log lines and stats ALL absent by construction, because Go prints an unrecovered panic *after* running deferred calls, not before them. That asymmetry, not the panic itself, is what isolated the defer.
+
 ### Does not yet apply to (bootstrap config validation)
 - xDS-sourced (not just static-file) dry-validation.
 - An admin-API-exposed live-reload-and-validate endpoint.
 - An RTDS/SDS validate companion.
+- A boot-path block occurring **before any defer is registered** — `os.OpenFile` on an `access_log` `path` that is a FIFO with no reader (`internal/accesslog/writer.go:56`, reached from `main.go:117`) still hangs silently, zero bytes on either stream. The repair above cannot reach it: at that point there is no deferred call registered whose wait could be released, so the visibility statement is scoped to panics unwinding through `main()` and is NOT a claim about the boot path as a whole.
+- A **shutdown**-class unbounded wait — `AsyncFileSink.Close` (`internal/accesslog/writer.go:91-98`) waits on its writer goroutine's done channel with no grace timeout; it is the only sink `Close` without one. The contract above is scoped to BOOT and says nothing about the shutdown drain.
 
 ---
 
