@@ -156,3 +156,118 @@ fixtures **120** (next-free `0119`; faithful predicate `^[0-9]{4}[a-z]?-` — a 
 - Zero pushes by any agent. Zero commits in any agent worktree. No unscoped `git restore` anywhere. Every experimental edit reverted by **explicit path**; `name.go` verified **sha256 byte-identical** across the T2 edit/revert cycle.
 
 ---
+
+---
+
+# IMPL record (2026-07-29)
+
+**Stage:** IMPL (lifecycle-state `3` -> DONE). **Row 79 FLIPPED `in-progress` -> `done`.** ADR-0301 PROPOSED -> COMPLETE, §Decision + §Consequences appended in place, no renumber, no `---` separator. Base master `22aa4dd6`, stage branch `phase79-impl`. Seven investigation agents on disjoint remits, each in its own detached worktree with private scratch, plus controller re-derivation and controller-authored repair.
+
+## Shipped
+
+| task | landed |
+|---|---|
+| T1 | three SN5-shaped byte-mirror arms — `runtime.` `access_logs.` `tracing.`; RED observed on all ten registration-site names before the arms |
+| T2 | terminal `ExtractTags` rejection enumerates BOTH acceptor species; byte-stable guard with a constant leg AND a rendered-error liveness leg |
+| T3 | stale enumeration swept; **the brief's own `envoy.yaml` site REFUTED** (it carries no enumeration at all) |
+| T4 | `WriteProm` aggregated skip log, format string AND separator pinned as named constants |
+| T5 | stacked control + three NCs as fired-leg SETS + the fuzz-flood check EXECUTED both directions |
+| T6 | `helpText` 15 -> 25 + two guards; **PLAN arm iota REFUTED under a derived roster** |
+| T7 | four-consumer sink byte gate; hoisting NC at two injection sites; **arm kappa reproduced** |
+| T8 | `0118` absence pin -> LABEL-AWARE parity; **PLAN ceiling mechanism (b) REFUTED** |
+| T9 | `BEHAVIOR_CONTRACT.md` — departure CLOSED for three roots, NARROWED to `sds.` |
+| T10 | break arms run within each task rather than as a separate roster pass |
+| T11 | full 120-fixture differential + `-race` + lint + vet |
+| T12 | ADR-0301 completed, row 79 flipped, sentinel re-run with NCs, stage closed |
+
+## ⚠️ THE HEADLINE: THE ROW'S OWN FIX WAS STALE ON ARRIVAL, AND EVERY GATE STAYED GREEN
+
+T1 landed `runtime.`/`access_logs.`/`tracing.` as switch arms. T2 then authored the terminal message enumerating **NINE** top-level segments. **Twelve were live.** T3 swept "NINE" into four fixture files; T6 pinned the text byte-exact. The wrong number reached five sites and a byte-stability guard, and `go build`, `go vet`, `golangci-lint`, the package suites and the differential were all green throughout.
+
+**This is precisely the defect the row exists to repair** — SPEC §1.3's *"fixed the number without auditing where the number lives"* — **reproduced one generation on, inside the repair.** Found independently by **three** investigations (T5, the T3 follow-up, T9), each by **execution**, none by review.
+
+Corrected atomically: `name.go` doc block + `noRecognizedSegmentErrFmt`, the `name_test.go` golden + prose, `internal/admin/stats.go`.
+
+## ⚠️ WHY THE BYTE-STABLE GUARD DID NOT CATCH IT — the reusable lesson
+
+`TestExtractTagsTerminalError_ByteStable` pins the message against silent DRIFT. **It cannot detect that the message is WRONG, because its golden is hand-written**: constant and golden carried the same wrong number, so both legs passed.
+
+**Identical in shape to T6's arm-4a result** — a key typo copy-pasted into the golden defeats a golden-comparison guard. **A guard whose expectation is authored by hand shares the author's mistake.**
+
+Remedy shipped as `internal/stats/segmentcount_test.go`, deriving BOTH sides from the code:
+- **leg 1** extracts detectors from `ExtractTags`' own AST; asserts claimed count AND set; reports missing/extra separately, never a count
+- **leg 2** drives every named root through `ExtractTags` — a phantom passes leg 1 and fails leg 2
+- **leg 3** AST set comparison for the four mid-name segments; **deliberately NOT an acceptance probe**, since each infix arm gates on a per-segment leaf allow-list unrelated to the claim
+- **leg 4** the two species must stay distinct — a mid-name segment must not parse root-anchored
+
+**Negative-controlled:** reverting to the nine-item form on a scratch copy fires leg 1 — `terminal message claims 9 top-level segments; ExtractTags has 12` — and names the three missing roots.
+
+⚠️ **TWO CONTROLLER PROBE DEFECTS CAUGHT EN ROUTE, both of my own making.** A single-segment root probe (`cluster.probe_leaf`) is rejected by SN1/SN2/SN3 for lacking `<rest>` — nothing to do with the claim — and would have reported every label-extracting root as a phantom. A mid-name acceptance probe could never pass at all. **A probe's INPUT is a claim too.**
+
+## ⚠️ SIX STATEMENTS THIS ROW'S OWN LANDING FALSIFIED
+
+1. The stale four-form enumeration (the row's subject) — T3.
+2. `envoy.yaml:16` + `envoy-go.yaml:25`: *"ExtractTags recognizes no `runtime.` top-level segment"* — falsified by T1. **Neither was in the PLAN's edit-site roster; `envoy-go.yaml` is named nowhere in `PLAN.md`.**
+3. `driver.go`: *"with no log and no error"* — the "no log" half falsified by T4.
+4. `envoy-go.yaml:28` + `README.md:72` + `expectations.yaml:77`: `assertPrometheusExpositionDeparture` — renamed by T8.
+5. The nine-item error string — stale on arrival.
+6. The `BEHAVIOR_CONTRACT.md` note recording (5) as *"RECORDED, NOT RESOLVED"* — overtaken when it WAS resolved later in the same session.
+
+⇒ **A roster derived at the branch point is invalid the moment a sibling task lands.** The documents therefore prefer **symbol anchors** to line cites: every by-line cite written during this row went stale inside this row.
+
+## PLAN claims REFUTED by execution
+
+- **Arm iota (the PLAN's self-declared "decisive row") is REFUTED under a DERIVED roster.** With the Prometheus roster derived — which the PLAN itself mandates — "copy the typo into the golden" means typoing the *internal* roster name, a consistent rename with no defect, which correctly passes BOTH guards. Typoing the key alone is caught by BOTH. **The PLAN's two mandates are mutually inconsistent.** The two-guard conclusion survives via a different defect class: a correct key set with an **empty or self-equal VALUE** is A-blind and B-caught.
+- **Ceiling mechanism (b) is REFUTED.** `scrapeProm` had **2 call sites + 4 map-index sites across 2 functions**, both owned by T8 — not "five other assertions". The flat-`/stats` legs consume `scrapeFlat`, a different function. No existing key moved.
+- **The `envoy.yaml` site in HEADLINE ONE is REFUTED** — the four-form regex counts **0** there (NC: `README.md` ⇒ 1).
+- **OTLP absolute byte pins are not reproducible** — they carry an unnamed 15-char version string; size is exactly `base + len(version)`, linear. **Every DELTA reproduces exactly** (0 / +138 / −42 / +96), so the PLAN's measurement is confirmed and only its absolutes are unusable.
+- **The NC diff-line total of 110 did not reproduce (measured 104)** — but the figure is renderer-dependent and no phase-79 document specifies a renderer, so this is recorded as unpinnable rather than as a refutation.
+- **"Not site-dependent" holds for diff-LINE counts, fails for OTLP BYTE counts** (segment-length driven).
+- **`bootstrap.go:621-622` is the stat-NAME const block, not the gauge registration** — `NewGauge` is at `:752-753`.
+- **The PLAN's leg B (`runtime.num_keys`) was killed by T1** — it now projects. T5 re-derived `filesystem.flushed_by_timer` and verified unprojectability three ways.
+- **The PLAN's "1 line / 1151 bytes"** reconciles rather than refutes: 1150 message / 1151 logged with a bare-comma join; 1179 message / **1180 logged** with `", "`. The unstated convention is *including the trailing newline*.
+
+## Broken-gate shape FIFTEEN — CONFIRMED LIVE
+
+**Arm kappa reproduced at both injection sites:** GOLDEN 4 restricted to the OTLP `(F,F)` cell, under the hoisting arm, **PASSES**. Right command, right assertion, **inert cell** — green on the correct tree and green on the wrong one. The neighbouring `(T,F)` cell **shrinks**, so a monotonic-growth assertion reds for the wrong reason. **Neither surfaces from a probe on the default configuration.** The subtest is named `F_F_default_INERT_UNDER_HOIST` in-tree so the trap is legible at the failure site.
+
+## Gates — every one run at the final tip
+
+| gate | result |
+|---|---|
+| full 120-fixture differential | **119 PASS + 1 FAIL**; `comm -3` **EMPTY**; no-driver **0**; SKIP **none** |
+| the one red | `0084-otlp-access-log`, `bind: address already in use`, **before any assertion** |
+| its classification | **INDEXED STARTUP FLAKE, on evidence** — fixture **untouched** by this row (empty diff), isolate-re-run **3x PASS** |
+| `go test ./internal/... -count=1` | **INNER_EXIT 0**, 70 `ok`, 0 FAIL |
+| `-race` on `stats` + `statssink` | **INNER_EXIT 0**, **0** `WARNING: DATA RACE` |
+| `internal/stats` + `statssink` + `admin` `-v` | **382 PASS / 0 FAIL / 0 `no tests to run`** |
+| `gofmt -l` (gated on OUTPUT) | **empty** |
+| `golangci-lint run` on four packages | **0** |
+| `go vet ./...` | **0** |
+| `git diff go.mod go.sum` | **0 bytes** |
+
+## Counts at this close — +0 on every axis
+
+fixtures **120** · fuzzers **55** · stat surface **1207** (DOCUMENTARY; the **DELTA** is what is asserted, and it is structural) · BackendKind tail **38** · go.mod modules **2** (lineage figure) · internal packages **73** · `ROADMAP.md` **227 lines / 111 data rows** · `DECISIONS.md` **17658**, tail **ADR-0301 COMPLETE**, next-free **ADR-0302** · `BEHAVIOR_CONTRACT.md` **5822**.
+
+## Sentinel — re-run MECHANICALLY, twice, and it does NOT fire; `stop` was NOT created
+
+**Before the ROADMAP edit:** (1) `NOT DONE: row 79` · (2) FIVE at `:189 :199 :209 :215 :223` · (3) `gRPC`, `WASM`.
+
+**After the ROADMAP edit:** (1) **prints NOTHING**, no `GATE FAIL` at `want=111` · (2) **FIVE, UNCHANGED — this row narrows NOTHING, stated rather than forecast** · (3) `gRPC`, `WASM` — **so the sentinel does NOT fire.**
+
+NCs all observed firing: `want=110`/`want=112` ⇒ `GATE FAIL: examined 111 …`; row 79 doctored back to `in-progress` ⇒ `NOT DONE: row 79`; invented slug ⇒ `NEVER OPENED: ZZZ-nonexistent`. Input measured at **227 lines / 1 007 766 bytes / 13** bare `candidates:` hits.
+
+**Leak check:** the new cell carries **0** occurrences of either deferred-candidate phrase and **0** new `<Family>-family row` slugs. The single `Observability-family row` hit is **pre-existing** in the cell and is a **registered** slug, so it silences nothing. NC on a doctored copy fires both checks.
+
+## ⚠️ A DEPARTURE FROM THE ADR BLOCK FORM, RECORDED RATHER THAN PAPERED OVER
+
+**ADR-0301 carries NO retained italic footer.** ADRs for phases 72-78 each close §Context with `*(§Decision + §Consequences land at the phase-NN IMPL.)*` and retain it; the phase-79 SPEC omitted it, and **zero lines followed ¶13**. So the PLAN's instruction to append *"after the retained footer"* was **unexecutable as written**. The IMPL appended directly after ¶13. **Writing a footer in order to retain it would have manufactured a record.**
+
+## Deferrals — carried forward UNCHANGED, none fixed
+
+Row **79.1** (the `sds.` hoisting arm, 20 names — the arm that genuinely BREAKS the sink no-op result, now executed rather than argued) · the **40-bullet `STATE_HISTORY.md` archive gap** · the module-path documentary defect · the mechanical stat-surface recount · `ROADMAP.md`'s malformed row 78 · **ADR-0299's STATUS still reads `PROPOSED`** · the Operational-tooling short-form normalization · the WASM row-summary rider (**still DECLINED on the merits**) · symmetric bind hardening · opening the gRPC family (**hard-blocked**).
+
+## Hygiene
+
+Seven agents, each in its own detached worktree with private scratch; all committed **locally only**; controller squash-pushed at close. Every git command used `git -C <abs-worktree-path>`. ⚠️ **The Bash cwd reset fired again — the NINETEENTH consecutive session** — observed live on the first `cd`. Every agent finished `git status --porcelain` EMPTY with experimental edits reverted by **explicit path**; `name.go` verified **sha256 byte-identical** across T7's two NC cycles.

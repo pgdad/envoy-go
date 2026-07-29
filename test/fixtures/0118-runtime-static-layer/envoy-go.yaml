@@ -18,14 +18,34 @@
 # by the driver's AssertStats. BackendCount stays 1 because the runner
 # t.Fatalf's on 0 (reference_differential_backendcount_min_one).
 #
-# ⚠️ THE VALUES ARE SCRAPED FROM THE FLAT /stats ENDPOINT, NOT /stats/prometheus
-# — a FINDING, not a style choice. envoy-go registers both gauges with the
-# correct values (`runtime.num_keys: 6` / `runtime.num_layers: 2` on /stats) but
-# its PROMETHEUS renderer SILENTLY DROPS them: internal/stats.ExtractTags
-# recognizes no `runtime.` top-level segment and internal/stats.WriteProm skips
-# any metric whose name fails to flatten. The reference publishes them on BOTH
-# endpoints. The driver pins that asymmetry symmetrically in
-# assertPrometheusExpositionDeparture. See README.md.
+# ⚠️ THE VALUES ARE SCRAPED FROM THE FLAT /stats ENDPOINT, NOT /stats/prometheus.
+# That began as a FINDING rather than a style choice — and the finding has since
+# been FIXED. Both halves matter; read them before editing this fixture.
+#
+#   PHASE 77 — WHY THIS FIXTURE EXISTS. envoy-go registered both gauges with the
+#   correct values (`runtime.num_keys: 6` / `runtime.num_layers: 2` on /stats),
+#   but its PROMETHEUS renderer DROPPED them: internal/stats.ExtractTags
+#   recognized no `runtime.` top-level segment, and internal/stats.WriteProm
+#   skips any metric whose name fails to flatten — at the time SILENTLY, with no
+#   log and no error. The reference published both names on BOTH endpoints, so
+#   the sides agreed on /stats and disagreed on /stats/prometheus. The flat
+#   endpoint was the sound cross-side seam and the asymmetry was PINNED, so that
+#   the day the projection learned `runtime.` this fixture would go RED and name
+#   its own follow-up.
+#
+#   PHASE 79 — THAT DAY. `runtime.` IS NOW RECOGNIZED: the projection gained
+#   byte-mirror root arms for `runtime.`, `access_logs.` and `tracing.`, so both
+#   gauges are now published on /stats/prometheus by BOTH sides and the phase-77
+#   asymmetry is CLOSED. WriteProm still skips a name it cannot flatten and still
+#   returns no error, but the skip is NO LONGER SILENT — it now emits one
+#   aggregated log line per call naming what it dropped.
+#
+# The flat-/stats legs are KEPT as a second seam (they distinguish a wrong GAUGE
+# from a wrong RENDERER), and the driver now asserts cross-side PARITY of the
+# prometheus exposition in assertPrometheusExpositionParity — which SUPERSEDED
+# the old departure pin rather than deleting it. The authoritative acceptor
+# roster is the rejection-error const in internal/stats/name.go; read it THERE
+# rather than trusting a roster copied into this file. See README.md.
 #
 # ⚠️ STATS ONLY — the reference's admin /runtime BODY is non-deterministic in
 # four independent ways (per-request JSON key order, a per-process Struct

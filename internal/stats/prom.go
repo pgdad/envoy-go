@@ -3,8 +3,19 @@ package stats
 import (
 	"fmt"
 	"io"
+	"log"
 	"sort"
 	"strings"
+)
+
+// promSkipLogFmt and promSkipLogSep pin the aggregate skip-report line emitted
+// by WriteProm. They are named constants, not inline literals, so the format
+// AND the separator are both pinnable: a byte figure quoted for this line is
+// unfalsifiable without the separator, since the join contributes
+// len(sep)*(n-1) bytes on its own.
+const (
+	promSkipLogFmt = "stats: WriteProm skipped %d registered metric name(s) with no recognized top-level segment: %s"
+	promSkipLogSep = ", "
 )
 
 // WriteProm walks the registry, flattens each metric via name.go's
@@ -15,11 +26,21 @@ import (
 // one metric line per fully-qualified label set. Group separator is a blank
 // line. Returns nil on success or the first io.Writer error encountered.
 //
-// On a flattenToProm error for any single metric (which should not happen if
-// NewCounter/NewGauge validation held), the metric is silently skipped and
-// the writer continues — log+ignore matches the BRAINSTORM §5.3 rationale
-// that "errors from WriteProm are logged and otherwise ignored (no retry,
-// no error response — too late, headers already sent)."
+// On a flattenToProm error for any single metric, that metric is omitted from
+// the exposition and the writer continues — no retry and no error response,
+// since the headers are already sent by the time WriteProm runs. The skipped
+// names are NOT lost: they are collected during the walk and reported in
+// AGGREGATE, as exactly ONE log line per WriteProm call, emitted after the walk
+// completes and only when the set is non-empty. Sorted, so the line is stable
+// across runs.
+//
+// The aggregate shape is deliberate. A per-metric log would emit one line per
+// skipped name per scrape, and a skip COUNTER cannot be used at all: Registry
+// .Walk holds r.mu.RLock across every callback while getOrRegister takes
+// r.mu.Lock, and Go's RWMutex is not reentrant, so registering a stat from
+// inside the walk DEADLOCKS the scrape it instruments.
+//
+// The stat surface is unchanged by this reporting path: +0.
 func WriteProm(w io.Writer, r *Registry) error {
 	type promLine struct {
 		labels []Label
@@ -33,11 +54,16 @@ func WriteProm(w io.Writer, r *Registry) error {
 	}
 	groups := make(map[string]*promGroup)
 	var keys []string
+	var skipped []string
 
 	r.Walk(func(m Metric) {
 		base, labels, err := flattenToProm(m.Name())
 		if err != nil {
-			return // skip malformed names (defense-in-depth; should not occur)
+			// Collect, do NOT log here: this callback runs under the
+			// Registry read lock, and the aggregate line is emitted once
+			// after the walk returns.
+			skipped = append(skipped, m.Name())
+			return
 		}
 		g, ok := groups[base]
 		if !ok {
@@ -51,6 +77,10 @@ func WriteProm(w io.Writer, r *Registry) error {
 		}
 		g.entries = append(g.entries, promLine{labels: labels, value: m.Format()})
 	})
+	if len(skipped) > 0 {
+		sort.Strings(skipped)
+		log.Printf(promSkipLogFmt, len(skipped), strings.Join(skipped, promSkipLogSep))
+	}
 	sort.Strings(keys)
 
 	for i, k := range keys {

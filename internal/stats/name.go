@@ -21,6 +21,30 @@ type Label struct {
 // class digit. The regex is anchored at end of string.
 var statusClassRE = regexp.MustCompile(`^(.+)_([1-5])xx$`)
 
+// noRecognizedSegmentErrFmt is the terminal ExtractTags rejection wording: the
+// name matched NONE of the acceptors. It is pinned byte-exact by
+// TestExtractTagsTerminalError_ByteStable in name_test.go.
+//
+// It enumerates BOTH acceptor species, because ExtractTags has two:
+//
+//   - 12 TOP-LEVEL segment detectors (strings.HasPrefix / strings.CutPrefix on
+//     the head of the name).
+//   - 4 MID-NAME segment detectors (strings.Index anywhere in the name).
+//
+// Enumerating only the top-level twelve would state a NECESSARY condition for
+// rejection while reading as a SUFFICIENT one: `anything.rbac.allowed` and
+// `anything.zookeeper.decoder_error` are ACCEPTED and have no recognized
+// top-level segment. In-tree prose has already miscategorized `.rbac.` as a
+// top-level prefix on exactly that reading, so the second clause is what stops
+// the wording rotting again.
+//
+// The leading `has no recognized top-level segment` clause is retained verbatim
+// as a stable grep anchor for the in-tree quotes of this message.
+const noRecognizedSegmentErrFmt = "stats: name %q has no recognized top-level segment " +
+	"(want one of the 12: cluster.|http.|listener.|server.|runtime.|access_logs.|tracing.|wasm.|mongo.|kafka.|redis.|thrift.) " +
+	"and no recognized mid-name segment " +
+	"(want one of the 4: .http_local_rate_limit.|.http_bandwidth_limit.|.rbac.|.zookeeper.)"
+
 // ExtractTags splits an internal hierarchical-dotted name into the residual
 // dotted name (tag-value segments removed, dots preserved) + the extracted tag
 // set (keys in the envoy_ Prometheus underscore form, values the dynamic tokens),
@@ -37,6 +61,13 @@ var statusClassRE = regexp.MustCompile(`^(.+)_([1-5])xx$`)
 //	SN3: listener.<addr>.<rest> → listener.<rest> + label envoy_listener_address=<addr>
 //	SN4: <residual>_Nxx         → <residual>_xx + label envoy_response_code_class=N (N ∈ 1..5)
 //	SN5: server.<rest>          → server.<rest> + no labels
+//	     Phase 79 extends the SN5 byte-mirror shape (residual = the input
+//	     VERBATIM, no label hoisted) to three further roots:
+//	       runtime.<rest>      → runtime.<rest>      + no labels
+//	       access_logs.<rest>  → access_logs.<rest>  + no labels
+//	       tracing.<rest>      → tracing.<rest>      + no labels
+//	     No dot→underscore pre-transform belongs in these arms; flattenToProm
+//	     applies it at projection time.
 //	SN6: HELP text best-effort English (handled by prom.go via helpText map)
 //	SN7: histograms not emitted (Task-2-time NewCounter/NewGauge are the only
 //	     registry methods; absence is the contract)
@@ -94,6 +125,17 @@ func ExtractTags(internal string) (string, []Label, error) {
 		// Rule SN5
 		rest = strings.TrimPrefix(internal, "server.")
 		residual = "server." + rest
+	case strings.HasPrefix(internal, "runtime."):
+		// Rule SN5 byte-mirror shape (phase 79): residual is the input
+		// VERBATIM, no label hoisted. flattenToProm does the dot->underscore
+		// at projection time, so no pre-transform belongs here.
+		residual = internal
+	case strings.HasPrefix(internal, "access_logs."):
+		// Rule SN5 byte-mirror shape (phase 79).
+		residual = internal
+	case strings.HasPrefix(internal, "tracing."):
+		// Rule SN5 byte-mirror shape (phase 79).
+		residual = internal
 	case strings.HasPrefix(internal, "wasm."):
 		// Phase 25.1 / Task 15 follow-up: wasm filter inline-prefix detection
 		// per AMEND-A2 + ADR-0202 + ADR-0203 (mirrors phase-15 bandwidth_limit's
@@ -347,7 +389,7 @@ func ExtractTags(internal string) (string, []Label, error) {
 				}
 			}
 		}
-		return "", nil, fmt.Errorf("stats: name %q has no recognized top-level segment (want cluster.|http.|listener.|server.)", internal)
+		return "", nil, fmt.Errorf(noRecognizedSegmentErrFmt, internal)
 	}
 
 	// Rule SN4: detect the trailing _Nxx and split (operates on the residual).
@@ -445,16 +487,29 @@ func escapeLabelValue(s string) string {
 // helpText maps a Prometheus name to a static English description per
 // BRAINSTORM §4.5. Per Rule SN6, HELP text is NOT byte-equal to Envoy's HELP
 // text — the differential equivalence claim is on values + label keys + types
-// only. Of the 15 entries, the first 10 cover the 13 unique Prometheus names
+// only. Of the 25 entries, the first 10 cover the 13 unique Prometheus names
 // emitted by 06.1 (the four _Nxx counters per HCM and per cluster collapse to
 // envoy_http_downstream_rq_xx and envoy_cluster_upstream_rq_xx respectively per
 // Rule SN4); one is an 06.2 backpressure counter; the next three are the
-// phase-74 listener-scope TLS handshake outcomes; and the last is phase 75's
+// phase-74 listener-scope TLS handshake outcomes; then phase 75's
 // listener-scope ssl.no_certificate — a SUCCESS-PATH annotation, not a member of
-// the outcome trichotomy. All four ssl.* entries have three-dot source names
-// (listener.<addr>.ssl.<leaf>) that flatten under SN3 to address-free residuals
-// plus an envoy_listener_address label. A name absent from this map emits its
-// own name as its HELP text (prom.go), so every emitted name wants an entry.
+// the outcome trichotomy; and the last ten are phase 79's byte-mirror roots
+// (runtime., access_logs., tracing.), whose Prometheus names are the plain
+// dot→underscore projection of the internal name with no label hoisted. All
+// four ssl.* entries have three-dot source names (listener.<addr>.ssl.<leaf>)
+// that flatten under SN3 to address-free residuals plus an
+// envoy_listener_address label. A name absent from this map emits its own name
+// as its HELP text (prom.go:59-61), so every emitted name wants an entry.
+//
+// ⚠️ HELP text is an envoy-go-internal quality choice, NOT a parity surface:
+// the reference emits ZERO # HELP lines on /stats/prometheus, so every entry
+// here WIDENS an existing block-level departure rather than closing one.
+//
+// GUARDED BY: TestHelpText_KeySetExact (key-set equality against the roster
+// projected through flattenToProm) AND TestHelpText_NoSelfEqualHelp (the real
+// WriteProm projection, asserting no rendered HELP degrades to its own name).
+// Both are required — the key-set guard alone cannot see an entry whose VALUE
+// is empty or equal to its key.
 var helpText = map[string]string{
 	"envoy_listener_downstream_cx_total":  "Total connections accepted on the listener.",
 	"envoy_listener_downstream_cx_active": "Active connections on the listener.",
@@ -473,4 +528,21 @@ var helpText = map[string]string{
 	"envoy_listener_ssl_fail_verify_no_cert": "Downstream TLS handshakes failed because no client certificate was presented where one was required.",
 
 	"envoy_listener_ssl_no_certificate": "Successful downstream TLS handshakes in which the client presented no certificate.",
+
+	// Phase 79 — the three byte-mirror roots. No label is hoisted, so the
+	// Prometheus name is "envoy_" + the internal name with dots replaced by
+	// underscores. Do NOT hand-type these keys: TestHelpText_KeySetExact
+	// derives them by running flattenToProm over the internal roster.
+	"envoy_runtime_num_keys":   "Number of keys in the active runtime snapshot.",
+	"envoy_runtime_num_layers": "Number of layers in the active runtime snapshot.",
+
+	"envoy_access_logs_grpc_access_log_logs_written":           "Total access-log records written by the gRPC access logger.",
+	"envoy_access_logs_grpc_access_log_logs_dropped":           "Total access-log records dropped by the gRPC access logger.",
+	"envoy_access_logs_open_telemetry_access_log_logs_written": "Total access-log records written by the OpenTelemetry access logger.",
+	"envoy_access_logs_open_telemetry_access_log_logs_dropped": "Total access-log records dropped by the OpenTelemetry access logger.",
+
+	"envoy_tracing_opentelemetry_spans_sent":    "Total spans sent by the OpenTelemetry tracer.",
+	"envoy_tracing_opentelemetry_spans_dropped": "Total spans dropped by the OpenTelemetry tracer.",
+	"envoy_tracing_zipkin_spans_sent":           "Total spans sent by the Zipkin tracer.",
+	"envoy_tracing_zipkin_spans_dropped":        "Total spans dropped by the Zipkin tracer.",
 }

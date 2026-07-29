@@ -1,6 +1,7 @@
 package stats
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -955,5 +956,131 @@ func TestExtractTags(t *testing.T) {
 	}
 	if _, _, err := ExtractTags("listener_manager.listener_create_success"); err == nil {
 		t.Error("ExtractTags(listener_manager.*): want error (no top-level rule), got nil")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Phase-79 byte-mirror root arms: runtime. / access_logs. / tracing.
+//
+// All three project with the SN5 shape: the residual is the input VERBATIM and
+// NO label is hoisted. The dot->underscore transform does NOT belong here --
+// flattenToProm applies it at projection time -- so ExtractTags must hand back
+// the dotted name unchanged.
+//
+// Every name below comes from a real NON-TEST registration site, re-derived at
+// this tip rather than cited:
+//
+//	runtime.num_keys, runtime.num_layers
+//	    names: internal/bootstrap/bootstrap.go:621-622
+//	    registered as gauges by setRuntimeStats, bootstrap.go:752-753
+//	access_logs.grpc_access_log.logs_written, .logs_dropped
+//	    internal/accesslog/stats.go:24-25 (RegisterGrpcSinkCounters)
+//	access_logs.open_telemetry_access_log.logs_written, .logs_dropped
+//	    internal/accesslog/stats.go:34-35 (RegisterOTLPSinkCounters)
+//	tracing.opentelemetry.spans_sent, .spans_dropped
+//	    internal/tracing/stats.go:53-54 (RegisterTracerCounters)
+//	tracing.zipkin.spans_sent, .spans_dropped
+//	    internal/tracing/stats.go:70-71 (RegisterZipkinCounters)
+// -----------------------------------------------------------------------------
+
+func TestExtractTags_ByteMirrorRoots(t *testing.T) {
+	names := []string{
+		"runtime.num_keys",
+		"runtime.num_layers",
+		"access_logs.grpc_access_log.logs_written",
+		"access_logs.grpc_access_log.logs_dropped",
+		"access_logs.open_telemetry_access_log.logs_written",
+		"access_logs.open_telemetry_access_log.logs_dropped",
+		"tracing.opentelemetry.spans_sent",
+		"tracing.opentelemetry.spans_dropped",
+		"tracing.zipkin.spans_sent",
+		"tracing.zipkin.spans_dropped",
+	}
+	for _, in := range names {
+		residual, labels, err := ExtractTags(in)
+		if err != nil {
+			t.Errorf("ExtractTags(%q): unexpected err %v (the byte-mirror arm must accept it)", in, err)
+		}
+		if residual != in {
+			t.Errorf("ExtractTags(%q) residual = %q, want the input verbatim (byte mirror)", in, residual)
+		}
+		// Gated on the success path so the property is not asserted vacuously:
+		// the error return hands back a nil label slice regardless.
+		if err == nil && labels != nil {
+			t.Errorf("ExtractTags(%q) labels = %+v, want nil (the byte-mirror arm hoists nothing)", in, labels)
+		}
+	}
+}
+
+// TestExtractTags_ByteMirrorRoots_StackedControls stacks the byte-mirror rows
+// against two controls in the same test, because a positive assertion alone
+// cannot catch an OVER-firing arm:
+//
+//   - cluster.backend.upstream_rq_total must KEEP its hoisted SN1 label.
+//   - listener_manager.listener_create_success must STAY rejected.
+//
+// CAVEAT on the second control: listener_manager.* has NO non-test registration
+// site anywhere in envoy-go. It is a synthetic control inherited from the
+// TestExtractTags negative above; it is valid as an over-fire control but it is
+// NOT evidence about a shipped metric.
+func TestExtractTags_ByteMirrorRoots_StackedControls(t *testing.T) {
+	const kept = "cluster.backend.upstream_rq_total"
+	residual, labels, err := ExtractTags(kept)
+	if err != nil {
+		t.Errorf("ExtractTags(%q): unexpected err %v", kept, err)
+	}
+	if residual != "cluster.upstream_rq_total" {
+		t.Errorf("ExtractTags(%q) residual = %q, want %q", kept, residual, "cluster.upstream_rq_total")
+	}
+	if !sameLabels(labels, []Label{{Key: "envoy_cluster_name", Value: "backend"}}) {
+		t.Errorf("ExtractTags(%q) labels = %+v, want the hoisted envoy_cluster_name=backend", kept, labels)
+	}
+
+	const rejected = "listener_manager.listener_create_success"
+	if _, _, err := ExtractTags(rejected); err == nil {
+		t.Errorf("ExtractTags(%q): want error (no top-level rule), got nil", rejected)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// TestExtractTagsTerminalError_ByteStable pins the terminal ExtractTags
+// rejection wording byte-exact, mirroring the phase-77
+// TestParseRejectConstants_ByteStable precedent
+// (internal/filter/http/admission_control/compiled_config_test.go:833).
+//
+// The wording had gone five generations without a guard and drifted to a
+// FOUR-item list while the code grew TWELVE top-level acceptors plus FOUR
+// mid-name acceptors. Both species are now enumerated: a top-level-only list
+// states a NECESSARY condition for rejection while reading as a SUFFICIENT one,
+// since names like `anything.rbac.allowed` are ACCEPTED and have no recognized
+// top-level segment.
+//
+// Two legs, because a constant can be pinned and not shipped:
+//
+//	Leg 1 pins the constant itself.
+//	Leg 2 drives a real ExtractTags rejection and pins the RENDERED error, so
+//	      the constant is proven to be the one the call site actually formats.
+// -----------------------------------------------------------------------------
+
+const wantNoRecognizedSegmentErrFmt = "stats: name %q has no recognized top-level segment " +
+	"(want one of the 12: cluster.|http.|listener.|server.|runtime.|access_logs.|tracing.|wasm.|mongo.|kafka.|redis.|thrift.) " +
+	"and no recognized mid-name segment " +
+	"(want one of the 4: .http_local_rate_limit.|.http_bandwidth_limit.|.rbac.|.zookeeper.)"
+
+func TestExtractTagsTerminalError_ByteStable(t *testing.T) {
+	// Leg 1 -- the constant, byte-exact.
+	if noRecognizedSegmentErrFmt != wantNoRecognizedSegmentErrFmt {
+		t.Errorf("terminal-error wording drift:\n  const: %q\n   want: %q",
+			noRecognizedSegmentErrFmt, wantNoRecognizedSegmentErrFmt)
+	}
+
+	// Leg 2 -- liveness: the rendered error from a real rejection. Proves the
+	// constant is what the :350-family call site formats, not a dead pin.
+	const reject = "zzzz_nonexistent.foo"
+	_, _, err := ExtractTags(reject)
+	if err == nil {
+		t.Errorf("ExtractTags(%q): want the terminal rejection error, got nil", reject)
+	} else if got, want := err.Error(), fmt.Sprintf(wantNoRecognizedSegmentErrFmt, reject); got != want {
+		t.Errorf("rendered terminal error drift:\n  got: %q\n want: %q", got, want)
 	}
 }

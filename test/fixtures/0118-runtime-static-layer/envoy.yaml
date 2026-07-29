@@ -10,13 +10,37 @@
 # (reference_differential_backendcount_min_one), not because any byte flows
 # through it.
 #
-# ⚠️ THE VALUES ARE SCRAPED FROM THE FLAT /stats ENDPOINT, NOT /stats/prometheus
-# — a FINDING, not a style choice. envoy-go registers both gauges with the
-# correct values but its PROMETHEUS renderer SILENTLY DROPS them:
-# internal/stats.ExtractTags recognizes no `runtime.` top-level segment and
-# internal/stats.WriteProm skips any metric whose name fails to flatten. The
-# reference publishes them on BOTH endpoints. The driver pins that asymmetry
-# symmetrically in assertPrometheusExpositionDeparture. See README.md.
+# ⚠️ THE VALUES ARE SCRAPED FROM THE FLAT /stats ENDPOINT, NOT /stats/prometheus.
+# That began as a FINDING rather than a style choice — and the finding has since
+# been FIXED. Both halves matter; read them before editing this fixture.
+#
+#   PHASE 77 — WHY THIS FIXTURE EXISTS. envoy-go registered both gauges with the
+#   correct values, but its PROMETHEUS renderer DROPPED them:
+#   internal/stats.ExtractTags recognized no `runtime.` top-level segment, and
+#   internal/stats.WriteProm skips any metric whose name fails to flatten — at
+#   the time, SILENTLY, with no log and no error. The reference published both
+#   names on BOTH endpoints, so the two sides agreed on /stats and disagreed on
+#   /stats/prometheus. The flat endpoint was chosen as the sound cross-side seam
+#   (neither name carries an address or a dynamic segment, so the internal name
+#   is byte-identical on both sides) and the asymmetry was PINNED deliberately,
+#   so that the day the projection learned `runtime.` this fixture would go RED
+#   and name its own follow-up.
+#
+#   PHASE 79 — THAT DAY. `runtime.` IS NOW RECOGNIZED: the projection gained
+#   byte-mirror root arms for `runtime.`, `access_logs.` and `tracing.`, so both
+#   gauges are now published on /stats/prometheus by BOTH sides and the phase-77
+#   asymmetry is CLOSED. WriteProm still skips a name it cannot flatten and still
+#   returns no error, but the skip is NO LONGER SILENT — it now emits one
+#   aggregated log line per call naming what it dropped, so a future recurrence
+#   is observable instead of invisible.
+#
+# The flat-/stats legs are KEPT as a second seam (they distinguish a wrong GAUGE
+# from a wrong RENDERER), and the driver now asserts cross-side PARITY of the
+# prometheus exposition in assertPrometheusExpositionParity — which SUPERSEDED
+# the old departure pin rather than deleting it. The authoritative acceptor
+# roster is the rejection-error const in internal/stats/name.go. Read it THERE
+# rather than trusting a roster copied into this file — a stale copy is exactly
+# what phase 79 had to sweep up. See README.md.
 #
 # ⚠️ STATS ONLY — the admin /runtime BODY is NOT comparable, in four independent
 # ways, all measured on the pinned reference image at the phase-77 PLAN:

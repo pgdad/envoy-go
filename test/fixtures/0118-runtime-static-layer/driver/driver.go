@@ -45,8 +45,9 @@ const (
 	statNumKeys   = "runtime.num_keys"
 	statNumLayers = "runtime.num_layers"
 
-	// The PROMETHEUS names. Used ONLY by the departure pin: the reference
-	// publishes both, envoy-go publishes NEITHER.
+	// The PROMETHEUS names. Used by assertPrometheusExpositionParity: as of
+	// phase 79 BOTH sides publish BOTH names. Through phase 78 the subject
+	// published NEITHER and this pair keyed an absence pin.
 	promNumKeys   = "envoy_runtime_num_keys"
 	promNumLayers = "envoy_runtime_num_layers"
 
@@ -151,15 +152,46 @@ func (*runtimeStaticLayerDriver) ProbeAdmin(ctx context.Context, refAdminAddr, s
 //	subject    /stats/prometheus  *** BOTH NAMES ABSENT ***
 //
 // The gauges ARE registered and DO carry the correct values on the subject; the
-// PROMETHEUS RENDERER drops them. internal/stats.ExtractTags recognizes only
-// the top-level segments `cluster.|http.|listener.|server.` (plus the hoisting
-// prefixes rbac./mongo./redis./thrift./…) and returns an error for anything
-// else; internal/stats.WriteProm's Walk callback SILENTLY SKIPS a metric whose
-// flattenToProm errors ("skip malformed names (defense-in-depth; should not
-// occur)"). `runtime.` was never added to that dispatch when the gauges landed,
-// so the two names vanish from the prometheus exposition with no log and no
-// error. Asserting /stats/prometheus as the PLAN specified would have made this
-// row PERMANENTLY RED for a reason that has nothing to do with layered_runtime.
+// PROMETHEUS RENDERER dropped them through phase 78. internal/stats.ExtractTags
+// recognizes TWELVE top-level segments and returns an error for anything else:
+//
+//	cluster. http. listener. server. runtime. access_logs. tracing. wasm.
+//	    the `case strings.HasPrefix(internal, ...)` arms of the ExtractTags switch
+//	mongo. kafka. redis. thrift.
+//	    the root-anchored `strings.CutPrefix(internal, ...)` calls in its default arm
+//
+// ⚠️ `runtime.`, `access_logs.` and `tracing.` are PHASE-79 additions. Before
+// this row the roster was NINE, which is why in-tree prose elsewhere still says
+// nine — treat any nine you find as stale until you have re-counted.
+//
+// ⚠️ FOUR FURTHER detectors exist and are NOT top-level — they are MID-NAME
+// (INFIX) `strings.Index` matches, declared as the `lrlSegment`, `blSegment`,
+// `rbacSegment` and `zkSegment` consts. They widen the set of accepted NAMES but
+// NOT the set of accepted ROOTS:
+//
+//	.http_local_rate_limit.   .http_bandwidth_limit.   .rbac.   .zookeeper.
+//
+// Each fires on ANY dot-free leading segment, so `ANYTHING_AT_ALL.rbac.allowed`
+// parses clean (residual `rbac.allowed`) while the ROOT-anchored `rbac.allowed`
+// does NOT parse — the head must be non-empty. Counting these four as roots is
+// the standing documentation error; the top-level answer is TWELVE, and the two
+// species must never be summed.
+//
+// ⚠️ NO name.go LINE NUMBERS ARE CITED ABOVE, DELIBERATELY. Every line cite this
+// comment previously carried went stale inside a single phase. Grep the symbols
+// named here instead; the authoritative roster is the `noRecognizedSegmentErrFmt`
+// const in internal/stats/name.go.
+//
+// internal/stats.WriteProm's Walk callback SKIPS a metric whose flattenToProm
+// errors. `runtime.` was not in that dispatch when the gauges landed, so the two
+// names vanished from the prometheus exposition — and through phase 78 that skip
+// was SILENT, with no log and no error, which is why the gap survived
+// registration, the whole unit suite and go vet alike. Phase 79 changed BOTH
+// halves: the `runtime.` arm landed, AND WriteProm now emits one aggregated log
+// line per call naming the metrics it skipped. The skip still returns no error,
+// so the log is the only signal. Asserting /stats/prometheus at phase 77, as
+// that PLAN specified, would have made this row PERMANENTLY RED for a reason
+// that had nothing to do with layered_runtime.
 //
 // The flat endpoint is a sound cross-side seam HERE specifically because the
 // two names carry NO address and NO dynamic segment, so the internal name is
@@ -201,11 +233,11 @@ func (d *runtimeStaticLayerDriver) AssertStats(t fixture.TB, refAdminAddr, subjA
 	if err != nil {
 		t.Fatalf("scrape subj /stats: %v", err)
 	}
-	refProm, err := scrapeProm(refAdminAddr)
+	refProm, err := scrapePromSamples(refAdminAddr)
 	if err != nil {
 		t.Fatalf("scrape ref /stats/prometheus: %v", err)
 	}
-	subjProm, err := scrapeProm(subjAdminAddr)
+	subjProm, err := scrapePromSamples(subjAdminAddr)
 	if err != nil {
 		t.Fatalf("scrape subj /stats/prometheus: %v", err)
 	}
@@ -213,12 +245,17 @@ func (d *runtimeStaticLayerDriver) AssertStats(t fixture.TB, refAdminAddr, subjA
 	// fixture.TB has EXACTLY Errorf/Fatalf/Helper — no Logf
 	// (reference_fixture_tb_has_no_logf). Diagnostics go through log.Printf.
 	// This line is also the evidence that the leg RAN at all.
-	_, refPromKeysOK := refProm[promNumKeys]
-	_, subjPromKeysOK := subjProm[promNumKeys]
+	// ⚠️ The prometheus fields RECORD BOTH SIDES' VALUES AND LABEL TEXT, not
+	// just presence. Presence alone was enough while this row pinned an
+	// ABSENCE; now that it asserts PARITY, a green run must leave behind the
+	// measured numbers it was green on.
+	refPromKeys, refPromKeyLabels := foldPromSamples(refProm[promNumKeys])
+	subjPromKeys, subjPromKeyLabels := foldPromSamples(subjProm[promNumKeys])
 	log.Printf("0118 AssertStats: ref num_keys=%d num_layers=%d | subj num_keys=%d num_layers=%d "+
-		"| prom-exposition ref_num_keys_present=%t subj_num_keys_present=%t",
+		"| prom-exposition ref_num_keys_present=%t(=%d labels=%q) subj_num_keys_present=%t(=%d labels=%q)",
 		ref[statNumKeys], ref[statNumLayers], subj[statNumKeys], subj[statNumLayers],
-		refPromKeysOK, subjPromKeysOK)
+		len(refProm[promNumKeys]) > 0, refPromKeys, refPromKeyLabels,
+		len(subjProm[promNumKeys]) > 0, subjPromKeys, subjPromKeyLabels)
 
 	want := map[string]uint64{
 		statNumKeys:   wantNumKeys,   // 1(A) + 2(B) + 1(C) + 2(D), UNION
@@ -263,53 +300,102 @@ func (d *runtimeStaticLayerDriver) AssertStats(t fixture.TB, refAdminAddr, subjA
 			subj[statNumKeys], subj[statNumLayers])
 	}
 
-	d.assertPrometheusExpositionDeparture(t, refProm, subjProm)
+	d.assertPrometheusExpositionParity(t, refProm, subjProm)
 }
 
-// assertPrometheusExpositionDeparture PINS the measured cross-side asymmetry of
-// the PROMETHEUS exposition, in BOTH directions, so it cannot drift silently.
+// promGauge pairs a PROMETHEUS name with its expected value.
 //
-// ⚠️ THIS IS A DEPARTURE PIN, NOT A PARITY CLAIM. The reference emits both
-// gauges to /stats/prometheus; envoy-go emits NEITHER, because
-// internal/stats.ExtractTags does not recognize a `runtime.` top-level segment
-// and internal/stats.WriteProm silently skips any metric whose name fails to
-// flatten. The gauges themselves are correct — only the renderer drops them.
+// ⚠️ A SLICE, not a map. The superseded departure pin iterated a map literal,
+// so its t.Errorf roster reordered between runs; a failure diff that reorders
+// is unreadable, and an ordered roster is also what makes "exactly which
+// assertions fired" a checkable statement.
+type promGauge struct {
+	name string
+	want uint64
+}
+
+var promGauges = []promGauge{
+	{name: promNumKeys, want: wantNumKeys},
+	{name: promNumLayers, want: wantNumLayers},
+}
+
+// assertPrometheusExpositionParity asserts CROSS-SIDE PARITY of the PROMETHEUS
+// exposition for the two runtime gauges: present on both sides, same value on
+// both sides, and STILL zero-label on both sides.
 //
-// Prose alone would not hold this: a documented gap that nothing executes is
-// exactly the shape this lineage keeps rediscovering. So it is asserted, and it
-// is asserted SYMMETRICALLY:
+// ⚠️ THIS SUPERSEDES A DEPARTURE PIN, AND THE FLIP IS THE POINT. Through phase
+// 78 this function asserted the two names were ABSENT from the SUBJECT's
+// /stats/prometheus: internal/stats.ExtractTags did not recognize a `runtime.`
+// top-level segment, and internal/stats.WriteProm silently skips any metric
+// whose name fails to flatten, so the renderer dropped two correct gauges with
+// no log and no error. The pin was written to go RED the day that changed.
+// Phase 79 is that day — internal/stats now carries a byte-mirror `runtime.`
+// arm — and the observed RED was exactly the two subject-absence branches, so
+// the pin discharged its purpose and is replaced rather than deleted.
 //
-//   - the REFERENCE side must KEEP publishing both names (a regression there
-//     would otherwise be invisible, since this row no longer reads the
-//     prometheus endpoint for its values);
-//   - the SUBJECT side must STILL be missing both names. ⚠️ THE DAY
-//     internal/stats LEARNS `runtime.`, THIS ROW GOES RED ON PURPOSE — that is
-//     the signal to move the value assertions above back onto
-//     /stats/prometheus as the phase-77 PLAN originally specified, and to
-//     delete this function.
-func (*runtimeStaticLayerDriver) assertPrometheusExpositionDeparture(t fixture.TB, refProm, subjProm map[string]uint64) {
+// ⚠️ CONVERTED, NOT DELETED. Deleting in favor of "the generic prometheus
+// comparison" is not available: there is no generic prometheus differential in
+// the runner, and this fixture's ProbeAdmin returns /ready only. Deleting would
+// leave the prometheus projection of these gauges with ZERO assertions on
+// EITHER side while reading as cleanup.
+//
+// ⚠️ THE FLAT-/stats LEGS IN AssertStats ARE DELIBERATELY KEPT AS A SECOND
+// SEAM. They are the only thing that distinguishes "the GAUGE is wrong" from
+// "the RENDERER is wrong": a flat-endpoint failure alongside a prometheus
+// failure indicts the gauge, a prometheus-only failure indicts the projection.
+//
+// ⚠️ THE LABEL LEG IS NOT DECORATION. Name-and-value parity alone is blind to a
+// build that hoists part of an internal name into a prometheus LABEL — the key
+// and the summed value both survive that move untouched. Asserting the label
+// text is empty is what makes this assertion able to fail on it.
+func (*runtimeStaticLayerDriver) assertPrometheusExpositionParity(t fixture.TB, refProm, subjProm map[string][]promSample) {
 	t.Helper()
 
-	for name, want := range map[string]uint64{promNumKeys: wantNumKeys, promNumLayers: wantNumLayers} {
-		v, ok := refProm[name]
-		if !ok {
+	for _, g := range promGauges {
+		refSamples, refOK := refProm[g.name]
+		subjSamples, subjOK := subjProm[g.name]
+
+		// ⚠️ THE ABSENT CHECK IS SEPARATE FROM THE VALUE CHECK, and each branch
+		// `continue`s — mirroring the flat-endpoint guard in AssertStats. A
+		// name that never lands in the map folds to 0, and 0 == 0 through a
+		// bare lookup is a VACUOUS pass.
+		if !refOK {
 			t.Errorf("ref: %s ABSENT from /stats/prometheus — the REFERENCE has always published it "+
-				"(measured `%s{} %d` on the pinned image); this row's value assertions moved to the flat "+
-				"/stats endpoint, so nothing else would catch a reference-side regression here", name, name, want)
+				"(measured `%s{} %d` on the pinned image)", g.name, g.name, g.want)
 			continue
 		}
-		if v != want {
-			t.Errorf("ref %s = %d on /stats/prometheus, want %d", name, v, want)
+		if !subjOK {
+			t.Errorf("subj: %s ABSENT from /stats/prometheus — phase 79 taught internal/stats the "+
+				"`runtime.` top-level segment, so the projection is required to emit it. An absence here "+
+				"means the byte-mirror arm was dropped from ExtractTags, or WriteProm is again skipping "+
+				"the name silently", g.name)
+			continue
 		}
-	}
 
-	for _, name := range []string{promNumKeys, promNumLayers} {
-		if v, ok := subjProm[name]; ok {
-			t.Errorf("subj: %s is NOW PRESENT on /stats/prometheus (= %d) — the phase-77 prometheus-exposition "+
-				"gap has been CLOSED. That is good news and this row is deliberately RED to force the follow-up: "+
-				"move this fixture's value assertions from the flat /stats endpoint back onto /stats/prometheus "+
-				"(as the phase-77 PLAN §1.3 specified) and DELETE "+
-				"assertPrometheusExpositionDeparture", name, v)
+		refVal, refLabels := foldPromSamples(refSamples)
+		subjVal, subjLabels := foldPromSamples(subjSamples)
+
+		if refVal != g.want {
+			t.Errorf("ref %s = %d on /stats/prometheus, want %d", g.name, refVal, g.want)
+		}
+		if subjVal != g.want {
+			t.Errorf("subj %s = %d on /stats/prometheus, want %d", g.name, subjVal, g.want)
+		}
+		if refVal != subjVal {
+			t.Errorf("cross-side mismatch %s on /stats/prometheus: ref=%d subj=%d", g.name, refVal, subjVal)
+		}
+
+		// ⚠️ Empty covers BOTH zero-label spellings (`name{} 6` and `name 6`) —
+		// see scrapePromSamples. A non-empty label text is a HOISTING change,
+		// which every name-keyed check above is blind to.
+		if refLabels != "" {
+			t.Errorf("ref: %s carries a NON-EMPTY label set %s on /stats/prometheus — this row asserts a "+
+				"BYTE-MIRROR projection with no labels on either side", g.name, refLabels)
+		}
+		if subjLabels != "" {
+			t.Errorf("subj: %s carries a NON-EMPTY label set %s on /stats/prometheus — the `runtime.` arm "+
+				"is a BYTE-MIRROR arm; hoisting any segment into a label is a cross-side divergence the "+
+				"name-and-value legs above cannot see", g.name, subjLabels)
 		}
 	}
 }
@@ -388,23 +474,59 @@ func scrapeFlat(adminAddr string) (map[string]uint64, error) {
 	return out, nil
 }
 
-// scrapeProm issues GET http://<addr>/stats/prometheus and returns a map keyed
-// by the metric NAME with the `{...}` label set STRIPPED ENTIRELY, colliding by
-// SUMMING. Cloned from 0110/driver.go.
+// promSample is ONE exposition line for one metric name: the RAW label text
+// between `{` and `}`, plus the value.
 //
-// ⚠️ The two gauges carry an EMPTY label set and each sample is preceded by its
-// own `# TYPE` line:
+// ⚠️ labels is EMPTY for BOTH zero-label spellings — the reference's
+// `envoy_runtime_num_keys{} 6` and envoy-go's brace-less
+// `envoy_runtime_num_keys 6`. That normalization is the whole reason the parity
+// assertion can run cross-side at all; see scrapePromSamples.
+type promSample struct {
+	labels string
+	value  uint64
+}
+
+// foldPromSamples reduces every sample recorded for ONE metric name to the
+// SUMMED value — preserving the collide-by-summing semantics this scrape has
+// always had — and to the set of NON-EMPTY label texts observed, joined for an
+// error message. An empty second return means every sample was zero-label.
+func foldPromSamples(samples []promSample) (uint64, string) {
+	var sum uint64
+	var withLabels []string
+	for _, s := range samples {
+		sum += s.value
+		if s.labels != "" {
+			withLabels = append(withLabels, "{"+s.labels+"}")
+		}
+	}
+	return sum, strings.Join(withLabels, " ")
+}
+
+// scrapePromSamples issues GET http://<addr>/stats/prometheus and returns, per
+// metric NAME, every sample line observed for it — value AND label text.
+// Cloned from 0110/driver.go, then made LABEL-AWARE at phase 79.
 //
-//	# TYPE envoy_runtime_num_keys gauge
-//	envoy_runtime_num_keys{} 6
-//	# TYPE envoy_runtime_num_layers gauge
-//	envoy_runtime_num_layers{} 2
+// ⚠️ IT IS LABEL-AWARE ON PURPOSE, AND THAT IS LOAD-BEARING. The previous
+// version discarded the `{...}` text entirely and returned map[string]uint64.
+// A cross-side parity assertion built on that shape passes SILENTLY against a
+// build that starts hoisting part of the internal name into a LABEL: the name
+// key and the summed value are both unchanged, so nothing observes the move.
+// Returning the label text lets the parity assertion below state the property
+// it actually means — same name, same value, and STILL no labels on either
+// side.
 //
-// The brace branch below handles `{}` correctly (open=…, closeIdx=open+1, so
-// the name is everything before `{` and the value everything after `}`). A
-// hand-rolled `grep -c` on either name would return 2 per scrape because of the
-// `# TYPE` line; the `#` skip below means that bites only a shell gate.
-func scrapeProm(adminAddr string) (map[string]uint64, error) {
+// ⚠️ MEASURED zero-label BRACE DIVERGENCE (executed at this task, both sides,
+// same run):
+//
+//	reference  `envoy_runtime_num_keys{} 6`     — braces present, empty
+//	subject    `envoy_runtime_num_keys 6`       — braces OMITTED
+//
+// so a RAW-LINE comparison of the two expositions is never valid here. Both
+// forms must go through the two-branch parser below, which yields labels == ""
+// for each. (The subject additionally emits a `# HELP` line the reference does
+// not; the `#` skip below absorbs it. A hand-rolled `grep -c` on either name
+// would therefore return 2 or 3 per scrape — that bites only a shell gate.)
+func scrapePromSamples(adminAddr string) (map[string][]promSample, error) {
 	url := "http://" + adminAddr + "/stats/prometheus"
 	resp, err := http.Get(url) //nolint:gosec // fixed admin URL, test-only
 	if err != nil {
@@ -419,19 +541,23 @@ func scrapeProm(adminAddr string) (map[string]uint64, error) {
 		return nil, fmt.Errorf("read %s body: %w", url, err)
 	}
 
-	out := map[string]uint64{}
+	out := map[string][]promSample{}
 	for _, line := range strings.Split(body.String(), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		var name, rest string
+		var name, labels, rest string
 		if open := strings.IndexByte(line, '{'); open >= 0 {
 			closeIdx := strings.LastIndexByte(line, '}')
 			if closeIdx < open {
 				continue // malformed: no closing brace
 			}
 			name = line[:open]
+			// ⚠️ `{}` yields "" here, exactly as the brace-less branch does.
+			// That is the deliberate normalization of the measured cross-side
+			// brace divergence — NOT a discarded label set.
+			labels = strings.TrimSpace(line[open+1 : closeIdx])
 			rest = strings.TrimSpace(line[closeIdx+1:])
 		} else {
 			sp := strings.IndexByte(line, ' ')
@@ -452,7 +578,7 @@ func scrapeProm(adminAddr string) (map[string]uint64, error) {
 		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
 			continue
 		}
-		out[name] += uint64(v)
+		out[name] = append(out[name], promSample{labels: labels, value: uint64(v)})
 	}
 	return out, nil
 }

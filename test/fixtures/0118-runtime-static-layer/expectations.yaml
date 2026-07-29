@@ -40,14 +40,42 @@
 #   subject    /stats/prometheus   *** BOTH NAMES ABSENT ***
 #
 # The gauges ARE registered on the subject and DO carry the correct values. The
-# PROMETHEUS RENDERER drops them: internal/stats.ExtractTags recognizes only the
-# top-level segments cluster./http./listener./server. (plus the hoisting
-# prefixes rbac./mongo./redis./thrift./...) and returns
+# PROMETHEUS RENDERER dropped them through phase 78: internal/stats.ExtractTags
+# recognizes TWELVE top-level segments and returns an error for anything else:
+#
+#   cluster. http. listener. server. runtime. access_logs. tracing. wasm.
+#       the `case strings.HasPrefix(internal, ...)` arms of the ExtractTags switch
+#   mongo. kafka. redis. thrift.
+#       the root-anchored `strings.CutPrefix(internal, ...)` calls in its default arm
+#
+# ⚠️ runtime., access_logs. and tracing. are PHASE-79 additions. Before this row
+# the roster was NINE, which is why in-tree prose elsewhere still says nine —
+# treat any nine you find as stale until you have re-counted.
+#
+# FOUR FURTHER detectors are MID-NAME (INFIX), NOT top-level — .rbac.,
+# .zookeeper., .http_local_rate_limit., .http_bandwidth_limit., declared as the
+# rbacSegment / zkSegment / lrlSegment / blSegment consts. Each fires on any
+# dot-free LEADING segment, so they accept more NAMES but add no ROOT:
+# ANYTHING_AT_ALL.rbac.allowed parses clean while the root-anchored
+# rbac.allowed does not. The top-level answer is TWELVE, and the two species
+# must never be summed.
+#
+# ⚠️ NO name.go LINE NUMBERS ARE CITED ABOVE, DELIBERATELY — every cite this
+# file previously carried went stale inside a single phase. Grep the symbols.
+# The rejection error is raised from the noRecognizedSegmentErrFmt const in
+# internal/stats/name.go and begins
 #   stats: name "runtime.num_keys" has no recognized top-level segment
-# for anything else — and internal/stats.WriteProm's Walk callback SILENTLY
-# SKIPS a metric whose flattenToProm errors ("skip malformed names
-# (defense-in-depth; should not occur)"). Nothing logs, nothing errors.
-# `runtime.` was never added to that dispatch when the gauges landed.
+# followed by parentheticals listing the recognized sets. ⚠️ THOSE ARE NOT
+# QUOTED HERE ON PURPOSE; read the const for its current text rather than
+# trusting a copy in this file.
+#
+# internal/stats.WriteProm's Walk callback SKIPS a metric whose flattenToProm
+# errors, and `runtime.` was not in that dispatch when the gauges landed. Through
+# phase 78 that skip was SILENT — nothing logged, nothing errored — which is why
+# the gap survived registration, the unit suite and go vet alike. Phase 79 fixed
+# BOTH halves: the `runtime.` arm landed, AND WriteProm now emits one aggregated
+# log line per call naming what it skipped. It still returns no error, so the log
+# is the only signal.
 #
 # Consequences, both acted on by the driver:
 #   1. THE VALUE ASSERTIONS READ THE FLAT /stats ENDPOINT. Sound cross-side HERE
@@ -55,16 +83,21 @@
 #      segment, so the internal name is cross-side IDENTICAL — the hazard behind
 #      reference_listener_stat_scope_cross_side_divergence (which forces
 #      listener stats through /stats/prometheus, where the address is a LABEL)
-#      does not arise. Asserting /stats/prometheus as the PLAN specified would
-#      have left this row PERMANENTLY RED for a reason unrelated to
-#      layered_runtime.
-#   2. THE DEPARTURE ITSELF IS PINNED, SYMMETRICALLY, by
-#      assertPrometheusExpositionDeparture — prose alone would not hold it. The
-#      REFERENCE must keep publishing both prometheus names (nothing else would
-#      catch a regression there now); the SUBJECT must still be missing both.
-#      ⚠️ THE DAY internal/stats LEARNS A `runtime.` SEGMENT, THIS ROW GOES RED
-#      ON PURPOSE — the signal to move the value assertions back onto
-#      /stats/prometheus and delete that function.
+#      does not arise. Asserting /stats/prometheus at phase 77, as that PLAN
+#      specified, would have left this row PERMANENTLY RED for a reason
+#      unrelated to layered_runtime. The flat legs are KEPT even now that the
+#      prometheus side works: they are what distinguishes a wrong GAUGE from a
+#      wrong RENDERER.
+#   2. THE PROMETHEUS EXPOSITION IS ASSERTED, SYMMETRICALLY, by
+#      assertPrometheusExpositionParity — prose alone would not hold it. ⚠️ THAT
+#      FUNCTION SUPERSEDED A DEPARTURE PIN AND THE FLIP IS THE POINT. Through
+#      phase 78 it asserted the SUBJECT was MISSING both prometheus names, and
+#      it was written to go RED the day internal/stats learned a `runtime.`
+#      segment. PHASE 79 IS THAT DAY: the arm landed, the pin went RED exactly
+#      as designed, and it was CONVERTED — not deleted — into a cross-side
+#      parity assertion (present on both sides, equal values, still zero-label).
+#      Deleting it would have left the prometheus projection of these gauges
+#      with ZERO assertions on either side while reading as cleanup.
 #
 # The fix — teaching ExtractTags a `runtime.` passthrough — is a change to a
 # shared, byte-gated component with its own name-mapping tests and is NOT part
