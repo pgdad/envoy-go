@@ -200,9 +200,66 @@ func repoRoot(t *testing.T) string {
 	return abs
 }
 
+// backendPortBand{Base,Span} bound the port range freeTCPPort draws from:
+// 11000..14999. Chosen to sit BELOW the kernel ephemeral range
+// (net.ipv4.ip_local_port_range, 32768+ by default) for the same reason
+// freeTCPPortBlock's 20000..31007 band does — see its comment — and clear of
+// every other claimed range: the static fixture ports (10000..10447,
+// 15000..15011, 18001..18007) and the subject blocks (20000..31007).
+const (
+	backendPortBandBase = 11000
+	backendPortBandSpan = 4000
+)
+
+// backendPortCursor strides freeTCPPort's candidates so a port released by the
+// previous fixture is not immediately re-offered to the next one.
+var backendPortCursor atomic.Uint32
+
+// freeTCPPort returns a port observed bindable ON THE WILDCARD ADDRESS, drawn
+// from a band outside the kernel's ephemeral range.
+//
+// Both properties are load-bearing, and this helper had NEITHER until the
+// 0084-otlp-access-log failure of 2026-07-30 (CI run 30505421651):
+//
+//	listen: listen tcp 0.0.0.0:36243: bind: address already in use
+//	runner_test.go:343: backend[0] not ready: waitTCPDial: ... within 5s
+//
+// (1) WILDCARD, not loopback. Every subprocess backend this feeds binds
+// `0.0.0.0:<port>`, whose conflict set is strictly larger than
+// `127.0.0.1:<port>`'s — a port held on any single interface address makes the
+// wildcard bind fail while a loopback probe still reports it free. Measured
+// directly: with a squatter on 192.168.1.76:46081, `127.0.0.1:46081` binds FREE
+// and `0.0.0.0:46081` fails EADDRINUSE. The old probe address therefore did not
+// answer the question its callers ask.
+//
+// (2) OUTSIDE the ephemeral range. 36243 is inside 32768..60999, which the
+// kernel hands out concurrently to the suite's own traffic (Docker, the
+// drivers' client connections). freeTCPPortBlock already moved the SUBJECT off
+// that range for exactly this reason and recorded ~8% of it busy under
+// full-suite load; the backend path never got the same treatment.
+//
+// A window remains between the probe's Close and the child's bind (the child
+// is `go run`, so the gap spans a build). Banding shrinks that window's
+// exposure to fixture-allocated ports only — the kernel no longer assigns from
+// here — but does not close it. A start-retry loop, as the subject-start path
+// has, would be the second line of defense if this ever recurs.
 func freeTCPPort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	for tries := 0; tries < 256; tries++ {
+		slot := backendPortCursor.Add(1)
+		port := backendPortBandBase + int(slot%backendPortBandSpan)
+		ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
+		if err != nil {
+			continue
+		}
+		_ = ln.Close()
+		return port
+	}
+	// Band exhausted: fall back to the kernel allocator rather than fail the
+	// fixture. Still wildcard-probed, so property (1) survives the fallback.
+	t.Logf("freeTCPPort: no free port in %d..%d after 256 tries; falling back to the ephemeral range",
+		backendPortBandBase, backendPortBandBase+backendPortBandSpan-1)
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		t.Fatalf("free port: %v", err)
 	}
@@ -256,6 +313,56 @@ func freeTCPPortBlock(t *testing.T) int {
 	}
 	t.Logf("freeTCPPortBlock: no fully-free %d-port block after 256 tries; falling back to an ephemeral base", subjectPortBlockSpan)
 	return freeTCPPort(t)
+}
+
+// TestFreeTCPPort_BandedAndWildcardBindable pins the two properties that the
+// 0084-otlp-access-log CI failure of 2026-07-30 showed freeTCPPort lacked: the
+// port must be OUTSIDE the kernel ephemeral range, and it must be bindable on
+// the WILDCARD address (which is what every subprocess backend binds), not
+// merely on loopback.
+func TestFreeTCPPort_BandedAndWildcardBindable(t *testing.T) {
+	// Static invariant: the backend band must not overlap the subject band.
+	// A future edit to either pair of constants trips this without needing a
+	// suite run to discover the collision.
+	backendHi := backendPortBandBase + backendPortBandSpan - 1
+	// freeTCPPortBlock's bases are 20000 + (slot*span % 11008). span divides
+	// 11008 evenly (11008/16 = 688), so the residues are exactly the multiples
+	// of span in [0, 11008-span] and the highest base is 20000+11008-span; the
+	// block it hands out then extends span-1 further. Top = 20000+11008-1.
+	const subjectModulus = 11008
+	subjectLo := 20000
+	subjectHi := 20000 + subjectModulus - 1
+	if backendPortBandBase <= subjectHi && subjectLo <= backendHi {
+		t.Errorf("backend band %d..%d overlaps subject band %d..%d",
+			backendPortBandBase, backendHi, subjectLo, subjectHi)
+	}
+
+	seen := make(map[int]bool)
+	for i := 0; i < 32; i++ {
+		port := freeTCPPort(t)
+
+		if port < backendPortBandBase || port > backendHi {
+			// Not fatal on its own: the documented fallback path may legitimately
+			// return an ephemeral port if the band is exhausted. Say so loudly
+			// rather than silently accepting an ephemeral port as normal.
+			t.Errorf("freeTCPPort returned %d, outside the band %d..%d "+
+				"(ephemeral fallback taken? the band should not be exhausted on an idle host)",
+				port, backendPortBandBase, backendHi)
+		}
+
+		// The property the old loopback probe did not establish.
+		ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
+		if err != nil {
+			t.Errorf("freeTCPPort returned %d but it is not wildcard-bindable: %v", port, err)
+		} else {
+			_ = ln.Close()
+		}
+
+		if seen[port] {
+			t.Errorf("freeTCPPort returned %d twice in %d calls; the cursor should stride", port, i+1)
+		}
+		seen[port] = true
+	}
 }
 
 // TestHostGatewayIP verifies that HostGatewayIP returns a non-empty literal IP
