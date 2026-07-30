@@ -43,7 +43,24 @@ jobs:
       - name: go mod download
         run: go mod download
       - name: differential suite
-        run: go test ./test/differential/... -timeout 5m -v
+        # The -timeout must exceed the WHOLE suite's wall time, not one fixture's.
+        # It was set to 5m at phase 00, when the corpus was a single fixture. The
+        # corpus is now 120 fixtures and the suite outgrew that budget: the last
+        # green run (2026-06-29, 91 fixtures) finished the job in 5m23s, i.e.
+        # already at the edge, and every run since has died on
+        # `panic: test timed out after 5m0s` — a month of red master, always with
+        # the suite still healthy and simply unfinished (it was mid-fixture, ~72
+        # of 120, with zero FAILs recorded).
+        #
+        # 20m is deliberately generous rather than fitted: a runner is slower and
+        # noisier than a dev box, the reference image is pulled cold on CI, and an
+        # over-large timeout costs nothing on a green run while an under-sized one
+        # is exactly the bug being fixed here. It still bounds a genuine hang.
+        # Re-check this when the corpus grows substantially.
+        run: go test ./test/differential/... -timeout 20m -v
+    # Bound the job itself too: without this a hung suite would occupy a runner
+    # for GitHub's 6-hour default instead of failing fast.
+    timeout-minutes: 30
 
   fuzz-smoke:
     needs: lint-vet-test

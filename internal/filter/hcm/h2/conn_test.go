@@ -860,7 +860,16 @@ func TestServerConn_HPACKTableSizeUpdate_PropagatesToOutgoingHEADERS(t *testing.
 // delivered correctly when the client announces INITIAL_WINDOW_SIZE=1 and
 // sends WINDOW_UPDATE frames incrementally.
 func TestServerConn_TinyWindowDelivery(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 30s, not the 5s used by the other tests in this file, and the difference is
+	// the workload rather than a style choice: INITIAL_WINDOW_SIZE=1 below forces
+	// one WINDOW_UPDATE round-trip PER BYTE, so a 1 KiB body costs 1024 sequential
+	// round-trips where the sibling tests cost a handful.
+	//
+	// This ctx bounds the SERVER's lifetime (startServerConn below), so it has to
+	// outlive the whole delivery loop. It is raised together with the per-frame
+	// read deadline further down -- see the note there for the measurement and for
+	// why a whole-loop deadline was the actual flake.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	const bodySize = 1024
@@ -929,13 +938,37 @@ func TestServerConn_TinyWindowDelivery(t *testing.T) {
 	}
 
 	// Read response headers + data; send WINDOW_UPDATE for each DATA byte.
+	//
+	// The read deadline is refreshed PER FRAME rather than set once before the
+	// loop, and that distinction is the whole fix for a CI flake.
+	// INITIAL_WINDOW_SIZE=1 forces one WINDOW_UPDATE round-trip per byte, so a
+	// 1 KiB body is 1024 sequential round-trips. A single absolute deadline
+	// covering the whole loop is therefore a THROUGHPUT assertion -- it fails once
+	// the per-round-trip cost exceeds deadline/1024 -- and nothing here means to
+	// assert throughput.
+	//
+	// Measured: ~20us per round-trip on a dev box (the whole test is 0.02s), but
+	// CI runs this under `go test -short -race ./...` on a 2-core runner with
+	// every other package competing, where ~5ms per round-trip is ordinary --
+	// and 1024 x 5ms blows a 5s whole-loop budget exactly. That is how this went
+	// red on master with `read frame: ... i/o timeout` while the server was
+	// healthy and still delivering.
+	//
+	// Confirmed by negative control rather than argued: squeezing the budget to
+	// 50ms, the per-frame form below PASSES (each frame arrives in ~20us) while
+	// the old whole-loop form FAILS with that exact i/o-timeout signature.
+	//
+	// Per frame, the deadline means what a deadline should -- "the peer has gone
+	// silent" -- independently of how many frames the body needs. A genuine stall
+	// still fails it.
 	var received []byte
-	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	const frameReadTimeout = 10 * time.Second
 	done := false
 	for !done {
+		_ = clientConn.SetReadDeadline(time.Now().Add(frameReadTimeout))
 		f, err := fr.ReadFrame()
 		if err != nil {
-			t.Fatalf("read frame: %v", err)
+			t.Fatalf("read frame after %d/%d body bytes: %v", len(received), bodySize, err)
 		}
 		switch ff := f.(type) {
 		case *http2.HeadersFrame:
