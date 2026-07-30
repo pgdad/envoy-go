@@ -37,6 +37,7 @@ type helpTextRosterEntry struct {
 //	runtime.*           internal/bootstrap/bootstrap.go
 //	access_logs.*       internal/accesslog/stats.go
 //	tracing.*           internal/tracing/stats.go
+//	sds.<secret>.*      internal/xds/stats.go RegisterSDSStats
 var helpTextRoster = []helpTextRosterEntry{
 	{internal: "listener.0_0_0_0_10000.downstream_cx_total"},
 	{internal: "listener.0_0_0_0_10000.downstream_cx_active", gauge: true},
@@ -65,6 +66,20 @@ var helpTextRoster = []helpTextRosterEntry{
 	{internal: "tracing.opentelemetry.spans_dropped"},
 	{internal: "tracing.zipkin.spans_sent"},
 	{internal: "tracing.zipkin.spans_dropped"},
+
+	// Phase 80 — the sds.<secret>.* family, registered by
+	// internal/xds/stats.go RegisterSDSStats. All five are counters.
+	//
+	// ⚠️ TWO-SEGMENT SHAPE IS MANDATORY. The sds. arm splits on the FIRST dot
+	// and rejects a tail with no further dot, so a single-segment "sds.x" is
+	// not projectable and would fail derivedHelpTextBases outright. The secret
+	// segment is operator-supplied; "server_cert" here stands for any value,
+	// because the arm hoists it into a label and it never reaches the base.
+	{internal: "sds.server_cert.update_success"},
+	{internal: "sds.server_cert.update_failure"},
+	{internal: "sds.server_cert.update_rejected"},
+	{internal: "sds.server_cert.update_attempt"},
+	{internal: "sds.server_cert.init_fetch_timeout"},
 }
 
 // derivedHelpTextBases projects every roster entry through the REAL

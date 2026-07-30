@@ -175,8 +175,33 @@ records only the stable token `rejected`.
   retirement above and still LIVE. Never assert
   `/listeners` or `total_listeners_active`; never treat a docker-proxy accept as
   listener liveness.
-- **SDS stream framing** and the `sds.<secret>.*` counters — impl-specific; only
-  the delivered CA's *effect* is asserted.
+- **SDS stream framing** — VersionInfo/Nonce/request-count/ACK cadence remain
+  impl-specific and unasserted; only the delivered CA's *effect* is asserted.
+- **The `sds.<secret>.*` counters — THIS BOUNDARY IS REVERSED at phase 80, by
+  measurement.** The earlier text forbade reaching into `sds.*` at all, on the
+  ground that `DriveSubject` hard-stops both SDS receivers before step 10, so
+  those scopes are reconnecting against a closed port while `AssertStats` runs
+  and are *"inherently unstable"*. **The mechanism is real and confirmed** — it
+  is exactly why the reference reads `update_attempt=3` / `update_failure=1`
+  instead of `1`/`0`. **The consequence was misattributed: the instability lands
+  on VALUES, not on names or labels.** Measured 4/4 consecutive runs, identical
+  every time. So the boundary is now split by *what* is asserted, not by scope:
+  - **Asserted cross-side (leg d):** all five of
+    `envoy_sds_{update_attempt,update_success,update_failure,update_rejected,
+    init_fetch_timeout}` are PRESENT on `/stats/prometheus` on **both** sides
+    carrying `envoy_xds_resource_name="rccf_validation_ca"`. This is the **first
+    in-tree fixture to assert a hoisted label VALUE**.
+  - **Asserted per side only:** a `>= 1` floor on `update_attempt` and
+    `update_success` — the only two names that move on both sides.
+  - **Still unasserted:** every VALUE cross-side. Measured ref `3/1/1/0/0`
+    against subj `1/1/0/0/0` — envoy-go is initial-fetch-only while the reference
+    re-attempts after the receivers close. A blanket per-side `>= 1` over all
+    five is **RED ON ARRIVAL** (executed: 5 failures, 3 subject + 2 reference),
+    and a value pin on the *reference* side is a flake by construction.
+  - **Still unasserted:** the reference's other `sds.*` families (it exposes
+    fourteen distinct `envoy_sds_*` names; the subject exposes exactly the five).
+    The asserted set is a strict **subset** — never set-equality assert.
+  - **Still unasserted:** `cluster.sds_cluster.*` entirely.
 
 ## Running
 

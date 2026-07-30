@@ -69,6 +69,81 @@ const (
 	armDeadline = 10 * time.Second
 )
 
+// --- the sds.* label-hoisting roster (phase 80) ---
+
+// sdsSecretLabel is the prometheus label BOTH sides hoist the SDS secret name
+// into. MEASURED against the live pinned reference and a real subject boot:
+//
+//	envoy_sds_update_success{envoy_xds_resource_name="edf_validation_ca"} 1
+//
+// ⚠️ THIS FIXTURE IS THE MIRROR ARM AND ITS VALUE IS THE DIFFERENT SECRET NAME.
+// 0110 serves "rccf_validation_ca" and this one serves "edf_validation_ca", so
+// the pair proves the label carries the OPERATOR-SUPPLIED name rather than a
+// constant. Neither fixture can establish that alone.
+const sdsSecretLabel = "envoy_xds_resource_name"
+
+// sdsProjectedNames is the five-name subset envoy-go registers per SDS secret
+// and (phase 80) projects onto /stats/prometheus with the secret name hoisted
+// into sdsSecretLabel. Every entry is asserted for PRESENCE plus the hoisted
+// LABEL on both sides — never for a value, and never cross-side by value.
+//
+// ⚠️ A strict SUBSET of the reference's own sds.* prometheus roster: it exposes
+// FOURTEEN distinct envoy_sds_* metric names, the subject exposes exactly these
+// five. Never set-equality assert; never assert a name outside this list.
+var sdsProjectedNames = []string{
+	"envoy_sds_update_attempt",
+	"envoy_sds_update_success",
+	"envoy_sds_update_failure",
+	"envoy_sds_update_rejected",
+	"envoy_sds_init_fetch_timeout",
+}
+
+// sdsMovedNames is the sub-subset that actually MOVES on both sides, and the
+// only one carrying a `>= 1` value floor.
+//
+// ⚠️ THE FLOOR SET IS PER-FIXTURE AND MUST NOT BE COPIED FROM 0110. 0110 floors
+// TWO names; this fixture floors ONE. MEASURED here:
+//
+//	name                 ref  subj
+//	update_attempt         3     1
+//	update_success         1     0   <- ZERO on the subject
+//	update_failure         1     0
+//	update_rejected        0     1   <- ONE on the subject
+//	init_fetch_timeout     0     0
+//
+// The reason is this fixture's own proposition: the served validation_context is
+// EMPTY (trusted_ca-absent, S1). The reference ACKs that update and books
+// update_success; envoy-go REJECTS it and books update_rejected instead, then
+// falls back to the inline default exactly as the byte observable requires. So
+// update_success is 1 on the reference and 0 on the subject, and update_rejected
+// is 0 and 1 — the two sides book the SAME event under OPPOSITE names.
+//
+// That divergence is NAMED, not asserted: it is a counter-classification
+// difference that the byte observable already proves harmless, and it is a fourth
+// independent reason values are never compared cross-side here. Only
+// update_attempt is >= 1 on both sides, so only update_attempt carries a floor.
+// Copying 0110's two-name floor set here is RED ON ARRIVAL (executed: exactly one
+// failure, `subj: envoy_sds_update_success ... = 0, want >= 1`).
+var sdsMovedNames = []string{
+	"envoy_sds_update_attempt",
+}
+
+// sdsHasValueFloor reports whether name carries the `>= 1` floor.
+func sdsHasValueFloor(name string) bool {
+	for _, n := range sdsMovedNames {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// promSample is ONE prometheus exposition line: its label set and its value.
+type promSample struct {
+	labels map[string]string
+	value  float64
+}
+
 // clientCertMode selects how the dial helper presents (or withholds) a client
 // certificate.
 type clientCertMode int
@@ -640,10 +715,22 @@ func mustRender(tpl string, data map[string]any) string {
 // the ONLY connections l_edf ever sees ⇒ deterministically 3 accepts / 1 handshake
 // success / 2 rejections per side.
 //
-// ⚠️ The assertion is deliberately CONFINED to listener.<addr>.ssl.* . It must not
-// reach into the sds.* or cluster.sds_cluster.* scopes: DriveSubject hard-stops
-// both SDS receivers before step 10, so those scopes are reconnecting against a
-// closed port while this runs and are inherently unstable.
+// ⚠️ THE sds.* BOUNDARY IS NOW SPLIT BY WHAT IS ASSERTED, NOT BY SCOPE (phase 80,
+// reversing this comment's own earlier prohibition, and mirroring 0110). The old
+// text forbade reaching into sds.* at all, on the ground that DriveSubject hard-stops
+// both SDS receivers before step 10, so those scopes are reconnecting against a closed
+// port while this runs. The MECHANISM is real and confirmed; the CONSEQUENCE was
+// misattributed. The instability lands on VALUES, never on names or labels: measured
+// across repeated runs the NAMES and the hoisted LABEL were identical every time,
+// while the reference's attempt/failure counts reflect its post-close reconnect. So:
+//
+//   - NAMES and LABELS are stable and ARE asserted cross-side (assertSDSProjection).
+//   - VALUES are NOT stable and are NEVER asserted cross-side. A value pin on the
+//     REFERENCE side is a flake by construction. Only the two names in sdsMovedNames
+//     carry a floor, and only per side.
+//
+// cluster.sds_cluster.* stays entirely UNasserted — it is not projected by this row
+// and the same value instability applies to it without a name+label leg to rescue it.
 //
 // Keying: the two sides normalize the listener address DIFFERENTLY in the flat
 // stat name (reference `listener.0.0.0.0_10447.ssl.handshake` vs envoy-go
@@ -726,6 +813,8 @@ func (d *edfDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr string
 			t.Errorf("cross-side mismatch %s: ref=%d subj=%d", n, refVal, subjVal)
 		}
 	}
+
+	d.assertSDSProjection(t, refAdminAddr, subjAdminAddr)
 }
 
 // scrapeProm issues GET http://<addr>/stats/prometheus and returns a map keyed by
@@ -787,6 +876,233 @@ func scrapeProm(adminAddr string) (map[string]uint64, error) {
 		out[name] += uint64(v)
 	}
 	return out, nil
+}
+
+// assertSDSProjection is the phase-80 leg: the FIVE sds.* counters this fixture's
+// served secret registers must appear on /stats/prometheus on BOTH sides with the
+// secret name hoisted into sdsSecretLabel.
+//
+// ⚠️ NAME + LABEL cross-side; NEVER a value cross-side. envoy-go is
+// initial-fetch-only and does not hold the SDS stream open, while the reference
+// maintains a long-lived subscription that RE-ATTEMPTS after DriveSubject hard-stops
+// both receivers. On top of that, this fixture's EMPTY validation_context is ACKed
+// by the reference and REJECTED by envoy-go, so the two sides book the same event
+// under opposite counter names. They nonetheless agree exactly on every NAME and on
+// the LABEL VALUE. That is the whole proposition: the hoisting is cross-side
+// identical even where the accounting is not.
+//
+// ⚠️ THE ROSTER IS SPLIT and the split is load-bearing. All five are asserted for
+// presence + label; only sdsMovedNames carries a `>= 1` floor, and here that is a
+// SINGLE name (see sdsMovedNames — the floor set is per-fixture and 0110's is
+// wrong for this one). A blanket per-side `>= 1` over all five is RED ON ARRIVAL.
+//
+// ⚠️ The five are a strict SUBSET of the reference's sds.* roster. No set-equality
+// assertion, and none of the other families is asserted.
+//
+// ⚠️ THIS IS THE MIRROR OF 0110's LEG AND ITS CONTRIBUTION IS THE SECOND SECRET
+// NAME. 0110 asserts envoy_xds_resource_name="rccf_validation_ca"; this one asserts
+// "edf_validation_ca". Only the PAIR rules out a hard-coded label value — either
+// fixture alone is satisfied by a projection that always emits its own name.
+// A second delta comes free: 0110's secret is served with a POPULATED
+// validation_context and this one's is served EMPTY (trusted_ca-absent, S1), so the
+// pair also shows the hoisting is indifferent to the served payload shape.
+func (*edfDriver) assertSDSProjection(t fixture.TB, refAdminAddr, subjAdminAddr string) {
+	t.Helper()
+
+	// The two scrapes are PRECONDITIONS, not properties -> Fatalf.
+	refL, err := scrapePromLabeled(refAdminAddr)
+	if err != nil {
+		t.Fatalf("scrape ref /stats/prometheus (labeled): %v", err)
+	}
+	subjL, err := scrapePromLabeled(subjAdminAddr)
+	if err != nil {
+		t.Fatalf("scrape subj /stats/prometheus (labeled): %v", err)
+	}
+
+	// ⚠️ THE ONLY Fatalf IN THIS LEG, and it is deliberately scoped to the
+	// SCRAPER-BROKEN diagnosis. A label-aware scrape returning ZERO families means
+	// the parser stopped working; that must be separable from "the sds.* projection
+	// did not land", which is what the per-name Errorf below reports. Every property
+	// assertion is Errorf so the first violation cannot hide the rest
+	// (reference_fatalf_makes_assertions_unreachable).
+	if len(refL) == 0 || len(subjL) == 0 {
+		t.Fatalf("label-aware scrape returned ZERO metric families (ref=%d subj=%d) — the SCRAPER is broken; "+
+			"this is NOT the same diagnosis as the sds.* projection failing to land", len(refL), len(subjL))
+	}
+
+	sides := []struct {
+		side string
+		m    map[string][]promSample
+	}{{"ref", refL}, {"subj", subjL}}
+
+	// fixture.TB has EXACTLY Errorf/Fatalf/Helper — no Logf
+	// (reference_fixture_tb_has_no_logf). Diagnostics go through log.Printf. The
+	// observed family roster is RECORDED with its denominator so that an empty
+	// result can never read as a zero result; it is never asserted.
+	for _, s := range sides {
+		fams := sdsFamilies(s.m)
+		log.Printf("0111 assertSDSProjection: %s families=%d sds_families=%d %v",
+			s.side, len(s.m), len(fams), fams)
+		for _, n := range sdsProjectedNames {
+			for _, sm := range s.m[n] {
+				log.Printf("0111 assertSDSProjection: %s %s{%s=%q} = %g",
+					s.side, n, sdsSecretLabel, sm.labels[sdsSecretLabel], sm.value)
+			}
+		}
+	}
+
+	for _, s := range sides {
+		var missing []string
+		for _, n := range sdsProjectedNames {
+			samples, ok := s.m[n]
+			if !ok {
+				missing = append(missing, n)
+				t.Errorf("%s: %s ABSENT from /stats/prometheus (the sds.* projection did not land)", s.side, n)
+				continue
+			}
+			hit, found := promSample{}, false
+			for _, sm := range samples {
+				if sm.labels[sdsSecretLabel] == secretName {
+					hit, found = sm, true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("%s: %s carries NO sample with %s=%q — the secret name was not hoisted into the label "+
+					"(%d sample(s) seen, label values %v)", s.side, n, sdsSecretLabel, secretName,
+					len(samples), labelValuesOf(samples, sdsSecretLabel))
+				continue
+			}
+			if sdsHasValueFloor(n) && hit.value < 1 {
+				t.Errorf("%s: %s{%s=%q} = %g, want >= 1 (this name is in sdsMovedNames and MUST have moved)",
+					s.side, n, sdsSecretLabel, secretName, hit.value)
+			}
+		}
+		// The SET, reported once and separately from the per-name failures
+		// (reference_stat_count_guard_blind_to_rename). Only MISSING is a defect:
+		// the roster is a strict subset, so "extra" sds families are expected and
+		// are recorded by the log above rather than asserted.
+		if len(missing) > 0 {
+			t.Errorf("%s: %d of %d projected sds names MISSING as a SET: %v",
+				s.side, len(missing), len(sdsProjectedNames), missing)
+		}
+	}
+}
+
+// labelValuesOf lists the value each sample carries for key — diagnostic text for
+// the label-missing failure, so the message names what WAS seen instead.
+func labelValuesOf(samples []promSample, key string) []string {
+	out := make([]string, 0, len(samples))
+	for _, s := range samples {
+		out = append(out, s.labels[key])
+	}
+	return out
+}
+
+// scrapePromLabeled is scrapeProm's LABEL-PRESERVING SIBLING. It is a sibling
+// and not an edit: scrapeProm keys by metric NAME with the label set stripped
+// ENTIRELY, which is exactly right for the ssl.* leg (the two sides normalize
+// the listener address differently, so that leg must ignore the label) and
+// STRUCTURALLY UNABLE to assert a hoisted label value. scrapeProm is therefore
+// retained unchanged and this one is added beside it.
+//
+// The return is keyed by metric NAME and carries EVERY line under that name as
+// its own promSample, so a family with one series per SDS secret stays
+// separable. Values are NOT collide-summed here (scrapeProm sums; that would
+// destroy the per-secret split this leg exists to read).
+//
+// Handles the labeled, bare and trailing-timestamp line variants (the 0055
+// scrapeProm + 0005 parseMetricLine shapes). Non-finite values are skipped
+// rather than converted. Negative values are RETAINED (gauges may go negative);
+// only the uint64 conversion in scrapeProm needed to drop them.
+func scrapePromLabeled(adminAddr string) (map[string][]promSample, error) {
+	url := "http://" + adminAddr + "/stats/prometheus"
+	resp, err := http.Get(url) //nolint:gosec // fixed admin URL, test-only
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+	}
+	var body bytes.Buffer
+	if _, err := body.ReadFrom(resp.Body); err != nil {
+		return nil, fmt.Errorf("read %s body: %w", url, err)
+	}
+
+	out := map[string][]promSample{}
+	for _, line := range strings.Split(body.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		var name, rest string
+		labels := map[string]string{}
+		if open := strings.IndexByte(line, '{'); open >= 0 {
+			closeIdx := strings.LastIndexByte(line, '}')
+			if closeIdx < open {
+				continue // malformed: no closing brace
+			}
+			name = line[:open]
+			labels = parseLabelSet(line[open+1 : closeIdx])
+			rest = strings.TrimSpace(line[closeIdx+1:])
+		} else {
+			sp := strings.IndexByte(line, ' ')
+			if sp < 0 {
+				continue
+			}
+			name = line[:sp]
+			rest = strings.TrimSpace(line[sp+1:])
+		}
+		// Strip an optional trailing timestamp ("<value> <timestamp>").
+		if sp := strings.IndexByte(rest, ' '); sp >= 0 {
+			rest = rest[:sp]
+		}
+		v, err := strconv.ParseFloat(rest, 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
+		out[name] = append(out[name], promSample{labels: labels, value: v})
+	}
+	return out, nil
+}
+
+// parseLabelSet parses a `key="value",key2="value2"` label string into a map
+// (the 0005 parseLabels shape, which is unexported in a different package and
+// therefore not reusable from here).
+//
+// The comma split is the in-tree precedent and is sound for every label this
+// fixture reads: the hoisted secret name is charset-guarded before registration
+// and the listener address cannot contain a comma either. A label value that
+// DID contain a comma would split wrongly — recorded, not guarded.
+func parseLabelSet(s string) map[string]string {
+	out := map[string]string{}
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		eq := strings.IndexByte(part, '=')
+		if eq < 0 {
+			continue
+		}
+		k := part[:eq]
+		v := strings.TrimSuffix(strings.TrimPrefix(part[eq+1:], `"`), `"`)
+		out[k] = v
+	}
+	return out
+}
+
+// sdsFamilies returns the observed envoy_sds_* metric NAMES. DIAGNOSTIC ONLY —
+// it is logged, never asserted. The projected five are a strict SUBSET of the
+// reference's roster, so a set-equality assertion here would be wrong by
+// construction; recording the denominator keeps an empty result from reading
+// as a zero result.
+func sdsFamilies(m map[string][]promSample) []string {
+	var names []string
+	for n := range m {
+		if strings.HasPrefix(n, "envoy_sds_") {
+			names = append(names, n)
+		}
+	}
+	return names
 }
 
 // Compile-time interface assertions. ⚠️ The StatsAsserter one is MANDATORY:

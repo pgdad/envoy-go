@@ -13,9 +13,9 @@ import (
 // aggregate skip line.
 //
 // Unprojectable by construction, re-derived at this tip rather than assumed:
-// it matches none of the TWELVE top-level prefix detectors live in name.go
-// (cluster. http. listener. server. runtime. access_logs. tracing. wasm. in the
-// switch; mongo. kafka. redis. thrift. in the default arm) and contains none of
+// it matches none of the THIRTEEN top-level prefix detectors live in name.go
+// (cluster. http. listener. server. runtime. access_logs. tracing. sds. wasm. in
+// the switch; mongo. kafka. redis. thrift. in the default arm) and contains none of
 // the four mid-name segments (.http_local_rate_limit. .http_bandwidth_limit.
 // .rbac. .zookeeper.). It is also a real Envoy server stat name, so the control
 // is not built on an invented shape.
@@ -23,7 +23,9 @@ import (
 // NOTE for future editors: `runtime.num_keys` is NOT a valid choice here. The
 // phase-79 byte-mirror arms gave `runtime.` a top-level acceptor, so it now
 // projects to envoy_runtime_num_keys and would silently turn leg B vacuous.
-// Any replacement must be re-checked against flattenToProm, not against prose.
+// Nor is any `sds.`-rooted name: the phase-80 arm gave `sds.` a top-level
+// acceptor too. Any replacement must be re-checked against flattenToProm, not
+// against prose.
 const promSkipUnprojectableName = "filesystem.flushed_by_timer"
 
 // promSkipProjectingName is the stacked control's OTHER leg: a name that DOES

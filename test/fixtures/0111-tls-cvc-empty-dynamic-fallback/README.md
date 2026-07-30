@@ -181,8 +181,34 @@ never cross-side string equality (`reference_differential_reference_parses_full_
   (`no_certificate=1` against `handshake=2`). Never assert
   `/listeners` or `total_listeners_active`; never treat a docker-proxy accept as
   listener liveness.
-- **SDS stream framing** and the `sds.<secret>.*` counters — impl-specific; only
-  the delivered-empty half's *effect* (the fallback) is asserted.
+- **SDS stream framing** — VersionInfo/Nonce/request-count/ACK cadence remain
+  impl-specific and unasserted; only the delivered-empty half's *effect* (the
+  fallback) is asserted.
+- **The `sds.<secret>.*` counters — THIS BOUNDARY IS REVERSED at phase 80**,
+  mirroring `0110`, and reversed by measurement. The earlier text forbade
+  reaching into `sds.*` at all, because `DriveSubject` hard-stops both SDS
+  receivers before step 10 and those scopes are then reconnecting against a
+  closed port. **The mechanism is real; the consequence was misattributed — the
+  instability lands on VALUES, not on names or labels.**
+  - **Asserted cross-side (leg d):** all five of
+    `envoy_sds_{update_attempt,update_success,update_failure,update_rejected,
+    init_fetch_timeout}` are PRESENT on both sides carrying
+    `envoy_xds_resource_name="edf_validation_ca"`. **The second secret name is
+    the point:** `0110` asserts `rccf_validation_ca`, and only the pair rules out
+    a hard-coded label value. The pair also spans both served shapes — `0110`'s
+    validation context is populated, this one's is empty.
+  - **Asserted per side only:** a `>= 1` floor on `update_attempt` **alone**.
+    ⚠️ The floor set is **per-fixture**; `0110` floors two names. Copying its set
+    here is red on arrival.
+  - **Still unasserted:** every VALUE cross-side. Measured ref `3/1/1/0/0`
+    against subj `1/0/0/1/0`, stable across runs — **the reference ACKs the empty
+    validation context and books `update_success`, while envoy-go REJECTS it and
+    books `update_rejected`**, then falls back to the inline default exactly as
+    the byte observable requires. The two sides book the same event under
+    opposite counter names. Named, not asserted.
+  - **Still unasserted:** the reference's other `sds.*` families (fourteen
+    distinct `envoy_sds_*` names against the subject's five) — strict **subset**,
+    never set-equality assert — and `cluster.sds_cluster.*` entirely.
 
 ## Running
 

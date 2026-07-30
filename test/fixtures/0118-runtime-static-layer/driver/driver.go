@@ -153,16 +153,18 @@ func (*runtimeStaticLayerDriver) ProbeAdmin(ctx context.Context, refAdminAddr, s
 //
 // The gauges ARE registered and DO carry the correct values on the subject; the
 // PROMETHEUS RENDERER dropped them through phase 78. internal/stats.ExtractTags
-// recognizes TWELVE top-level segments and returns an error for anything else:
+// recognizes THIRTEEN top-level segments and returns an error for anything else:
 //
-//	cluster. http. listener. server. runtime. access_logs. tracing. wasm.
+//	cluster. http. listener. server. runtime. access_logs. tracing. sds. wasm.
 //	    the `case strings.HasPrefix(internal, ...)` arms of the ExtractTags switch
 //	mongo. kafka. redis. thrift.
 //	    the root-anchored `strings.CutPrefix(internal, ...)` calls in its default arm
 //
-// ⚠️ `runtime.`, `access_logs.` and `tracing.` are PHASE-79 additions. Before
-// this row the roster was NINE, which is why in-tree prose elsewhere still says
-// nine — treat any nine you find as stale until you have re-counted.
+// ⚠️ `runtime.`, `access_logs.` and `tracing.` are PHASE-79 additions and `sds.`
+// is a PHASE-80 addition. Before phase 79 the roster was NINE, and between
+// phases 79 and 80 it was one short of the figure above — which is why in-tree
+// prose elsewhere still carries both stale figures. Treat any count you find
+// here or elsewhere as stale until you have re-counted from the switch.
 //
 // ⚠️ FOUR FURTHER detectors exist and are NOT top-level — they are MID-NAME
 // (INFIX) `strings.Index` matches, declared as the `lrlSegment`, `blSegment`,
@@ -174,8 +176,8 @@ func (*runtimeStaticLayerDriver) ProbeAdmin(ctx context.Context, refAdminAddr, s
 // Each fires on ANY dot-free leading segment, so `ANYTHING_AT_ALL.rbac.allowed`
 // parses clean (residual `rbac.allowed`) while the ROOT-anchored `rbac.allowed`
 // does NOT parse — the head must be non-empty. Counting these four as roots is
-// the standing documentation error; the top-level answer is TWELVE, and the two
-// species must never be summed.
+// the standing documentation error; the top-level answer is THIRTEEN, and the
+// two species must never be summed.
 //
 // ⚠️ NO name.go LINE NUMBERS ARE CITED ABOVE, DELIBERATELY. Every line cite this
 // comment previously carried went stale inside a single phase. Grep the symbols

@@ -23,16 +23,21 @@ import (
 // internal/stats + internal/statssink suite was GREEN under a hoisting arm.
 //
 // These four goldens pin the WIRE OUTPUT of all four ExtractTags consumers in
-// the statssink package over one shared 13-entry registry, so a hoisting arm
+// the statssink package over one shared 14-entry registry, so a hoisting arm
 // goes RED on every one of them.
 //
-// The roster is 10 byte-mirror names + 3 STACKED CONTROLS, because a positive
-// assertion alone cannot catch an over-firing arm:
+// The roster is 10 byte-mirror names + 3 STACKED CONTROLS + 1 phase-80 hoisting
+// name, because a positive assertion alone cannot catch an over-firing arm:
 //   - cluster.backend.upstream_rq_total / .membership_total: the SN1 hoist MUST
 //     SURVIVE (a byte-mirror arm that swallowed cluster.* would show up here).
 //   - listener_manager.listener_create_success: matches NO rule, so ExtractTags
 //     errors and every consumer takes its own fallback. It MUST STAY
 //     UNTRANSFORMED (an arm that started matching it would show up here).
+//   - sds.server_cert.update_success: phase 80's own hoisting family. Until it
+//     joined this roster, ALL FOUR goldens were byte-identical with the sds. arm
+//     live and without it — command, assertion and cross-product all correct,
+//     the INPUT ROSTER the defect. Any new hoisting root belongs here on the
+//     same day its arm lands.
 //
 // Registration order IS emission order (stats.Registry.Walk is
 // registration-ordered, registry.go:133), so every assertion below is on the
@@ -40,12 +45,26 @@ import (
 // blind to a reordering AND to a name rewrite that happened to keep the count.
 
 // goldenName is one roster entry: the full dotted registered name, the residual
-// ExtractTags must return, whether it is a counter, and its value.
+// ExtractTags must return, whether it is a counter, its value, and the single
+// tag the sinks must put on the wire for it.
+//
+// tagKey/tagValue are HAND-DECLARED, never derived from ExtractTags — deriving
+// them would compare the implementation against itself. tagKey is the sink-side
+// DOTTED form ("envoy.cluster_name"), which is label.go's
+// "envoy." + TrimPrefix(key, "envoy_") rewrite of the Prometheus-side
+// UNDERSCORED key ("envoy_cluster_name"). Both spellings are live in the tree
+// and they are NOT interchangeable.
+//
+// Both are "" for every entry that must reach the wire untagged. The tagged
+// entries are exactly goldenTaggedIdx; TestGolden_RosterTagDeclarationsAgree
+// keeps the two declarations from drifting apart.
 type goldenName struct {
 	full     string
-	residual string // == full for every byte-mirror entry; the SN1 hoist for the controls
+	residual string // == full for every byte-mirror entry; the SN1-shape hoist for the rest
 	counter  bool
 	value    int64
+	tagKey   string // sink-side dotted key, "" when the entry must emit no tag
+	tagValue string
 }
 
 // goldenRoster is the registry in REGISTRATION order == emission order.
@@ -54,26 +73,53 @@ type goldenName struct {
 // untransformed name (label.go:39, dogstatsd.go:86, graphite.go:70,
 // otlp.go:194-197).
 var goldenRoster = []goldenName{
-	{"cluster.backend.upstream_rq_total", "cluster.upstream_rq_total", true, 7},
-	{"cluster.backend.membership_total", "cluster.membership_total", false, 3},
-	{"listener_manager.listener_create_success", "listener_manager.listener_create_success", true, 1},
-	{"runtime.num_keys", "runtime.num_keys", false, 5},
-	{"runtime.num_layers", "runtime.num_layers", false, 2},
-	{"access_logs.grpc_access_log.logs_written", "access_logs.grpc_access_log.logs_written", true, 11},
-	{"access_logs.grpc_access_log.logs_dropped", "access_logs.grpc_access_log.logs_dropped", true, 0},
-	{"access_logs.open_telemetry_access_log.logs_written", "access_logs.open_telemetry_access_log.logs_written", true, 13},
-	{"access_logs.open_telemetry_access_log.logs_dropped", "access_logs.open_telemetry_access_log.logs_dropped", true, 0},
-	{"tracing.opentelemetry.spans_sent", "tracing.opentelemetry.spans_sent", true, 17},
-	{"tracing.opentelemetry.spans_dropped", "tracing.opentelemetry.spans_dropped", true, 0},
-	{"tracing.zipkin.spans_sent", "tracing.zipkin.spans_sent", true, 19},
-	{"tracing.zipkin.spans_dropped", "tracing.zipkin.spans_dropped", true, 0},
+	{"cluster.backend.upstream_rq_total", "cluster.upstream_rq_total", true, 7, "envoy.cluster_name", "backend"},
+	{"cluster.backend.membership_total", "cluster.membership_total", false, 3, "envoy.cluster_name", "backend"},
+	{"listener_manager.listener_create_success", "listener_manager.listener_create_success", true, 1, "", ""},
+	{"runtime.num_keys", "runtime.num_keys", false, 5, "", ""},
+	{"runtime.num_layers", "runtime.num_layers", false, 2, "", ""},
+	{"access_logs.grpc_access_log.logs_written", "access_logs.grpc_access_log.logs_written", true, 11, "", ""},
+	{"access_logs.grpc_access_log.logs_dropped", "access_logs.grpc_access_log.logs_dropped", true, 0, "", ""},
+	{"access_logs.open_telemetry_access_log.logs_written", "access_logs.open_telemetry_access_log.logs_written", true, 13, "", ""},
+	{"access_logs.open_telemetry_access_log.logs_dropped", "access_logs.open_telemetry_access_log.logs_dropped", true, 0, "", ""},
+	{"tracing.opentelemetry.spans_sent", "tracing.opentelemetry.spans_sent", true, 17, "", ""},
+	{"tracing.opentelemetry.spans_dropped", "tracing.opentelemetry.spans_dropped", true, 0, "", ""},
+	{"tracing.zipkin.spans_sent", "tracing.zipkin.spans_sent", true, 19, "", ""},
+	{"tracing.zipkin.spans_dropped", "tracing.zipkin.spans_dropped", true, 0, "", ""},
+
+	// Phase 80 — the sds. root, the SECOND hoisting family on this roster and
+	// the reason the tag key stopped being a per-file constant. Its hoisted key
+	// differs from the cluster.* controls', so a golden that hard-codes one key
+	// for every tagged index cannot see this family at all.
+	{"sds.server_cert.update_success", "sds.update_success", true, 7, "envoy.xds_resource_name", "server_cert"},
 }
 
 // goldenTaggedIdx are the roster indices carrying a SURVIVING extracted tag —
-// the two cluster.* stacked controls. Every other index MUST reach the wire
-// with zero tags. Keeping this as an explicit index set (not "everything with a
-// dot") means a hoisting arm cannot quietly join it.
-var goldenTaggedIdx = map[int]bool{0: true, 1: true}
+// the two cluster.* stacked controls and phase 80's sds. entry. Every other
+// index MUST reach the wire with zero tags. Keeping this as an explicit index
+// set (not "everything with a dot") means a hoisting arm cannot quietly join it.
+var goldenTaggedIdx = map[int]bool{0: true, 1: true, 13: true}
+
+// TestGolden_RosterTagDeclarationsAgree keeps the two hand-declared statements
+// about which entries are tagged — goldenTaggedIdx and a non-empty
+// goldenName.tagKey — from drifting apart. Without it an entry could be listed
+// in goldenTaggedIdx while carrying an empty tagKey, and every golden above
+// would then assert that the wire tag is the EMPTY key, silently.
+func TestGolden_RosterTagDeclarationsAgree(t *testing.T) {
+	for i, e := range goldenRoster {
+		if goldenTaggedIdx[i] && e.tagKey == "" {
+			t.Errorf("roster[%d] %q is in goldenTaggedIdx but declares no tagKey", i, e.full)
+		}
+		if !goldenTaggedIdx[i] && e.tagKey != "" {
+			t.Errorf("roster[%d] %q declares tagKey %q but is not in goldenTaggedIdx", i, e.full, e.tagKey)
+		}
+	}
+	for i := range goldenTaggedIdx {
+		if i < 0 || i >= len(goldenRoster) {
+			t.Errorf("goldenTaggedIdx names index %d, outside the %d-entry roster", i, len(goldenRoster))
+		}
+	}
+}
 
 // goldenPrefix is the sink prefix all four goldens compose with.
 const goldenPrefix = "envoy-go"
@@ -83,7 +129,7 @@ const goldenPrefix = "envoy-go"
 // literal at each call site.
 const goldenOTLPVersion = "1.0.0"
 
-// goldenRegistry builds the 13-entry registry in goldenRoster order.
+// goldenRegistry builds the 14-entry registry in goldenRoster order.
 func goldenRegistry(t *testing.T) *stats.Registry {
 	t.Helper()
 	reg := stats.NewRegistry()
@@ -127,7 +173,7 @@ func statsdValueSuffix(e goldenName) string {
 
 // readOneBatch Submits the snapshot and returns the ORDERED lines of the single
 // batched datagram. Both UDP sinks are constructed with a datagram cap far above
-// the whole batch, so all 13 lines ride ONE datagram: the order is then the
+// the whole batch, so all 14 lines ride ONE datagram: the order is then the
 // sink's emission order by construction, not a property of UDP delivery.
 func readOneBatch(t *testing.T, read func(n int) []string) []string {
 	t.Helper()
@@ -138,7 +184,7 @@ func readOneBatch(t *testing.T, read func(n int) []string) []string {
 	return strings.Split(dgrams[0], "\n")
 }
 
-// goldenDatagramCap is comfortably above the whole 13-line batch (~800 B) and
+// goldenDatagramCap is comfortably above the whole 14-line batch (~850 B) and
 // below the 4096 B test read buffer.
 const goldenDatagramCap = 4000
 
@@ -164,7 +210,7 @@ func TestGolden_DogStatsd_ByteMirrorWire(t *testing.T) {
 	for i, e := range goldenRoster {
 		line := goldenPrefix + "." + e.residual + statsdValueSuffix(e)
 		if goldenTaggedIdx[i] {
-			line += "|#envoy.cluster_name:backend"
+			line += "|#" + e.tagKey + ":" + e.tagValue
 		}
 		want = append(want, line)
 	}
@@ -205,7 +251,7 @@ func TestGolden_Graphite_ByteMirrorWire(t *testing.T) {
 	for i, e := range goldenRoster {
 		name := goldenPrefix + "." + e.residual
 		if goldenTaggedIdx[i] {
-			name += ";envoy.cluster_name=backend"
+			name += ";" + e.tagKey + "=" + e.tagValue
 		}
 		want = append(want, name+statsdValueSuffix(e))
 	}
@@ -250,9 +296,10 @@ func TestGolden_LabelMapper_ByteMirrorWire(t *testing.T) {
 				t.Errorf("labelmapper: control[%d] %q labels = %d, want 1", i, fam.GetName(), len(labels))
 				continue
 			}
-			if labels[0].GetName() != "envoy.cluster_name" || labels[0].GetValue() != "backend" {
-				t.Errorf("labelmapper: control[%d] label = {%q,%q}, want {envoy.cluster_name,backend}",
-					i, labels[0].GetName(), labels[0].GetValue())
+			e := goldenRoster[i]
+			if labels[0].GetName() != e.tagKey || labels[0].GetValue() != e.tagValue {
+				t.Errorf("labelmapper: control[%d] label = {%q,%q}, want {%q,%q}",
+					i, labels[0].GetName(), labels[0].GetValue(), e.tagKey, e.tagValue)
 			}
 			continue
 		}
@@ -297,11 +344,16 @@ type otlpCell struct {
 // (cell base) + len(goldenOTLPVersion), measured exactly linear over a
 // 0/5/15/16-character sweep. Change that constant and all four pins move
 // together by the same amount.
+// ⚠️ These four figures are MEASURED IN THIS TREE, never computed. They moved
+// 1134/1200/1118/1184 -> 1212/1320/1184/1292 when phase 80's sds. entry joined
+// goldenRoster; before that they were identical with and without the sds. arm,
+// which is exactly the blindness this roster entry removes. Re-measure — do not
+// arithmetic — whenever the roster or goldenOTLPVersion changes.
 var goldenOTLPCells = []otlpCell{
-	{"F_F_default_INERT_UNDER_HOIST", false, false, 1134},
-	{"F_T_attrs", false, true, 1200},
-	{"T_F_residual_name", true, false, 1118},
-	{"T_T_both", true, true, 1184},
+	{"F_F_default_INERT_UNDER_HOIST", false, false, 1212},
+	{"F_T_attrs", false, true, 1320},
+	{"T_F_residual_name", true, false, 1184},
+	{"T_T_both", true, true, 1292},
 }
 
 func TestGolden_OTLP_ByteMirrorWire(t *testing.T) {
@@ -348,8 +400,9 @@ func TestGolden_OTLP_ByteMirrorWire(t *testing.T) {
 					continue
 				}
 				k, v := attrs[0].GetKey(), attrs[0].GetValue().GetStringValue()
-				if k != "envoy.cluster_name" || v != "backend" {
-					t.Errorf("otlp: control[%d] attribute = {%q,%q}, want {envoy.cluster_name,backend}", i, k, v)
+				e := goldenRoster[i]
+				if k != e.tagKey || v != e.tagValue {
+					t.Errorf("otlp: control[%d] attribute = {%q,%q}, want {%q,%q}", i, k, v, e.tagKey, e.tagValue)
 				}
 			}
 

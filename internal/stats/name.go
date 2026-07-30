@@ -27,11 +27,11 @@ var statusClassRE = regexp.MustCompile(`^(.+)_([1-5])xx$`)
 //
 // It enumerates BOTH acceptor species, because ExtractTags has two:
 //
-//   - 12 TOP-LEVEL segment detectors (strings.HasPrefix / strings.CutPrefix on
+//   - 13 TOP-LEVEL segment detectors (strings.HasPrefix / strings.CutPrefix on
 //     the head of the name).
 //   - 4 MID-NAME segment detectors (strings.Index anywhere in the name).
 //
-// Enumerating only the top-level twelve would state a NECESSARY condition for
+// Enumerating only the top-level thirteen would state a NECESSARY condition for
 // rejection while reading as a SUFFICIENT one: `anything.rbac.allowed` and
 // `anything.zookeeper.decoder_error` are ACCEPTED and have no recognized
 // top-level segment. In-tree prose has already miscategorized `.rbac.` as a
@@ -41,7 +41,7 @@ var statusClassRE = regexp.MustCompile(`^(.+)_([1-5])xx$`)
 // The leading `has no recognized top-level segment` clause is retained verbatim
 // as a stable grep anchor for the in-tree quotes of this message.
 const noRecognizedSegmentErrFmt = "stats: name %q has no recognized top-level segment " +
-	"(want one of the 12: cluster.|http.|listener.|server.|runtime.|access_logs.|tracing.|wasm.|mongo.|kafka.|redis.|thrift.) " +
+	"(want one of the 13: cluster.|http.|listener.|server.|runtime.|access_logs.|tracing.|sds.|wasm.|mongo.|kafka.|redis.|thrift.) " +
 	"and no recognized mid-name segment " +
 	"(want one of the 4: .http_local_rate_limit.|.http_bandwidth_limit.|.rbac.|.zookeeper.)"
 
@@ -68,6 +68,11 @@ const noRecognizedSegmentErrFmt = "stats: name %q has no recognized top-level se
 //	       tracing.<rest>      → tracing.<rest>      + no labels
 //	     No dot→underscore pre-transform belongs in these arms; flattenToProm
 //	     applies it at projection time.
+//	     Phase 80 adds a fourth root, but with the SN1 shape rather than the
+//	     byte-mirror one, because the secret name is operator-supplied:
+//	       sds.<secret>.<rest> → sds.<rest> + label envoy_xds_resource_name=<secret>
+//	     <secret> is the FIRST dotted segment only, non-greedy, matching every
+//	     other dynamic-token arm here; interior dots stay in <rest>.
 //	SN6: HELP text best-effort English (handled by prom.go via helpText map)
 //	SN7: histograms not emitted (Task-2-time NewCounter/NewGauge are the only
 //	     registry methods; absence is the contract)
@@ -136,6 +141,28 @@ func ExtractTags(internal string) (string, []Label, error) {
 	case strings.HasPrefix(internal, "tracing."):
 		// Rule SN5 byte-mirror shape (phase 79).
 		residual = internal
+	case strings.HasPrefix(internal, "sds."):
+		// Rule SN1 shape (phase 80): sds.<secret>.<rest> hoists the
+		// operator-supplied secret name into envoy_xds_resource_name.
+		//
+		// FIRST dot, SINGLE segment, non-greedy -- the same shape the reference
+		// uses. A last-dot reading would need a strings.LastIndex that appears
+		// nowhere in this function: all four dynamic-token arms split on the
+		// first dot. Secret names with interior dots are legal, so the two
+		// readings are not interchangeable; TestExtractTags_SDSDottedNameFork
+		// is the guard, because every secret name in the fixture corpus is
+		// dot-free and therefore cannot tell them apart.
+		//
+		// No dot->underscore pre-transform belongs here; flattenToProm applies
+		// it at projection time, as it does for the phase-79 roots above.
+		tail := strings.TrimPrefix(internal, "sds.")
+		dot := strings.Index(tail, ".")
+		if dot < 0 {
+			return "", nil, fmt.Errorf("stats: name %q matches sds.* but has no <rest> segment", internal)
+		}
+		labels = append(labels, Label{Key: "envoy_xds_resource_name", Value: tail[:dot]})
+		rest = tail[dot+1:]
+		residual = "sds." + rest
 	case strings.HasPrefix(internal, "wasm."):
 		// Phase 25.1 / Task 15 follow-up: wasm filter inline-prefix detection
 		// per AMEND-A2 + ADR-0202 + ADR-0203 (mirrors phase-15 bandwidth_limit's
@@ -487,15 +514,18 @@ func escapeLabelValue(s string) string {
 // helpText maps a Prometheus name to a static English description per
 // BRAINSTORM §4.5. Per Rule SN6, HELP text is NOT byte-equal to Envoy's HELP
 // text — the differential equivalence claim is on values + label keys + types
-// only. Of the 25 entries, the first 10 cover the 13 unique Prometheus names
+// only. Of the 30 entries, the first 10 cover the 13 unique Prometheus names
 // emitted by 06.1 (the four _Nxx counters per HCM and per cluster collapse to
 // envoy_http_downstream_rq_xx and envoy_cluster_upstream_rq_xx respectively per
 // Rule SN4); one is an 06.2 backpressure counter; the next three are the
 // phase-74 listener-scope TLS handshake outcomes; then phase 75's
 // listener-scope ssl.no_certificate — a SUCCESS-PATH annotation, not a member of
-// the outcome trichotomy; and the last ten are phase 79's byte-mirror roots
+// the outcome trichotomy; then ten are phase 79's byte-mirror roots
 // (runtime., access_logs., tracing.), whose Prometheus names are the plain
-// dot→underscore projection of the internal name with no label hoisted. All
+// dot→underscore projection of the internal name with no label hoisted; and the
+// last five are phase 80's sds. root, which unlike those three HOISTS its
+// operator-supplied secret segment into an envoy_xds_resource_name label, so all
+// five bases are secret-free and one entry each serves every secret name. All
 // four ssl.* entries have three-dot source names (listener.<addr>.ssl.<leaf>)
 // that flatten under SN3 to address-free residuals plus an
 // envoy_listener_address label. A name absent from this map emits its own name
@@ -545,4 +575,15 @@ var helpText = map[string]string{
 	"envoy_tracing_opentelemetry_spans_dropped": "Total spans dropped by the OpenTelemetry tracer.",
 	"envoy_tracing_zipkin_spans_sent":           "Total spans sent by the Zipkin tracer.",
 	"envoy_tracing_zipkin_spans_dropped":        "Total spans dropped by the Zipkin tracer.",
+
+	// Phase 80 — the sds. root. The secret segment is hoisted into an
+	// envoy_xds_resource_name label, so the base names below carry no secret
+	// name and one entry covers every secret. Do NOT hand-type these keys:
+	// TestHelpText_KeySetExact derives them by running flattenToProm over the
+	// internal roster.
+	"envoy_sds_update_success":     "Total SDS secret updates successfully applied.",
+	"envoy_sds_update_failure":     "Total SDS secret updates that failed to apply.",
+	"envoy_sds_update_rejected":    "Total SDS secret updates rejected as invalid.",
+	"envoy_sds_update_attempt":     "Total SDS secret update attempts initiated.",
+	"envoy_sds_init_fetch_timeout": "Total SDS initial-fetch timeouts.",
 }

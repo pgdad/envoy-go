@@ -29,17 +29,19 @@ task, against the shipped config, on both sides:
 
 The gauges **are** registered on the subject and **do** carry the correct
 values. The **prometheus renderer** dropped them through phase 78:
-`internal/stats.ExtractTags` recognizes **twelve** top-level segments and returns
+`internal/stats.ExtractTags` recognizes **thirteen** top-level segments and returns
 an error for anything else:
 
 | species | segments | anchor |
 |---|---|---|
-| prefix `switch` | `cluster.` `http.` `listener.` `server.` `runtime.` `access_logs.` `tracing.` `wasm.` | the `case strings.HasPrefix(internal, …)` arms |
+| prefix `switch` | `cluster.` `http.` `listener.` `server.` `runtime.` `access_logs.` `tracing.` `sds.` `wasm.` | the `case strings.HasPrefix(internal, …)` arms |
 | root-anchored `strings.CutPrefix` (default arm) | `mongo.` `kafka.` `redis.` `thrift.` | the `strings.CutPrefix(internal, …)` calls |
 
-⚠️ `runtime.`, `access_logs.` and `tracing.` are **phase-79 additions**. Before
-this row the roster was nine, which is why in-tree prose elsewhere still says
-nine — treat any nine you find as stale until you have re-counted.
+⚠️ `runtime.`, `access_logs.` and `tracing.` are **phase-79 additions** and
+`sds.` is a **phase-80 addition**. Before phase 79 the roster was nine, and
+between phases 79 and 80 it was one short of the figure above — which is why
+in-tree prose elsewhere still carries both stale figures. Treat any count you
+find here or elsewhere as stale until you have re-counted from the switch.
 
 ⚠️ **Four further detectors are MID-NAME (INFIX), not top-level** — `.rbac.`,
 `.zookeeper.`, `.http_local_rate_limit.`, `.http_bandwidth_limit.`, declared as
@@ -48,7 +50,7 @@ via `strings.Index` on any **dot-free leading segment**, so they accept more
 *names* but add no *root*: `ANYTHING_AT_ALL.rbac.allowed` parses clean (residual
 `rbac.allowed`), while the root-anchored `rbac.allowed` does **not** parse at
 all. Counting them as roots is the standing documentation error this file used to
-make. The top-level answer is **twelve**, and the two species must never be
+make. The top-level answer is **thirteen**, and the two species must never be
 summed.
 
 ⚠️ **No `name.go` line numbers are cited above, deliberately.** Every cite this

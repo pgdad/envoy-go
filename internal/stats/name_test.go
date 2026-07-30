@@ -941,11 +941,18 @@ func TestExtractTags(t *testing.T) {
 		{"http.hcm_local.downstream_rq_2xx", "http.downstream_rq_xx",
 			[]Label{{Key: "envoy_response_code_class", Value: "2"}, {Key: "envoy_http_conn_manager_prefix", Value: "hcm_local"}}},
 		{"server.live", "server.live", nil},
+		{"sds.server_cert.update_success", "sds.update_success",
+			[]Label{{Key: "envoy_xds_resource_name", Value: "server_cert"}}},
+		{"sds.validation_ca.update_rejected", "sds.update_rejected",
+			[]Label{{Key: "envoy_xds_resource_name", Value: "validation_ca"}}},
 	}
 	for _, c := range cases {
 		residual, labels, err := ExtractTags(c.in)
 		if err != nil {
-			t.Fatalf("ExtractTags(%q): %v", c.in, err)
+			// Errorf, not Fatalf: a Fatal here would make every later row and
+			// the negative assertion below dead code.
+			t.Errorf("ExtractTags(%q): %v", c.in, err)
+			continue
 		}
 		if residual != c.wantResidual {
 			t.Errorf("ExtractTags(%q) residual = %q, want %q", c.in, residual, c.wantResidual)
@@ -1042,6 +1049,87 @@ func TestExtractTags_ByteMirrorRoots_StackedControls(t *testing.T) {
 	}
 }
 
+// TestExtractTags_SDSDottedNameFork guards the sds. arm's central design
+// decision: the secret name is the FIRST dotted segment, taken as a SINGLE
+// segment, non-greedy.
+//
+// Nothing else in the tree can guard it. Every SDS secret name the fixture
+// corpus registers is dot-free, so a first-dot arm and a last-dot arm produce
+// byte-identical output on all of them -- the differential cannot discriminate
+// the fork at all. Only a name carrying interior dots separates the two, and
+// that is what this test supplies.
+//
+// Under a last-dot reading, sds.my.dotted.cert.update_success would hoist
+// envoy_xds_resource_name="my.dotted.cert" and leave residual sds.update_success.
+// The rows below fail loudly in that world.
+//
+// Two controls are stacked into the same test, because a guard that passes
+// because nothing ran is not a guard:
+//
+//   - cluster.backend.upstream_rq_total must KEEP its hoisted SN1 label, so a
+//     new arm that swallowed the switch would be caught.
+//   - filesystem.flushed_by_timer must STAY rejected: it is a real reference
+//     Envoy root that envoy-go does not implement, so it exercises the terminal
+//     default rather than a synthetic name.
+func TestExtractTags_SDSDottedNameFork(t *testing.T) {
+	cases := []struct {
+		in           string
+		wantResidual string
+		wantLabels   []Label
+		wantErr      bool
+	}{
+		// FIRST-dot, single-segment, non-greedy.
+		{in: "sds.my.dotted.cert.update_success", wantResidual: "sds.dotted.cert.update_success",
+			wantLabels: []Label{{Key: "envoy_xds_resource_name", Value: "my"}}},
+		{in: "sds.alpha.beta.gamma.update_success", wantResidual: "sds.beta.gamma.update_success",
+			wantLabels: []Label{{Key: "envoy_xds_resource_name", Value: "alpha"}}},
+		// The dot-free corpus shape, for contrast with the rows above.
+		{in: "sds.server_cert.update_success", wantResidual: "sds.update_success",
+			wantLabels: []Label{{Key: "envoy_xds_resource_name", Value: "server_cert"}}},
+		// The arm's own dot<0 reject, mirroring SN1/SN2/SN3.
+		{in: "sds.nodots", wantErr: true},
+	}
+	for _, c := range cases {
+		residual, labels, err := ExtractTags(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("ExtractTags(%q): want an error (no <rest> segment), got residual %q", c.in, residual)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("ExtractTags(%q): unexpected err %v", c.in, err)
+			continue
+		}
+		if residual != c.wantResidual {
+			t.Errorf("ExtractTags(%q) residual = %q, want %q (first-dot, single-segment)",
+				c.in, residual, c.wantResidual)
+		}
+		if !sameLabels(labels, c.wantLabels) {
+			t.Errorf("ExtractTags(%q) labels = %+v, want %+v", c.in, labels, c.wantLabels)
+		}
+	}
+
+	// Stacked control 1 -- an unrelated label-hoisting arm still hoists.
+	const kept = "cluster.backend.upstream_rq_total"
+	residual, labels, err := ExtractTags(kept)
+	if err != nil {
+		t.Errorf("ExtractTags(%q): unexpected err %v", kept, err)
+	}
+	if residual != "cluster.upstream_rq_total" {
+		t.Errorf("ExtractTags(%q) residual = %q, want %q", kept, residual, "cluster.upstream_rq_total")
+	}
+	if !sameLabels(labels, []Label{{Key: "envoy_cluster_name", Value: "backend"}}) {
+		t.Errorf("ExtractTags(%q) labels = %+v, want the hoisted envoy_cluster_name=backend", kept, labels)
+	}
+
+	// Stacked control 2 -- an unimplemented root stays rejected.
+	const rejected = "filesystem.flushed_by_timer"
+	if _, _, err := ExtractTags(rejected); err == nil {
+		t.Errorf("ExtractTags(%q): want error (no top-level rule), got nil", rejected)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // TestExtractTagsTerminalError_ByteStable pins the terminal ExtractTags
 // rejection wording byte-exact, mirroring the phase-77
@@ -1049,7 +1137,7 @@ func TestExtractTags_ByteMirrorRoots_StackedControls(t *testing.T) {
 // (internal/filter/http/admission_control/compiled_config_test.go:833).
 //
 // The wording had gone five generations without a guard and drifted to a
-// FOUR-item list while the code grew TWELVE top-level acceptors plus FOUR
+// FOUR-item list while the code grew THIRTEEN top-level acceptors plus FOUR
 // mid-name acceptors. Both species are now enumerated: a top-level-only list
 // states a NECESSARY condition for rejection while reading as a SUFFICIENT one,
 // since names like `anything.rbac.allowed` are ACCEPTED and have no recognized
@@ -1063,7 +1151,7 @@ func TestExtractTags_ByteMirrorRoots_StackedControls(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 const wantNoRecognizedSegmentErrFmt = "stats: name %q has no recognized top-level segment " +
-	"(want one of the 12: cluster.|http.|listener.|server.|runtime.|access_logs.|tracing.|wasm.|mongo.|kafka.|redis.|thrift.) " +
+	"(want one of the 13: cluster.|http.|listener.|server.|runtime.|access_logs.|tracing.|sds.|wasm.|mongo.|kafka.|redis.|thrift.) " +
 	"and no recognized mid-name segment " +
 	"(want one of the 4: .http_local_rate_limit.|.http_bandwidth_limit.|.rbac.|.zookeeper.)"
 

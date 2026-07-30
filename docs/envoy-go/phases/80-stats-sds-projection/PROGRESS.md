@@ -162,3 +162,102 @@ fixtures **120** (bare predicate **118**) · fuzzers **55** (⚠️ both scopes 
 **Not run at this stage, flagged rather than silently dropped:** the full 120-fixture differential and `-race` (**the PLAN owes none of it; T12 runs it at the IMPL**) · h2spec · any two-secret shape (unconstructible — §2.5's hard boot reject) · the subject side's **hoisted label key** post-landing (asserted against the **reference** only; if envoy-go hoists under a different key, T9 fails on the label check, not the name check) · a flake study of the reference's `3/1` values (4 runs is not one).
 
 **No flake fired at this stage.**
+
+---
+
+# IMPL record (2026-07-30)
+
+**Stage:** IMPL (lifecycle-state `3` → DONE). **Row 80 flips `in-progress` → `done`.** Sentinel `want` STAYS **112** — this row adds no row. Base master **`28aa342d`** (the PLAN squash tip, located by SUBJECT via `git log --grep 'phase 80'`, never by position). Worktree `/home/esa/git/envoy-go-wt/phase80-impl`, branch `phase80-impl`.
+
+**Eleven task commits**, squashed at close: T1 `16cf67e9` · T3 `3117c3ef` · T5 `0352b45e` · T4 `b30f933c` · T6 `c40198bc` · T7 `21598400` · T8 `de4f7566` · T2 `a412ab38` · T9 `7016bf65` · T10 `c38baa3b` · T13 `4f5b7944`. Seven subagents, all committing **locally only**; controller squash-pushed. Two ran in parallel on disjoint packages (`internal/stats` vs `internal/boot`+`internal/xds`), two more in parallel on disjoint trees (the `TWELVE` sweep vs fixture `0110`/`0111`), and the break agent ran alongside the doc agent — every one staging by **explicit path**, none ever running an unscoped `git restore`.
+
+## ⚠️ THE HEADLINE: THE PLAN'S OWN SPLIT ARITHMETIC IS THE THING THIS STAGE REFUTED
+
+PLAN §4 states **`~640 net .go < ~1500 (~2.3× margin)`**. **Realized: 1701 insertions / 65 deletions = 1636 net `.go`** — **over the ~1500 trigger by 136 lines.** Unlike the SPEC's estimate (which PLAN §1.3 correctly diagnosed as wrong per-bucket with *cancelling* errors), here **every bucket over-ran and the errors COMPOUNDED**:
+
+| bucket | PLAN estimate (ins) | realized ins | ratio |
+|---|---|---|---|
+| production | ~86 | **135** | 1.6× |
+| test | ~457 | **935** | 2.0× |
+| fixture driver | ~154 | **631** | **4.1×** |
+| **`.go` total** | **~700 (~640 net)** | **1701 (1636 net)** | **2.4× / 2.6×** |
+
+**The dominant miss is the fixture bucket**, and its cause is a conditional the PLAN priced at zero: *"plus `0111`'s parallel pair **if mirrored**"*. It **was** mirrored — at **320 insertions, more than `0110`'s 302** — and mirroring turned out to be load-bearing, not optional (see the counter-classification finding below).
+
+⚠️ **THE SPLIT DID NOT RETROACTIVELY FIRE, AND THAT IS THE CORRECT READING.** `BOOTSTRAP_PROMPT.md` §6.1 (`:290`) gates *"`PLAN.md` **estimates** exceed ~1500 lines of code of net change"* — the number **the PLAN writes down**. The PLAN estimated ~640 across **13 tasks** (≪ ~25), so neither trigger was live at authoring time. **But 1636 is the lineage's first realized crossing** (comparables: 1406, 1446, phase 79's 1532), and it is recorded rather than absorbed.
+
+⚠️ **THE THIRD §6.1 TRIGGER DID FIRE, ON T4, EXACTLY WHERE THE PLAN SAID TO WATCH FOR IT.** T4 enumerated **6** sub-steps against a ~10 threshold and executed **17** — ~2.8× the enumeration, ~1.7× the threshold. It stayed atomic (one commit, the tree never red between legs), which is why it was right not to split it, but the estimate was low.
+
+## Refutation ledger — what EXECUTION found that the PLAN got wrong
+
+**Load-bearing (changed what shipped):**
+
+1. **⚠️ A SECOND CROSS-SIDE DEPARTURE, NAMED BY NO PHASE-80 DOCUMENT.** Fixture `0111` serves an **EMPTY** `validation_context`. **The reference ACKs it and books `sds.<secret>.update_success`; envoy-go REJECTS it and books `update_rejected`**, then falls back to the inline default exactly as the byte observable requires. **The two sides book the same event under OPPOSITE counter names** (ref `3/1/1/0/0` vs subj `1/0/0/1/0`). ⇒ **mirroring `0110`'s two-name floor set into `0111` is RED ON ARRIVAL**; `0111` floors `update_attempt` **alone**. This is `reference_sds_empty_ack_narrow_classifier` observed for the first time **through the stats surface**. Recorded as a named, unasserted divergence in `BEHAVIOR_CONTRACT.md` — and it is a **fourth independent argument** against cross-side value assertions.
+2. **The G6 code block does not compile.** The PLAN prints keyed rows including `wantErr: true` for `TestExtractTags`' table — which is a **positional** three-field literal with **no `wantErr` field**. Two compile errors at once. G6 was given its own function with its own table type. `reference_plan_break_instructions_dont_compile`, fired on a *task* block rather than a break block.
+3. **`t.Fatalf` was already live in the table the PLAN sends rows to.** Appending under it would have made the trailing negative assertion dead code — the exact hazard §2 constraint 3 names. Converted to `Errorf` + `continue`. **The PLAN's instruction, followed literally, would have SHIPPED the anti-pattern it forbids.**
+4. **The predicate's fork-adjacent rationale is wrong in both cells.** PLAN T6: *"`1leading_digit` and `trailing_dot.` … **both are valid** as bare names."* Measured: `IsValidName("1leading_digit") = false` **and** `IsValidName("trailing_dot.") = false` — **both INVALID**. The SPEC's verdict was corrected in the *wrong direction*. The *expectations* are unaffected (`sds.` supplies the leading char; the segment leg catches the trailing dot) but the stated reason is false. Each case now pins `wantBareValid` so this cannot recur silently. `reference_probe_input_is_a_claim`.
+
+**Bookkeeping / gate-shape (recorded, did not change what shipped):**
+
+5. **⚠️ *"It is never 45"* IS ITSELF FALSE.** PLAN §1.12 asserts the spelled-needle file figure is **43** and *"never 45"*. Measured across the lineage: **42** @`53855de0` · **43** @`7d014546` and @`47b9b378` · **45** @`28aa342d` — **the PLAN's own squash added `PLAN.md`+`PROGRESS.md` and moved 43→45**, so ADR-0302 ¶11's *"forty-five"* was **correct at the tip the PLAN was measuring from**. It is **38** after T2's sweep and **39** at HEAD. ADR-0302 ¶11 now carries **39 with its tip named**, recorded as a **moving measurement, not a constant.** `reference_a_drift_correction_is_itself_a_claim` — a drift correction is itself a claim, and this one was wrong.
+6. **Break arm γ's "three tests" is false, for an instructive reason.** With the arm deleted and the constant at 13, `TestExtractTagsTerminalError_ByteStable` **PASSES** — its golden is **hand-written and was bumped in lockstep with the constant**. It only fires once the two desync. **`reference_handwritten_golden_shares_author_mistake`, firing on the very guard whose own file header describes that hazard.** What actually caught the defect is `segmentcount_test.go`, which hard-codes nothing. Arm δ has the mirror-image error: reverting the constant alone fires **two** tests, not one.
+7. **Break arm λ is understated.** PLAN §1.1 and the λ row predict *"reds on THREE names on the SUBJECT side."* Executed, stable over 3 runs: **5 errors — 3 subject AND 2 reference.** `update_rejected` and `init_fetch_timeout` are **0 on BOTH sides**, which §1.1's own table shows in its ref column while the prose marks those rows RED only in the subject column.
+8. **⚠️ A SECOND κ DATAPOINT, FOUND BY ACCIDENT AND WORSE THAN THE FIRST.** Broken-gate shape **seventeen** was confirmed live (roster un-extended ⇒ **1134 bytes in both worlds**, arm present or deleted, while the NC `1134→1135` fires — command, assertion and cross-product all correct, the *input roster* the entire defect). **But under arm α, with the roster FULLY EXTENDED, the `F_F` cell STILL passed** while the other three failed. ⇒ **extending the roster is necessary but not sufficient — a `(F,F)`-only cell restriction remains fatal even after the roster fix.** The κ hazard survives its own remedy.
+9. **Break arm η's injection site is NOT a live variable.** Both post-dial positions (after `NewSDSClient`, and after `RegisterSDSStats`) produce **byte-identical** failures. §1.5's masking claim is confirmed; the sub-choice is unobservable. Note that at site 2 the invalid name reaches `RegisterSDSStats` and **nothing in `internal/xds` fires** — the skip-branch layer is blind to it, as §4.3's unreachability argument implies.
+10. **Arms α, θ and ι each fire MORE than the PLAN names** — α adds `TestHelpText_KeySetExact` and both terminal-error guards (5 tests in `internal/stats`, not 3); θ adds `TestValidateSDSSecretName_PrintableByteSweep` (`.` crosses from the rejected to the accepted byte set — a genuinely independent second catcher); ι adds `TestGolden_RosterTagDeclarationsAgree` **first and most diagnostically**, and within OTLP only the two `emitTagsAsAttributes=true` cells fire.
+11. **Line anchors drifted mid-row, as predicted and then observed.** `golden_bytemirror_test.go:354` is a closing brace (the literal is at `:351-352`). `name.go:490` is **`:517`** after T1 landed above it (`helpText` `:540`, not `:513`). The SN9-collision cite `:501` is at **`:555`** — and `:501` at this tip *is* a real `wasm.` line, so a line-anchored reader lands on a **plausible-looking wrong target**. `STATE.md:48` is `:50`. `next-prompt.txt:150` is a **phantom cite** (the file carries eight `twelve`, none on `:150`). **Every phrase anchor held; every line anchor that mattered had moved.**
+12. **`git grep -c … ⇒ 0` is a broken gate as literally specified.** With zero matching lines `git grep -c` **prints nothing and exits 1** — it never prints `0`. And `-c` counts **LINES, not occurrences**: pre-edit it reads **3** against **4** live `79.1` occurrences, so it structurally cannot distinguish "3 of 4 repaired" from "4 of 4". The discriminating measure is `grep -o … | wc -l` plus per-phrase probes.
+13. **The `internal/boot` census is 23, not the PLAN's 21** — 23 at base, before any edit; 30 after T6+T8. **The reject added zero tests, so 21 was never right at this tip.**
+14. **PLAN T10 says "the NEW DEPARTURE", singular** (there are two), **misses a paragraph that goes FALSE** the moment the `sds.`-deferral sentence is closed (the phase-79 resolution paragraph two lines above still read *"STILL OPEN, NARROWED, for `sds.`"*), and **omits the `# HELP` section** the row moves 25→30.
+15. **T12's touched-package roster says six; it is EIGHT** — T2's sweep modified `0118`'s driver and T9 mirrored to `0111`'s. Both were linted.
+16. **Two claims held exactly and are recorded so no later stage re-derives them:** T7's sweep reproduced **95 / 64 / 31 / 0** and the 31-byte rejected set **byte-identical**, with guard-reject ⊇ skipAll at exactly one mismatch (`"."`, guard stricter); and the four OTLP `wantBytes` re-measured to **1212 / 1320 / 1184 / 1292**, matching the PLAN — **measured, not inherited**, and they coincide only because the roster entry is byte-identical and `goldenOTLPVersion` is unchanged. **The PLAN's caution that they are tree-local remains correct in principle; it simply did not bite here.**
+
+## Gates — ACTUAL output
+
+| gate | result |
+|---|---|
+| **full 120-fixture differential** `-count=1 -v` | **INNER_EXIT=0**, **120 `--- PASS`**, FAIL/SKIP **EMPTY**, `no driver registered` **0**, **`comm -3` EMPTY** (ran=120, dirs=120), **402 s** — 33 % of CI's `-timeout 20m` |
+| **h2spec** (the FOURTH `cmd/envoy-go` consumer, run explicitly) | INNER_EXIT=0, `53 tests, 53 passed, 0 skipped, 0 failed` across 18 sections |
+| `go test ./internal/... -count=1` | INNER_EXIT=0, 70 `ok`, 0 FAIL |
+| `-race` over the four touched trees (a SECOND run) | INNER_EXIT=0, **`DATA RACE` count 0** |
+| `go vet ./...` | 0, **0 bytes** |
+| `gofmt -l` over **eight** packages | **OUTPUT EMPTY** (gated on output — it never exits non-zero; NC on a doctored file **printed the name AND still exited 0**) |
+| `golangci-lint run` over eight packages | **own exit 0**, 0 bytes; NC with `-E godot` ⇒ exit 1 with a real finding, **proving the loader reaches the packages** |
+| `git diff … -- go.mod go.sum` | **0 bytes** |
+| **stat-surface delta** | **+0, PROVEN BY ENUMERATION.** Added registration call sites in the diff: **2, both in a `_test.go`**. **Production set = ∅.** Matcher non-vacuity: the same regex tree-wide = **508 call sites / 84 files**. The five `TestNoNewStat*` guards were re-confirmed **blind** (all in `internal/statssink/registration_test.go`) and **did not discharge this** |
+
+**Zero hazards fired.** `address already in use` = **0** in the 161 KB differential log (**both** bands clean — the `f2dd994a` backend banding held), `subject ready: EOF` = **0**, `0061-lb-ring-hash` PASS, `internal/cluster` / `internal/httpclient` / `internal/filter/hcm/h2` all `ok` plain and under `-race`. **`reference_sds_init_fetch_timeout_dial_budget_flake` did not fire in any run** despite being live for this row's subject. **No isolate-re-run was needed.**
+
+## Sentinel — re-run MECHANICALLY after the ROADMAP flip. It does NOT fire
+
+| check | ACTUAL output | NC, observed FIRING |
+|---|---|---|
+| **(1)** `want=112` | **NOTHING** — row 80 is now `done` | `want=111` ⇒ `GATE FAIL: examined 112 data rows, expected 111`; row 76 doctored ⇒ `NC NOT DONE: row 76` |
+| **(2)** | **FIVE** — `:190 :200 :210 :216 :224` | union **5**, long-arm-only **4**, short-arm-only **1** ⇒ **5→4, NOT 5→0** |
+| **(3)** | **`NEVER OPENED: gRPC`, `NEVER OPENED: WASM`** | invented slug prints; registered `Observability` correctly silent |
+
+Input measured at **228 lines / 112 data rows / 13** bare `candidates:` hits. **(2) and (3) still print ⇒ the sentinel does NOT fire. `ls stop` ⇒ `No such file or directory`; it was NOT created.**
+⚠️ **CHECK (2) IS UNCHANGED. THIS ROW NARROWS NOTHING — STATED, NOT FORECAST. The twenty-seventh consecutive phase at which it did not go down.**
+
+**The leak check RE-ARMED and passed.** Row 80's cell: deferred-candidate phrases **0**; slugs present = **`Observability-family row` only**, registered **51×** elsewhere. ⚠️ **The by-mention silencing was reproduced LIVE**: on a doctored copy `gRPC` **stopped printing** while `WASM` kept printing, and check (2) went 5→6. **`grep` cannot tell a mention from a use.**
+**Row-80 well-formedness**: the **disjunction** was required — over all 112 rows, ARM-A (`NF!=8`, escape-aware) catches 57/69 only and ARM-B (trailing-piece) catches 78 only. The **compensating-defect NC** (inject an inner pipe + strip the trailing one) makes naive `NF==8` **pass a malformed row**, exactly as on real row 78; ARM-B catches it.
+
+## Bookkeeping
+
+**ADR-0302** §Decision + §Consequences appended **IN PLACE** (ADR-0044-as-used, no renumber, no `---`), STATUS `PROPOSED` → `COMPLETE`, **footer RETAINED** at `:17692` (`od`-verified U+00A7). Per-block footer scan re-derived: **ADR-0294…0300 = SEVEN**, ADR-0301 = 0 (the recorded departure), ADR-0302 = 1 — **ADR-0301's own "seven blocks / ADR-0295 through ADR-0300" miscount was NOT copied.** No whole-file grep count carried into any ADR.
+**The ADR-0299 rider landed**: STATUS `PROPOSED` → `COMPLETE`. The guard *"a `PROPOSED` STATUS must carry no §Decision"* over all 301 blocks named **ADR-0299 and no other** pre-edit and is **silent** post-edit, NC'd both ways. STATUS census **13 COMPLETE / 2 PROPOSED → 15 / 0**.
+**`STATE.md`** §Current rolled **IN PLACE**; §Project **left alone** (frozen at the phase-76 IMPL close, self-contradicting §Current — repairing a count by editing the sentence that states it is how the ADR-0296/0297 species starts). All seven §Current fields verified singleton, NC both ways.
+**Eviction**: `phase 79 (stats-prometheus-projection) SPEC done` — **re-derived as oldest at this tip**, verified **ABSENT** from the archive (0 hits / 428 lines) with a **firing NC** on the phase-79 BRAINSTORM sibling (1). Body migrated **VERBATIM**, `cmp` exit 0, with a firing `cmp` NC against a sibling body. **`STATE_HISTORY.md` 428 → 430.** The known `phase 77 PLAN done` gap re-checked and **not widened**.
+
+## Six-gate (§7.5, `/BOOTSTRAP_PROMPT.md` at the REPO ROOT — `:357`, `:360-365`, `:367` re-verified exact)
+
+(a) differential **GREEN, 120/120** · (b) corpus **120** dirs, same run · (c) h2spec **53/53**; proxy-wasm **INHERITED, not re-run — said so rather than claimed** · (d) fuzzers **VACUOUS AND RECORDED AS VACUOUS** (55 repo-wide, **0** added; matcher NC: 11 `+func Test` added) · (e) `gofmt`/`vet`/`golangci-lint`/`-race` all clean · (f) ⚠️ **FINDING — no `REVIEW.md` for phase 80, and none since 25.3; 84 of 121 phase dirs carry none. A standing lineage departure from §7.5(f), recorded as such rather than as compliance.**
+
+## Broken-gate count stays **EIGHTEEN** — no new shape, but two priors fired live
+
+No nineteenth shape was found. **Shape seventeen (a golden roster omitting the family under test) was reproduced live and then shown to survive its own remedy** (finding 8). **The hand-written-golden shape fired on a break arm's prediction** (finding 6). **`gofmt -l` printing while exiting 0** was observed directly in an NC. **A harness's exit code is not the command's** was defended against throughout by `INNER_EXIT` capture and did not fire.
+
+## Carried forward, deliberately NOT fixed
+
+`DECISIONS.md` ADR-0301 §Decision (b)'s *"has failed twelve top-level detectors"* — **present tense inside immutable ADR text, factually wrong as of `16cf67e9`; a named permanent discrepancy** · `ROADMAP.md`'s five `twelve` (§Schema-invariant-blocked; **four are pure false positives** and the fifth is historically true, so **nothing is owed there on the merits**) · the `wasm.` **SN9 collision** with ADR-0118 (which is why the `sds.` arm claims **no SN number at all**) · `BEHAVIOR_CONTRACT.md`'s `# HELP` departure, **widened** 25→30 and explicitly **not** parity work · full hyphen fidelity · the general dynamic-token charset exposure across six families (**this row does NOT audit whether the five existing rejects are complete**) · **`--mode validate` cannot validate ANY SDS bootstrap** (`validate.Bootstrap` passes a nil provider) · the `listener.`/`stat_prefix` sanitization inconsistency · the `STATE_HISTORY.md` archive gap · `ROADMAP.md`'s malformed rows 57/69/78 · the differential bind **retry** gap (the allocator half landed at `f2dd994a`) · the two `//nolint:gosec` directives this row added, **inert** because `gosec` is not among the 9 linters `.golangci.yml` enables.
+⚠️ **A NEW NEEDLE COLLISION, named now:** `0110`'s driver comment *"envoy_sds_* metric names (twelve families…)"* is **accurate** (the reference exposes **14 distinct names / 12 families** — the `update_duration` histogram contributes `_sum`/`_bucket`/`_count`) but is a **false positive for any future `\btwelve\b` top-level-detector sweep.**

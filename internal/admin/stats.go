@@ -17,7 +17,7 @@ import (
 // to reference Envoy's /stats endpoint) used by the 32.1 cross-side
 // StatsAsserter to compare redis.<sp>.* + cluster.<name>.* counters by internal
 // name — bypassing the /stats/prometheus path, which skips names whose root is
-// not one of the twelve top-level segments ExtractTags recognizes. As of phase
+// not one of the thirteen top-level segments ExtractTags recognizes. As of phase
 // 79 that skip is no longer silent: WriteProm emits one aggregated log line per
 // call naming what it dropped, though it still returns no error. (The redis.
 // Prometheus tag-extractor arm was deferred to 32.2 when this comment was

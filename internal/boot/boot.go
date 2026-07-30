@@ -193,6 +193,13 @@ func NewSDSProvider(dialer *grpcclient.Dialer, bs *bootstrap.Bootstrap, baseDir 
 	if err != nil {
 		return nil, err
 	}
+	// The reject MUST precede the dial. Placed after NewSDSClient, an
+	// unreachable-cluster or absent-SDS-server config fails at the dial
+	// first and MASKS this error, which would force every observation of
+	// the name reject to stand up a live SDS server (phase 80, T5).
+	if err := validateSDSSecretName(secretName); err != nil {
+		return nil, err
+	}
 	client, err := grpcclient.NewSDSClient(dialer, clusterName)
 	if err != nil {
 		return nil, fmt.Errorf("xds: sds: dial cluster %q: %w", clusterName, err)
@@ -200,6 +207,86 @@ func NewSDSProvider(dialer *grpcclient.Dialer, bs *bootstrap.Bootstrap, baseDir 
 	opener := xdsgrpc.NewOpener(client)
 	sdsStats := xds.RegisterSDSStats(registry, secretName)
 	return xds.NewProvider(opener, xds.Node{ID: node.GetId(), Cluster: node.GetCluster()}, baseDir, timeout, sdsStats), nil
+}
+
+// sdsStatSuffixes is the five-counter sds.<secret>.* suffix set that
+// xds.RegisterSDSStats composes. Kept here only so sdsLongestStatSuffix (and
+// the tests that sweep it) can derive the assembled name that
+// validateSDSSecretName checks, rather than hard-coding one.
+var sdsStatSuffixes = []string{
+	"update_success",
+	"update_failure",
+	"update_rejected",
+	"update_attempt",
+	"init_fetch_timeout",
+}
+
+// sdsLongestStatSuffix returns the longest member of sdsStatSuffixes.
+// Validating the assembled name built from the LONGEST suffix suffices: all
+// five suffixes agree (valid or invalid together) for every secret name --
+// re-verified exhaustively at phase 80 over 95 single-byte and 9025 two-byte
+// names, zero disagreements. ADR-0065 Consequences (b) states the same rule
+// for cluster names, but its stated REASON there ("the suffixes differ only
+// in their last 4 chars") does NOT transfer to this suffix set, which differs
+// in both length and prefix -- hence the independent re-verification.
+func sdsLongestStatSuffix() string {
+	longest := ""
+	for _, s := range sdsStatSuffixes {
+		if len(s) > len(longest) {
+			longest = s
+		}
+	}
+	return longest
+}
+
+// invalidSecretNameErrFmt is the byte-stable boot-reject wording for an SDS
+// secret name that cannot form a clean metric name.
+const invalidSecretNameErrFmt = "xds: sds: invalid secret name: %q " +
+	"(must contain only ASCII letters, digits, underscore, or dot, " +
+	"and form a valid metric-name segment)"
+
+// validateSDSSecretName rejects an operator-supplied SDS secret name that
+// cannot form a clean metric name, at the boot boundary and BEFORE the SDS
+// dial. ADR-0065 Consequences (e) mandates boundary validation for metric
+// names derived from user input.
+//
+// Two legs, both applied to the ASSEMBLED name rather than to the bare secret
+// name:
+//
+//  1. Segment well-formedness. stats.IsValidName is a CHARSET guard only and
+//     ACCEPTS an interior empty segment, so a bare-name-only check passes ""
+//     and "trailing_dot.": they assemble to sds..init_fetch_timeout and
+//     sds.trailing_dot..init_fetch_timeout, both of which register cleanly and
+//     would then project to envoy_sds__update_success where the reference
+//     serves envoy_sds_update_success with the name hoisted into a label.
+//  2. The stats charset, via stats.IsValidName on the same assembled name.
+//
+// Sanitizing is FORECLOSED by ADR-0065's own Context: two names differing only
+// in invalid characters would collapse to a single label value, a silent
+// data-loss bug. So this rejects rather than rewrites.
+//
+// DEPARTURE, NOT A FIX (phase 80). The reference ACCEPTS a hyphenated secret
+// name such as "server-cert": it boots green and serves
+// envoy_sds_update_success{envoy_xds_resource_name="server-cert"} 1 with the
+// hyphen verbatim in the label value. The same config boot-FAILS here. That is
+// an envoy-go-strict departure recorded deliberately, not a defect being
+// repaired.
+//
+// The xds.RegisterSDSStats skip branch and the nil-safe increment helpers both
+// STAY: two-layer defense is the established pattern here, and deleting the
+// nil-safe path is a proven boot-path SIGSEGV (a nil *stats.Counter Inc is a
+// process crash with no recover()).
+func validateSDSSecretName(name string) error {
+	assembled := "sds." + name + "." + sdsLongestStatSuffix()
+	for _, seg := range strings.Split(assembled, ".") {
+		if seg == "" {
+			return fmt.Errorf(invalidSecretNameErrFmt, name)
+		}
+	}
+	if !stats.IsValidName(assembled) {
+		return fmt.Errorf(invalidSecretNameErrFmt, name)
+	}
+	return nil
 }
 
 // luaCompileErrorSubstring is the byte-stable arm-16 wrap prefix emitted by

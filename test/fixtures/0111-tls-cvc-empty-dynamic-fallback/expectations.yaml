@@ -168,6 +168,32 @@
 #       The ABSENT check is separate from the value check: a counter that fails
 #       to REGISTER would read 0 == 0 and pass vacuously.
 #
+#   (d) CROSS-SIDE, at the SDS LABEL-HOISTING layer (phase 80; the driver's
+#       assertSDSProjection, same runner step 10). The FIVE counters
+#       envoy_sds_{update_attempt,update_success,update_failure,update_rejected,
+#       init_fetch_timeout} must each be PRESENT on /stats/prometheus on BOTH sides
+#       carrying envoy_xds_resource_name="edf_validation_ca" — the SERVED SECRET
+#       NAME, hoisted out of the flat stat name and into a LABEL identically by the
+#       reference and by envoy-go.
+#       ⚠️ THIS IS THE MIRROR OF 0110's LEG AND THE SECOND SECRET NAME IS THE POINT.
+#       0110 asserts "rccf_validation_ca"; only the PAIR rules out a hard-coded
+#       label value. The pair also spans both served shapes: 0110's secret carries a
+#       populated validation_context, this one's is EMPTY (S1).
+#       ⚠️ NAME + LABEL cross-side, NEVER a value cross-side, and the FLOOR SET IS
+#       PER-FIXTURE. 0110 floors two names; this fixture floors ONE
+#       (update_attempt). Measured here, stable 4/4 runs — ref 3/1/1/0/0 against
+#       subj 1/0/0/1/0: the reference ACKs the EMPTY validation_context and books
+#       update_success, while envoy-go REJECTS it and books update_rejected, then
+#       falls back to the inline default exactly as legs (a)/(b) require. The two
+#       sides book the same event under OPPOSITE counter names while agreeing on
+#       every NAME and on the LABEL VALUE. Copying 0110's two-name floor set here is
+#       RED ON ARRIVAL (executed: one failure, subj update_success = 0, want >= 1).
+#       The five are a strict SUBSET of the reference's fourteen envoy_sds_* names —
+#       no set-equality assertion; only MISSING is reported, never EXTRA.
+#       Keying is the DELIBERATE OPPOSITE of leg (c): leg (c) strips the label set
+#       entirely because the listener address differs cross-side, so leg (d) uses a
+#       SIBLING scraper (scrapePromLabeled) rather than editing scrapeProm.
+#
 #   Because exactly ONE structurally-valid stream exists, (a) strictly subsumes
 #   (b) for this fixture: any deviation on either side trips (a) first. (b) is
 #   retained as the harness-standard cross-side leg. Per-side FAILURE tokens are
@@ -220,10 +246,27 @@
 #
 #   SDS stream framing (VersionInfo/Nonce/request-count/ACK cadence —
 #   impl-specific; only the DELIVERED-empty half's EFFECT — the fallback — is asserted).
-#   The sds.<secret>.* stat counters (not asserted by this fixture's StatsAsserter,
-#   which is CONFINED to listener.<addr>.ssl.* — DriveSubject hard-stops both SDS
-#   receivers before step 10, so the sds.* and cluster.sds_cluster.* scopes are
-#   reconnecting against a closed port while AssertStats runs).
+#
+#   The sds.<secret>.* counters — THIS BOUNDARY IS REVERSED AT PHASE 80, mirroring
+#   0110, and it is reversed by MEASUREMENT. The earlier text said the StatsAsserter
+#   is CONFINED to listener.<addr>.ssl.* and must not reach into sds.* at all, because
+#   DriveSubject hard-stops both SDS receivers before step 10, leaving the sds.* and
+#   cluster.sds_cluster.* scopes reconnecting against a closed port while AssertStats
+#   runs. The MECHANISM is real and confirmed; the CONSEQUENCE was misattributed. The
+#   instability lands on VALUES ONLY — the metric NAMES and the hoisted LABEL were
+#   identical on every run. The boundary is now split by what is asserted:
+#     ASSERTED — leg (d) above: five names, present on both sides with
+#       envoy_xds_resource_name="edf_validation_ca".
+#     ASSERTED, per side only — a >= 1 floor on update_attempt ALONE.
+#     UNasserted — every VALUE cross-side, and any floor on the other four. In
+#       particular update_success is 1 on the reference and 0 on the subject, and
+#       update_rejected is 0 and 1: the empty validation_context is ACKed by the
+#       reference and REJECTED by envoy-go. That divergence is NAMED, not asserted —
+#       legs (a)/(b) already prove the fallback behaves identically.
+#     UNasserted — the reference's other sds.* families (fourteen distinct
+#       envoy_sds_* names against the subject's five). Strict SUBSET: never
+#       set-equality assert.
+#     UNasserted — cluster.sds_cluster.* entirely.
 #
 # Cross-refs: phase 68 SPEC §8 + ADR-0290 + ADR-0019 +
 #             reference_go_client_cert_withholding +

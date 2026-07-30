@@ -162,6 +162,33 @@
 #       (the accept path ran) and ssl.handshake > 0 (the TLS path itself ran —
 #       downstream_cx_total alone is NOT a decode-ran guard on the reference).
 #
+#   (d) CROSS-SIDE, at the SDS LABEL-HOISTING layer (phase 80; the driver's
+#       assertSDSProjection, same runner step 10). The FIVE counters
+#       envoy_sds_{update_attempt,update_success,update_failure,update_rejected,
+#       init_fetch_timeout} must each be PRESENT on /stats/prometheus on BOTH sides
+#       carrying envoy_xds_resource_name="rccf_validation_ca" — the SERVED SECRET
+#       NAME, hoisted out of the flat stat name and into a LABEL identically by the
+#       reference and by envoy-go. This is the FIRST in-tree fixture to assert a
+#       hoisted label VALUE; 0111's cross-side prom assertion is precedent only for
+#       the metric NAME surviving hoisting.
+#       ⚠️ NAME + LABEL cross-side, NEVER a value cross-side. envoy-go is
+#       initial-fetch-only and does not hold the SDS stream open; the reference keeps
+#       a long-lived subscription that RE-ATTEMPTS after DriveSubject hard-stops both
+#       receivers. Measured ref 3/1/1/0/0 against subj 1/1/0/0/0 (4/4 runs, identical)
+#       — the sides agree on every NAME and on the LABEL VALUE and disagree on two of
+#       the five VALUES.
+#       ⚠️ The ROSTER IS SPLIT: only update_attempt and update_success carry a >= 1
+#       floor, and only per side. A blanket per-side >= 1 over all five is RED ON
+#       ARRIVAL (executed: 5 failures, 3 subject + 2 reference).
+#       The five are a strict SUBSET of the reference's fourteen envoy_sds_* names —
+#       no set-equality assertion; only MISSING is reported, never EXTRA.
+#       One Fatalf guards vacuity, scoped to the SCRAPER-BROKEN diagnosis (a
+#       label-aware scrape returning ZERO families), so it stays separable from
+#       "the projection did not land"; every per-name check is Errorf.
+#       Keying is the DELIBERATE OPPOSITE of leg (c): leg (c) strips the label set
+#       entirely because the listener address differs cross-side, so leg (d) uses a
+#       SIBLING scraper (scrapePromLabeled) rather than editing scrapeProm.
+#
 #   Because exactly ONE structurally-valid stream exists, (a) strictly subsumes
 #   (b) for this fixture: any deviation on either side trips (a) first. (b) is
 #   retained as the harness-standard cross-side leg.
@@ -207,12 +234,36 @@
 #
 #   SDS stream framing (VersionInfo/Nonce/request-count/ACK cadence —
 #   impl-specific; only the DELIVERED CA's EFFECT is asserted).
-#   The sds.<secret>.* stat counters (NOT asserted by this fixture's StatsAsserter,
-#   which is CONFINED to listener.<addr>.ssl.* — DriveSubject hard-stops both SDS
-#   receivers before step 10, so the sds.* and cluster.sds_cluster.* scopes are
-#   reconnecting against a closed port while AssertStats runs). The boundary itself
-#   is UNCHANGED: these counters remain unasserted. Only the "(no StatsAsserter)"
-#   parenthetical is corrected — the fixture HAS one as of phase 75.
+#
+#   The sds.<secret>.* counters — THIS BOUNDARY IS REVERSED AT PHASE 80, and it is
+#   reversed by MEASUREMENT. The earlier text said the StatsAsserter is CONFINED to
+#   listener.<addr>.ssl.* and must not reach into sds.* at all, because DriveSubject
+#   hard-stops both SDS receivers before step 10, leaving the sds.* and
+#   cluster.sds_cluster.* scopes reconnecting against a closed port while AssertStats
+#   runs, and therefore "inherently unstable". The MECHANISM is real and confirmed:
+#   the hard-stopped receiver is exactly why the reference reads update_attempt=3 and
+#   update_failure=1 rather than 1 and 0. The CONSEQUENCE was misattributed. Measured
+#   4/4 consecutive runs, byte-identical every time, the instability lands on VALUES
+#   ONLY — the metric NAMES and the hoisted LABEL are stable on both sides.
+#
+#   So the boundary is now SPLIT by what is asserted, not by scope:
+#     ASSERTED (leg d) — the FIVE names envoy_sds_{update_attempt,update_success,
+#       update_failure,update_rejected,init_fetch_timeout} must each be PRESENT on
+#       /stats/prometheus on BOTH sides carrying
+#       envoy_xds_resource_name="rccf_validation_ca". This is the first in-tree
+#       fixture to assert a HOISTED LABEL VALUE.
+#     ASSERTED, per side only — a >= 1 floor on update_attempt and update_success,
+#       the only two names that move on BOTH sides.
+#     UNasserted — every VALUE cross-side, and any value floor on the other three.
+#       Measured ref 3/1/1/0/0 against subj 1/1/0/0/0: three of the five are ZERO on
+#       the subject, so a blanket per-side >= 1 over all five is RED ON ARRIVAL. And
+#       a value pin on the REFERENCE side is a flake by construction — its retry
+#       count after receiver close is timing-dependent.
+#     UNasserted — the reference's other sds.* families (it exposes FOURTEEN distinct
+#       envoy_sds_* metric names; the subject exposes exactly the five). The asserted
+#       set is a strict SUBSET: never set-equality assert here.
+#     UNasserted — cluster.sds_cluster.* entirely: not projected by this row, and the
+#       same value instability applies with no name+label leg to rescue it.
 #
 # Cross-refs: phase 67 SPEC §10 + §3.7 (forced-send) + §3.3/§3.5 (fetch-failure
 #             characterization) + ADR-0019 + ADR-0289 +
