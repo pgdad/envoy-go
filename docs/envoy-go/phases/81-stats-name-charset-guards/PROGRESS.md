@@ -239,3 +239,118 @@ All five agents' experimental edits reverted **by explicit path** with `sha256su
 ## Next
 
 **→ the phase-81 PLAN.** Enumerate against ~14 tasks / ~1000 net `.go`; hold **D-81-DEPTH** to table-driven-shared; schedule the `tenant-foo` edit; and **land F1 and F2 ATOMICALLY** — shipping the boot reject without the `Inc` backstop leaves the process crashable by the very config class the row exists to protect.
+
+---
+
+# PLAN record (2026-07-31)
+
+**Stage:** PLAN (lifecycle-state `2` → 3). **Row 81 STAYS `in-progress`**; `ROADMAP.md`, `BEHAVIOR_CONTRACT.md` and `DECISIONS.md` **BYTE-UNTOUCHED**; sentinel `want` STAYS **113**. Docs-only: **ZERO production `.go`, ZERO test `.go` committed.**
+
+**Base:** master **`82e425ac`**, taken from `git rev-parse master` at session start. ⚠️ At this tip the SPEC squash **IS** the master tip, so the recurring "the router's quoted SHA sits below the tip" hazard did not bite — it was still re-derived rather than assumed. Worktree `/home/esa/git/envoy-go-wt/phase-81-plan`, branch `phase-81-plan`.
+
+**File set:** `PLAN.md` (NEW) + `PROGRESS.md` + `STATE.md` + `STATE_HISTORY.md` + `next-prompt.txt` — **five files**, matching the phase-79/80 PLAN precedent (§Recent at its five-entry cap with an unarchived evictee).
+
+## What was EXECUTED at this stage
+
+**Five investigation agents on disjoint remits**, each in its own DETACHED worktree with private scratch and a private port band inside `42000-42499`, plus controller re-derivation of every load-bearing claim (`feedback_brief_citations_not_evidence` — **five briefs re-derived, four corrected**).
+
+| agent | remit | headline |
+|---|---|---|
+| **A1** | sources A, B, H + the incumbent-template census | the assembled template makes **mongo strictly weaker than its three bare-guarded siblings** |
+| **A2** | **the keystone** — F1 + F2 | **§2.8's "OVER-REJECTS = 1" does not transfer to F**; the SPEC's pasted panic name is the **reference's** |
+| **A3** | sources C, D, E, G | **D-81-EMPTY's premise collapses**; four of §8's seven cited tests never reach the production entry point |
+| **A4** | gates, blast radius, the full differential | a **SECOND corpus red**; the differential **ABORTS** and the notification reported success |
+| **A5** | counts, ADR state, bookkeeping | **ADR-0045's mis-location charge is REFUTED**; `84 of 121` is stale |
+
+**Zero commits, zero pushes, zero branches by any agent.** Every experimental edit reverted **by explicit path**; all five reported `git status --porcelain` = **0 lines**, controller-re-confirmed. No docker container created by any agent.
+
+## ⚠️ THE HEADLINE: THE BARE-VS-ASSEMBLED QUESTION IS DECIDED BY **SEGMENT POSITION**, AND THE SPEC MEASURED IT AT THE DEGENERATE POSITION
+
+SPEC §2.8 measures `network/rbac` and concludes **"MIS-ACCEPTS = 0, OVER-REJECTS = 1"**, then §3 promotes that template row-wide. **Three agents hit the wall independently, on three different sources.** Controller re-derivation, executed inside `internal/stats`:
+
+| position | disagreements / 9 tokens |
+|---|---|
+| **LEADING** (`<tok>.zookeeper.decoder_error`) | **1** — only a trailing dot |
+| **INTERIOR** (`http.myhcm.rbac.rbac.policy.<tok>.allowed`) | **5** — `0policy`, `policy.`, `.policy`, `9`, `""` |
+
+**`network/rbac`'s token LEADS the assembled name — the one position where the answer is degenerate**, and that is exactly where "OVER-REJECTS = 1" comes from. ⚠️ **EIGHT OF THE NINE SOURCES ARE INTERIOR**; only B (zookeeper) is leading.
+
+**DECISION: ASSEMBLED AT ALL NINE**, per ADR-0065 §Consequences (b) (`DECISIONS.md:2379`, verbatim-verified). A bare probe at an interior position would **boot-reject four config shapes that today boot, serve, and register a perfectly valid counter** — a regression in an availability row — and would make **F1 and F2 disagree**, since F2 can only probe the assembled key. **Two consequences recorded as deliberate**: the guards inherit the interior-empty-segment hole by construction (SPEC §13.1, now measured on four sources, with ACCEPT-pins left in the corpus as a failing-first anchor for the successor), and mongo ends up more permissive than its three bare-guarded siblings.
+
+## ⚠️ THE SECOND HEADLINE: D-81-EMPTY'S PREMISE COLLAPSES
+
+A3's three-arm cross-product, all executed: unconditional **BARE** ⇒ wasm `ok`, **rbac FAIL (26 top-level)**, compressor `ok`; unconditional **ASSEMBLED** ⇒ all `ok`; **skip-if-empty** ⇒ all `ok`. Under the assembled template an empty token yields a **valid** name at every one of C/D/E/G, and D/E never see an empty segment at all because `namespacePrefix("")` substitutes the literal `"rbac"` (controller-verified at `rbac.go:507`). ⇒ **§8 reasoned about a BARE token and applied the conclusion to an ASSEMBLED template.**
+
+⚠️ **Four of §8's seven cited tests cannot be reddened by ANY production guard** — `TestNew_LibraryName_EmptyAllowed` calls a test-local `buildFromAny`, `TestStatsNamespace_LibraryNameEmpty_DoubleDotPath` calls `newFilterStats` directly, and both wasm rows call `registerPluginConfigName`/`unregisterPluginConfigName`. ⚠️ **And §8's H row is miscited** — controller-verified **ONE** bare `RateLimit{}` literal (`fuzz_test.go:380`), not two. **Skip-if-empty is KEPT for legibility, but is NOT load-bearing, and A/B omit it entirely** (their empty case is already rejected upstream).
+
+## ⚠️ THE THIRD HEADLINE: A SECOND CORPUS RED, AND THE DIFFERENTIAL ABORTS
+
+**`internal/filter/http/wasm/abi_callbacks_test.go:1453`** sets `&compiledConfig{pluginName: "my-plugin"}` — the **source-C field itself** (`compiled_config.go:444-447`), `IsValidName` = **false**. **AMBER, not hard red, and only because of guard placement**: the struct literal bypasses the `pc.GetName()` boundary. ⚠️ **It becomes a hard red the moment the guard relocates** — which §7's shared-driver disposition makes tempting. T4 pins the placement and records it.
+
+**A4's first full differential run ABORTED at fixture 84 of 119** — `panic: … bind: address already in use` in `0083`'s own ALS receiver — and **35 fixtures silently never ran**, while the background-task notification reported *"completed (exit code 0)"* against an `INNER_EXIT=1`. Classified **KNOWN-LIVE FLAKE, third species** (out-of-band ephemeral port, driver-owned receiver, isolate re-run PASS, full re-run 120/120). ⚠️ **Budget ~2 launches per green pass.**
+
+## Refutation ledger — what EXECUTION found that the SPEC and router got wrong
+
+1. **§2.8's "OVER-REJECTS = 1" does not generalise** — decided by segment position. **Load-bearing: it decides all nine guards.**
+2. **§8's D-81-EMPTY premise collapses** under the assembled template. **Load-bearing.**
+3. **§8's seven-test roster** — four tests unreachable, the H row miscited, and a bare guard on D/E reds **26**, not 2.
+4. **§7's single shared table is NOT CONSTRUCTIBLE.** Five of six guard targets are **package-private across five packages** (controller-verified); F1's and F2's tables are in different packages too. **The shared audit is ~7 per-package drivers. Load-bearing — it re-prices D-81-DEPTH.**
+5. **§2.1's pasted panic name is the REFERENCE'S.** envoy-go emits `http.myhcm.rbac.**rbac**.policy.allow-admins.allowed` — **doubled**. Independently re-proves SPEC §13 item 3 **by execution**.
+6. **§12's F2 "~50" is 96** (1.92×); F1's 174 confirmed at **178**; the "~75/source" model is wrong in both directions (D/E **38** each, C **99**, G **86**). **MEASURED TOTAL 725 — BELOW the SPEC's band floor of 850.**
+7. **ADR-0045's "mis-location" charge is REFUTED** — `BOOTSTRAP_PROMPT.md:209` §5 state 2 genuinely carries the split gate at `:225-226`, and ADR-0045 cites **both** §6.1 and §5 state 2, **both accurately**.
+8. **`84 of 121 phase dirs` is stale — it is 85 of 122** (37 with `REVIEW.md`, unchanged; newest 25.3).
+9. **§9's `208-code-site / 84-file` is a MIXED DENOMINATOR** — 208 sites live in **36** production files; 84 is the production+test count (508 hits).
+10. **§9's "1830 extracted values" is not reproducible** (four extractions: 5336 / 987 / 1202 / 2241), and **`http.test` has ZERO occurrences in `test/`** — it lives only in three packages outside the nine, while the fixture corpus carries **170** distinct dotted values. **The property holds on a stated denominator: 0 of 108.**
+11. **§4.1's "21 files register a per-route validator" is a file-mention count** — the real figure is **FIVE filters** (`builtins.go:67-71`, verified against the live registry).
+12. **§3's h2spec pricing overstates it ~100×** — **4 s** against the differential's **406 s** — and **the `./cmd/envoy-go` consumer set is THREE packages**, not two: `cmd/envoy-go/main_test.go` builds and boots the same binary at four sites and **can red on a new boot reject** (9 s; T11 adds it).
+13. **§10's A=4 / B=3 count INSTANTIATIONS, not token values** — `0050` and `0047` **deliberately omit** `stat_prefix`. Value-supplying coverage is **A=3, B=2**.
+14. **Two anchors drifted** (`namespacePrefix` decl `:507` not `:500-506`; `codec_test.go:517/:538` not `:518/:539`) — while the one SPEC §14 **warned** would drift, `DECISIONS.md:6291`, **did not**: the +42 lines were a tail append that cannot shift `:6291`.
+
+## Findings no phase-81 document carries
+
+`internal/filter/network/rbac/rbac.go:50` already contains the token **`F2`** as an unrelated phase-26 fork label — **do not use it as a grep anchor there** · **`/BOOTSTRAP_PROMPT.md` does not exist at the filesystem root**, and its second copy (`docs/superpowers/plans/2026-04-21-…`, **1024** lines vs **522**) shifts **all nine** cited anchors by **+197 for §6.x but +228 for §7.5** — no constant correction works · a **THIRD extractor trap** in `STATE_HISTORY.md`: naive `^- \*\*prior active-phase:\*\*` ⇒ **161**, parenthetical-tolerant ⇒ **167**, the **6** eviction-form bullets at `:420 :424 :428 :430 :432 :434` — with the naive anchor **phase 79 reads as entirely absent when all four of its bullets are present** · **`misspell` locale US fired LIVE twice** on first-draft guard prose · guard C needs a **new `internal/stats` import** and sits before a local `stats :=` shadow · the per-route wasm reject is **FAIL-OPEN**, not a boot failure · **F2's aggregated-log-dedupe assertion has NO in-tree precedent** — all four landed GUARD-SKIP sites are silent · **the archive-gap total of 57 is NOT reproducible** and **phase 76 is missing THREE bullets**, never called out — **no number is carried** · **the ALS-family driver port race** (`allocateALSPort` bind→close→re-bind) aborts the whole binary and is untracked.
+
+## Cost
+
+**MEASURED, not modelled** — every figure produced by building the guard and its tests, running them, and reading `git diff --numstat`:
+
+| src | guard | test | net | | src | guard | test | net |
+|---|---|---|---|---|---|---|---|---|
+| A | 12 | 47 | **59** | | G | 11 | 75 | **86** |
+| B | 12 | 47 | **59** | | F1 | 60 | 118 | **178** |
+| H | 18 | 54 | **72** | | F2 | 22 | 74 | **96** |
+| C | 12 | 87 | **99** | | **TOTAL** | **165** | **560** | **725** |
+| D | 9 | 29 | **38** | | | | | |
+| E | 9 | 29 | **38** | | | | | |
+
+**BAND 750-1000, BUDGET ~850. TWELVE tasks. NEITHER §6.1 trigger fires** — **2.1×** margin on tasks, **1.5-2.0×** on LoC. ⚠️ **The figures are REALIZED-BASIS and must NOT be re-multiplied**; phase 80's 2.56× does not transfer (its fixture bucket was 631 of 1636 at 4.10×, and phase 81 adds **+0** fixtures). **NO SPLIT**; the SPEC's coherent axis (81.1 rbac / 81.2 filter-prefix) is carried forward unused.
+
+## Sentinel — re-run MECHANICALLY at this stage. It does NOT fire; `stop` was NOT created
+
+`ls stop` ⇒ `No such file or directory`. **It must not be created.**
+
+- **(1)** `NOT DONE: row 81` at `want=113`. NCs all fired: `want=112` ⇒ `GATE FAIL: examined 113 data rows, expected 112`; row 81 doctored `done` ⇒ **SILENT**; row 62 doctored on that same copy ⇒ `NOT DONE: row 62`.
+  ⚠️ **THE ROW-62 NC DID NOT LAND ON FIRST ATTEMPT** — a `sed` targeting `done      ` missed the real `| done |` spacing and printed nothing, reading exactly like *"the check is blind."* Caught by inspecting the doctored field before trusting it, then redone with `awk`. **`reference_gate_command_negative_control`, firing on the controller in the session's FIRST gate.**
+- **(2)** **FIVE — `:191 :201 :211 :217 :225` — UNCHANGED. The THIRTIETH consecutive phase at which it did not go down. STATED, not forecast.** One-arm strip ⇒ **4**, not 0.
+- **(3)** `NEVER OPENED: gRPC`, `NEVER OPENED: WASM`. NCs: invented slug fired; registered `Observability` correctly silent.
+- Input measured **229 lines / 113 data rows**.
+
+⚠️ **`want` STAYS 113.** ⚠️ **THE LEAK CHECK IS INAPPLICABLE, NOT "PASSED"** — this PLAN writes no ROADMAP cell, so the check has no input. **It re-arms at the IMPL.**
+
+## Six-gate (§7.5, `BOOTSTRAP_PROMPT.md` at the REPO ROOT — `:357`, `:360-365`, `:367` re-verified exact)
+
+⚠️ **`/BOOTSTRAP_PROMPT.md` with a leading slash resolves NOWHERE** — the file exists only at the repo root. For a docs-only PLAN the whole §7.5 set is **NOT OWED** (it is the *phase-done* gate; row 81 flips at the IMPL). Within it: (a)/(b)/(c)/(e) **not owed** — no fixture, no `.go`; (d) **VACUOUS**, said to be vacuous rather than green (**55** fuzzers tree-wide, **0** added; NC on a fuzzer-adding commit fires with 1); (f) ⚠️ **STANDING LINEAGE DEPARTURE — no `REVIEW.md`, 85 of 122 dirs carry none, none since 25.3.**
+
+## Hygiene
+
+⚠️ **`reference_bash_cwd_reset_commits_to_main` FIRED, OBSERVED** — `Shell cwd was reset to /home/esa/git/envoy-go`, repeatedly. **Twenty-seventh consecutive session.** Every git command used `git -C <abs-path>`; branch tripwired `phase-81-plan`, never `master`.
+
+**Controller probes**: three `_test.go` files written into the PLAN worktree's `internal/stats`, run, and **deleted by explicit path**, with `git status --porcelain` ⇒ **0** verified after each.
+
+**Broken-gate count stays EIGHTEEN** — no nineteenth shape, but **FIVE priors fired live**: the row-62 NC that did not land · a **build failure read as a zero result** (A3's first break arm orphaned an import, so `[build failed]` produced zero `--- FAIL:` lines and a count-based gate read **0**) · **a harness's exit code is not the command's** (the differential abort, notification said 0) · **a vacuous gate arm on a clean tree** (stat-surface ARM 1 is empty-in/empty-out; the real discriminator was a comment-only edit) · **`\t` in GNU ERE**, firing in the **opposite** direction from the documented warning — the harness `grep` **shell function** normalizes it and returns 126, while `command grep` returns 0, **so the trap bites exactly where gates run**.
+
+**Flakes:** one fired — `0083-grpc-access-log-headers`, classified **known-live, third species**, with isolate-re-run PASS and full re-run 120/120. **None of the "recurrence is a FINDING" species fired.**
+
+## Next
+
+**→ the phase-81 IMPL.** Execute the twelve tasks against ~850 net `.go`. **Land T7 and T8 atomically**; **land T3's `tenant-foo` repair in the same commit as guard H**; **pin guard C at the `pc.GetName()` boundary**; and complete **ADR-0303 §Decision + §Consequences with the STATUS flip `PROPOSED` → `COMPLETE` in that same commit.**
