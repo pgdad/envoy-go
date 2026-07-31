@@ -2807,3 +2807,267 @@ func TestEtagHelpers_MatchFormerRegexSemantics(t *testing.T) {
 		}
 	}
 }
+
+// --- Phase-81 row `stats-name-charset-guards`, source G:
+// compressor_library.name ---
+
+// newGzipCompressorAny is the phase-81 arm helper: a gzip Compressor proto
+// with the given compressor_library.name, already wrapped in anypb.Any.
+func newGzipCompressorAny(t *testing.T, libName string) *anypb.Any {
+	t.Helper()
+	return mustAny(t, newGzipCompressor(
+		t,
+		&gzipv3.Gzip{},
+		&compressorv3.Compressor_ResponseDirectionConfig{},
+		libName,
+	))
+}
+
+// TestRow81_CompressorLibraryNameGuard is the phase-81 source-G guard arm.
+//
+// `compressor_library.name` is operator-supplied and is interpolated VERBATIM
+// into the 17 counter names built by newFilterStats. stats.Registry.NewCounter
+// PANICS (registry.go checkName) on a name failing stats.NamePattern, and New
+// runs on the listener-construction path — so before the guard an invalid
+// token was a config-triggered PROCESS CRASH, not a config rejection.
+//
+// Three arms: invalid (reject), valid (passthrough), empty (passthrough — the
+// D5 shape; see TestRow81_CompressorD5NonRegression).
+//
+// The table ALSO cross-checks that the guard's single probe suffix
+// (`response.total_uncompressed_bytes`) is not load-bearing: every one of the
+// 17 assembled names puts the token at the same INTERIOR segment position and
+// therefore must agree with the probe's verdict.
+func TestRow81_CompressorLibraryNameGuard(t *testing.T) {
+	cases := []struct {
+		name       string
+		libName    string
+		wantReject bool
+	}{
+		// --- invalid: would panic NewCounter without the guard ---
+		{"hyphen", "text-optimized", true},
+		{"space", "text optimized", true},
+		{"slash", "text/optimized", true},
+		{"colon", "gzip:v1", true},
+		{"at_sign", "gzip@v1", true},
+		{"percent", "gzip%20", true},
+		{"newline", "gzip\n", true},
+		{"non_ascii", "gzip_日本語", true},
+		{"brace", "gzip{a}", true},
+		// --- valid: must pass through untouched ---
+		{"plain", "text_optimized", false},
+		// A LEADING dot is accepted for the same reason a trailing one is:
+		// at the token's interior segment position it produces an interior
+		// empty segment, and stats.NamePattern rejects only a TRAILING dot.
+		// A bare-token probe would have rejected this working config. Second
+		// instance of the hole deliberately inherited at this row (the first
+		// is SPEC §13.1's trailing dot — see
+		// TestRow81_CompressorTrailingDotAcceptPin); both close together at
+		// successor row `stats-name-empty-segment-guards`.
+		{"leading_dot", ".gzip", false},
+		{"underscore_lead", "_lib", false},
+		{"digits_inside", "gzip9lib", false},
+		{"all_digits", "9", false},
+		{"leading_digit", "9lib", false},
+		{"trailing_underscore", "lib_", false},
+		{"dotted_segments", "a.b.c", false},
+		{"single_letter", "z", false},
+		// --- empty: the ratified D5 consecutive-dot shape ---
+		{"empty", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := stats.NewRegistry()
+			_, err := New(newGzipCompressorAny(t, tc.libName), envoyhttp.FactoryCtx{
+				Stats:      reg,
+				StatPrefix: "ingress_p81",
+			})
+			if tc.wantReject {
+				if err == nil {
+					t.Fatalf("New(libName=%q) = nil error; want reject", tc.libName)
+				}
+				if !strings.Contains(err.Error(), "compressor_library.name") {
+					t.Errorf("err = %q; want substring %q", err.Error(), "compressor_library.name")
+				}
+				if !strings.Contains(err.Error(), stats.NamePattern) {
+					t.Errorf("err = %q; want the regex source %q", err.Error(), stats.NamePattern)
+				}
+				// A rejected config must register NOTHING: the whole point is
+				// that NewCounter is never reached.
+				n := 0
+				reg.Walk(func(stats.Metric) { n++ })
+				if n != 0 {
+					t.Errorf("rejected config registered %d metrics; want 0", n)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New(libName=%q) = %v; want passthrough", tc.libName, err)
+			}
+			// Passthrough must have registered all 17 counters — i.e. the
+			// guard did not merely "not reject", the registration really ran.
+			for _, want := range stats17ExpectedNames("ingress_p81", tc.libName) {
+				if !registryHasCounter(reg, want) {
+					t.Errorf("counter %q NOT registered after New(libName=%q)", want, tc.libName)
+				}
+			}
+		})
+
+		// Suffix-independence cross-check: the guard probes ONE of the 17
+		// counter names. Assert all 17 agree, so the choice of probe suffix
+		// cannot silently change the guard's verdict.
+		for _, assembled := range stats17ExpectedNames("ingress_p81", tc.libName) {
+			if got := stats.IsValidName(assembled); got == tc.wantReject {
+				t.Errorf("stats.IsValidName(%q) = %v; want %v (assembled-name verdict must match arm %q)",
+					assembled, got, !tc.wantReject, tc.name)
+			}
+		}
+	}
+}
+
+// TestRow81_CompressorD5NonRegression is the phase-81 owed non-regression arm
+// for the D5 settlement, driven through the PRODUCTION `New` path.
+//
+// It is deliberately NOT a duplicate of
+// TestStatsNamespace_LibraryNameEmpty_DoubleDotPath: that test calls
+// newFilterStats DIRECTLY and is therefore structurally BLIND to any guard
+// added in `New`. Only a New-driven arm can catch a source-G guard that
+// wrongly rejects (or rewrites) the empty library name.
+//
+// The pin being protected:
+//   - compressor.go newFilterStats: "the consecutive-dots D5 shape when
+//     libraryName == "" — DO NOT collapse."
+//   - compressor_test.go: "This is the LOAD-BEARING D5 behavioral pin."
+//   - ADR-0132 §Decision (v): "`compressor_library.name` is LOAD-BEARING for
+//     stat-namespace identity. Operators with bare-Gzip configs (no `name:`
+//     set) emit stats under `compressor..gzip.<counter>` ... Phase-14 envoy-go
+//     MUST mirror this exact shape."
+func TestRow81_CompressorD5NonRegression(t *testing.T) {
+	const hcm = "ingress_p81"
+	reg := stats.NewRegistry()
+	// Production path: New → newFilterStats, libraryName == "".
+	factory, err := New(newGzipCompressorAny(t, ""), envoyhttp.FactoryCtx{
+		Stats:      reg,
+		StatPrefix: hcm,
+	})
+	if err != nil {
+		t.Fatalf("New(libName=\"\") = %v; want success (D5: empty name is RATIFIED, ADR-0132 §Decision (v))", err)
+	}
+	if factory == nil {
+		t.Fatal("New(libName=\"\") returned a nil factory")
+	}
+
+	// (1) The canonical D5 verbatim path, with the DOUBLE dot.
+	wantD5 := "http." + hcm + ".compressor..gzip.response.compressed"
+	if !registryHasCounter(reg, wantD5) {
+		t.Errorf("counter %q NOT registered via New (D5 double-dot path collapsed or rejected?)", wantD5)
+	}
+
+	// (2) All 17 per-library names must carry `..gzip.`.
+	names := stats17ExpectedNames(hcm, "")
+	if len(names) != 17 {
+		t.Fatalf("test bug: stats17ExpectedNames returned %d names; want 17", len(names))
+	}
+	for _, name := range names {
+		if !strings.Contains(name, "..gzip.") {
+			t.Errorf("expected name %q to contain `..gzip.` (D5 consecutive-dot shape)", name)
+		}
+		if !registryHasCounter(reg, name) {
+			t.Errorf("counter %q NOT registered via New (D5)", name)
+		}
+	}
+
+	// (3) The registry really holds 17 counters — a guard that skipped
+	// registration entirely would pass (1)+(2) vacuously if those only
+	// inspected the derived name strings.
+	got := 0
+	reg.Walk(func(m stats.Metric) {
+		if m.Type() == stats.MetricCounter && strings.Contains(m.Name(), "..gzip.") {
+			got++
+		}
+	})
+	if got != 17 {
+		t.Errorf("registry holds %d `..gzip.` counters after New(libName=\"\"); want 17", got)
+	}
+
+	// (4) The reason guard G can leave D5 intact at all: stats.NamePattern
+	// permits INTERIOR consecutive dots. Asserted here so a NamePattern change
+	// that closed the interior-empty-segment hole reds THIS test with a
+	// pointed message rather than a mystery rejection above.
+	if !stats.IsValidName("compressor..gzip.total") {
+		t.Error("stats.IsValidName(\"compressor..gzip.total\") = false; " +
+			"the interior empty-segment hole closed — D5 (ADR-0132 §Decision (v)) can no longer be represented")
+	}
+}
+
+// TestRow81_CompressorTrailingDotAcceptPin is the ACCEPT-pin for the interior
+// empty-segment hole, INHERITED DELIBERATELY at this row.
+//
+// A `compressor_library.name` ending in a dot (e.g. "lib.") assembles to
+// `http.<hcm>.compressor.lib..gzip.…`, whose empty segment sits INTERIOR —
+// and stats.NamePattern rejects only a TRAILING dot. The token is therefore
+// ACCEPTED. This is not an oversight and MUST NOT be "fixed" here: closing it
+// is the successor row `stats-name-empty-segment-guards`. Pinning the accept
+// makes that successor row's behavior change visible as a red test rather than
+// a silent widening.
+func TestRow81_CompressorTrailingDotAcceptPin(t *testing.T) {
+	const hcm = "ingress_p81"
+	const lib = "lib."
+
+	// The bare token is REJECTED in isolation (trailing dot) ...
+	if stats.IsValidName(lib) {
+		t.Errorf("stats.IsValidName(%q) = true; want false (bare token has a trailing dot)", lib)
+	}
+	// ... but ACCEPTED at its real interior position. This is exactly why the
+	// guard probes the assembled name: a bare probe would boot-reject a
+	// working config.
+	assembled := "http." + hcm + ".compressor." + lib + ".gzip.response.total_uncompressed_bytes"
+	if !stats.IsValidName(assembled) {
+		t.Errorf("stats.IsValidName(%q) = false; want true (empty segment is INTERIOR)", assembled)
+	}
+
+	reg := stats.NewRegistry()
+	if _, err := New(newGzipCompressorAny(t, lib), envoyhttp.FactoryCtx{
+		Stats:      reg,
+		StatPrefix: hcm,
+	}); err != nil {
+		t.Fatalf("New(libName=%q) = %v; want ACCEPT (interior empty-segment hole is inherited "+
+			"deliberately; closing it belongs to successor row `stats-name-empty-segment-guards`)", lib, err)
+	}
+	for _, want := range stats17ExpectedNames(hcm, lib) {
+		if !registryHasCounter(reg, want) {
+			t.Errorf("counter %q NOT registered after New(libName=%q)", want, lib)
+		}
+	}
+}
+
+// TestRow81_CompressorRejectWordingPin byte-pins the source-G reject wording
+// and its rendered form, so a reword is a deliberate edit rather than an
+// accident.
+func TestRow81_CompressorRejectWordingPin(t *testing.T) {
+	const wantFmt = "compressor: compressor_library.name: invalid characters in %q (must match %s)"
+	if rejectLibraryNameInvalidFmt != wantFmt {
+		t.Errorf("rejectLibraryNameInvalidFmt = %q; want %q", rejectLibraryNameInvalidFmt, wantFmt)
+	}
+	// The `must match` argument is the stats package's EXPORTED pattern, not a
+	// hand-copy — assert no drift.
+	if stats.NamePattern != `^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$` {
+		t.Errorf("stats.NamePattern = %q; the pinned reject wording quotes a stale regex", stats.NamePattern)
+	}
+	wantRendered := "compressor: compressor_library.name: invalid characters in " +
+		`"text-optimized"` + " (must match " + stats.NamePattern + ")"
+	_, err := New(newGzipCompressorAny(t, "text-optimized"), envoyhttp.FactoryCtx{
+		Stats:      stats.NewRegistry(),
+		StatPrefix: "ingress_p81",
+	})
+	if err == nil {
+		t.Fatal("New(libName=\"text-optimized\") = nil error; want reject")
+	}
+	if err.Error() != wantRendered {
+		t.Errorf("err = %q; want %q", err.Error(), wantRendered)
+	}
+	// Every compressor parse-reject carries the package prefix.
+	if !strings.HasPrefix(err.Error(), "compressor: ") {
+		t.Errorf("err = %q; want the \"compressor: \" package prefix", err.Error())
+	}
+}

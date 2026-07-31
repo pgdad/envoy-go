@@ -1274,3 +1274,195 @@ func TestUnregisterPluginConfigName_EmptyName_NoOp(t *testing.T) {
 	resetPluginConfigNameRegistry()
 	unregisterPluginConfigName("") // must not panic
 }
+
+// -----------------------------------------------------------------------------
+// phase-81 (`stats-name-charset-guards`) source C — PluginConfig.name stat-name
+// charset guard at buildCompiledConfigImpl.
+// -----------------------------------------------------------------------------
+//
+// The guard sits at the pc.GetName() boundary, BEFORE arm 26 and BEFORE the
+// `stats := newFilterStats(...)` ShortVarDecl, and probes the ASSEMBLED name
+// "wasm." + name + "." + statNameHttpCallDispatchUnknownCluster. Without it an
+// operator-supplied name containing a character outside [a-zA-Z0-9_.] reaches
+// stats.Registry.checkName, which PANICS — an un-recovered, config-triggered
+// process crash at listener build.
+
+// p81PluginNameInvalidWant is the BYTE-EXACT rejection wording for the plugin
+// name "p81-bad-name". Pinned as a literal (not re-derived from the format
+// const) so a silent edit to either parseRejectPluginNameInvalidFmt or
+// stats.NamePattern is caught here rather than laundered by a tautology.
+const p81PluginNameInvalidWant = `wasm: config.name "p81-bad-name" contains characters that are invalid in a stat name (the assembled per-plugin stat scope wasm.<name>.* must match ^[a-zA-Z_]([a-zA-Z0-9_.]*[a-zA-Z0-9_])?$; envoy-go-strict)`
+
+// p81Arm17Prefix is the arm-17 compile-failed prefix. A config that reaches it
+// PROVES the charset guard passed the name through (the guard fires strictly
+// earlier, before arm 26 and before resolveDataSource / CompileModule).
+const p81Arm17Prefix = "wasm: config.vm_config.code: compile: "
+
+// TestBuildCompiledConfig_PluginNameCharset_Table is the 3-arm table for the
+// source-C guard: invalid / valid-passthrough / empty-passthrough, plus the
+// bare-vs-assembled discrimination row.
+//
+// The 4th row is the anti-regression for the PLAN's load-bearing decision to
+// probe the ASSEMBLED name rather than the bare token: "9p81" is INVALID as a
+// standalone stat name (stats.NamePattern requires a leading [a-zA-Z_]) but is
+// perfectly legal at the INTERIOR segment position this guard occupies. A
+// bare-token probe would boot-reject that working config. The row asserts BOTH
+// halves — that the bare token is invalid AND that the config passes through.
+func TestBuildCompiledConfig_PluginNameCharset_Table(t *testing.T) {
+	resetPluginConfigNameRegistry()
+
+	// Bare-vs-assembled discrimination premise, asserted rather than assumed.
+	if stats.IsValidName("9p81") {
+		t.Fatal(`stats.IsValidName("9p81") = true; want false (leading digit) — the bare-vs-assembled row is vacuous without this`)
+	}
+	if !stats.IsValidName("wasm.9p81." + statNameHttpCallDispatchUnknownCluster) {
+		t.Fatal(`assembled "wasm.9p81.<suffix>" is invalid; want valid — the bare-vs-assembled row is vacuous without this`)
+	}
+
+	cases := []struct {
+		name string
+		// plugin is the operator-supplied PluginConfig.name under test.
+		plugin string
+		// wantErr, when non-empty, is the BYTE-EXACT expected error. Empty
+		// means "guard must pass through" — verified by the parse reaching
+		// arm 17 (p81Arm17Prefix), which is strictly downstream of the guard.
+		wantErr string
+	}{
+		{"Invalid_Hyphen_Rejected", "p81-bad-name", p81PluginNameInvalidWant},
+		{"Valid_Passthrough", "p81_good_name", ""},
+		{"Empty_Passthrough", "", ""},
+		{"BareInvalid_AssembledValid_Passthrough", "9p81", ""},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			m := validWasmConfig()
+			m.Config.Name = tc.plugin
+			_, err := buildCompiledConfig(context.Background(), toAny(t, m), envoyhttp.FactoryCtx{})
+			if err == nil {
+				t.Fatalf("buildCompiledConfig(name=%q) = nil error; want an error", tc.plugin)
+			}
+			if tc.wantErr != "" {
+				if err.Error() != tc.wantErr {
+					t.Errorf("err = %q;\n want EXACTLY %q", err.Error(), tc.wantErr)
+				}
+				return
+			}
+			// Passthrough arm: the guard must NOT have fired.
+			if strings.Contains(err.Error(), "contains characters that are invalid in a stat name") {
+				t.Errorf("err = %q; charset guard FIRED on a name it must pass through", err.Error())
+			}
+			if !strings.HasPrefix(err.Error(), p81Arm17Prefix) {
+				t.Errorf("err = %q; want prefix %q (guard passed through to arm 17)", err.Error(), p81Arm17Prefix)
+			}
+		})
+	}
+}
+
+// TestBuildCompiledConfig_PluginNameCharset_TrailingDotAcceptPin pins the
+// interior empty-segment hole as an ACCEPT, DELIBERATELY.
+//
+// stats.IsValidName("a..b") == true — the whole-string regex permits interior
+// consecutive dots — so a trailing-dot plugin name "p81_trailing." assembles to
+// "wasm.p81_trailing..<suffix>" and the guard ACCEPTS it. This is INHERITED
+// BEHAVIOR per phase-81 SPEC §13.1, deferred to the successor row
+// `stats-name-empty-segment-guards`. This test is an ACCEPT-pin, not an
+// aspiration: if a later change makes it reject, that change belongs to the
+// successor row and must update this pin explicitly.
+func TestBuildCompiledConfig_PluginNameCharset_TrailingDotAcceptPin(t *testing.T) {
+	resetPluginConfigNameRegistry()
+
+	const trailing = "p81_trailing."
+	if !stats.IsValidName("wasm." + trailing + "." + statNameHttpCallDispatchUnknownCluster) {
+		t.Fatalf("assembled name for %q is invalid; the empty-segment hole has CLOSED — see SPEC §13.1 + successor row `stats-name-empty-segment-guards`", trailing)
+	}
+
+	m := validWasmConfig()
+	m.Config.Name = trailing
+	_, err := buildCompiledConfig(context.Background(), toAny(t, m), envoyhttp.FactoryCtx{})
+	if err == nil {
+		t.Fatal("buildCompiledConfig returned nil error; want arm-17 compile-failed wrap")
+	}
+	if strings.Contains(err.Error(), "contains characters that are invalid in a stat name") {
+		t.Errorf("err = %q; the charset guard REJECTED a trailing-dot name. That hole is inherited DELIBERATELY (SPEC §13.1); closing it is the successor row `stats-name-empty-segment-guards`, not this one", err.Error())
+	}
+	if !strings.HasPrefix(err.Error(), p81Arm17Prefix) {
+		t.Errorf("err = %q; want prefix %q (trailing-dot ACCEPTED by the guard)", err.Error(), p81Arm17Prefix)
+	}
+}
+
+// TestPerRouteWasm_PluginNameCharset_ByteIdenticalWording is the per-route TIER
+// pin. Both per-route entry points must surface the BYTE-IDENTICAL listener-tier
+// wording (single source of truth = buildCompiledConfigImpl):
+//
+//   - validatePerRouteWasm — the BOOT-time HCM per-route shape-check, which runs
+//     buildCompiledConfigImpl with validateOnly=true. This arm is what makes the
+//     guard's placement BEFORE arm 26 load-bearing: arm 26 is skipped under
+//     validateOnly and the validate-only short-circuit return sits AFTER
+//     CompileModule, so a guard placed later would miss this tier entirely.
+//   - parsePerRouteWasm — the DISPATCH-time per-route build.
+func TestPerRouteWasm_PluginNameCharset_ByteIdenticalWording(t *testing.T) {
+	resetPluginConfigNameRegistry()
+
+	// Boot tier (validate-only). buildWasmProtoInlineBytes needs no real module
+	// bytes here: the guard fires strictly before resolveDataSource/compile.
+	bootProto := buildWasmProtoInlineBytes([]byte("not-wasm"), "p81-bad-name")
+	bootErr := validatePerRouteWasm(bootProto)
+	if bootErr == nil {
+		t.Fatal("validatePerRouteWasm = nil; want the charset reject (BOOT tier — proves the guard precedes the validate-only short-circuit)")
+	}
+	if bootErr.Error() != p81PluginNameInvalidWant {
+		t.Errorf("validatePerRouteWasm err = %q;\n want EXACTLY the listener-tier wording %q", bootErr.Error(), p81PluginNameInvalidWant)
+	}
+
+	// Dispatch tier.
+	dispatchProto := buildWasmProtoInlineBytes([]byte("not-wasm"), "p81-bad-name")
+	_, dispatchErr := parsePerRouteWasm(dispatchProto, envoyhttp.FactoryCtx{})
+	if dispatchErr == nil {
+		t.Fatal("parsePerRouteWasm = nil error; want the charset reject (DISPATCH tier)")
+	}
+	if dispatchErr.Error() != p81PluginNameInvalidWant {
+		t.Errorf("parsePerRouteWasm err = %q;\n want EXACTLY the listener-tier wording %q", dispatchErr.Error(), p81PluginNameInvalidWant)
+	}
+}
+
+// TestBuildCompiledConfig_GuestSideConfigName_NonRegression pins that the
+// string "guest-side-config" — for which stats.IsValidName is FALSE — keeps
+// flowing through untouched.
+//
+// It is exempt BY CALL GRAPH, NOT because the string is harmless. It is the
+// Name of a NESTED PluginConfig used purely as an opaque non-Struct payload in
+// the OUTER PluginConfig.configuration Any; parseEnvoyGoStrictFields ignores a
+// non-Struct Any wholesale and never reads the nested Name. Guard C reads only
+// the OUTER pc.GetName(). If a future change ever probes a name reached through
+// PluginConfig.configuration, this test turns red and that is CORRECT — it is
+// reporting a real new reject surface, not a flake.
+func TestBuildCompiledConfig_GuestSideConfigName_NonRegression(t *testing.T) {
+	resetPluginConfigNameRegistry()
+
+	// The premise: the nested name really would be rejected if it were probed.
+	if stats.IsValidName("wasm.guest-side-config." + statNameHttpCallDispatchUnknownCluster) {
+		t.Fatal(`assembled "wasm.guest-side-config.<suffix>" is VALID; this non-regression pin is vacuous`)
+	}
+
+	m := validWasmConfig()
+	m.Config.Name = "p81_guest_side_outer"
+	guestPayload := &wasmcommonv3.PluginConfig{Name: "guest-side-config"}
+	any, err := anypb.New(guestPayload)
+	if err != nil {
+		t.Fatalf("anypb.New(guestPayload): %v", err)
+	}
+	m.Config.Configuration = any
+
+	_, err = buildCompiledConfig(context.Background(), toAny(t, m), envoyhttp.FactoryCtx{})
+	if err == nil {
+		t.Fatal("buildCompiledConfig returned nil error; want arm-17 compile-failed wrap")
+	}
+	if strings.Contains(err.Error(), "contains characters that are invalid in a stat name") {
+		t.Errorf("err = %q; guard C reached the NESTED PluginConfig.configuration name. It must read ONLY the outer pc.GetName()", err.Error())
+	}
+	if !strings.HasPrefix(err.Error(), p81Arm17Prefix) {
+		t.Errorf("err = %q; want prefix %q", err.Error(), p81Arm17Prefix)
+	}
+}

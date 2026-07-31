@@ -33,6 +33,13 @@ package ratelimit
 //  14. RateLimit_Action.extension arm set (descriptor-producer extension-point deferred)
 //  15. RateLimit_Action.dynamic_metadata arm set (deprecated; use 'metadata')
 //
+// §5.1 charset arm added by phase 81 (stats-name-charset-guards):
+//
+//  16. stat_prefix carries a character invalid for a metric name (would panic
+//      newFilterStats -> NewCounterIfAbsent -> checkName at listener build).
+//      Fires AFTER arms 6-12 because the assembled-name probe needs the
+//      resolved RLS cluster name — see the site comment in buildCompiledConfig.
+//
 // # AMEND-3 defaults / clamps
 //
 // After all PARSE-REJECT arms pass, the AMEND-3 defaults/clamps fire:
@@ -75,6 +82,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // rlsCallFn is the mode-agnostic outbound ShouldRateLimit closure captured at
@@ -143,6 +151,16 @@ const (
 	// precedent). NOT asserted byte-stable as consts in
 	// TestParseRejectConstants_ByteStable — covered by the §5.1 PARSE-REJECT
 	// rows that match the fully-quoted runtime wording.
+
+	// parseRejectStatPrefixInvalid — the filter-config `stat_prefix` (AMEND-3
+	// 13th field) carries a character that internal/stats.IsValidName rejects.
+	// Unguarded, such a token reaches newFilterStats -> NewCounterIfAbsent,
+	// whose checkName PANICS the process at listener construction (registry.go
+	// checkName / getOrRegister). ADR-0059 keeps the panic correct for
+	// programmer error; this arm is the matching operator-input boundary check.
+	// envoy-go-strict departure is NOT claimed here — upstream Envoy's
+	// stat-name sanitizer accepts the same alphabet.
+	parseRejectStatPrefixInvalid = "ratelimit: stat_prefix contains characters invalid for a metric name"
 
 	// ---- §5.2 envoy-go-strict project-local arms (ADR-0200) ----
 
@@ -449,6 +467,38 @@ func buildCompiledConfig(typedConfig *anypb.Any, ctx envoyhttp.FactoryCtx) (*com
 	clusterName, err := validateGrpcServiceAndResolveCluster(gs, ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	// §5.1 Arm 16 (phase 81 stats-name-charset-guards): stat_prefix must be
+	// metric-name safe. Numbered 16 because §5.2 already owns 13-15.
+	//
+	// ORDERING IS DELIBERATE, NOT INCIDENTAL — DO NOT HOIST THIS ARM.
+	// The probe below assembles the FULL counter name, which needs
+	// `clusterName`; that value only exists after
+	// validateGrpcServiceAndResolveCluster (arms 6-12) has run. Consequence:
+	// a config carrying BOTH an unknown RLS cluster AND an invalid
+	// stat_prefix reports the CLUSTER error, not the charset error. That
+	// precedence is accepted — `clusterName` is pre-guaranteed metric-name
+	// valid by arms 9/11 (it named a cluster the manager already loaded), so
+	// the assembled probe isolates `sp` as the only untrusted segment. Moving
+	// this arm above arms 6-12 would force a BARE-token probe, and
+	// stats.IsValidName is whole-string anchored: at this INTERIOR segment
+	// position a bare probe disagrees with the assembled one and would
+	// boot-reject configs that today boot, serve and register a valid
+	// counter. Pinned by TestBuildCompiledConfig_StatPrefixCharset's
+	// ClusterErrorPrecedesCharsetError arm.
+	//
+	// The probe suffix must track newFilterStats (stats.go): the assembled
+	// name is `cluster.<clusterName>.ratelimit.<stat_prefix>.<leaf>`.
+	// `tok != ""` is kept because the empty case is LIVE and landed —
+	// newFilterStats elides the segment wholesale (including its leading dot)
+	// when stat_prefix is empty, so for an empty token this probe would not
+	// be the name actually registered.
+	if sp := raw.GetStatPrefix(); sp != "" {
+		probe := "cluster." + clusterName + ".ratelimit." + sp + "." + statNameFailureModeAllowed
+		if !stats.IsValidName(probe) {
+			return nil, errors.New(parseRejectStatPrefixInvalid)
+		}
 	}
 
 	// All PARSE-REJECT arms passed — populate the 13-field cc per AMEND-3.

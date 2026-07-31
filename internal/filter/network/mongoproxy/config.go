@@ -6,6 +6,8 @@ import (
 
 	commonfaultv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/common/fault/v3"
 	mongo_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/mongo_proxy/v3"
+
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // PARSE-REJECT arms (ADR-0080 byte-stable; SPEC §6; D-S29.1-1). The error prefix
@@ -16,6 +18,7 @@ import (
 // fixture disposition is parent D-P5, resolved at the 29.3 SPEC).
 const (
 	errStatPrefixRequired      = "mongo_proxy: stat_prefix is required"
+	errStatPrefixInvalid       = "mongo_proxy: stat_prefix contains characters invalid for a metric name"
 	errDelaySpecifierRequired  = "mongo_proxy: delay: a delay type must be specified"
 	errDelayFixedDelayTooSmall = "mongo_proxy: delay: fixed_delay must be greater than 0s"
 	errDelayDenominatorInvalid = "mongo_proxy: delay: percentage denominator is not a defined value"
@@ -80,6 +83,47 @@ type compiledConfig struct {
 func parseConfig(msg *mongo_proxyv3.MongoProxy) (*compiledConfig, error) {
 	if msg.GetStatPrefix() == "" {
 		return nil, errors.New(errStatPrefixRequired)
+	}
+	// stat_prefix character-class guard (ADR-0065 §Consequences (e)).
+	// newMongoStats (stats.go) assembles "mongo." + stat_prefix + "." + <leaf>
+	// and hands it to statroster.New / NewGaugeIfAbsent, which reach
+	// Registry.checkName — that PANICS on a name failing stats.NamePattern, so
+	// an unguarded operator token is a config-triggered process crash.
+	//
+	// PROBE THE ASSEMBLED NAME, NEVER THE BARE TOKEN (ADR-0065 §Consequences
+	// (b)). NamePattern is whole-string anchored, so a token's verdict depends
+	// on its SEGMENT POSITION. Here the token is INTERIOR — the fixed "mongo."
+	// segment sits to its left — and bare vs assembled disagree on 5 of 9
+	// measured token shapes. A bare probe would boot-reject configs that today
+	// boot, serve and register a perfectly valid counter. The executable pin
+	// for that measurement is internal/stats/name_position_test.go.
+	//
+	// "cx_destroy_remote_with_active_rq" is the LONGEST leaf in the package
+	// (32 bytes; longest of the 22 rosterSuffixes and longer than the
+	// op_query_active gauge). Per ADR-0065 §Consequences (b) validating the
+	// longest assembled name suffices: the other leaves differ only in
+	// characters already inside NamePattern's permitted class, so they pass or
+	// fail together.
+	//
+	// There is deliberately NO `!= ""` arm: empty is already rejected above by
+	// errStatPrefixRequired, so such an arm would be dead code. The bare-probe
+	// redis/thrift/kafka incumbents omit it for the same reason.
+	//
+	// RECORDED, NOT FIXED (a divergence this shape creates): an interior
+	// assembled probe makes mongo ACCEPT a leading-digit stat_prefix — "1abc"
+	// assembles to "mongo.1abc.cx_destroy_remote_with_active_rq", a perfectly
+	// valid metric name — where the bare-guarded thriftproxy / kafkabroker /
+	// redisproxy siblings REJECT the same token. Both are correct at their own
+	// segment position; the divergence is in the ERROR SURFACE, not in what can
+	// crash. SPEC §13.5 records the bare incumbents as stronger, not weaker.
+	//
+	// INHERITED HOLE, DELIBERATE (SPEC §13.1): stats.IsValidName("a..b") is
+	// true, so a trailing-dot stat_prefix ("foo." → "mongo.foo..op_query") is
+	// ACCEPTED here. That is expected and is deferred whole to successor row
+	// stats-name-empty-segment-guards; config_test.go carries an accept-pin arm
+	// so a later "fix" cannot land silently.
+	if !stats.IsValidName("mongo." + msg.GetStatPrefix() + ".cx_destroy_remote_with_active_rq") {
+		return nil, errors.New(errStatPrefixInvalid)
 	}
 	cfg := &compiledConfig{
 		statPrefix:          msg.GetStatPrefix(),

@@ -1,13 +1,18 @@
 package rbac
 
 import (
+	"bytes"
 	"crypto/tls"
+	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 
+	xdscorev3 "github.com/cncf/xds/go/xds/core/v3"
 	xdsmatcherv3 "github.com/cncf/xds/go/xds/type/matcher/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	rbacconfigv3 "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
@@ -1740,5 +1745,609 @@ func TestDecodeHeaders_DenyMatch_NoResponseCodeDetailsEmitted_DivergenceWindow(t
 		if strings.Contains(strings.ToLower(h.Name), "response-code-details") {
 			t.Errorf("response-code-details header present: %q (envoy-go MVP DEFERS per amendment 11 + §8.12)", h.Name)
 		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Group 81-DE — phase-81 stat-name charset guards, sources D + E
+// (rules_stat_prefix / shadow_rules_stat_prefix).
+//
+// D and E share ONE table-driven driver: the two proto fields occupy the SAME
+// interior segment position in the assembled counter name
+// (`http.<hcm>.rbac.<TOKEN>.<suffix>`), differing only in which suffix family
+// follows and which wording constant fires. statPrefixCharsetCases is that
+// shared table; TestBuildCompiledConfig_RulesStatPrefix_Charset and
+// TestBuildCompiledConfig_ShadowRulesStatPrefix_Charset drive it.
+//
+// EVERY case is stated in terms of the ASSEMBLED name, never the bare token.
+// Cases 9leading_digit / 9 / 0123456789 are the discriminators: they FAIL
+// stats.IsValidName in isolation (the pattern's `^[a-zA-Z_]` anchor) but PASS
+// at the interior position, and they register a live counter today. A bare
+// token guard would boot-reject them.
+//
+// The dot cases (`a..b`, `trailing.`, `.leading`, `.`) are ACCEPT-PINS, not
+// oversights: stats.IsValidName("a..b") == true, so an interior empty segment
+// is INHERITED. Closing that hole is deferred to the successor row
+// stats-name-empty-segment-guards per SPEC 13.1.
+// ----------------------------------------------------------------------------
+
+// statPrefixCharsetCase is one row of the shared D/E charset table.
+type statPrefixCharsetCase struct {
+	name   string // subtest name
+	token  string // the rules_stat_prefix / shadow_rules_stat_prefix value
+	reject bool   // true when buildCompiledConfig must return an error
+	why    string // documentation of the assembled-name disposition
+}
+
+// statPrefixCharsetCases is the 29-row shared table. 17 accepts + 12 rejects.
+var statPrefixCharsetCases = []statPrefixCharsetCase{
+	// --- ACCEPTS (assembled name matches stats.NamePattern) ---
+	{"Plain", "simple", false, "lowercase ASCII letters"},
+	{"Underscore", "with_underscore", false, "underscore is in-charset"},
+	{"MixedCase", "MixedCase", false, "uppercase is in-charset"},
+	{"TrailingDigits", "digits123", false, "digits are in-charset after a letter"},
+	{"LeadingDigit", "9leading_digit", false, "INTERIOR position: leading digit is fine; a BARE probe would reject"},
+	{"LeadingUnderscore", "_leading_underscore", false, "underscore start"},
+	{"SingleChar", "x", false, "one letter"},
+	{"SingleDigit", "9", false, "INTERIOR position: bare probe would reject"},
+	{"SingleUnderscore", "_", false, "one underscore"},
+	{"AllDigits", "0123456789", false, "INTERIOR position: bare probe would reject"},
+	{"TrailingUnderscore", "trailing_", false, "underscore end is in-charset"},
+	{"MixedAlnumDot", "A_B.c9", false, "interior dot plus alnum"},
+	{"InteriorDot", "a.b", false, "dots are the segment separator"},
+	{"InteriorEmptySegment", "a..b", false, "ACCEPT-PIN SPEC 13.1: stats.IsValidName(\"a..b\") == true; deferred to stats-name-empty-segment-guards"},
+	{"TrailingDot", "trailing.", false, "ACCEPT-PIN: assembles to `...trailing..allowed`, an INTERIOR double dot, which the pattern permits"},
+	{"LeadingDot", ".leading", false, "ACCEPT-PIN: assembles to `...rbac..leading.allowed`, interior double dot"},
+	{"BareDot", ".", false, "ACCEPT-PIN: assembles to `...rbac...allowed`, interior triple dot"},
+
+	// --- REJECTS (out-of-charset byte survives assembly) ---
+	{"Hyphen", "has-hyphen", true, "hyphen is out-of-charset at every position"},
+	{"IdiomaticHyphen", "allow-admins", true, "the headline idiom: hyphenated names are ubiquitous in RBAC configs"},
+	{"Space", "has space", true, "space out-of-charset"},
+	{"Slash", "has/slash", true, "slash out-of-charset"},
+	{"Colon", "has:colon", true, "colon out-of-charset"},
+	{"Percent", "has%percent", true, "percent out-of-charset"},
+	{"Star", "has*star", true, "asterisk out-of-charset"},
+	{"Comma", "has,comma", true, "comma out-of-charset"},
+	{"Pipe", "has|pipe", true, "pipe out-of-charset"},
+	{"Semicolon", "has;semicolon", true, "semicolon out-of-charset"},
+	{"Tab", "has\ttab", true, "tab out-of-charset"},
+	{"NonASCII", "café", true, "non-ASCII rune out-of-charset"},
+}
+
+// TestBuildCompiledConfig_RulesStatPrefix_Charset drives the shared table
+// against source D (rules_stat_prefix -> `http.<hcm>.rbac.<TOKEN>.allowed`).
+// On accept it additionally proves the probe SHAPE is the registered shape by
+// asserting the exact counter landed on the Registry.
+func TestBuildCompiledConfig_RulesStatPrefix_Charset(t *testing.T) {
+	for _, tc := range statPrefixCharsetCases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := stats.NewRegistry()
+			ctx := envoyhttp.FactoryCtx{Stats: reg, StatPrefix: "hcm"}
+			c := &rbacv3.RBAC{Rules: happyRulesEngine(), RulesStatPrefix: tc.token}
+			cc, err := buildCompiledConfig(c, ctx, false /*isPerRoute*/)
+			if tc.reject {
+				if err == nil {
+					t.Fatalf("rules_stat_prefix %q: want error (%s), got nil", tc.token, tc.why)
+				}
+				wantWording := fmt.Sprintf(rejectRulesStatPrefixInvalidFmt, tc.token, stats.NamePattern)
+				if err.Error() != wantWording {
+					t.Errorf("err = %q; want %q", err.Error(), wantWording)
+				}
+				if strings.Contains(err.Error(), "shadow_rules_stat_prefix") {
+					t.Errorf("source D fired source E's wording: %q", err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("rules_stat_prefix %q: want success (%s), got %v", tc.token, tc.why, err)
+			}
+			want := "http.hcm.rbac." + tc.token + ".allowed"
+			if !containsString(collectMetricNames(reg), want) {
+				t.Errorf("accepted token %q did not register %q; the guard probe and the registered name disagree", tc.token, want)
+			}
+			if cc.rulesStatPrefix != tc.token {
+				t.Errorf("rulesStatPrefix = %q; want %q", cc.rulesStatPrefix, tc.token)
+			}
+		})
+	}
+}
+
+// TestBuildCompiledConfig_ShadowRulesStatPrefix_Charset drives the SAME table
+// against source E (shadow_rules_stat_prefix ->
+// `http.<hcm>.rbac.<TOKEN>.shadow_allowed`).
+func TestBuildCompiledConfig_ShadowRulesStatPrefix_Charset(t *testing.T) {
+	for _, tc := range statPrefixCharsetCases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := stats.NewRegistry()
+			ctx := envoyhttp.FactoryCtx{Stats: reg, StatPrefix: "hcm"}
+			c := &rbacv3.RBAC{
+				Rules:                 happyRulesEngine(),
+				ShadowRules:           happyRulesEngine(),
+				ShadowRulesStatPrefix: tc.token,
+			}
+			cc, err := buildCompiledConfig(c, ctx, false /*isPerRoute*/)
+			if tc.reject {
+				if err == nil {
+					t.Fatalf("shadow_rules_stat_prefix %q: want error (%s), got nil", tc.token, tc.why)
+				}
+				wantWording := fmt.Sprintf(rejectShadowRulesStatPrefixInvalidFmt, tc.token, stats.NamePattern)
+				if err.Error() != wantWording {
+					t.Errorf("err = %q; want %q", err.Error(), wantWording)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("shadow_rules_stat_prefix %q: want success (%s), got %v", tc.token, tc.why, err)
+			}
+			want := "http.hcm.rbac." + tc.token + ".shadow_allowed"
+			if !containsString(collectMetricNames(reg), want) {
+				t.Errorf("accepted token %q did not register %q; the guard probe and the registered name disagree", tc.token, want)
+			}
+			if cc.shadowRulesStatPrefix != tc.token {
+				t.Errorf("shadowRulesStatPrefix = %q; want %q", cc.shadowRulesStatPrefix, tc.token)
+			}
+		})
+	}
+}
+
+// TestBuildCompiledConfig_StatPrefixGuards_AssembledNotBare is the explicit
+// discrimination pin behind the shared table: "9leading_digit" FAILS
+// stats.IsValidName as a bare token and PASSES as an assembled name, and the
+// guard must follow the assembled verdict. A bare-token guard would pass this
+// file's compile and still be wrong; this test is the one that catches it.
+func TestBuildCompiledConfig_StatPrefixGuards_AssembledNotBare(t *testing.T) {
+	const token = "9leading_digit"
+	if stats.IsValidName(token) {
+		t.Fatalf("premise broken: stats.IsValidName(%q) is now true; the bare-vs-assembled discrimination is gone", token)
+	}
+	if !stats.IsValidName("http.hcm.rbac." + token + ".allowed") {
+		t.Fatalf("premise broken: assembled name for %q is no longer valid", token)
+	}
+	reg := stats.NewRegistry()
+	ctx := envoyhttp.FactoryCtx{Stats: reg, StatPrefix: "hcm"}
+	c := &rbacv3.RBAC{
+		Rules:                 happyRulesEngine(),
+		ShadowRules:           happyRulesEngine(),
+		RulesStatPrefix:       token,
+		ShadowRulesStatPrefix: token,
+	}
+	if _, err := buildCompiledConfig(c, ctx, false /*isPerRoute*/); err != nil {
+		t.Fatalf("assembled-valid token %q boot-rejected: %v (guard is probing the BARE token)", token, err)
+	}
+	for _, want := range []string{
+		"http.hcm.rbac." + token + ".allowed",
+		"http.hcm.rbac." + token + ".denied",
+		"http.hcm.rbac." + token + ".shadow_allowed",
+		"http.hcm.rbac." + token + ".shadow_denied",
+	} {
+		if !containsString(collectMetricNames(reg), want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+}
+
+// TestBuildCompiledConfig_StatPrefixGuards_EmptyHCMPrefixShape pins the
+// second assembled shape: when FactoryCtx.StatPrefix is empty the base folds
+// to `rbac.<TOKEN>`, and the guard must probe THAT shape (a guard hard-coding
+// the `http.` root would mis-verdict this path).
+func TestBuildCompiledConfig_StatPrefixGuards_EmptyHCMPrefixShape(t *testing.T) {
+	reg := stats.NewRegistry()
+	ctx := envoyhttp.FactoryCtx{Stats: reg} // no StatPrefix
+	c := &rbacv3.RBAC{Rules: happyRulesEngine(), RulesStatPrefix: "9digits"}
+	if _, err := buildCompiledConfig(c, ctx, false /*isPerRoute*/); err != nil {
+		t.Fatalf("empty-HCM shape: want success, got %v", err)
+	}
+	if !containsString(collectMetricNames(reg), "rbac.9digits.allowed") {
+		t.Errorf("missing rbac.9digits.allowed; got %v", collectMetricNames(reg))
+	}
+	c2 := &rbacv3.RBAC{Rules: happyRulesEngine(), RulesStatPrefix: "bad-token"}
+	if _, err := buildCompiledConfig(c2, envoyhttp.FactoryCtx{Stats: stats.NewRegistry()}, false); err == nil {
+		t.Errorf("empty-HCM shape with out-of-charset token: want error, got nil")
+	}
+}
+
+// TestBuildCompiledConfig_StatPrefixGuards_NilRegistryStillRejects pins that
+// the D/E verdict is a property of the CONFIG, not of the test wiring: an
+// out-of-charset prefix is rejected even when ctx.Stats is nil (ADR-0085
+// nil-tolerance skips REGISTRATION, not VALIDATION).
+func TestBuildCompiledConfig_StatPrefixGuards_NilRegistryStillRejects(t *testing.T) {
+	c := &rbacv3.RBAC{Rules: happyRulesEngine(), RulesStatPrefix: "allow-admins"}
+	if _, err := buildCompiledConfig(c, envoyhttp.FactoryCtx{}, false /*isPerRoute*/); err == nil {
+		t.Fatalf("nil Registry: want error, got nil")
+	}
+}
+
+// TestNew_RulesStatPrefixInvalid_BootRejects pins the guard at the PUBLIC
+// entry point (New), not merely at the unexported helper: the operator-visible
+// disposition is a boot failure with a nil factory.
+func TestNew_RulesStatPrefixInvalid_BootRejects(t *testing.T) {
+	c := &rbacv3.RBAC{Rules: happyRulesEngine(), RulesStatPrefix: "allow-admins"}
+	factory, err := New(mustAny(t, c), freshFactoryCtx())
+	if err == nil {
+		t.Fatalf("New: want boot reject, got nil")
+	}
+	if factory != nil {
+		t.Errorf("New: want nil factory, got %v", factory)
+	}
+	if !strings.Contains(err.Error(), "rules_stat_prefix") {
+		t.Errorf("err = %q; want it to name rules_stat_prefix", err.Error())
+	}
+}
+
+// TestNew_ShadowRulesStatPrefixInvalid_BootRejects is the source-E sibling.
+func TestNew_ShadowRulesStatPrefixInvalid_BootRejects(t *testing.T) {
+	c := &rbacv3.RBAC{
+		Rules:                 happyRulesEngine(),
+		ShadowRules:           happyRulesEngine(),
+		ShadowRulesStatPrefix: "shadow-admins",
+	}
+	factory, err := New(mustAny(t, c), freshFactoryCtx())
+	if err == nil {
+		t.Fatalf("New: want boot reject, got nil")
+	}
+	if factory != nil {
+		t.Errorf("New: want nil factory, got %v", factory)
+	}
+	if !strings.Contains(err.Error(), "shadow_rules_stat_prefix") {
+		t.Errorf("err = %q; want it to name shadow_rules_stat_prefix", err.Error())
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Group 81-F1 — phase-81 stat-name charset guard, source F1 (policy names
+// under track_per_rule_stats).
+//
+// This is the row's HEADLINE defect. Before the guard, an idiomatic
+// `allow-admins` policy name plus track_per_rule_stats:true booted GREEN and
+// killed the PROCESS on the first matching request, via
+// (*rbacengine.PerPolicyCounters).Inc -> NewCounterIfAbsent ->
+// stats.checkName's panic, on the HCM dispatch goroutine which carries no
+// recover(). The measured panic name is the DOUBLE-rbac form
+// `http.myhcm.rbac.rbac.policy.allow-admins.allowed` (baseStatPrefix emits one
+// `rbac` segment, then namespacePrefix("") substitutes a second).
+//
+// The policy name occupies the SAME interior segment position as
+// rules_stat_prefix, so the D/E table (statPrefixCharsetCases) is reused
+// verbatim rather than duplicated — that reuse is itself the claim that the
+// two sources share a position, and the accept rows would fail here if they
+// did not.
+// ----------------------------------------------------------------------------
+
+// policyOnly builds a one-policy any/any policies map under the given name.
+func policyOnly(name string) *rbacconfigv3.RBAC {
+	return &rbacconfigv3.RBAC{
+		Action:   rbacconfigv3.RBAC_ALLOW,
+		Policies: allowAnyPolicy(name),
+	}
+}
+
+// TestBuildCompiledConfig_PolicyNameCharset_PrimaryRules drives the shared
+// charset table against source F1's primary-engine arm.
+func TestBuildCompiledConfig_PolicyNameCharset_PrimaryRules(t *testing.T) {
+	for _, tc := range statPrefixCharsetCases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := stats.NewRegistry()
+			ctx := envoyhttp.FactoryCtx{Stats: reg, StatPrefix: "hcm"}
+			c := &rbacv3.RBAC{Rules: policyOnly(tc.token), TrackPerRuleStats: true}
+			_, err := buildCompiledConfig(c, ctx, false /*isPerRoute*/)
+			if tc.reject {
+				if err == nil {
+					t.Fatalf("policy name %q: want boot reject (%s), got nil — this config PANICS the process on first match", tc.token, tc.why)
+				}
+				want := fmt.Sprintf(rejectPolicyNameInvalidFmt, tc.token, stats.NamePattern)
+				if err.Error() != want {
+					t.Errorf("err = %q; want %q", err.Error(), want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("policy name %q: want success (%s), got %v", tc.token, tc.why, err)
+			}
+		})
+	}
+}
+
+// TestBuildCompiledConfig_PolicyNameCharset_ShadowRules drives the same table
+// against the shadow-engine arm (shadow policy names reach Inc through
+// emitShadowCounters with the shadow base + the `shadow_allowed` suffix
+// family).
+func TestBuildCompiledConfig_PolicyNameCharset_ShadowRules(t *testing.T) {
+	for _, tc := range statPrefixCharsetCases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := stats.NewRegistry()
+			ctx := envoyhttp.FactoryCtx{Stats: reg, StatPrefix: "hcm"}
+			c := &rbacv3.RBAC{
+				Rules:                 happyRulesEngine(),
+				ShadowRules:           policyOnly(tc.token),
+				ShadowRulesStatPrefix: "sh",
+				TrackPerRuleStats:     true,
+			}
+			_, err := buildCompiledConfig(c, ctx, false /*isPerRoute*/)
+			if tc.reject {
+				if err == nil {
+					t.Fatalf("shadow policy name %q: want boot reject (%s), got nil", tc.token, tc.why)
+				}
+				want := fmt.Sprintf(rejectPolicyNameInvalidFmt, tc.token, stats.NamePattern)
+				if err.Error() != want {
+					t.Errorf("err = %q; want %q", err.Error(), want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("shadow policy name %q: want success (%s), got %v", tc.token, tc.why, err)
+			}
+		})
+	}
+}
+
+// TestBuildCompiledConfig_PolicyNameCharset_EmptyHCMPrefixShape drives the
+// table against the SECOND assembled shape — with an empty FactoryCtx
+// StatPrefix the base folds from `http.<hcm>.rbac.<prefix>` to
+// `rbac.<prefix>`. A guard that hard-coded either root would mis-verdict one
+// of the two shapes.
+func TestBuildCompiledConfig_PolicyNameCharset_EmptyHCMPrefixShape(t *testing.T) {
+	for _, tc := range statPrefixCharsetCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := envoyhttp.FactoryCtx{Stats: stats.NewRegistry()} // no StatPrefix
+			c := &rbacv3.RBAC{Rules: policyOnly(tc.token), TrackPerRuleStats: true}
+			_, err := buildCompiledConfig(c, ctx, false /*isPerRoute*/)
+			if tc.reject != (err != nil) {
+				t.Fatalf("empty-HCM shape, policy name %q: reject=%v, err=%v (%s)", tc.token, tc.reject, err, tc.why)
+			}
+		})
+	}
+}
+
+// TestBuildCompiledConfig_PolicyNameCharset_GateOff is the trackPerRuleStats
+// GATE arm: with the gate false NO per-policy counter is ever constructed, so
+// NO policy name can panic and EVERY row of the table — including all 12
+// out-of-charset ones — must keep booting. An ungated guard reds this test.
+func TestBuildCompiledConfig_PolicyNameCharset_GateOff(t *testing.T) {
+	for _, tc := range statPrefixCharsetCases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := stats.NewRegistry()
+			ctx := envoyhttp.FactoryCtx{Stats: reg, StatPrefix: "hcm"}
+			c := &rbacv3.RBAC{
+				Rules:             policyOnly(tc.token),
+				ShadowRules:       policyOnly(tc.token),
+				TrackPerRuleStats: false,
+			}
+			if _, err := buildCompiledConfig(c, ctx, false /*isPerRoute*/); err != nil {
+				t.Fatalf("track_per_rule_stats=false, policy name %q: want success (nothing can register a per-policy counter), got %v", tc.token, err)
+			}
+		})
+	}
+}
+
+// TestBuildCompiledConfig_PolicyNameGuard_AssembledNotBare is the F1
+// discrimination pin: a digit-leading policy name is INVALID bare and VALID
+// assembled, boots today, and registers a live per-policy counter. A bare
+// probe would boot-reject it.
+func TestBuildCompiledConfig_PolicyNameGuard_AssembledNotBare(t *testing.T) {
+	const token = "9admins"
+	if stats.IsValidName(token) {
+		t.Fatalf("premise broken: stats.IsValidName(%q) is now true", token)
+	}
+	reg := stats.NewRegistry()
+	ctx := envoyhttp.FactoryCtx{Stats: reg, StatPrefix: "hcm"}
+	c := &rbacv3.RBAC{Rules: policyOnly(token), TrackPerRuleStats: true, RulesStatPrefix: "rp"}
+	cc, err := buildCompiledConfig(c, ctx, false /*isPerRoute*/)
+	if err != nil {
+		t.Fatalf("assembled-valid policy name %q boot-rejected: %v (guard is probing the BARE name)", token, err)
+	}
+	// It must actually register when emitted — proving the guard's probe shape
+	// is the shape Inc builds.
+	cc.stats.perPolicy.Inc(cc.stats.reg, cc.stats.primaryBase, token, "allowed")
+	want := "http.hcm.rbac.rp.policy." + token + ".allowed"
+	if !containsString(collectMetricNames(reg), want) {
+		t.Errorf("missing %q after Inc; got %v", want, collectMetricNames(reg))
+	}
+}
+
+// TestNew_PolicyNameInvalid_ListenerTier_BootFails pins the LISTENER-tier
+// disposition: boot failure, nil factory. This is the arm that converts a
+// request-time process kill into a config-load error.
+func TestNew_PolicyNameInvalid_ListenerTier_BootFails(t *testing.T) {
+	c := &rbacv3.RBAC{Rules: policyOnly("allow-admins"), TrackPerRuleStats: true}
+	factory, err := New(mustAny(t, c), envoyhttp.FactoryCtx{Stats: stats.NewRegistry(), StatPrefix: "myhcm"})
+	if err == nil {
+		t.Fatalf("New: want boot failure, got nil (this config kills the process on first match)")
+	}
+	if factory != nil {
+		t.Errorf("New: want nil factory, got %v", factory)
+	}
+	want := fmt.Sprintf(rejectPolicyNameInvalidFmt, "allow-admins", stats.NamePattern)
+	if err.Error() != want {
+		t.Errorf("err = %q; want %q", err.Error(), want)
+	}
+}
+
+// TestDecodeHeaders_PolicyNameInvalid_PerRouteTier_LogsAndInheritsListener
+// pins the PER-ROUTE-tier disposition, which is log + inherit-listener per
+// ADR-0072 (boot-fail-fast applies at New, not at request-time per-route
+// resolution). The dispositions are NOT two branches in the guard: F1 returns
+// an error at both tiers and resolvePerRouteConfig's pre-existing
+// inherit-listener path supplies the second disposition.
+//
+// Rebinds the process-global log destination; MUST NOT call t.Parallel().
+func TestDecodeHeaders_PolicyNameInvalid_PerRouteTier_LogsAndInheritsListener(t *testing.T) {
+	var logBuf bytes.Buffer
+	origFlags, origPrefix := log.Flags(), log.Prefix()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(os.Stderr)
+		log.SetFlags(origFlags)
+		log.SetPrefix(origPrefix)
+	})
+
+	reg := stats.NewRegistry()
+	listener := &rbacv3.RBAC{Rules: policyOnly("p_ok")}
+	fl, cb := newFilterWithCtx(t, listener, envoyhttp.FactoryCtx{Stats: reg, StatPrefix: "hcm"})
+	// Per-route override carrying the un-nameable policy name + the gate on.
+	cb.routeCfg = &rbacv3.RBACPerRoute{
+		Rbac: &rbacv3.RBAC{Rules: policyOnly("allow-admins"), TrackPerRuleStats: true},
+	}
+
+	status := fl.DecodeHeaders(http.Header{}, false)
+	if status != envoyhttp.Continue {
+		t.Errorf("status: got %v, want Continue (inherit listener, which ALLOWs)", status)
+	}
+	if fl.activeRC != fl.state.listenerRC {
+		t.Errorf("activeRC: want the LISTENER config (inherit-listener); got %p vs listener %p", fl.activeRC, fl.state.listenerRC)
+	}
+	// The pre-existing inherit-listener diagnostic, carrying the F1 wording.
+	logged := logBuf.String()
+	if !strings.Contains(logged, "rbac: per-route resolve failed (inherit-listener):") {
+		t.Errorf("log = %q; want the inherit-listener diagnostic", logged)
+	}
+	if !strings.Contains(logged, `policy name "allow-admins" cannot form a valid metric name`) {
+		t.Errorf("log = %q; want the F1 wording carried through", logged)
+	}
+	// 4 base counters only — the per-route tier registered nothing.
+	names := collectMetricNames(reg)
+	if len(names) != 4 {
+		t.Errorf("registry size: got %d %v, want exactly the 4 listener base counters", len(names), names)
+	}
+	for _, want := range []string{
+		"http.hcm.rbac.rbac.allowed",
+		"http.hcm.rbac.rbac.denied",
+		"http.hcm.rbac.rbac.shadow_allowed",
+		"http.hcm.rbac.rbac.shadow_denied",
+	} {
+		if !containsString(names, want) {
+			t.Errorf("missing base counter %q", want)
+		}
+	}
+}
+
+// TestBuildRulesEngine_HyphenPolicyName_NotGuarded is the NEGATIVE-SPACE pin
+// for the F1 SITE decision: the guard is NOT in rbacengine.BuildRulesEngine.
+// That helper is shared with the L4 consumer
+// (internal/filter/network/rbac/rbac.go), which never constructs
+// PerPolicyCounters and is blind to track_per_rule_stats — a guard there would
+// boot-reject L4 configs that CANNOT panic. If this test ever reds, the guard
+// has been hoisted and L4 has regressed.
+func TestBuildRulesEngine_HyphenPolicyName_NotGuarded(t *testing.T) {
+	for _, profile := range []rbacengine.Profile{rbacengine.ProfileHTTP, rbacengine.ProfileL4} {
+		if _, err := rbacengine.BuildRulesEngine(policyOnly("allow-admins"), profile); err != nil {
+			t.Errorf("BuildRulesEngine(profile=%v) with policy %q: got %v, want nil (the shared builder must stay charset-blind)", profile, "allow-admins", err)
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Group 81-F2 (consumer side) — the matcher-engine path F1 CANNOT cover.
+//
+// BuildMatcherEngine does only a terminal-TypeURL allow-list; the policy name
+// is action.GetName() read out of the match tree at REQUEST time. Nothing
+// enumerates it at boot, so the config below MUST boot green — and the
+// (*PerPolicyCounters).Inc backstop is the only thing standing between it and
+// a process kill.
+// ----------------------------------------------------------------------------
+
+// buildAnyAllowMatcher returns a single-predicate matcher tree whose terminal
+// Action carries the given name + action enum. Mirrors
+// fuzz_test.go's buildAnyAllowMatcherForFuzz (testing.F vs testing.T).
+func buildAnyAllowMatcher(t *testing.T, actionName string, act rbacconfigv3.RBAC_Action) *xdsmatcherv3.Matcher {
+	t.Helper()
+	actionAny := mustAny(t, &rbacconfigv3.Action{Name: actionName, Action: act})
+	inputAny := mustAny(t, &matcherv3.HttpRequestHeaderMatchInput{HeaderName: "x-user"})
+	return &xdsmatcherv3.Matcher{
+		MatcherType: &xdsmatcherv3.Matcher_MatcherList_{
+			MatcherList: &xdsmatcherv3.Matcher_MatcherList{
+				Matchers: []*xdsmatcherv3.Matcher_MatcherList_FieldMatcher{{
+					Predicate: &xdsmatcherv3.Matcher_MatcherList_Predicate{
+						MatchType: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate_{
+							SinglePredicate: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate{
+								Input: &xdscorev3.TypedExtensionConfig{Name: "header-input-x-user", TypedConfig: inputAny},
+								Matcher: &xdsmatcherv3.Matcher_MatcherList_Predicate_SinglePredicate_ValueMatch{
+									ValueMatch: &xdsmatcherv3.StringMatcher{
+										MatchPattern: &xdsmatcherv3.StringMatcher_Exact{Exact: "alice"},
+									},
+								},
+							},
+						},
+					},
+					OnMatch: &xdsmatcherv3.Matcher_OnMatch{
+						OnMatch: &xdsmatcherv3.Matcher_OnMatch_Action{
+							Action: &xdscorev3.TypedExtensionConfig{Name: "action", TypedConfig: actionAny},
+						},
+					},
+				}},
+			},
+		},
+	}
+}
+
+// TestDecodeHeaders_MatcherEngineUnNameableAction_SkipsStatNoPanic is the
+// end-to-end F2 arm. No recover() anywhere in this test: if the backstop is
+// removed, the test binary dies with
+// `panic: stats: invalid metric name: "http.hcm.rbac.rbac.policy.allow-admins.allowed"`.
+func TestDecodeHeaders_MatcherEngineUnNameableAction_SkipsStatNoPanic(t *testing.T) {
+	reg := stats.NewRegistry()
+	listener := &rbacv3.RBAC{
+		Matcher:           buildAnyAllowMatcher(t, "allow-admins", rbacconfigv3.RBAC_ALLOW),
+		TrackPerRuleStats: true,
+	}
+	// (a) boots GREEN — F1 does not (and cannot) enumerate the matcher tree.
+	fl, _ := newFilterWithCtx(t, listener, envoyhttp.FactoryCtx{Stats: reg, StatPrefix: "hcm"})
+	before := len(collectMetricNames(reg))
+
+	// (b) no panic on the guarded path.
+	status := fl.DecodeHeaders(http.Header{"X-User": []string{"alice"}}, false)
+
+	// (c) the enforcement disposition is unchanged.
+	if status != envoyhttp.Continue {
+		t.Errorf("status: got %v, want Continue (matcher terminal is ALLOW)", status)
+	}
+	// (d) no dynamic counter — by NAME and by registry TOTAL (a name-only
+	// assertion would miss a MIS-ASSEMBLED registration under some other key).
+	absent := "http.hcm.rbac.rbac.policy.allow-admins.allowed"
+	if containsString(collectMetricNames(reg), absent) {
+		t.Errorf("un-nameable per-policy counter %q was registered", absent)
+	}
+	if after := len(collectMetricNames(reg)); after != before {
+		t.Errorf("registry size: %d -> %d; want unchanged (nothing may be registered under ANY key)", before, after)
+	}
+	// (e) the fixed counters still fire.
+	if got := fl.state.listenerRC.stats.allowed.Load(); got != 1 {
+		t.Errorf("base allowed counter: got %d, want 1 (fixed counters fire regardless of policy nameability)", got)
+	}
+}
+
+// TestDecodeHeaders_MatcherEngineUnNameableAction_DenyDispositionUnchanged is
+// the disposition control for the arm above: an un-nameable policy name must
+// not perturb enforcement. Same tree, DENY terminal -> 403 + StopIteration,
+// byte-identical to a nameable-policy DENY.
+func TestDecodeHeaders_MatcherEngineUnNameableAction_DenyDispositionUnchanged(t *testing.T) {
+	run := func(actionName string) (envoyhttp.FilterHeadersStatus, *rbacLocalReplyArgs) {
+		listener := &rbacv3.RBAC{
+			Matcher:           buildAnyAllowMatcher(t, actionName, rbacconfigv3.RBAC_DENY),
+			TrackPerRuleStats: true,
+		}
+		fl, cb := newFilterWithCtx(t, listener, envoyhttp.FactoryCtx{Stats: stats.NewRegistry(), StatPrefix: "hcm"})
+		st := fl.DecodeHeaders(http.Header{"X-User": []string{"alice"}}, false)
+		return st, cb.localReply
+	}
+	nameableStatus, nameableReply := run("deny_admins")
+	unNameableStatus, unNameableReply := run("deny-admins")
+	if nameableStatus != unNameableStatus {
+		t.Errorf("status diverged on policy nameability: nameable=%v, un-nameable=%v", nameableStatus, unNameableStatus)
+	}
+	if unNameableStatus != envoyhttp.StopIteration {
+		t.Errorf("status: got %v, want StopIteration", unNameableStatus)
+	}
+	if nameableReply == nil || unNameableReply == nil {
+		t.Fatalf("SendLocalReply: nameable=%v, un-nameable=%v; want both non-nil", nameableReply, unNameableReply)
+	}
+	if nameableReply.status != unNameableReply.status || nameableReply.body != unNameableReply.body {
+		t.Errorf("local reply diverged: nameable=%d/%q, un-nameable=%d/%q",
+			nameableReply.status, nameableReply.body, unNameableReply.status, unNameableReply.body)
+	}
+	if unNameableReply.status != 403 {
+		t.Errorf("local reply status: got %d, want 403", unNameableReply.status)
 	}
 }

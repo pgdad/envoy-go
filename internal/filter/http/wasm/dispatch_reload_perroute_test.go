@@ -378,3 +378,63 @@ func TestDispatch_FailOpenBypass(t *testing.T) {
 		t.Errorf("vm_reload_success = %d; want 0 (FAIL_OPEN bypass triggers no reload attempt)", got)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// phase-81 (`stats-name-charset-guards`) source C — per-route FAIL-OPEN pin.
+// -----------------------------------------------------------------------------
+
+// TestDispatch_PerRoutePluginNameCharset_FailsOpen pins the RUNTIME disposition
+// of the source-C charset guard on the per-route dispatch tier.
+//
+// A per-route override whose PluginConfig.name fails the stat-name charset check
+// makes resolveEffective return an error at DecodeHeaders. That is NOT a boot
+// failure and NOT an error returned to any caller — decode_headers.go FAILS OPEN:
+// it increments the LISTENER plugin's envoy_go.failures counter, logs, and
+// returns Continue. The stream proceeds unfiltered against no VM at all.
+//
+// Assert the DISPOSITION, not an error return:
+//   - DecodeHeaders == Continue (no 503, no panic),
+//   - the LISTENER plugin's envoy_go.failures went 0 → 1,
+//   - f.eff stayed nil (the assignment sits after the error return), so the
+//     stream never bound a per-route VM.
+//
+// Reaching this path at all is the proof that the un-guarded name would
+// otherwise have hit newFilterStats → NewCounterIfAbsent → checkName's panic on
+// a POST-BOOT, REQUEST-TIME goroutine with no recover() above it.
+func TestDispatch_PerRoutePluginNameCharset_FailsOpen(t *testing.T) {
+	reg := stats.NewRegistry()
+
+	listener := newTestCompiledConfig(t, buildContinueProxyWasm(), "plugin_listener_p81", reg)
+	listener.factoryCtx = envoyhttp.FactoryCtx{Stats: reg}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	const failuresStat = "wasm.plugin_listener_p81.envoy_go.failures"
+	if got := findStatCounterValue(reg, failuresStat); got != 0 {
+		t.Fatalf("baseline %s = %d; want 0", failuresStat, got)
+	}
+
+	// Per-route override with a charset-invalid PluginConfig.name.
+	overrideProto := buildWasmProtoInlineBytes(buildContinueProxyWasm(), "p81-bad-route-name")
+
+	cb := &routeCfgDecoderCb{routeProto: overrideProto}
+	f := &filter{cfg: listener}
+	f.SetDecoderCallbacks(cb)
+	f.SetEncoderCallbacks(fakeEncoderCb{})
+
+	hdr := gohttp.Header{}
+	hdr.Set(":method", "GET")
+	if got := f.DecodeHeaders(hdr, true); got != envoyhttp.Continue {
+		t.Fatalf("DecodeHeaders = %v; want Continue (per-route build failure FAILS OPEN, it is not a reject to the caller)", got)
+	}
+	if cb.localReplyCalls != 0 {
+		t.Errorf("SendLocalReply called %d times (status %d); want 0 — the per-route charset reject FAILS OPEN, it does not 503", cb.localReplyCalls, cb.localReplyStatus)
+	}
+	if f.eff != nil {
+		t.Errorf("f.eff = %p; want nil (DecodeHeaders returns BEFORE the f.eff assignment on a resolveEffective error)", f.eff)
+	}
+	if got := findStatCounterValue(reg, failuresStat); got != 1 {
+		t.Errorf("%s = %d; want 1 (fail-open path increments the LISTENER plugin's envoy_go.failures)", failuresStat, got)
+	}
+
+	f.OnDestroy()
+}

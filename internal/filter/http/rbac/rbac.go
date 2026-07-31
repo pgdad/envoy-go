@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
 
 	rbacv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
@@ -205,6 +206,36 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 	}, nil
 }
 
+// PARSE-REJECT wording constants for the phase-81 stat-name charset guards.
+// These exact strings are pinned by the byte-stable tests; do not change the
+// wording. The %q-carrying format-string shape mirrors
+// lua/compiled_config.go's parseRejectStatPrefixInvalidFmt (the operator needs
+// to see WHICH token was rejected); the network/rbac sibling's bare
+// errors.New constants carry no token and are the weaker form.
+//
+// The second %s verb is filled with stats.NamePattern — the EXPORTED regex
+// source the Registry itself enforces, NOT a hand-copied literal (the lua
+// package keeps a private statNameRegexLiteral copy and needs a drift test to
+// pin it; consuming stats.NamePattern makes drift structurally impossible).
+const (
+	rejectRulesStatPrefixInvalidFmt       = "rbac: rules_stat_prefix: invalid characters in %q (must match %s)"
+	rejectShadowRulesStatPrefixInvalidFmt = "rbac: shadow_rules_stat_prefix: invalid characters in %q (must match %s)"
+	rejectPolicyNameInvalidFmt            = "rbac: track_per_rule_stats: policy name %q cannot form a valid metric name (must match %s)"
+)
+
+// sortedPolicyNames returns a policies-map's keys in lexicographic order so
+// the boot-reject error text is deterministic under Go's randomized map
+// iteration (rbacengine.BuildRulesEngine sorts for the same reason). Generic
+// over the value type so this file needs no envoy/config/rbac/v3 import.
+func sortedPolicyNames[V any](m map[string]V) []string {
+	names := make([]string, 0, len(m))
+	for n := range m {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // buildCompiledConfig parses + validates an rbacv3.RBAC outer envelope per
 // SPEC §6.5 + ADR-0141. The 7-consumed proto-faithful field decomposition per
 // §1.1 amendment 1: rules + matcher + shadow_rules + shadow_matcher (dual-
@@ -224,6 +255,41 @@ func buildCompiledConfig(c *rbacv3.RBAC, ctx envoyhttp.FactoryCtx, isPerRoute bo
 		rulesStatPrefix:       c.GetRulesStatPrefix(),
 		shadowRulesStatPrefix: c.GetShadowRulesStatPrefix(),
 		trackPerRuleStats:     c.GetTrackPerRuleStats(),
+	}
+
+	// Phase-81 sources D + E: rules_stat_prefix / shadow_rules_stat_prefix are
+	// operator-controlled tokens that land verbatim inside a REGISTERED metric
+	// name (newFilterStats -> Registry.NewCounterIfAbsent -> checkName, which
+	// PANICS on an out-of-charset name). Validate at the input boundary and
+	// return an error instead.
+	//
+	// PROBE THE ASSEMBLED NAME, NEVER THE BARE TOKEN. The Registry's regex is
+	// whole-string anchored, so a bare-token probe measures the token at the
+	// START-of-string position while the token actually occupies an INTERIOR
+	// position. The two positions disagree: a bare probe would reject non-empty
+	// tokens that assemble into a perfectly valid counter name today, and it
+	// would desynchronize this guard from the per-policy guard below (which can
+	// only ever probe an assembled key). Mirrors the assembled-probe discipline
+	// already landed at network/rbac/rbac.go and lua/compiled_config.go.
+	//
+	// The empty token is skipped for uniformity with those siblings. Note that
+	// the skip is NOT what keeps empty-prefix configs booting: namespacePrefix
+	// substitutes the literal "rbac" for an empty token, so the empty token
+	// never yields an empty segment and the assembled probe accepts it either
+	// way.
+	//
+	// The INTERIOR empty-segment hole ("a..b" -> stats.IsValidName == true) is
+	// INHERITED DELIBERATELY here; closing it is deferred to the successor row
+	// stats-name-empty-segment-guards per SPEC 13.1. Do not tighten.
+	if p := cc.rulesStatPrefix; p != "" {
+		if !stats.IsValidName(baseStatPrefix(ctx.StatPrefix, p) + ".allowed") {
+			return nil, fmt.Errorf(rejectRulesStatPrefixInvalidFmt, p, stats.NamePattern)
+		}
+	}
+	if p := cc.shadowRulesStatPrefix; p != "" {
+		if !stats.IsValidName(baseStatPrefix(ctx.StatPrefix, p) + ".shadow_allowed") {
+			return nil, fmt.Errorf(rejectShadowRulesStatPrefixInvalidFmt, p, stats.NamePattern)
+		}
 	}
 
 	// Primary engine selection. Per §1.1 amendment 2 + rbac.pb.go:38: rules
@@ -262,6 +328,56 @@ func buildCompiledConfig(c *rbacv3.RBAC, ctx envoyhttp.FactoryCtx, isPerRoute bo
 			return nil, err
 		}
 		cc.shadowMatcher = shadowMatcherEngine
+	}
+
+	// Phase-81 source F1: track_per_rule_stats promotes operator-supplied
+	// POLICY NAMES into registered metric names at request-time first match
+	// ((*rbacengine.PerPolicyCounters).Inc -> NewCounterIfAbsent ->
+	// stats.checkName). checkName PANICS, and there is NO recover() anywhere on
+	// the HCM/HTTP-filter dispatch path (the tree's recover() sites are all VM
+	// wrappers in internal/lua and internal/wasm). So without this guard an
+	// idiomatic hyphenated policy name such as `allow-admins` boots GREEN and
+	// kills the PROCESS on the first matching request. Enumerate the rules
+	// engine at boot and reject there instead.
+	//
+	// GATED on trackPerRuleStats: with the gate off no per-policy counter is
+	// ever constructed, so a hyphenated policy name is harmless and MUST keep
+	// booting. An ungated guard would reject configs that cannot panic.
+	//
+	// NOT hoisted into rbacengine.BuildRulesEngine: that helper is shared with
+	// the L4 consumer (internal/filter/network/rbac), which never constructs
+	// PerPolicyCounters and is blind to track_per_rule_stats — a guard there
+	// would boot-reject L4 configs that CANNOT panic.
+	//
+	// The MATCHER engine is deliberately NOT covered here: BuildMatcherEngine
+	// only allow-lists the terminal Any TypeURL, and the policy name arrives
+	// from Action.GetName() read out of the match tree at REQUEST time, so
+	// nothing enumerates it at boot. Source F2 — the skip-and-log backstop
+	// inside (*rbacengine.PerPolicyCounters).Inc — is what covers that path.
+	//
+	// Probe the ASSEMBLED key (`<base>.policy.<name>.<suffix>`), matching the
+	// exact string Inc builds, for the same interior-position reason as the D/E
+	// guards above.
+	//
+	// TIER DISPOSITION: this returns an error for BOTH tiers, and the two
+	// dispositions the row owes fall out of the EXISTING machinery rather than
+	// a branch here — at the listener tier New propagates the error and boot
+	// fails; at the per-route tier buildCompiledPerRoute wraps it and
+	// resolvePerRouteConfig logs `rbac: per-route resolve failed
+	// (inherit-listener): ...` and inherits the listener config per ADR-0072.
+	if cc.trackPerRuleStats {
+		primaryBase := baseStatPrefix(ctx.StatPrefix, cc.rulesStatPrefix)
+		for _, name := range sortedPolicyNames(c.GetRules().GetPolicies()) {
+			if !stats.IsValidName(primaryBase + ".policy." + name + ".allowed") {
+				return nil, fmt.Errorf(rejectPolicyNameInvalidFmt, name, stats.NamePattern)
+			}
+		}
+		shadowBase := baseStatPrefix(ctx.StatPrefix, cc.shadowRulesStatPrefix)
+		for _, name := range sortedPolicyNames(c.GetShadowRules().GetPolicies()) {
+			if !stats.IsValidName(shadowBase + ".policy." + name + ".shadow_allowed") {
+				return nil, fmt.Errorf(rejectPolicyNameInvalidFmt, name, stats.NamePattern)
+			}
+		}
 	}
 
 	// Stats — register the 4 base counters under the SN2-reuse namespace per

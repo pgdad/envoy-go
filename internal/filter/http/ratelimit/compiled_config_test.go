@@ -571,7 +571,12 @@ func testBuildCompiledConfigHappyPath(t *testing.T) {
 			{Header: &corev3.HeaderValue{Key: "x-rl-policy", Value: "test"}},
 		},
 		StatusOnError: &typev3.HttpStatus{Code: typev3.StatusCode_BadGateway}, // 502
-		StatPrefix:    "tenant-foo",
+		// `tenant_foo`, not `tenant-foo`: phase 81's §5.1 arm 16 charset guard
+		// PARSE-REJECTs a `-` in stat_prefix (it would panic
+		// newFilterStats -> NewCounterIfAbsent). Repaired in the same commit
+		// as the guard; the reject itself is pinned by
+		// TestBuildCompiledConfig_StatPrefixCharset.
+		StatPrefix: "tenant_foo",
 	}
 
 	cc, err := buildCompiledConfig(toAnyRL(t, c), h2Ctx)
@@ -613,12 +618,187 @@ func testBuildCompiledConfigHappyPath(t *testing.T) {
 	if cc.statusOnError != 502 {
 		t.Errorf("statusOnError: got %d, want 502", cc.statusOnError)
 	}
-	if cc.statPrefix != "tenant-foo" {
-		t.Errorf("statPrefix: got %q, want %q", cc.statPrefix, "tenant-foo")
+	if cc.statPrefix != "tenant_foo" {
+		t.Errorf("statPrefix: got %q, want %q", cc.statPrefix, "tenant_foo")
 	}
 	if len(cc.responseHeadersToAdd) != 1 {
 		t.Errorf("responseHeadersToAdd len: got %d, want 1", len(cc.responseHeadersToAdd))
 	}
+}
+
+// ----------------------------------------------------------------------------
+// TestBuildCompiledConfig_StatPrefixCharset — phase 81 §5.1 arm 16.
+//
+// Source H of the stats-name-charset-guards row: the filter-config
+// `stat_prefix` (AMEND-3 13th field) flows unvalidated into newFilterStats ->
+// (*stats.Registry).NewCounterIfAbsent, whose checkName PANICS the process at
+// listener construction on a name that fails stats.IsValidName. The guard
+// probes the ASSEMBLED counter name, never the bare token, because
+// stats.IsValidName is whole-string anchored and `stat_prefix` occupies an
+// INTERIOR segment of `cluster.<rls>.ratelimit.<stat_prefix>.<leaf>`: at that
+// position digit-leading, dot-leading and bare-digit tokens are all LEGAL,
+// and a bare-token probe would boot-reject configs that today boot, serve and
+// register a perfectly valid counter. The accept arms below pin exactly that.
+// ----------------------------------------------------------------------------
+
+func TestBuildCompiledConfig_StatPrefixCharset(t *testing.T) {
+	h2Ctx := ratelimitFactoryCtxWithClusterMgr(mkRatelimitH2ClusterMgr(t, rlsClusterName_test))
+
+	cases := []struct {
+		name string
+		// statPrefix is the operator-supplied token under test.
+		statPrefix string
+		// wantErr is the byte-stable reject wording, or "" for an accept arm.
+		wantErr string
+		// wantFMAName is the counter name newFilterStats registers for an
+		// accept arm — asserted so the guard's probe shape cannot drift away
+		// from the name actually registered.
+		wantFMAName string
+	}{
+		// ---- Reject arms: characters outside the stats.NamePattern alphabet.
+		{
+			name:       "Reject_Hyphen",
+			statPrefix: "tenant-foo",
+			wantErr:    parseRejectStatPrefixInvalid,
+		},
+		{
+			name:       "Reject_Space",
+			statPrefix: "tenant foo",
+			wantErr:    parseRejectStatPrefixInvalid,
+		},
+		{
+			name:       "Reject_Slash",
+			statPrefix: "tenant/foo",
+			wantErr:    parseRejectStatPrefixInvalid,
+		},
+		{
+			name:       "Reject_Colon",
+			statPrefix: "tenant:foo",
+			wantErr:    parseRejectStatPrefixInvalid,
+		},
+		// ---- Accept arm: an ordinary valid token passes through verbatim.
+		{
+			name:        "Accept_ValidPassthrough",
+			statPrefix:  "tenant_foo",
+			wantFMAName: "cluster." + rlsClusterName_test + ".ratelimit.tenant_foo.failure_mode_allowed",
+		},
+		// ---- Accept arm: the empty token. LIVE and landed — newFilterStats
+		// elides the segment wholesale (including its leading dot), so the
+		// guard keeps its `sp != ""` arm and never probes a name that is not
+		// the one registered.
+		{
+			name:        "Accept_EmptyPassthrough",
+			statPrefix:  "",
+			wantFMAName: "cluster." + rlsClusterName_test + ".ratelimit.failure_mode_allowed",
+		},
+		// ---- Accept arms proving the assembled probe is NOT a bare probe.
+		// Each of these FAILS stats.IsValidName as a bare token yet is a
+		// legal interior segment; rejecting them would be a regression.
+		{
+			name:        "Accept_DigitLeading_InteriorLegal",
+			statPrefix:  "0policy",
+			wantFMAName: "cluster." + rlsClusterName_test + ".ratelimit.0policy.failure_mode_allowed",
+		},
+		{
+			name:        "Accept_BareDigit_InteriorLegal",
+			statPrefix:  "9",
+			wantFMAName: "cluster." + rlsClusterName_test + ".ratelimit.9.failure_mode_allowed",
+		},
+		{
+			name:        "Accept_LeadingDot_InteriorLegal",
+			statPrefix:  ".policy",
+			wantFMAName: "cluster." + rlsClusterName_test + ".ratelimit..policy.failure_mode_allowed",
+		},
+		// ---- ACCEPT-PIN for the DELIBERATELY INHERITED interior
+		// empty-segment hole (SPEC §13.1).
+		//
+		// stats.IsValidName("a..b") == true, so a trailing-dot stat_prefix
+		// assembles to a name carrying an empty interior segment
+		// (`...ratelimit.policy..failure_mode_allowed`) that the registry
+		// ACCEPTS and registers. This arm pins that ACCEPTANCE on purpose.
+		// It is NOT an oversight and it is NOT to be "fixed" here: closing
+		// the empty-segment hole is a whole-registry change owned by the
+		// successor row `stats-name-empty-segment-guards`. If a later change
+		// makes this arm fail, that change belongs to that row, not this one.
+		{
+			name:        "AcceptPin_TrailingDot_InheritedEmptySegmentHole",
+			statPrefix:  "policy.",
+			wantFMAName: "cluster." + rlsClusterName_test + ".ratelimit.policy..failure_mode_allowed",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := validRateLimitConfig()
+			c.StatPrefix = tc.statPrefix
+
+			cc, err := buildCompiledConfig(toAnyRL(t, c), h2Ctx)
+
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("buildCompiledConfig(stat_prefix=%q): want error %q, got nil", tc.statPrefix, tc.wantErr)
+				}
+				if err.Error() != tc.wantErr {
+					t.Errorf("buildCompiledConfig(stat_prefix=%q) error = %q; want %q", tc.statPrefix, err.Error(), tc.wantErr)
+				}
+				if cc != nil {
+					t.Errorf("buildCompiledConfig(stat_prefix=%q): want nil config on reject, got %+v", tc.statPrefix, cc)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("buildCompiledConfig(stat_prefix=%q): want accept, got error %v", tc.statPrefix, err)
+			}
+			if cc.statPrefix != tc.statPrefix {
+				t.Errorf("statPrefix: got %q, want %q", cc.statPrefix, tc.statPrefix)
+			}
+
+			// Close the loop: the accepted token must survive the REAL
+			// registration path. NewCounterIfAbsent panics on an invalid
+			// name, so this sub-assertion is the actual crash-safety proof —
+			// the guard's probe is only trustworthy if it predicts this.
+			reg := stats.NewRegistry()
+			fs := newFilterStats(reg, cc.rlsClusterName, cc.statPrefix)
+			if fs.failureModeAllowed == nil {
+				t.Fatalf("newFilterStats(stat_prefix=%q): failure_mode_allowed counter is nil", tc.statPrefix)
+			}
+			if got := fs.failureModeAllowed.Name(); got != tc.wantFMAName {
+				t.Errorf("registered counter name = %q; want %q", got, tc.wantFMAName)
+			}
+			if !stats.IsValidName(fs.failureModeAllowed.Name()) {
+				t.Errorf("registered counter name %q fails stats.IsValidName", fs.failureModeAllowed.Name())
+			}
+		})
+	}
+
+	// ---- Ordering-precedence pin.
+	//
+	// The charset arm needs the resolved RLS cluster name to assemble its
+	// probe, so it necessarily fires AFTER the arms 6-12 cluster-load gates.
+	// A config carrying BOTH an unknown cluster AND an invalid stat_prefix
+	// therefore reports the CLUSTER error. This is ACCEPTED, and this arm
+	// exists so a later reader cannot silently hoist the guard above the
+	// cluster gates (which would force a bare-token probe and break the
+	// Accept_* arms above).
+	t.Run("ClusterErrorPrecedesCharsetError", func(t *testing.T) {
+		otherCtx := ratelimitFactoryCtxWithClusterMgr(mkRatelimitH2ClusterMgr(t, "some_other_cluster"))
+
+		c := validRateLimitConfig()
+		c.StatPrefix = "tenant-foo" // would trip the charset arm on its own
+
+		_, err := buildCompiledConfig(toAnyRL(t, c), otherCtx)
+		if err == nil {
+			t.Fatal("buildCompiledConfig: want error, got nil")
+		}
+		wantCluster := `ratelimit: rate_limit_service.grpc_service: unknown cluster "` + rlsClusterName_test + `"`
+		if err.Error() != wantCluster {
+			t.Errorf("error = %q; want the CLUSTER arm %q (charset arm must not preempt arms 6-12)", err.Error(), wantCluster)
+		}
+		if strings.Contains(err.Error(), parseRejectStatPrefixInvalid) {
+			t.Errorf("error = %q; the charset arm preempted the cluster arm — the guard was hoisted above validateGrpcServiceAndResolveCluster", err.Error())
+		}
+	})
 }
 
 // ----------------------------------------------------------------------------
@@ -835,6 +1015,12 @@ func TestParseRejectConstants_ByteStable(t *testing.T) {
 			"S51_ClusterManagerNotAvailable",
 			parseRejectClusterManagerNotAvailable,
 			"ratelimit: rate_limit_service.grpc_service: cluster manager not available (FactoryCtx.ClusterManager is nil)",
+		},
+		// §5.1 charset arm 16 (phase 81 stats-name-charset-guards).
+		{
+			"S51_StatPrefixInvalid",
+			parseRejectStatPrefixInvalid,
+			"ratelimit: stat_prefix contains characters invalid for a metric name",
 		},
 		// §5.2 envoy-go-strict project-local arms (ADR-0200).
 		{

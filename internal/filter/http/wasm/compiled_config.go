@@ -179,6 +179,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 
 	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
+	"github.com/pgdad/envoy-go/internal/stats"
 	"github.com/pgdad/envoy-go/internal/stats/dynamic"
 	internalwasm "github.com/pgdad/envoy-go/internal/wasm"
 )
@@ -389,6 +390,28 @@ const (
 	// env_vars_cap_exceeded counter on this reject path; Task 7 lands the
 	// reject only.
 	parseRejectEnvVarsCapExceeded = "wasm: config.vm_config.environment_variables exceeds the envoy-go-strict cap (max 64 entries, max 4096 bytes per value)"
+
+	// -------------------------------------------------------------------------
+	// phase-81 (`stats-name-charset-guards`) source C — PluginConfig.name
+	// stat-name charset guard.
+	// -------------------------------------------------------------------------
+
+	// PluginConfig.name is operator-supplied and is interpolated into EVERY
+	// per-plugin stat name as `wasm.<name>.<suffix>` (16 counters via
+	// newFilterStats) plus the per-plugin *dynamic.Registry scope prefix
+	// `wasm.<name>`. stats.Registry.checkName PANICS (it does not error) on a
+	// name failing stats.NamePattern, and nothing recovers it — so an
+	// unguarded operator token is a config-triggered process crash at listener
+	// build (ADR-0059 keeps the panic correct for PROGRAMMER errors; this is
+	// the matching input-boundary check for the OPERATOR surface).
+	//
+	// %q-formatted at the use site with the offending name + %s with the
+	// pattern the assembled scope must satisfy. NOT a numbered 25.x arm and
+	// deliberately NOT added to TestParseRejectConstants_ByteStable (that
+	// roster is closed over the parent §6.2 / 25.2 §6.2 numbered arms and
+	// carries its own row-count gate); pinned instead by
+	// TestBuildCompiledConfig_PluginNameCharset_Table.
+	parseRejectPluginNameInvalidFmt = "wasm: config.name %q contains characters that are invalid in a stat name (the assembled per-plugin stat scope wasm.<name>.* must match %s; envoy-go-strict)"
 )
 
 // -----------------------------------------------------------------------------
@@ -963,6 +986,74 @@ func buildCompiledConfigImpl(ctx context.Context, typedConfig *anypb.Any, factor
 	if err != nil {
 		// PARSE-REJECT arms 19-23 bubble up byte-stable per D-25.2-P5.
 		return nil, err
+	}
+
+	// -------------------------------------------------------------------------
+	// phase-81 source C — PluginConfig.name stat-name charset guard.
+	// -------------------------------------------------------------------------
+	//
+	// pc.GetName() flows UNVALIDATED into two stat-name registration paths
+	// further down this same function:
+	//
+	//  (1) newFilterStats(factoryCtx.Stats, pc.GetName()) — registers the 16
+	//      per-plugin counters `wasm.<name>.<suffix>` via NewCounterIfAbsent,
+	//      whose checkName PANICS on a name failing stats.NamePattern. No
+	//      recover() sits on the listener-build path ⇒ un-recovered process
+	//      crash from operator config.
+	//  (2) dynamic.NewRegistry(factoryCtx.Stats, "wasm."+pc.GetName(), ...)
+	//      below. That path is already fail-SAFE on its own (Registry.Register
+	//      pre-validates composeFullName via stats.IsValidName and returns
+	//      ErrBadArgument rather than panicking), but it derives from the SAME
+	//      pc.GetName(), so this single guard covers it: both probes have the
+	//      shape "wasm." + name + "." + <fixed suffix that begins with a letter
+	//      and ends alphanumeric>, which stats.NamePattern accepts iff `name`
+	//      draws only from [a-zA-Z0-9_.]. The two probes are therefore
+	//      result-EQUIVALENT for every possible name.
+	//
+	// Probe the ASSEMBLED name, NEVER the bare token. stats.NamePattern is
+	// whole-string anchored (`^[a-zA-Z_](...)?$`), so a bare-token probe would
+	// reject names that are perfectly legal at this INTERIOR segment position
+	// ("9x", "_x", "x_", "") and would boot-reject working configs. Mirrors the
+	// landed incumbents at internal/filter/http/lua/compiled_config.go and
+	// internal/filter/network/rbac/rbac.go.
+	//
+	// Suffix choice: statNameHttpCallDispatchUnknownCluster, the longest of the
+	// 16 per-plugin suffixes. All 16 begin with a letter and end alphanumeric,
+	// so every one of them yields the identical accept/reject verdict; longest
+	// is the conservative pin, not a semantic requirement.
+	//
+	// EMPTY name passes through DELIBERATELY ("wasm..http_call_..." is valid —
+	// interior consecutive dots are permitted) preserving the empty-name
+	// carve-out that arm 26 / registerPluginConfigName depend on. By the same
+	// rule a TRAILING-dot name ("p.") assembles to "wasm.p..<suffix>" and is
+	// ALSO ACCEPTED. That interior empty-segment hole is INHERITED DELIBERATELY
+	// per phase-81 SPEC §13.1 and is deferred to the successor row
+	// `stats-name-empty-segment-guards`; it is pinned as an ACCEPT by
+	// TestBuildCompiledConfig_PluginNameCharset_TrailingDotAcceptPin. Do not
+	// "fix" it here.
+	//
+	// PLACEMENT — LOAD-BEARING, NOT STYLISTIC. Three constraints:
+	//
+	//  (a) BEFORE arm 26 below, so the guard also fires on the boot-time
+	//      validate-only shape-check (validatePerRouteWasm →
+	//      validateWasmConfigShape → this body with validateOnly=true). Arm 26
+	//      is SKIPPED under validateOnly and the validate-only short-circuit
+	//      return sits FURTHER DOWN (after CompileModule), so anything placed
+	//      after that return would miss the boot-time per-route tier entirely.
+	//  (b) BEFORE the `stats := newFilterStats(...)` ShortVarDecl below. Go
+	//      scopes that local from its own declaration onward, so the `stats`
+	//      PACKAGE selector still resolves HERE. Moving this guard below that
+	//      line rebinds `stats` to *filterStats and FAILS TO COMPILE. Do not
+	//      relocate it downward.
+	//  (c) AT THE pc.GetName() BOUNDARY — not inside compiledConfig
+	//      construction, not in a pluginName accessor, not as an unconditional
+	//      precondition in newFilterStats. Tests build &compiledConfig{
+	//      pluginName: ...} by STRUCT LITERAL with tokens that fail
+	//      stats.IsValidName (abi_callbacks_test.go: "my-plugin"); those paths
+	//      register no stat and must stay green. Relocating the guard onto the
+	//      field / accessor / newFilterStats turns them into a hard red.
+	if !stats.IsValidName("wasm." + pc.GetName() + "." + statNameHttpCallDispatchUnknownCluster) {
+		return nil, fmt.Errorf(parseRejectPluginNameInvalidFmt, pc.GetName(), stats.NamePattern)
 	}
 
 	// Arm 26: cross-PluginConfig duplicate PluginConfig.name registry consult.

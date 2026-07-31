@@ -6,6 +6,8 @@ import (
 	"time"
 
 	zookeeper_proxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/zookeeper_proxy/v3"
+
+	"github.com/pgdad/envoy-go/internal/stats"
 )
 
 // Wire opcodes (upstream decoder.h:30-58; AMEND-A6 — gaps, a negative value,
@@ -147,6 +149,7 @@ const (
 // These strings are byte-stable from this commit forward — DO NOT CHANGE.
 const (
 	errStatPrefixRequired               = "zookeeper_proxy: stat_prefix is required"
+	errStatPrefixInvalid                = "zookeeper_proxy: stat_prefix contains characters invalid for a metric name"
 	errLatencyOverrideThresholdRequired = "zookeeper_proxy: latency_threshold_overrides: threshold is required"
 	errLatencyOverrideThresholdTooSmall = "zookeeper_proxy: latency_threshold_overrides: threshold must be at least 1ms"
 	errLatencyOverrideOpcodeUndefined   = "zookeeper_proxy: latency_threshold_overrides: opcode is not a defined opcode"
@@ -168,6 +171,44 @@ const (
 func parseConfig(msg *zookeeper_proxyv3.ZooKeeperProxy) (*compiledConfig, error) {
 	if msg.GetStatPrefix() == "" {
 		return nil, errors.New(errStatPrefixRequired)
+	}
+	// stat_prefix character-class guard (ADR-0065 §Consequences (e)).
+	// newRosterStats (stats.go) assembles stat_prefix + ".zookeeper." +
+	// <suffix> and hands it to statroster.New, which reaches
+	// Registry.checkName — that PANICS on a name failing stats.NamePattern, so
+	// an unguarded operator token is a config-triggered process crash.
+	//
+	// LEADING POSITION — the one source in phase 81 where the variable segment
+	// starts the assembled name, with no fixed segment to its left. Measured
+	// over the row's nine-token roster, bare and assembled agree on 8 of 9: the
+	// sole disagreement is a trailing-dot token, which the assembled probe
+	// ACCEPTS ("foo." → "foo..zookeeper.…", an interior empty segment) and a
+	// bare probe would reject. The assembled probe is used ANYWAY, for
+	// uniformity with the other eight guards in the row and because ADR-0065
+	// §Consequences (b) states the rule as "validate the longest assembled
+	// name" — the rule is positional-invariant even where the position makes it
+	// nearly equivalent to the bare check. The executable pin of the
+	// leading-vs-interior measurement is internal/stats/name_position_test.go.
+	//
+	// "getallchildrennumber_decoder_error" is the LONGEST of the 201 roster
+	// suffixes (34 bytes; rosterSuffixes, stats.go — re-derived, not assumed)
+	// and longer than the dynamic "auth.<scheme>_rq" family's widest member.
+	// Per ADR-0065 §Consequences (b) the longest suffices: the other suffixes
+	// differ only in characters already inside NamePattern's permitted class.
+	//
+	// There is deliberately NO `!= ""` arm: empty is rejected immediately above
+	// by errStatPrefixRequired. That ORDER is load-bearing here, unlike at the
+	// interior sources — an empty token assembles to ".zookeeper.…", which is
+	// INVALID, so a reordering would silently change the empty-prefix error
+	// from errStatPrefixRequired to errStatPrefixInvalid. config_test.go pins
+	// the empty arm against errStatPrefixRequired for exactly that reason.
+	//
+	// INHERITED HOLE, DELIBERATE (SPEC §13.1): stats.IsValidName("a..b") is
+	// true, so a trailing-dot stat_prefix is ACCEPTED. Expected; deferred whole
+	// to successor row stats-name-empty-segment-guards. config_test.go carries
+	// an accept-pin arm so a later "fix" cannot land silently.
+	if !stats.IsValidName(msg.GetStatPrefix() + ".zookeeper.getallchildrennumber_decoder_error") {
+		return nil, errors.New(errStatPrefixInvalid)
 	}
 
 	cfg := &compiledConfig{

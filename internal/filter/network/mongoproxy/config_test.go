@@ -115,18 +115,74 @@ func TestParseRejectConstants_ByteStable(t *testing.T) {
 	// ADR-0080 byte-stable wording guard (D-S29.1-1). DO NOT update these to
 	// match a code change — a mismatch means the production wording regressed.
 	want := map[string]string{
-		"stat_prefix": "mongo_proxy: stat_prefix is required",
-		"specifier":   "mongo_proxy: delay: a delay type must be specified",
-		"fixed_delay": "mongo_proxy: delay: fixed_delay must be greater than 0s",
-		"denominator": "mongo_proxy: delay: percentage denominator is not a defined value",
+		"stat_prefix":         "mongo_proxy: stat_prefix is required",
+		"stat_prefix_invalid": "mongo_proxy: stat_prefix contains characters invalid for a metric name",
+		"specifier":           "mongo_proxy: delay: a delay type must be specified",
+		"fixed_delay":         "mongo_proxy: delay: fixed_delay must be greater than 0s",
+		"denominator":         "mongo_proxy: delay: percentage denominator is not a defined value",
 	}
 	got := map[string]string{
 		"stat_prefix": errStatPrefixRequired, "specifier": errDelaySpecifierRequired,
 		"fixed_delay": errDelayFixedDelayTooSmall, "denominator": errDelayDenominatorInvalid,
+		"stat_prefix_invalid": errStatPrefixInvalid,
 	}
 	for k, w := range want {
 		if got[k] != w {
 			t.Errorf("%s arm = %q, want %q", k, got[k], w)
 		}
+	}
+}
+
+// TestParseConfig_StatPrefixCharsetGuard covers the phase-81 stat_prefix
+// character-class guard in parseConfig. Without it, newMongoStats assembles
+// "mongo." + stat_prefix + "." + <leaf> and Registry.checkName PANICS —
+// a config-triggered process crash (ADR-0065 §Consequences (e)).
+//
+// The guard probes the ASSEMBLED name at an INTERIOR segment position, so the
+// accepted set is WIDER than a bare-token check would give. Two rows below are
+// deliberate ACCEPT-pins rather than reject arms; both are load-bearing.
+func TestParseConfig_StatPrefixCharsetGuard(t *testing.T) {
+	cases := []struct {
+		name    string
+		prefix  string
+		wantErr string // "" ⇒ accepted
+	}{
+		{"valid underscore prefix", "mongo_a", ""},
+		{"hyphen rejected", "my-mongo", errStatPrefixInvalid},
+		{"space rejected (the ADR-0065 fuzz seed shape)", "0000000000 0", errStatPrefixInvalid},
+		// The empty prefix is caught by the EARLIER required-check; it must NOT
+		// surface as the charset error even though "mongo..<leaf>" is valid.
+		{"empty yields REQUIRED, not INVALID", "", errStatPrefixRequired},
+		// ACCEPT-PIN (SPEC §13.1): the interior empty-segment hole is INHERITED
+		// DELIBERATELY. stats.IsValidName("a..b") is true, so "foo." assembles
+		// to "mongo.foo..cx_destroy_remote_with_active_rq" and is ACCEPTED.
+		// Deferred whole to successor row stats-name-empty-segment-guards.
+		// DO NOT "fix" this arm into a reject.
+		{"ACCEPT-PIN trailing dot (SPEC §13.1 inherited hole)", "foo.", ""},
+		// ACCEPT-PIN: the interior probe accepts a leading-digit token that the
+		// bare-guarded thriftproxy / kafkabroker / redisproxy siblings REJECT.
+		// Recorded at the guard site; the divergence is in the error surface,
+		// not in what can crash.
+		{"ACCEPT-PIN leading digit (interior-position divergence)", "1abc", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := parseConfig(&mongo_proxyv3.MongoProxy{StatPrefix: tc.prefix})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Errorf("parseConfig(%q) err = %v, want nil", tc.prefix, err)
+				}
+				if cfg == nil {
+					t.Errorf("parseConfig(%q) cfg = nil, want non-nil", tc.prefix)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("parseConfig(%q) err = nil, want %q", tc.prefix, tc.wantErr)
+			}
+			if err.Error() != tc.wantErr {
+				t.Errorf("parseConfig(%q) err = %q, want %q", tc.prefix, err.Error(), tc.wantErr)
+			}
+		})
 	}
 }

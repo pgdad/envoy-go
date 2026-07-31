@@ -136,6 +136,7 @@ func TestWireOpcodeToOpname(t *testing.T) {
 func TestParseRejectConstants_ByteStable(t *testing.T) {
 	cases := []struct{ name, constant, want string }{
 		{"stat-prefix-required", errStatPrefixRequired, "zookeeper_proxy: stat_prefix is required"},
+		{"stat-prefix-invalid", errStatPrefixInvalid, "zookeeper_proxy: stat_prefix contains characters invalid for a metric name"},
 		{"latency-override-threshold-required", errLatencyOverrideThresholdRequired, "zookeeper_proxy: latency_threshold_overrides: threshold is required"},
 		{"latency-override-threshold-too-small", errLatencyOverrideThresholdTooSmall, "zookeeper_proxy: latency_threshold_overrides: threshold must be at least 1ms"},
 		{"latency-override-opcode-undefined", errLatencyOverrideOpcodeUndefined, "zookeeper_proxy: latency_threshold_overrides: opcode is not a defined opcode"},
@@ -195,5 +196,64 @@ func TestParseConfig_OneMillisecondAccepted(t *testing.T) {
 			{Opcode: zookeeper_proxyv3.LatencyThresholdOverride_Ping, Threshold: durationpb.New(time.Millisecond)}}})
 	if err != nil {
 		t.Fatalf("parseConfig(1ms thresholds) = %v, want nil (gte is inclusive)", err)
+	}
+}
+
+// TestParseConfig_StatPrefixCharsetGuard covers the phase-81 stat_prefix
+// character-class guard in parseConfig. Without it, newRosterStats assembles
+// stat_prefix + ".zookeeper." + <suffix> and Registry.checkName PANICS —
+// a config-triggered process crash (ADR-0065 §Consequences (e)).
+//
+// zookeeper_proxy is the ONE phase-81 source whose variable segment LEADS the
+// assembled name. That makes the assembled probe agree with a bare-token check
+// on 8 of the row's 9 measured token shapes — the exception is the trailing-dot
+// token, MEASURED (not assumed) to be ACCEPTED here. The rows below pin the
+// leading-position behavior that the interior sources do NOT share: a
+// leading-digit and a leading-dot prefix are REJECTED here, where mongo_proxy's
+// interior probe accepts both.
+func TestParseConfig_StatPrefixCharsetGuard(t *testing.T) {
+	cases := []struct {
+		name    string
+		prefix  string
+		wantErr string // "" ⇒ accepted
+	}{
+		{"valid underscore prefix", "zk_a", ""},
+		{"hyphen rejected", "my-zk", errStatPrefixInvalid},
+		{"space rejected (the ADR-0065 fuzz seed shape)", "zk 1", errStatPrefixInvalid},
+		// The empty prefix is caught by the EARLIER required-check. Order is
+		// LOAD-BEARING at a leading position: "" assembles to ".zookeeper.…",
+		// which is INVALID, so a reordering would silently swap this wording.
+		{"empty yields REQUIRED, not INVALID", "", errStatPrefixRequired},
+		// LEADING-position-only rejects — the interior sources accept both.
+		{"leading digit rejected (leading position)", "1abc", errStatPrefixInvalid},
+		{"leading dot rejected (leading position)", ".zk", errStatPrefixInvalid},
+		// ACCEPT-PIN (SPEC §13.1): the interior empty-segment hole is INHERITED
+		// DELIBERATELY. "foo." assembles to
+		// "foo..zookeeper.getallchildrennumber_decoder_error", and
+		// stats.IsValidName("a..b") is true, so it is ACCEPTED — MEASURED, and
+		// the sole bare-vs-assembled disagreement at this position. Deferred
+		// whole to successor row stats-name-empty-segment-guards. DO NOT "fix"
+		// this arm into a reject.
+		{"ACCEPT-PIN trailing dot (SPEC §13.1 inherited hole)", "foo.", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := parseConfig(&zookeeper_proxyv3.ZooKeeperProxy{StatPrefix: tc.prefix})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Errorf("parseConfig(%q) err = %v, want nil", tc.prefix, err)
+				}
+				if cfg == nil {
+					t.Errorf("parseConfig(%q) cfg = nil, want non-nil", tc.prefix)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("parseConfig(%q) err = nil, want %q", tc.prefix, tc.wantErr)
+			}
+			if err.Error() != tc.wantErr {
+				t.Errorf("parseConfig(%q) err = %q, want %q", tc.prefix, err.Error(), tc.wantErr)
+			}
+		})
 	}
 }

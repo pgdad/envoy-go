@@ -59,6 +59,17 @@ const gzipLibraryTypeURL = "type.googleapis.com/envoy.extensions.compression.gzi
 // compression is attempted.
 const defaultMinContentLength uint32 = 30
 
+// rejectLibraryNameInvalidFmt is the parse-reject wording emitted by New when
+// the operator-supplied `compressor_library.name` carries characters that
+// would make the assembled 17-counter stat names fail stats.NamePattern.
+// Format args: (1) the offending name verbatim, (2) the regex source
+// (stats.NamePattern — referenced, NOT hand-copied, so the wording cannot
+// drift from internal/stats's nameRE). Mirrors the lua
+// parseRejectStatPrefixInvalidFmt wording shape.
+//
+// Byte-pinned by TestRow81_CompressorRejectWordingPin.
+const rejectLibraryNameInvalidFmt = "compressor: compressor_library.name: invalid characters in %q (must match %s)"
+
 // defaultContentTypes is the 8-entry default content_type list per SPEC §11.1
 // (compressor.proto v1.37.2 line 49-65 verbatim). When
 // response_direction_config.common_config.content_type is unset OR empty,
@@ -291,6 +302,45 @@ func New(tc *anypb.Any, ctx envoyhttp.FactoryCtx) (envoyhttp.FilterInstanceFacto
 	gzipCfg, libraryName, err := unmarshalCompressorLibrary(cfg.GetCompressorLibrary())
 	if err != nil {
 		return nil, err
+	}
+	// Stat-name charset guard (phase-81 row `stats-name-charset-guards`,
+	// source G). libraryName is the operator-supplied
+	// `compressor_library.name`; newFilterStats below interpolates it VERBATIM
+	// into all 17 counter names. stats.Registry.NewCounter PANICS via
+	// checkName on a name failing stats.NamePattern, and New runs on the
+	// listener-construction path — so without this guard a token containing
+	// `-`, ` `, `/`, … is a config-triggered PROCESS CRASH rather than a
+	// config rejection.
+	//
+	// Probe the ASSEMBLED name, never the bare token. stats.NamePattern is
+	// whole-string anchored, so a bare-token probe would apply the
+	// leading-char rule (`^[a-zA-Z_]`) and the trailing-char rule to a token
+	// that in fact sits at an INTERIOR segment position, boot-rejecting
+	// working configs (a leading-digit or trailing-dot token is perfectly
+	// legal there). Mirrors internal/filter/network/rbac/rbac.go and
+	// internal/filter/http/lua/compiled_config.go. The probe reproduces the
+	// exact shape newFilterStats registers; ctx.StatPrefix is itself already
+	// IsValidName-guarded upstream at internal/filter/hcm/config.go (the
+	// `http.<prefix>.downstream_rq_total` probe), so it cannot be the cause
+	// of a rejection misattributed here. All 17 counter names put the token
+	// at the same interior position and therefore share this verdict — see
+	// TestRow81_CompressorLibraryNameGuard's all-17 cross-check.
+	//
+	// The `tok != ""` skip is LOAD-BEARING, not an optimization. The empty
+	// library name is the RATIFIED D5 shape (ADR-0132 §Decision (v)) that
+	// emits `compressor..gzip.<counter>` with consecutive dots; see the
+	// "DO NOT collapse" pin on newFilterStats below. Independently verified:
+	// stats.IsValidName("compressor..gzip.total") == true — NamePattern
+	// permits INTERIOR consecutive dots (only a trailing dot is rejected), so
+	// this guard leaves D5 intact even without the skip. The skip makes that
+	// independent of the probe's exact shape. Pinned by
+	// TestRow81_CompressorD5NonRegression, which drives this production path.
+	if tok := libraryName; tok != "" {
+		probe := "http." + ctx.StatPrefix + ".compressor." + tok +
+			".gzip.response.total_uncompressed_bytes"
+		if !stats.IsValidName(probe) {
+			return nil, fmt.Errorf(rejectLibraryNameInvalidFmt, tok, stats.NamePattern)
+		}
 	}
 	compiled, err := buildCompiledConfig(cfg, gzipCfg, libraryName)
 	if err != nil {

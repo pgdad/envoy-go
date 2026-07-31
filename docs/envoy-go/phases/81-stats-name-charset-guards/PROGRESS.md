@@ -354,3 +354,133 @@ A3's three-arm cross-product, all executed: unconditional **BARE** ⇒ wasm `ok`
 ## Next
 
 **→ the phase-81 IMPL.** Execute the twelve tasks against ~850 net `.go`. **Land T7 and T8 atomically**; **land T3's `tenant-foo` repair in the same commit as guard H**; **pin guard C at the `pc.GetName()` boundary**; and complete **ADR-0303 §Decision + §Consequences with the STATUS flip `PROPOSED` → `COMPLETE` in that same commit.**
+
+---
+
+# IMPL record (2026-07-31)
+
+**Stage:** IMPL (lifecycle-state `3` → `DONE`). **ROW 81 FLIPPED `in-progress` → `done`; THE PHASE IS CLOSED.** Sentinel `want` STAYS **113** (this stage adds no row). Base master **`2a910ef2`** — taken from `git rev-parse master` at session start, not from any SHA quoted in the router. Worktree `/home/esa/git/envoy-go-wt/phase-81-impl`, branch `phase-81-impl`.
+
+## What was EXECUTED at this stage
+
+**Five implementation agents on disjoint package sets**, each in its own worktree off the same base, committing locally only and never pushing; the controller re-derived every load-bearing claim itself and integrated each branch by patch/cherry-pick with an `apply --check` gate first.
+
+| agent | tasks | headline |
+|---|---|---|
+| **A1** | T1 mongo, T2 zookeeper, T9a the segment-position table | **at zookeeper the empty-check ORDER is load-bearing** — no phase-81 document says so |
+| **A2** | T3 ratelimit + the corpus repair | **the `tok != ""` arm is a FIDELITY choice, not a safety gate**, proven by neutering it |
+| **A3** | T4 wasm | **the `newFilterStats` relocation claim is FALSE**, and the struct-literal roster is **five** sites, not two |
+| **A4** | T6 compressor | **the prescribed break arm is a VACUOUS BREAK MODE** — it cannot fire; substituted one that does |
+| **A5** | T5 D+E, T7 F1, T8 F2 (the keystone) | **F2 caught live exactly what F1 dropped**, turning the atomicity argument into an observation |
+
+All five reported `git status --porcelain` = **0 lines**, controller-re-confirmed. Zero pushes, zero branches beyond their own, zero docker containers created.
+
+## ⚠️ THE HEADLINE: THE ROW'S CENTRAL DECISION WAS RE-DERIVED INDEPENDENTLY AND HELD EXACTLY, WHILE FIVE OF THE PLAN'S SUPPORTING CLAIMS DID NOT
+
+The controller re-ran the segment-position cross-product inside `internal/stats` before dispatching anything: **LEADING disagrees on 1 of 9, INTERIOR on 5 of 9**, with the interior set exactly `0policy`, `policy.`, `.policy`, `9`, `""` — reproducing the PLAN's §1.1 measurement to the token. Every downstream `IsValidName` value the row depends on was confirmed in the same run: `a..b` **true**, `compressor..gzip.total` **true**, `tenant-foo` / `my-plugin` / `guest-side-config` all **false**, and mongo assembled `1abc` **true** against bare `1abc` **false**. **The decision to probe the assembled name at all nine sources is therefore executed fact at three independent levels** — controller, three agents at the PLAN, and five agents at the IMPL — and every guard shipped that way.
+
+⚠️ **What did not survive is the PLAN's account of *why* several of the constraints hold.** The constraints' conclusions all stand; five of their stated reasons were wrong, and each was caught by executing the counterfactual rather than reading it. That is the stage's real yield.
+
+## Refutation ledger — what EXECUTION found that the PLAN got wrong
+
+**Load-bearing:**
+
+1. ⚠️ **"Relocating guard C into `newFilterStats` turns `my-plugin` into a hard red" — FALSE.** `abi_callbacks_test.go:1453` sets `pluginName` by struct literal and reads it back through `GetProperty("plugin_name")`; it **never calls `newFilterStats`**. That relocation is the **vacuous** one. The two that genuinely redden are the other two the PLAN named. The pin at the `pc.GetName()` boundary stands; one of its three reasons is withdrawn.
+2. ⚠️ **The wasm struct-literal `pluginName:` roster is FIVE sites, not two.** `body_test.go:73` and `trailers_test.go:38` are fed from a `pluginName string` **parameter** and are invisible to any literal-value grep, plus the production site. **The two omitted sites are precisely the ones that decide claim 1**, so the undercount was load-bearing.
+3. ⚠️ **The compressor break arm the PLAN prescribed is a VACUOUS BREAK MODE.** "Drop the `tok != ""` skip so the guard rejects the empty name" cannot fire: with `tok == ""` the probe assembles to `…compressor..gzip.…`, an **interior** empty segment, which `NamePattern` accepts. Executed: `ok`, zero failures. Substituted a bare-token arm, which reds `TestRow81_CompressorD5NonRegression` specifically. `reference_vacuous_break_modes`.
+4. ⚠️ **D-81-EMPTY is decorative at every INTERIOR source — confirmed three independent ways this stage** (ratelimit empty-arm neutered to `true` ⇒ package green; the compressor arm above; the rbac skip confirmed inert because `namespacePrefix("")` substitutes `"rbac"`). ⚠️ **But the one place it IS live is the opposite of where anyone looked: source B.** An empty zookeeper prefix assembles to `.zookeeper.<leaf>` — a **leading** dot, hence **invalid** — so B is safe without an empty arm **only because the pre-existing `errStatPrefixRequired` check runs first**. That ordering is now load-bearing, is pinned, and hoisting the charset guard above it would silently change `0047-zookeeper-boot-reject`'s error string. Source A has no such coupling.
+5. ⚠️ **F2's aggregated-log-dedupe is NOT a precedent-free test shape, and the precedent the PLAN cited is not one.** `internal/stats/promskip_test.go` is an exact precedent — capture, flag/prefix reset, cleanup restore, non-empty-line count, must-not-parallelize note — with three more in the tree. Meanwhile the mongo `codec_test.go:517`/`:538` pair the PLAN called "the precedent for capture" are **guard-skip no-panic** precedents containing **no log capture at all**. A budget line and a test shape were both derived from that mis-citation.
+
+**Structural and numeric:**
+
+6. **The interior empty-segment hole covers LEADING dots and a bare `.`, not only trailing dots.** Every prior phase-81 document names only the trailing shape. Found twice independently (compressor, rbac). The prohibition bites only at a string boundary, which an interior token never occupies. Deferred candidate 1 is widened accordingly.
+7. **The stat-surface arm split `143 + 67 = 210` is wrong.** The real disjoint split at this tip is **175 Counter + 35 Gauge = 210 raw**, → **174 + 34 = 208** code sites after the two `internal/stats/doc.go` comment lines (one in each arm). The **208 / 36** denominator itself is exact and unmoved by this row.
+8. **The production edit surface is SEVEN files, not the nine PLAN §3 states.** §3 lists seven paths under a "9 files" heading.
+9. **Break-arm magnitudes are understated ~5×.** F1 gutted reds **36 subtests + 5 top-level tests**, not "~7 charset subtests"; the gate arm reds **12** names, not "~7".
+10. **`checkName` is at `registry.go:115-119`, not `113-118`** — `:113` is its doc comment. The same off-by-comment error the PLAN itself flagged for `namespacePrefix`, reproduced one paragraph later, and inherited into this stage's own briefs before an agent caught it.
+11. **"Longest suffix" is irrelevant to correctness, and it is not always unique.** Every per-plugin and per-library suffix begins with a letter and ends alphanumeric, so all yield the identical verdict for any token; `NamePattern` has no length bound. `response.total_uncompressed_bytes` **ties at 33 bytes** with `response.content_length_too_small`. The wasm break arm proved it from the other side: the panic fired on `executions`, the **shortest** suffix and the first registered. Retained as a documentation convention, recorded as such at each site.
+12. **The wasm "second registration path" was ALREADY fail-safe.** `dynamic.Registry.Register` pre-validates via `stats.IsValidName` and returns `ErrBadArgument`, with an in-code comment saying why. The guard covers it on a stronger argument than the PLAN's: both probes are **result-equivalent for every possible name**, not merely correlated.
+13. **The mongo leaf roster is 22 suffixes, not 23** (the 32-byte longest is unchanged); the zookeeper roster is exactly **201** as claimed. Both re-derived by execution rather than eyeballed.
+14. **Two incumbent guards carry stale cites** — `hcm/config.go:221`, `hcm/config.go:209`, `cluster/manager.go:205` are all wrong; the live sites are `internal/filter/hcm/config.go:267` and `internal/cluster/manager.go:419`, and `internal/filter/network/hcm/` does not exist. New comments were anchored on the probe **shape** instead.
+15. **`stats.NamePattern` is exported**, so the hand-copied `statNameRegexLiteral` the lua package maintains (with its own drift test) is unnecessary; the new guards consume the exported constant, making drift structurally impossible rather than test-detected.
+16. **The `STATE_HISTORY.md` tolerant-anchor count is 168, not the PLAN's 167** — that figure was measured at 434 lines, before the PLAN's own eviction append took the file to 436.
+17. **`SPEC §13.1` has no literal heading.** §13 is at `SPEC.md:417` and the empty-segment hole is its **item 1**; the guards' comments cite it as such.
+
+## ⚠️ THE COST: A MEASURED PROTOTYPE IS A LOWER BOUND, NOT AN ESTIMATE
+
+| bucket | PLAN (measured prototypes) | REALIZED | ratio |
+|---|---|---|---|
+| production `.go` | 165 | **424** | 2.57× |
+| test `.go` | 560 | **1812** | 3.24× |
+| **net total** | **725** (budget ~850, band 750-1000) | **2229** | **3.07×** |
+
+**16 files: 7 production, 9 test.** ⚠️ **THIS CROSSES BOOTSTRAP §6.1's `~1500` TRIGGER AND IS RECORDED AS A FINDING, NOT RETROACTIVELY SPLIT.** §6.1 gates the estimate the PLAN writes down; that estimate tripped neither threshold (12 tasks against ~25, ~850 against ~1500), so the split correctly did not fire at authoring time — the phase-80 precedent exactly. **This is the lineage's SECOND realized crossing, and the first in which the PLAN's estimate was itself measured-basis**: nine guards were built, run and read off `git diff --numstat` at the PLAN, and the row still ran 3× over them. The excess is almost entirely comment and regression-test volume — placement constraints, exemption rationales, accept-pin justifications the PLAN required at each site, plus regression arms for the assembled-probe decision that its task list did not enumerate. The coherent split axis (`81.1` = F1+F2+D+E, `81.2` = A+B+C+G+H) remains available and **unused**.
+
+**Task count: TWELVE enumerated, TWELVE executed.** The §6.1 third trigger (mid-execution `>~10` sub-steps) did **not** fire.
+
+## Sentinel — re-run MECHANICALLY after the ROADMAP flip. It does NOT fire; `stop` was NOT created
+
+Input measured **229 lines / 113 data rows**, so an empty result cannot read as a zero result.
+
+- **(1)** at `want=113`: **SILENT** — correct, every row is now `done`. ⚠️ **This is the one stage where silence is indistinguishable from a broken check, so the doctored-copy NC was MANDATORY and was run: row 62 flipped to `in-progress` on a scratch copy ⇒ `NOT DONE: row 62`.** The NC was **verified to have LANDED** by printing the doctored status field before trusting the result — the precise failure the PLAN hit when its `sed` missed the real column spacing. Denominator NC at `want=112` ⇒ `GATE FAIL: examined 113 data rows, expected 112`.
+- **(2)** **FIVE — `:191 :201 :211 :217 :225` — UNCHANGED. The THIRTY-FIRST consecutive phase at which it did not go down. STATED, not forecast. This row narrows NOTHING.**
+- **(3)** `NEVER OPENED: gRPC`, `NEVER OPENED: WASM`. NC: an invented slug fires.
+- ⇒ checks (2) and (3) both print, so **the sentinel does not fire**. `ls stop` ⇒ `No such file or directory`, and it was not created.
+
+**⚠️ THE LEAK CHECK WAS ARMED AT THIS STAGE AND PASSED.** Row 81's cell alone carries **0** sentinel matcher phrases, and the only family slug it prints is `Observability-family row`, already registered elsewhere — a use, not a mention. The extractor was negative-controlled: injecting a second slug into a scratch copy made it print. Row well-formedness unchanged: **NF=8**, flagged by neither arm of the disjunction gate; `ROADMAP.md` stays **229 lines / 113 data rows**.
+
+## Bookkeeping
+
+`DECISIONS.md` **17766 → 17796**; **ADR-0303 `PROPOSED` → `COMPLETE` with its §Decision + §Consequences in the SAME commit**, appended in place after the **retained** italic footer, no renumber and no separator. Invariants held: `^---$` **216**, retained footers **NINE**, headings **302**, ids 0001-0303 with one gap at ADR-0209, next-free **ADR-0304**, STATUS census **15 COMPLETE + 1 PROPOSED → 16 COMPLETE**. The recurrence guard (*a `PROPOSED` STATUS must carry no `### Decision` heading*) is silent on the landed tree **and fires on a doctored copy of the POST-flip state**, so its silence is meaningful. The block carries **no whole-file grep count** — the ADR-0296/0302 self-falsifying species is avoided by enumerating per site.
+
+`BEHAVIOR_CONTRACT.md` **5868 → 5870**. ⚠️ **The departure paragraph was RELOCATED before landing, for a reason worth recording.** Placed inline in the rbac stat subsection it would have shifted **nine** existing `BEHAVIOR_CONTRACT.md:<line>` citations by +2 — and every one of them lives in an **append-only or archived** document (`DECISIONS.md:17383`, `STATE_HISTORY.md`, historical phase records), so none could be repaired. All nine sit below line 5078; the file's own documented home for this material, `### Phase 16 forward-pointer notes`, sits at **5526** and is named by the rbac section itself. Landing there shifts **nothing** — verified mechanically against a stated denominator of **66** cites, zero at or above 5526, with `### Phase 16 forward-pointer notes` confirmed still at 5526 afterward. `reference_stale_cite_recurs_fix_by_pattern`, caught **before** landing rather than after.
+
+`STATE_HISTORY.md` **436 → 438**: §Recent was at its five-entry cap, so **`phase 80 (stats-sds-projection) SPEC done`** — **RE-DERIVED as oldest at this tip, not inherited** — was moved **VERBATIM**, its absence verified beforehand (**0** hits) with **firing NCs on three phase-79 siblings** (1 each), the migrated body confirmed **byte-identical** by `sha256sum`, and **the identity check itself negative-controlled** (a deliberately doctored copy correctly mismatched).
+
+## Gates — ACTUAL output
+
+- **Full 120-fixture differential: `INNER_EXIT=0`, `--- PASS` = 120, FAIL/SKIP EMPTY, `no driver registered` = 0, `panic|DATA RACE|SIGSEGV` = 0, `comm -3` against the fixture directory EMPTY, 402 s** — inside SPEC §3's ~400-430 s band and within 4 s of the PLAN's 406 s baseline. ⚠️ **This was the THIRD launch; see the abort section below.**
+- **h2spec**, run explicitly as a consumer **not** covered by `./test/differential/`: `INNER_EXIT=0`, **106 passed / 0 failed / 0 skipped** summed across the suite's reported groups, with the extractor negative-controlled (a synthetic `3 failed` line is seen). ⚠️ **The lineage's "53/53" figure is one half of that total** — the suite reports per-group counts and the run covers both arms; the method and denominator are stated here rather than the inherited number.
+- **`go test ./cmd/envoy-go/ -count=1`**: `INNER_EXIT=0`, 8.7 s. **The THIRD consumer of the binary**, which boots real configs and can red on a new boot reject. Neither the SPEC nor the router names it.
+- **Per-package** `go test -count=1` over the seven target packages plus `internal/rbac` and `internal/stats`: all `ok`. `-race`: all `ok` (nine packages, merged tree).
+- **`gofmt -l`** over all 16 touched files: **EMPTY OUTPUT** (it never exits non-zero; the gate is on output).
+- **`go vet`** over the eight packages: **0**.
+- **`golangci-lint run`** (v1.64.8) over the eight packages: **exit 0**. ⚠️ **Negative-controlled on the MERGED tree** — a British spelling injected into a comment fired `misspell` at exit 1, the doctored line was grep-confirmed present before the run, and the file was restored **byte-identical to the committed blob**. An empty lint result is not evidence the linter looked.
+- **`git diff go.mod go.sum`**: **0 lines**.
+- **Stat surface +0, by CALL-SITE ENUMERATION** (the `TestNoNewStat*` guards were proven blind at the PLAN). ARM 1 prints nothing **against a 476-line production input diff with 410 added lines**, and the matcher was negative-controlled against a synthetic registration line (⇒ 1), so the empty result is a real zero rather than a broken matcher. ARM 2 unmoved at **208 code sites / 36 production files**. ⚠️ **Never 208/84.**
+
+## ⚠️ THE DIFFERENTIAL ABORTED TWICE, AND THE NAMED DEFERRAL IS UNDERSTATED 4.7×
+
+Both aborts were the **driver-owned receiver port race**, not a regression: the failing bind is the fixture driver's **own** receiver on an **out-of-band kernel-ephemeral** port (43109, then 45951 — outside `20000-31007`, `11000-14999`, and every static fixture range), reached through the driver's `allocate → read → close → re-bind` TOCTOU window. Neither hardened half of `reference_differential_fullsuite_startup_flake` fired; an in-band recurrence of either would still be a FINDING.
+
+- **Run 1** — `INNER_EXIT=1`, aborted at **fixture 86 of 119** on `0085-otlp-access-log-operators`, **33 never ran**. ⚠️ **The harness notification reported "completed (exit code 0)".** `reference_harness_exit_code_is_not_command_exit_code`, **third consecutive instance**.
+- **Isolate re-run of `0085`** — **PASS**, with the selector match asserted **positively** (a real `--- PASS:` line, `no tests to run` ⇒ 0).
+- **Run 2** — `INNER_EXIT=1`, aborted at **fixture 84** on `0083-grpc-access-log-headers`, **35 never ran**.
+- **Run 3 — CLEAN. 120/120, `INNER_EXIT=0`, zero panics, `comm -3` EMPTY, 402 s.** That is the run the gate rests on.
+
+⚠️ **BUDGET CONSEQUENCE, CORRECTED UPWARD: the PLAN budgeted ~2 launches per green pass; this session needed THREE (~20 min of wall clock, plus a fourth short isolate run).** The observed abort rate was **2 in 3**, not 1 in 2.
+
+⚠️ **The PLAN names this deferral as "the ALS-family driver port race (`0081`/`0082`/`0083`)". Enumerated at this tip, the shape spans FOURTEEN fixtures across THREE families** — gRPC access-log (`0081`-`0083`), OTLP access-log (`0084`, `0085`), and the tracing receivers (`0087`, `0102`, `0105`-`0107`, `0114`-`0117`) — all carrying a driver-owned `ensureServer`. **4.7× understated.** It aborts the whole test binary rather than failing one subtest, so a naive `--- PASS` tally reads as "a few failures" rather than as an abort.
+
+⚠️ **A CONFOUND THIS SESSION HAD THAT THE PLAN DID NOT, RECORDED RATHER THAN ASSUMED AWAY:** two sibling Claude sessions were live on the same machine throughout, plus an unrelated long-running container, so ephemeral-port churn was higher than at the PLAN — a plausible reason the observed rate moved from 1-in-2 to 2-in-2. `reference_parallel_agents_shared_machine_namespaces`, at the level of **sessions** rather than agents. **No container was torn down**, by name or otherwise, because none was created by this session.
+
+## Six-gate (§7.5, `BOOTSTRAP_PROMPT.md` at the REPO ROOT — `:357`, `:360-365`, `:367`)
+
+- **(a) build + unit tests** — green, including `-race`.
+- **(b) differential** — see above.
+- **(c) conformance** — h2spec run explicitly as a distinct consumer; proxy-wasm **INHERITED, not re-run**, and said to be.
+- **(d) fuzzers** — **VACUOUS**: this row adds none (**55** repo-wide, unchanged). Said to be vacuous, not green.
+- **(e) lint/format/vet/modules** — green, with the lint gate negative-controlled.
+- **(f) `REVIEW.md`** — **ABSENT. A STANDING LINEAGE DEPARTURE, recorded rather than claimed as compliance**: 85 of 122 phase directories carry none, and the last authored was 25.3. `PROGRESS.md` has discharged it for the whole recent lineage.
+
+## Broken-gate count stays **EIGHTEEN** — no nineteenth shape, but FIVE priors fired live
+
+1. **A vacuous break mode** — the compressor arm the PLAN prescribed cannot fire (ledger 3).
+2. **A harness's exit code is not the command's** — reported success against `INNER_EXIT=1`, twice.
+3. **An empty output is not a zero result** — driving both the stat-surface input measure and the lint negative control.
+4. **A negative control must be verified to have LANDED** — the sentinel's doctored row-62 field was inspected before its result was trusted.
+5. **`golangci-lint` runs `misspell` at `locale: US`** — fired on the merged tree under a deliberate control, and it covers `_test.go` files too.
+
+## Carried forward, deliberately NOT fixed
+
+The interior empty-segment hole (now widened to leading dots; **BLOCKED** on ADR-0132 §Decision (v); slug `stats-name-empty-segment-guards`) · the RBAC policy-name **PROJECTION** divergence · the HTTP-rbac empty-prefix fallback divergence, **upgraded to measured fact** by the doubled `rbac` segment in a live panic · the matcher-tree `Action`-name boot walk · the three bare-prefix incumbents, now a two-way divergence since mongo accepts a leading-digit prefix its siblings reject · the two-leg `invalidSecretNameErrFmt` wording · the `STATE_HISTORY.md` archive gap (**no total asserted**) · **the driver-owned receiver port race, now enumerated at fourteen fixtures** · `my-plugin` at `abi_callbacks_test.go:1453`, owed only if a later row relocates guard C · the lua package's hand-copied regex literal, unnecessary now that `NamePattern` is consumed directly · and the two stale incumbent guard cites (ledger 14).
