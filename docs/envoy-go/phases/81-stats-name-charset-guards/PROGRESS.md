@@ -103,3 +103,139 @@ Docs-only: **ZERO production `.go`, ZERO test `.go`**. `BEHAVIOR_CONTRACT.md` an
 ## Next
 
 **→ the phase-81 SPEC.** It must dispose **D-81-HELPER** first: a shared `internal/stats` helper makes the full 120-fixture differential **and** an explicit h2spec run mandatory for every later stage of this row; per-package inlining does not.
+
+---
+
+# SPEC record (2026-07-31)
+
+**Stage:** SPEC (lifecycle-state `1` → `2`). **ROW 81 STAYS `in-progress`**; `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` **BYTE-UNTOUCHED**; sentinel `want` STAYS **113**. Base master **`aab596e4`** — from `git rev-parse master`, **not** the BRAINSTORM squash `3816a17f`, which sits two router-only commits below the tip. Worktree `/home/esa/git/envoy-go-wt/phase-81-spec`, branch `phase-81-spec`. Docs-only: **ZERO production `.go`, ZERO test `.go`**.
+
+⚠️ **THIS IS THE FIRST `# SPEC record` IN THE REPOSITORY.** Census over all 91 `PROGRESS.md` files across 122 phase dirs: `# IMPL record` **8** · `# PLAN record` **4** · `# BRAINSTORM record` **1** (phase 81's own, minted yesterday) · **`# SPEC record` 0**; the dominant shape is per-Task sections (**86** of 91). Recorded as a **new convention**, not as compliance with one.
+
+## What was EXECUTED at this stage
+
+**Five investigation agents in parallel**, each in its own DETACHED worktree with private scratch and a private port band inside `42000-42499`; the controller re-derived every load-bearing claim itself (`feedback_brief_citations_not_evidence`). Zero commits, zero pushes, zero branches; `git status --porcelain` = 0 lines reported 5/5.
+
+| agent | remit | outcome |
+|---|---|---|
+| A1 | D-81-HELPER | **the fork's stated tradeoff does not exist** |
+| A2 | D-81-F-SITE + the reference | **the BRAINSTORM's site is wrong; the reference accepts** |
+| A3 | census + D-81-WORDING | ⚠️ **found the NINTH SOURCE** |
+| A4 | D-81-SANITIZE + cost | **the contradiction dissolves; a THIRD fork named** |
+| A5 | corpus survivability | ⚠️ **REFUTED — one proven hard RED** |
+
+## ⚠️ THE HEADLINE: F IS TWO SOURCES, AND THE BRAINSTORM'S REMEDY COVERS ONE
+
+`BuildMatcherEngine` (`internal/rbac/rbac.go:147-153`) does **only** `matcher.New(m, []string{actionTypeURL})` — a TypeURL allowlist. `Evaluate` at `:249`/`:251` returns `action.GetName()`, read out of the matcher tree's terminal `Action` proto **at request time**, and **nothing enumerates those names at boot**. Proved by execution with a firing NC:
+
+```
+BOOT ACCEPTED matcher Action.name="allow_admins"  → Inc registered cleanly     ← NC arm
+BOOT ACCEPTED matcher Action.name="allow-admins"  → *** Inc PANICKED:
+    stats: invalid metric name: "http.myhcm.rbac.policy.allow-admins.allowed"
+```
+
+⇒ **A matcher-based RBAC config still panics the process under any boot-only remedy.** The row's remedy is therefore two-part (§4 of the SPEC), and F1/F2 must land **atomically**.
+
+## ⚠️ THE SECOND HEADLINE: THE REFERENCE ACCEPTS, AND THE REAL GAP IS **PROJECTION**
+
+Controller-run, `envoyproxy/envoy:contrib-v1.37.2`, three arms torn down BY NAME:
+
+| arm | `/stats` | `/stats/prometheus` |
+|---|---|---|
+| `allow-admins`, track=true | `http.myhcm.rbac.policy.allow-admins.allowed: 1` | `envoy_http_rbac_policy_allowed{envoy_rbac_policy_name="allow-admins",…} 1` |
+| `allow_admins` (NC) | `…policy.allow_admins.allowed: 1` | `…{envoy_rbac_policy_name="allow_admins",…} 1` |
+| track absent (control) | **empty** | **empty** |
+
+The reference's metric NAME is **policy-name-independent**; the name is hoisted into a **label**, which has no charset to violate. envoy-go **flattens** it and has no `rbac_policy_name` extraction (0 hits; NC `envoy_http_conn_manager_prefix` ⇒ 2). ⇒ **any reject is an envoy-go-strict DEPARTURE, not a fix**, and the projection gap is a NEW deferred candidate.
+
+## ⚠️ THE THIRD HEADLINE: THE CORPUS DOES NOT SURVIVE
+
+`internal/filter/http/ratelimit/compiled_config_test.go:574` `StatPrefix: "tenant-foo"`, asserted at `:616-617`. `IsValidName("tenant-foo") = false`. Green today; guard **H** makes `:579`'s `t.Fatalf` live. ⚠️ **No differential run can find it** — `0032`/`0033` set only the HCM `stat_prefix`. BRAINSTORM §4.2's *"no existing fixture should red"* is narrowly true (fixture YAML **is** clean) and materially wrong as a corpus claim: the red is in a unit test, exactly where §4.2 did not look.
+
+## The four D-questions disposed, plus TWO the BRAINSTORM never named
+
+| question | disposition |
+|---|---|
+| **D-81-HELPER** | **INLINE** — the tradeoff does not exist: `go list -deps ./cmd/envoy-go` = 560 pkgs containing **8 of 8**; gate obligation identical; asymmetry **11.09 s** |
+| **D-81-F-SITE** | **TWO PARTS** — a `trackPerRuleStats`-gated boot reject at `http/rbac buildCompiledConfig` (which also degrades correctly at the request-time per-route tier) **plus** a skip-and-log backstop at `PerPolicyCounters.Inc` |
+| **D-81-SANITIZE** | **DISSOLVES ON SCOPE** — ADR-0065's rejection is a TWO-LIMB conjunction; `normalizeAddr` fails limb (ii); ADR-0065 §Decision cites it **approvingly**. All nine sources satisfy both limbs ⇒ reject |
+| **D-81-WORDING** | eight byte-stable wordings, family-split preserved, identifier-collision-checked |
+| **D-81-DEPTH** (NEW) | **table-driven-shared** — worth ~450-500 net lines and the entire split decision |
+| **D-81-EMPTY** (NEW) | **skip-if-empty** — else 7 tests red and ADR-0132 §Decision (v) is contradicted |
+
+## Refutation ledger — what EXECUTION found that the BRAINSTORM and router got wrong
+
+**Load-bearing:**
+
+1. **F is TWO sources; the count is NINE.** The boot-only remedy covers F1 only.
+2. **The BRAINSTORM's F site is wrong.** `internal/rbac BuildRulesEngine` is shared (3 non-test call sites) and blind to `track_per_rule_stats`; network rbac never constructs `PerPolicyCounters` (`Inc` has exactly **2** non-test call sites, both in `http/rbac`). A guard there rejects configs that **cannot panic**.
+3. **⚠️ The per-route tier compiles at REQUEST time** — `resolvePerRouteConfig` → `buildCompiledPerRoute` → `buildCompiledConfig`, and rbac registers **no `RegisterPerRouteValidator`** while 21 files repo-wide do. Recorded nowhere before.
+4. **D-81-HELPER's tradeoff does not exist** (above), and the *"one definition, no drift"* doctrine cite is about the **regex source**, already shared. `registry.go:53-59` states the opposite intent verbatim.
+5. **The corpus does not survive** — one hard RED, invisible to the differential.
+6. **The reference accepts the hyphen verbatim**; the real gap is projection.
+7. **D-81-SANITIZE dissolves.** ⇒ **ADR-0302 §Consequences (vii) item 5's *"internally inconsistent"* is PARTIALLY REFUTED** — it drops limb (ii) and the post-bind fact.
+8. **The router's split axis is REFUTED.** 81.1-sources/81.2-retrofit is not a split; the retrofit is already out of scope, and re-badging it would park row 81 `in-progress` behind it (§6.2 items 4-5). The real axis is **F1/F2/D/E vs A/B/C/G/H**.
+
+**Bookkeeping / gate-shape:**
+
+9. **`BEHAVIOR_CONTRACT.md:931` is a scope over-read and a non-unique anchor** — **5** occurrences, all inside **stats-sink** subsections, and **13 `*-boot-reject` fixture dirs** exist, so it is not honoured tree-wide either. The conclusion survives on a far stronger, on-family citation: `0044-network-rbac-boot-reject/driver/driver.go:22-26`, which names *"invalid stat_prefix"* verbatim as a **subject-side-only reject covered by unit tests, NOT cross-side fixtures**.
+10. **The retained-italic-footer count is EIGHT, not seven** — ADR-0294..0300 (the contiguous seven) **plus ADR-0302**. ADR-0301 carries none. And **ADR-0301's STATUS is miscounted a second way**: its *"seven blocks"* is right for 0294..0300 but the range it names, *"ADR-0295 through ADR-0300"*, is **SIX** — it drops ADR-0294.
+11. **`~19` distinct token sources is REFUTED — there are 23.** 15 sites ⇒ **13** distinct guarded tokens (two duplicate guards); +8 unguarded = 21 `IsValidName`-class; **+2 protected by another mechanism** (a closed-set allowlist in `zookeeperproxy/stats.go`, and `normalizeAddr`, the tree's ONLY sanitizer) = 23. The coincidence `15+8=23` is accidental.
+12. **The 15 split 11 REJECT / 4 SKIP**, and **all four SKIP sites sit on post-Freeze/request-time paths** — four landed precedents for the F2 backstop, a distinction the flat table erased.
+13. **The BRAINSTORM's guard-census derivation carries a phantom exclusion** — *"minus `registry.go`'s own definition"*. `registry.go:60` is `func IsValidName(`, **unqualified**, so it never enters a `stats\.IsValidName` grep. Number right, arithmetic doesn't close.
+14. **The router's SDS "misleading messages" cites point at the wrong files.** `internal/xds/stats.go` has **no error message at all**; the `"is not supported in phase 03"` strings live in `internal/tls/config.go:437`/`:454`, and `boot.go:161-162` only **quotes** one in a comment. ⚠️ A genuinely misleading charset message *does* exist elsewhere: `invalidSecretNameErrFmt` serves two legs with one charset-only wording — `"a..b"` is `IsValidName`-**VALID** yet rejected with *"must contain only ASCII letters…"*.
+15. **The incumbent template's own rationale is wrong.** `network/rbac/rbac.go:105`'s *"a bare-prefix check would mis-accept"* measures **MIS-ACCEPTS = 0, OVER-REJECTS = 1** on a literal suffix. The correct rule is *"guard every variable segment"*. ⚠️ **And the assembled form is the WEAKER arm on the deferred defect** — it accepts `foo.` as `foo..rbac.allowed`, so row 81's guards inherit the interior-empty-segment hole **by construction**. The canonical anchor is **ADR-0065 §Consequences (b)**, not that comment.
+16. **The four §4.2 rosters are wrong as rosters, right as properties** — **77** distinct fixture-YAML `stat_prefix` (not 111), **16**/**59** wasm plugin names (not 3), **22** RBAC policy keys (not 3). `text_optimized` stands.
+17. **The empty-segment hole is INTERIOR-ONLY** — `a.`, `.a`, `..`, `""` are all already rejected. Cheaper than "well-formedness" implies. ⚠️ **And its target is GENERATED, not authored**: a config-token sweep for `..` finds **zero** across 1830 values and is structurally blind.
+18. **`ST1005` is NOT enforced** (probed: `errors.New("Invalid stat prefix.")` ⇒ exit 0); `misspell` locale US **is** (NC fired). No enabled linter constrains error wording beyond spelling — **the SPEC does not claim a gate that does not exist**.
+19. **`210` production registration sites is a grep count; the CODE-site count is 208** (2 comment lines in `internal/stats/doc.go:20,21`).
+20. **`clusterName` is not a tenth source** — transitively guarded, proved via `ctx.ClusterManager.Get`'s `unknown cluster` reject.
+21. **Phase 80's applicable multiplier is 1.97×, not 2.56×** — the 4.10× fixture bucket was **631 of 1636 (38%)** and phase 81 has **+0 fixtures**.
+22. ⚠️ **THE CONTROLLER'S OWN DRAFTING BRIEF CARRIED A WRONG FAMILY ORDINAL, AND THE WRITER REFUTED IT.** The brief said this is the **TWENTY-FIFTH** §9 Observability-family row, on the premise that row 80 held the twenty-fourth. Re-derived from `ROADMAP.md`'s own ordinal cells at `aab596e4`, mapped row → ordinal: row 79 **TWENTY-SECOND**, row 80 **TWENTY-THIRD**, row 81 **TWENTY-FOURTH** — one ordinal per row, no gap, no duplicate, agreeing with what ADR-0301 and ADR-0302 each claim for themselves and with the ROADMAP row-81 cell. `grep -c 'TWENTY-FIFTH'` ⇒ **0** (NC `TWENTY-FOURTH` ⇒ 1). **ADR-0303 claims the TWENTY-FOURTH.** Recorded because a wrong ordinal asserted in an ADR is precisely the species that acquires authority by being landed (`reference_brainstorm_adjective_acquires_adr_authority`).
+23. ⚠️ **AND THE SPEC'S OWN ROUTER PROSE WAS REFUTED BY ITS OWN COMMIT — CAUGHT POST-COMMIT, PRE-PUSH, BY RUNNING IT.** The rolled router asserted `git log --grep 'phase 81'` returns **2** at this tip. **It returns 4.** `git log` greps the **whole commit message**, and two router commits (`aab596e4`, `b66486a8`) discuss the matcher in their BODIES, so **the sentence warning about the grep satisfies the grep** — `reference_sentinel_matcher_string_self_clears` in a NEW carrier, a **commit body** rather than a document. The slug-anchored form `^phase 81 (stats-name-charset-guards)` returns exactly **2**, with a firing positive control on the completed phase 80 (**4** — IMPL/PLAN/SPEC/BRAINSTORM) and **0** on an invented slug. **The router now carries the anchored form.** This is the stage's twenty-third refutation and the only one whose target was the stage's own output.
+
+## Findings no phase-81 document carried
+
+- ⚠️ **A live cross-side stat-name divergence.** `http/rbac/rbac.go:500-506` `namespacePrefix` returns the literal `"rbac"` on an empty `rules_stat_prefix`, justified by a code comment asserting the C++ filter does the same. **Refuted by the reference itself** — an arm with no `rules_stat_prefix` emitted `http.myhcm.rbac.policy.allow-admins.allowed`, a **single** `rbac` segment. The differential cannot see it: `0018/envoy.yaml` sets an explicit prefix at `:107 :127 :247` and its header says so deliberately.
+- ⚠️ **The compressor D5 collision.** ADR-0132 §Decision (v) + `TestStatsNamespace_LibraryNameEmpty_DoubleDotPath` pin a **deliberate, reference-probed** `compressor..gzip.` double dot. The deferred retrofit contradicts a landed ADR.
+- **F and H have ZERO fixture coverage** — the differential can neither regress on nor cover the headline crash or the one proven red.
+- **`guest-side-config`** (`wasm/compiled_config_test.go:1147`) looks like a violation and is not: an opaque `anypb` payload, not the outer `pc.GetName()`. Recorded so a sweep does not "fix" it.
+- **Three incumbents validate the BARE prefix** (`redisproxy:50`, `thriftproxy:44`, `kafkabroker:61`) — **stronger**, not weaker, per refutation 15. Nothing owed on the merits.
+
+## Cost
+
+**Band ~850-1200 net `.go`, budget ~1000. Tasks ~14.** Three independent measurements reconciled: A1 ~30/source (~240), A2 **174 for F1 alone** (fully built), A4 850-1000 shared-depth / 1390-1500 per-source-deep. **The spread IS D-81-DEPTH.** On the chosen posture: F1 174 + F2 backstop ~50 + 7 × ~75 + shared audit ~140 ≈ **890**.
+
+**Neither §6.1 trigger fires** — ~14 vs ~25 tasks (1.8×), ~1000 vs ~1500 net (1.25-1.75×). The third, mid-execution trigger must be **recorded if it fires, never absorbed** (it fired at phase 80).
+
+## Sentinel — re-run MECHANICALLY at this stage. It does NOT fire; `stop` was NOT created
+
+| check | ACTUAL | NC, observed FIRING |
+|---|---|---|
+| **(1)** `want=113` | **`NOT DONE: row 81`** | `want=112` ⇒ `GATE FAIL: examined 113 data rows, expected 112`; row 81 doctored `done` ⇒ **SILENT**; row 62 doctored on that copy ⇒ `NOT DONE: row 62` |
+| **(2)** | **FIVE** — `:191 :201 :211 :217 :225`, UNCHANGED | one-arm strip ⇒ **5 → 4, not 5 → 0** |
+| **(3)** | `NEVER OPENED: gRPC`, `NEVER OPENED: WASM` | invented slug fires; `Observability` silent |
+
+Input **229 lines / 113 data rows**. `ls stop` ⇒ `No such file or directory`; **NOT created**. **`want` STAYS 113.**
+
+⚠️ **THE LEAK CHECK IS INAPPLICABLE, NOT "PASSED"** — this SPEC writes no ROADMAP cell.
+⚠️ **CHECK (2) UNCHANGED AT FIVE — THIS ROW NARROWS NOTHING, STATED NOT FORECAST.** Twenty-ninth consecutive phase.
+⚠️ **Row well-formedness**: ARM-A flags **57, 69** only; ARM-B flags **78** only. Naive `NF==8` flags **SEVENTEEN**, of which **FIFTEEN are FALSE POSITIVES and TWO (57, 69) TRUE**, while row **78 is absent** — wrong in **both** directions, 15 FP + 1 FN. The router's parenthetical is the FLAG SET, not the FP set.
+
+## Six-gate (§7.5, `/BOOTSTRAP_PROMPT.md` at the REPO ROOT — `:357`, `:360-365`, `:367` re-verified exact)
+
+(a)/(b)/(c)/(e) **NOT OWED** — no fixture and no `.go` touched · (d) **VACUOUS**, said to be vacuous rather than green (**55** fuzzers repo-wide, **0** added; NC `^func FuzzZZ` ⇒ 0) · (f) ⚠️ **STANDING LINEAGE DEPARTURE — no `REVIEW.md`; none since 25.3, 84 of 121 phase dirs carry none.** Recorded as a departure, not compliance.
+
+## Hygiene
+
+Docs-only: **ZERO production `.go`, ZERO test `.go`**. `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` **BYTE-UNTOUCHED**; `DECISIONS.md` gains **ADR-0303 §Context** only. Per-task `gofmt`/`golangci-lint` **not owed**.
+
+All five agents' experimental edits reverted **by explicit path** with `sha256sum` byte-identity; **`git status --porcelain` = 0 lines reported 5/5**. Docker containers removed **BY NAME** (`p81ctl-hyphen`, `p81ctl-underscore`, `p81ctl-control`, plus A2's four) — never by an `ancestor=`/image filter; `docker ps -a --filter name=p81ctl` ⇒ **0**.
+
+⚠️ **`reference_bash_cwd_reset_commits_to_main` FIRED, OBSERVED** on the controller side. **Twenty-sixth consecutive session.** All git commands used `git -C <abs-path>`; branch tripwired `phase-81-spec`, never `master`.
+
+**Broken-gate count stays EIGHTEEN** — no nineteenth shape, but **three priors fired live**: a `-run` no-match printing `[no tests to run]` and **exiting 0**; a negative control whose **own input was wrong** (a `.replace()` hit a comment, not the config — the arm read as "extractor blind" when the injection never landed); and `grep -c` on zero matches **printing `0` while exiting 1**.
+
+## Next
+
+**→ the phase-81 PLAN.** Enumerate against ~14 tasks / ~1000 net `.go`; hold **D-81-DEPTH** to table-driven-shared; schedule the `tenant-foo` edit; and **land F1 and F2 ATOMICALLY** — shipping the boot reject without the `Inc` backstop leaves the process crashable by the very config class the row exists to protect.
