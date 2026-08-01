@@ -20,7 +20,7 @@ numTrailers = uint32(len(resp.Trailer))
 
 `:411-417` then carries `// TODO Task 15: stash (resp.Header, bodyBytes, resp.Trailer) on the originating *StreamContext`. **That stash never landed.** A code comment is not evidence (`reference_code_comment_not_evidence`), so the consumer side was walked one layer up, and then one layer further:
 
-- `internal/filter/http/wasm/abi_callbacks.go:186-192` — `headerMapForType` handles **only** types 0 and 1; its `default:` returns `(nil, false)`, covering `HttpCallResponseHeaders` (4) and `HttpCallResponseTrailers` (5).
+- `internal/filter/http/wasm/abi_callbacks.go:178-191` — `headerMapForType` handles **only** types 0 and 1; its `default:` returns `(nil, false)`, covering `HttpCallResponseHeaders` (4) and `HttpCallResponseTrailers` (5).
 - `abi_callbacks.go:200-204` — `GetHeaderMap` short-circuits on `!active || headers == nil` and returns `(nil, false)`; its own doc comment states *"the host wrapper converts `!ok` to `WasmResultNotFound` for the guest."*
 - `abi_callbacks.go:647-661` — `GetBuffer`'s `default:` swallows `HttpCallResponseBody` (4) and returns `(nil, nil)`.
 
