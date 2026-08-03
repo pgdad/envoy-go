@@ -53,3 +53,62 @@ Input measured **230 lines / 114 data rows** before anything was written. **(1) 
 ## Handoff
 
 **SPEC.** It drafts ADR-0305 §Context and must answer four open questions — ⚠️ **question 1 (does arming a 10 s watchdog change `0036` (n)'s timing, given that scenario's whole point is indefinite accumulation) BY MEASUREMENT, not by reasoning.** Band **350-600 net `.go`, budget ~450, 6-8 tasks**, declared explicitly as a **LOWER BOUND**: `reference_measured_prototype_is_a_lower_bound` has fired on **two consecutive rows** (3.07x, 2.55x) with test scaffolding dominating both, and this estimate is again production-measured with a modelled test side.
+
+---
+
+# SPEC record (2026-08-03)
+
+**Stage:** SPEC (lifecycle-state `1` -> `2`). **ROW 83 STAYS `in-progress`**; `ROADMAP.md` is **BYTE-UNTOUCHED** and the sentinel `want` **STAYS 115**. Base master **`5d0892e4`** (from `git rev-parse master`, **not** the `8a0126d2` the router's prose still names), branch `phase-83-spec`. Docs-only: **ZERO production `.go`, ZERO test `.go`.**
+
+## What landed
+
+`SPEC.md` NEW · `DECISIONS.md` **17858 -> 17892** (ADR-0305 §Context, STATUS **PROPOSED**) · `PROGRESS.md` +1 stage record · `STATE.md` rolled **IN PLACE** (ADR-0288) · `STATE_HISTORY.md` +1 evicted entry · `next-prompt.txt` rolled forward. `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` **BYTE-UNTOUCHED**.
+
+## Method
+
+**FIVE investigation agents** on disjoint remits, each in its own **DETACHED** worktree off `5d0892e4` with private scratch and a private port band inside `43400-43799`. Every load-bearing claim was re-derived by the controller; **one agent claim did not survive that re-derivation**, and **one controller hypothesis did not survive an agent's measurement** (SPEC §2.2, §2.5).
+
+## The stage's headline
+
+**The defect is real and the row's own principal risk measures ZERO — because no guest in this repository reaches the broken arms at all, and the fix as chartered is incorrect.**
+
+Instrumenting `body.go:226` across five full `0036` runs yields **ZERO fires**, with two firing positive controls. Three measured reasons: (n) trips the cap 82 lines before the arm; (a)/(b)/(c) Pause only on non-final chunks; and ⚠️ **(a)/(b)/(c) are not driven at all** — `driver.go:511-513` emits a constant skip token, so the whole fixture produces **one** body chunk. ⚠️ **This refutes the BRAINSTORM's load-bearing *"three vendored guests already do it"*: true of source, false of execution.** ⇒ **the failing-first anchor must be SYNTHETIC, and the differential is structurally blind to the row.**
+
+⚠️ **AND THE NAIVE FIX IS WRONG.** `DecodeData` runs once per chunk, so `beginDecodePause` re-arms per chunk and the final-chunk `Continue` neither clears the flag nor stops the timers. ⚠️ **`Stop()`-before-reassign — the BRAINSTORM's entire S3 — is INSUFFICIENT:** over 300 superseded generations, `Stop()` alone fires **299** spurious resumes, `Stop()` + a generation counter fires **1**. ⚠️ **`-race` reports nothing** — it is a logical race.
+
+⚠️ **A SEVENTH UNBOUNDED PARK, in the same file, that a census of six does not cover:** `body.go:282`'s encode-side cap returns `DataStopIterationNoBuffer` with no local reply, and the encode chain has no `localReplyDone` counterpart.
+
+## The four open questions, disposed
+
+1. **D-83-CAP — ZERO RISK, BY MEASUREMENT.** `0036` with the fix: **19.25 s** vs a 19.33-20.36 s baseline, inside a 1.03 s variance, **zero watchdog fires**; a **10 s -> 1 ms** sweep passes at every value. Cross-product both ways: raising (n)'s cap makes the arm fire and release at **exactly 10.0 s**; removing the fix makes it park **15 s**.
+2. **D-83-TRAILERS — FLAG AND ARM.** The alternative fails on its own terms: the current behavior is a **permanent unresumable park**, and ⚠️ **there is no stream idle timeout anywhere in the tree**. A one-line change flips a RED probe GREEN, so an anchor exists despite zero production callers.
+3. **D-83-WATCHDOG — 10 s STAYS, THE DERIVATION IS REBUILT.** ⚠️ **Both** stated constraints fall (the lower one too, which no prior document states). The corpus arms the watchdog **once**, for **747 µs**, released by the guest. Real ceiling: the differential's **90 s per-fixture budget**, not the cited 15 s client timeout.
+4. **D-83-LOGHOME — ADR-0305 §Context, explicitly NOT chartered.** No shape has a failing-first anchor, and an ADR amendment is unavailable under ADR-0288's append-only rule.
+
+**THREE NEW FORKS the BRAINSTORM never named:** D-83-TIMER (generation guard), D-83-STALETOKEN (a hazard this row widens threefold and does not close, deferred BY NAME), D-83-ENCODECAP (the seventh park).
+
+## Refutation count: **TWENTY-THREE**, of which **NINE are load-bearing**
+
+Load-bearing: no in-tree reproducer · the controller's own reframing was half wrong · `pause.go:19-21`'s stated (n) dependency is **inverted** · **both** watchdog constraints fall · the census guard is vacuous **and so is the whole package on that axis** · **BROKEN-GATE SHAPE 26** — a liveness barrier placed upstream of the gate it claims to prove, installed one row earlier *as the fix* for that same failure · **ADR-0106 contains no sole-leg rule** (`sole` 0, `leg` 0, NCs firing) · ADR-0304's own STATUS is wrong at the commit that wrote it · the `ROADMAP.md:<line>` cite count self-falsified a **FOURTH** time, inside the commit that named the species.
+
+Also refuted: the trailers signature is `(i32,i32)->i32` so S2 needs a **new type-section entry** · `testLifecycleCapabilities` has **neither** trailers capability ⇒ silently vacuous S2 tests · `ContinueStream` discards its resume result by design · the watchdog log string misattributes the callback · `trailers.go`'s Pause arms had **zero** test coverage · `pause_test.go:435/436` are both `RunDecodeTrailers` · `doc.go:219` carries **two** errors · the 35-crate denominator is 25 fixture guests + 10 conformance crates · the sourceless blob is in **0039**, not 0036 · S7's diffstat is **9/26 net −17**, not 9/23/−14 · the TIME-WAIT justification does not reproduce.
+
+## Gates — a docs-only SPEC owes (a)-(f) only in the posture a docs-only stage can have
+
+(a)/(b) no fixture changed and no `.go` committed — **inherited from the phase-82 IMPL, not re-run and not claimed**. (c) proxy-wasm **INHERITED**; the denominator when a stage runs it is **10 of the cpp-host's 16 files (62.5%), 6 deferred**. (d) **VACUOUS** — no fuzzer added (**55**, `-- '*.go'`-scoped; unrestricted 161). (e) `go.mod`/`go.sum` byte-untouched. (f) `REVIEW.md` **ABSENT — the STANDING LINEAGE DEPARTURE**, named: **87 of 124** phase dirs carry none, 37 carry one, none since 25.3.
+
+§6.1 (`:285`, triggers `:289`/`:290`, `:291` BLANK, third `:292`) — **neither fires at the revised budget**; see SPEC §13.
+
+## Sentinel
+
+Input measured **231 lines / 115 data rows** first. **(1)** `NOT DONE: row 83` at `want=115` with the denominator printed — correct while the phase is open. **(2) FIVE, unchanged — the thirty-seventh consecutive phase without a decrease; this row narrows nothing, and that is now STRUCTURAL** (the `### WASM host family` heading at `:221` owns none of the five anchors). **(3) `NEVER OPENED: gRPC` — alone.** `stop` **NOT** created and must not be.
+
+**FIVE negative controls, ALL FIRED**, including the doctored-copy NC with `NC LANDED? [ in-progress ]` inspected first, and both check-(2) strip arms (**one-arm 5 -> 4, both-arms 5 -> 0**). ⚠️ **The one-arm result was re-confirmed accidentally and live** when a single-phrase matcher printed ONE of five anchors.
+
+**Leak check VERIFIED BY DIFF** (`git diff --stat master -- docs/envoy-go/ROADMAP.md` EMPTY), and the sentinel's file scope was confirmed by **positive control**: the four matcher strings written into a scratch `SPEC.md` moved nothing, while concatenated onto a `ROADMAP.md` copy they moved check (2) **5 -> 7** and made check (3) go **SILENT — a false PASS**.
+
+**Row well-formedness** re-executed over all 115 rows: ARM-A {119, 131}, ARM-B {140}, naive `NF!=8` **17** and **misses 140**. Row 83 clean on both arms; both arms NC'd with the doctoring verified to have landed — ⚠️ **a first NC attempt did NOT land and would have read as "the arm is blind".**
+
+## Handoff
+
+**PLAN.** It owes an explicit **§6.1 re-evaluation against a MEASURED test side** (this SPEC's is analogue-scaled — the exact failure mode of phases 81 and 82), a task ordering that lands the generation guard **before or with** S1/S2, a disposition for the stale-token hazard, a remedy choice for the encode-side cap, and **a break roster whose arms are proven RED first** — because the differential cannot go red on this row and the package's existing guard is vacuous. **Revised band 950-1400 net `.go`, budget ~1150, 12-16 tasks.**
