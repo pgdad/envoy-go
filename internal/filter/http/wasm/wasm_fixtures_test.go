@@ -339,6 +339,41 @@ func buildPauseProxyWasm() []byte {
 	)
 }
 
+// buildPauseResponseProxyWasm constructs a module whose
+// proxy_on_response_headers returns ProxyActionPause (=1) while
+// proxy_on_request_headers returns ProxyActionContinue (=0).
+//
+// EXISTS BECAUSE THE ENCODE HALF OF S1 IS UNEXERCISED. Measured at phase-82:
+// ZERO of the 35 guest crates in this repository (10 conformance + 7 in
+// fixture 0034 + 14 in 0036 + 4 in 0038) return Action::Pause from
+// proxy_on_response_headers, so encode_headers.go's honored-Pause arm has NO
+// real guest and NO differential coverage. This synthetic fixture is its only
+// exercise. buildPauseProxyWasm (above) is the decode-side sibling and exports
+// no response-headers callback at all.
+func buildPauseResponseProxyWasm() []byte {
+	return fixBuildModule(
+		fixTypeSection(
+			[2][]byte{nil, nil},
+			[2][]byte{{fixTypeI32, fixTypeI32, fixTypeI32}, {fixTypeI32}},
+		),
+		fixFunctionSection([]uint32{0, 0, 1, 1}),
+		fixMemorySection(1),
+		fixExportSection([]fixExport{
+			{name: "_initialize", kind: fixExtFunction, idx: 0},
+			{name: "proxy_abi_version_0_2_1", kind: fixExtFunction, idx: 1},
+			{name: "proxy_on_request_headers", kind: fixExtFunction, idx: 2},
+			{name: "proxy_on_response_headers", kind: fixExtFunction, idx: 3},
+			{name: "memory", kind: fixExtMemory, idx: 0},
+		}),
+		fixCodeSection([][]byte{
+			fixFuncBody(),
+			fixFuncBody(),
+			fixFuncBody(fixI32Const(0)), // request headers → ProxyActionContinue
+			fixFuncBody(fixI32Const(1)), // response headers → ProxyActionPause
+		}),
+	)
+}
+
 // buildTrappingProxyWasm constructs a module whose proxy_on_request_headers
 // executes the `unreachable` instruction (opcode 0x00) — a guest TRAP. wazero
 // surfaces this as a RuntimeError from fn.Call, which the host catches as a

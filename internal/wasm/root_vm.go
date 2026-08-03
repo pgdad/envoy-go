@@ -225,6 +225,20 @@ type RootVM struct {
 	httpCallsMu    sync.Mutex
 	nextCallID     uint32
 
+	// httpCallResp caches the response of the most recently completed
+	// proxy_http_call so the guest can read it back from inside its
+	// proxy_on_http_call_response callback via the HttpCallResponse* header-map
+	// (wire 6/7) + buffer (wire 4) types. Read through the HTTPCallResponse
+	// accessor; written through SetHTTPCallResponse. See the type doc at
+	// http_call.go for the lifetime + read-only contract.
+	//
+	// atomic.Pointer rather than a plain field because the write happens on the
+	// http-call dispatch goroutine (handleHttpCallResponse) while reads happen
+	// from hostcall bodies; the write is ordered BEFORE the dispatchMu-held
+	// guest invocation that reads it, so the pointer swap is the only
+	// synchronization needed.
+	httpCallResp atomic.Pointer[HTTPCallResponse]
+
 	// foreign-function registry (Task 7 per AMEND-A9 + R-25.2-8 + D-P-PLAN-9):
 	//
 	//   - foreignReg: the registry consulted by CallForeignFunction. Set once

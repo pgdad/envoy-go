@@ -6,12 +6,28 @@
 //     mutate-passthrough / (c) body-mutate-replace / (d) trailers-add /
 //     (e) trailers-read / (f) shared-data-read-after-write / (g)
 //     foreign-function-deny-default / (h) property-stream-info / (i)
-//     metric-define-only / (j) env-vars-rejected-passthrough.
+//     metric-define-only / (j) env-vars-rejected-passthrough. NOTE:
+//     these 10 arms currently emit a CONSTANT skip token on BOTH sides
+//     (see emitConstantSkipToken) — their cross-side comparison is
+//     DEFERRED per PROGRESS.md Task 20 Concern 1 and is explicitly NOT
+//     in phase-82 scope.
 //
 //   - 4 subject-only via StatsAsserter per
 //     reference_differential_asserter_dispatch: (k) tick-fires-counter /
 //     (l) httpCall-success / (m) httpCall-unknown-cluster / (n)
 //     body-cap-exceeded.
+//
+// Scenario (l) is MIXED as of phase 82: it keeps its subject-only stats
+// legs AND is additionally compared cross-side. Its guest dispatches an
+// http call to cluster_b and sets response header `x-httpcall-status:
+// <:status of the http-call response>` (initial value 0 when the guest
+// callback never fires). Phase 82 wires the http-call response header
+// cache, honors Action::Pause on request headers, and the guest resumes
+// the paused stream — so BOTH sides must report the SAME status.
+// driveProxy therefore emits (l)'s OBSERVED status + header value on
+// each side instead of a constant token: a subject that reports a wrong
+// x-httpcall-status, or omits the header, diverges byte-wise and
+// CompareBytes fires.
 //
 // Topology: 14 listeners (one per scenario; each carries one
 // envoy.filters.http.wasm filter consuming the per-scenario .wasm under
@@ -27,6 +43,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -310,26 +327,35 @@ func (d *wasmAdvDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr st
 	if !dispFound || dispValue < 1 {
 		t.Errorf("scenario (l) httpCall-success: http_call_dispatched counter = %d (found=%v); want >= 1", dispValue, dispFound)
 	}
-	// Either http_call_response (delivered to the guest) OR
-	// http_call_response_after_close (delivered AFTER stream cancellation;
-	// AMEND-B3 defensive-observability counter) is a valid signal that the
-	// dispatch goroutine completed + the response-routing path fired. In
-	// this fixture the subject's stream-control pause is NOT yet honored
-	// (parent §1 architectural primitive 6 deferred per the wasm-side log
-	// "proxy_on_request_headers returned PAUSE without captured local
-	// response — stream-control deferred ... continuing") so the stream
-	// closes BEFORE the response lands, driving the response to the
-	// after_close branch on most runs. Both counter increments validate
-	// the HTTPDispatcher production wiring (Task 20 fix-up #2) is live —
-	// SUM them per the assertion-intent "the response routing path fired
-	// at least once". The narrow-string lookup excludes the after_close
-	// match from the bare-response counter via the _after_close negative-
-	// substring constraint per the per-arm dedicated branch below.
+	// Two INDEPENDENT legs, both reporting via t.Errorf so neither is dead
+	// code (per reference_fatalf_makes_assertions_unreachable):
+	//
+	//   leg 1 (positive): http_call_response >= 1 — the response reached
+	//     the guest's proxy_on_http_call_response callback.
+	//   leg 2 (negative): http_call_response_after_close == 0 — no
+	//     response was routed to the defensive AMEND-B3 post-close branch,
+	//     i.e. Action::Pause held the stream open until the response
+	//     landed.
+	//
+	// This REPLACES a SUM-of-both disjunction (respDelivered +
+	// respPostClose >= 1). That disjunction was INVARIANT under the
+	// phase-82 stream-control fix: before the fix the subject did not
+	// honor Action::Pause, so the stream closed first and the response
+	// landed in the after_close branch — the sum was 1 either way, and two
+	// compensating defects canceled each other in the gate metric (per
+	// reference_compensating_defects_cancel_in_the_gate_metric). Splitting
+	// the legs makes each defect report on its own.
+	//
+	// The requireAll/excludeAny split is load-bearing: the bare-delivered
+	// counter name is a PREFIX of the after_close name, so a naive
+	// substring lookup would match either counter non-deterministically.
 	respDelivered := sumCounterMatching(stats, []string{"plugin_l", "http_call_response"}, []string{"after_close"})
 	respPostClose := sumCounterMatching(stats, []string{"plugin_l", "http_call_response_after_close"}, nil)
-	respTotal := respDelivered + respPostClose
-	if respTotal < 1 {
-		t.Errorf("scenario (l) httpCall-success: http_call_response + http_call_response_after_close sum = %d (delivered=%d, post-close=%d); want sum >= 1", respTotal, respDelivered, respPostClose)
+	if respDelivered < 1 {
+		t.Errorf("scenario (l) httpCall-success: http_call_response = %d; want >= 1 (the http-call response must reach the guest callback)", respDelivered)
+	}
+	if respPostClose != 0 {
+		t.Errorf("scenario (l) httpCall-success: http_call_response_after_close = %d; want 0 (Action::Pause must hold the stream open until the http-call response lands)", respPostClose)
 	}
 
 	// Arm (m) httpCall-unknown-cluster: assert subject's
@@ -501,14 +527,28 @@ func (d *wasmAdvDriver) driveProxy(ctx context.Context, addrs map[string]string,
 	time.Sleep(tickSettleDelay)
 	fmt.Fprintf(&buf, "scenario k subject-only\n")
 
-	// (l) httpCall-success — SUBJECT-ONLY. The wasm guest issues an
-	// httpCall to cluster_b at proxy_on_request_headers; the response
-	// carries x-httpcall-status: but the value diverges cross-side
-	// (subject may return 200 from cluster_b echo; reference V8 may
-	// return 0 if its envoy ext doesn't recognize the cluster). Wire
-	// stream emits a constant token.
-	_ = runScenarioGet(ctx, client, addrs[scenarioName(11)], "l")
-	fmt.Fprintf(&buf, "scenario l subject-only\n")
+	// (l) httpCall-success — CROSS-SIDE as of phase 82 (it ALSO keeps its
+	// subject-only stats legs in AssertStats). The wasm guest issues an
+	// httpCall to cluster_b at proxy_on_request_headers, returns
+	// Action::Pause, and sets response header x-httpcall-status from the
+	// :status of the http-call response (its initial value is 0, so a
+	// callback that never fires reports 0 rather than the real status).
+	//
+	// The pre-phase-82 divergence ran REFERENCE-correct / SUBJECT-wrong —
+	// the inverse of what this comment used to claim. Reference Envoy
+	// (V8) honors Action::Pause and delivers the http-call response to
+	// the guest; envoy-go did NOT honor the pause, so the stream closed
+	// BEFORE the response landed and the response was routed to the
+	// defensive http_call_response_after_close branch, leaving the
+	// guest's call_status at its initial 0. See the matching (and always
+	// correct) note on the (l) stats legs in AssertStats above.
+	//
+	// Phase 82 closes that gap on the subject side (Pause honored +
+	// http-call response header cache with a synthesized :status), so
+	// both sides must now emit the SAME status. Emitting each side's
+	// OBSERVED value — not a constant token — is what makes this arm's
+	// cross-side comparison non-vacuous.
+	emitScenario(&buf, runScenarioGet(ctx, client, addrs[scenarioName(11)], "l"))
 
 	// (m) httpCall-unknown-cluster — SUBJECT-ONLY.
 	_ = runScenarioGet(ctx, client, addrs[scenarioName(12)], "m")
@@ -595,21 +635,35 @@ func emitConstantSkipToken(buf *bytes.Buffer, id string) {
 // shape is mirrored between sides (no side label is emitted) so
 // CompareBytes fires on equivalence.
 //
-// Currently UNUSED at Task 20 fix-up #2 (cross-side arms a-j SKIPPED via
-// emitConstantSkipToken above). Retained for the follow-up phase that
-// restores the per-arm probes after the upstream-buffering parity fix.
-//
-//nolint:unused // reserved for the cross-side arm restoration in a follow-up phase (PROGRESS.md Task 20 Concern 1).
+// LIVE as of phase 82 — but for scenario (l) ONLY. Cross-side arms
+// (a)-(j) are still SKIPPED via emitConstantSkipToken above; restoring
+// them is deferred per PROGRESS.md Task 20 Concern 1 and is explicitly
+// out of phase-82 scope.
 func emitScenario(buf *bytes.Buffer, r scenarioResult) {
 	if r.err != nil {
-		fmt.Fprintf(buf, "scenario %s status=ERR body=ERR (%v)\n", r.id, r.err)
+		fmt.Fprintf(buf, "scenario %s status=ERR body=ERR (%s)\n", r.id, classifyErr(r.err))
 		return
 	}
 	verdict := classifyBody(r.id, r.body, r.headers)
 	fmt.Fprintf(buf, "scenario %s status=%d body=%s\n", r.id, r.status, verdict)
 }
 
-//nolint:unused // helper for emitScenario; reserved for cross-side arm restoration (PROGRESS.md Task 20 Concern 1).
+// classifyErr maps a probe error to a side-STABLE token. The raw error
+// text embeds the per-side listener ADDRESS (reference and subject bind
+// different host ports), so emitting %v would make two identically-
+// failing sides diverge byte-wise — a FALSE cross-side red. Only the
+// error CLASS crosses into the compared byte stream. A one-sided failure
+// still diverges, because the healthy side emits status=<n>.
+func classifyErr(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	}
+	return "other"
+}
+
 func classifyBody(id string, body []byte, headers http.Header) string {
 	switch id {
 	case "a":
@@ -689,11 +743,23 @@ func classifyBody(id string, body []byte, headers http.Header) string {
 			return "x-env-keys=" + v
 		}
 		return "mismatch(x-env-keys_absent)"
+	case "l":
+		// (l) httpCall-success. The guest sets x-httpcall-status from the
+		// :status of its dispatch_http_call response; the value is the
+		// guest's initial 0 when proxy_on_http_call_response never fires.
+		// The RAW value is emitted (never normalized) so that a subject
+		// reporting a WRONG status — notably the 0 that a missing
+		// http-call response header cache yields — diverges from the
+		// reference's real status. An ABSENT header is distinguished from
+		// a present-but-empty one by the mismatch token.
+		if v := headers.Get("x-httpcall-status"); v != "" {
+			return "x-httpcall-status=" + v
+		}
+		return "mismatch(x-httpcall-status_absent)"
 	}
 	return "skip"
 }
 
-//nolint:unused // helper for classifyBody; reserved for cross-side arm restoration (PROGRESS.md Task 20 Concern 1).
 func reflectedHeaders(body []byte) map[string]string {
 	if len(body) == 0 {
 		return nil
@@ -716,7 +782,6 @@ func reflectedHeaders(body []byte) map[string]string {
 	return out
 }
 
-//nolint:unused // helper for classifyBody; reserved for cross-side arm restoration (PROGRESS.md Task 20 Concern 1).
 func reflectedKeys(hdrs map[string]string) []string {
 	keys := make([]string, 0, len(hdrs))
 	for k := range hdrs {
@@ -726,7 +791,6 @@ func reflectedKeys(hdrs map[string]string) []string {
 	return keys
 }
 
-//nolint:unused // helper for classifyBody; reserved for cross-side arm restoration (PROGRESS.md Task 20 Concern 1).
 func trim(body []byte) string {
 	const max = 80
 	s := string(body)

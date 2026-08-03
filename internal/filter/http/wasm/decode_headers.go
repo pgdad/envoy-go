@@ -249,15 +249,26 @@ func (f *filter) DecodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 
 	// ProxyAction handling per 25.2 SPEC §4.3:
 	//   - Continue → http.Continue
-	//   - Pause w/o captured-local-response → log + http.Continue
-	//     (stream-control deferred to 25.2 per parent §1 architectural
-	//     primitive 6 — at 25.2 the wasm filter has no pause/resume
-	//     plumbing on headers; the guest's request to pause is logged +
-	//     ignored so the stream continues).
+	//   - Pause w/o captured-local-response → StopIteration (phase-82 S1).
+	//
+	// Pause is now HONORED. Before phase-82 this arm logged "stream-control
+	// deferred" and returned Continue, i.e. the guest's pause was silently
+	// discarded — while FOUR of the six ProxyActionPause arms in this package
+	// (body.go x2, trailers.go x2) had honored Pause all along. Returning
+	// StopIteration makes FilterChain.RunDecodeHeaders park the stream on the
+	// chain-scoped decodeResumeCh; the guest resumes it with
+	// proxy_continue_stream(0), which lands in abiCallbacks.ContinueStream ->
+	// filter.resumeDecode.
+	//
+	// beginDecodePause records that THIS filter owes exactly one resume (the
+	// CAS gate against spuriously un-parking a sibling filter on the same
+	// chain) and arms the S9 watchdog that bounds the park — see pause.go for
+	// both, including the measured connection+goroutine leak an unbounded
+	// park produces.
 	switch action {
 	case abi.ProxyActionPause:
-		logf("INFO wasm: proxy_on_request_headers returned PAUSE without captured local response — stream-control deferred (parent §1 architectural primitive 6); continuing")
-		return envoyhttp.Continue
+		f.beginDecodePause()
+		return envoyhttp.StopIteration
 	case abi.ProxyActionContinue:
 		fallthrough
 	default:
@@ -397,6 +408,12 @@ func (f *filter) SetDecoderCallbacks(cb envoyhttp.DecoderFilterCallbacks) { f.de
 // value headers contribute their full value count — matching the
 // abiCallbacks.GetHeaderMapSize semantic at Task 11 + the proxy-wasm
 // pair-emission shape (one wire pair per (key, value) tuple).
+//
+// DELIBERATE TWIN: internal/wasm/http_call.go has an identical unexported
+// headerValueCount, used to size the proxy_on_http_call_response num_headers /
+// num_trailers args. The duplication is intentional: internal/wasm cannot
+// import this package (the dependency runs THIS package → internal/wasm, and
+// not the reverse — see `go list -deps`). Keep the two in sync.
 func numHeaderValues(h gohttp.Header) uint32 {
 	var n uint32
 	for _, vs := range h {

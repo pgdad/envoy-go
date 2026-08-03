@@ -3,5 +3,14 @@
 # Cargo.toml + src/lib.rs are committed for operator-reproducibility
 # per Task 20 PLAN, but the per-crate target/ + Cargo.lock are NOT
 # checked in.
+#
+# EXCEPTION (phase 82): l_httpcall_success/Cargo.lock IS checked in. That
+# blob is byte-reproducible ONLY under rustc 1.94.0 + log 0.4.30, and the
+# `log` version is a TRANSITIVE dep of proxy-wasm =0.4.x — nothing in
+# Cargo.toml pins it, so without the lock the blob silently drifts (log
+# 0.4.33 yields a SAME-SIZE, 49791-bytes-different blob). The exception is
+# deliberately NARROW: the other 13 scenario crates stay ignored so a
+# build-all-14 run does not litter the worktree with untracked lock files.
 target/
 Cargo.lock
+!l_httpcall_success/Cargo.lock

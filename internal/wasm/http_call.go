@@ -76,10 +76,83 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
+
+// HTTPCallResponse is the host-side cache of a completed proxy_http_call
+// response, readable by the guest from inside proxy_on_http_call_response.
+//
+// The guest reads it back through three ABI surfaces, all of which resolve
+// through this one struct:
+//
+//   - WasmHeaderMapTypeHttpCallResponseHeaders  (wire 6) → Headers
+//   - WasmHeaderMapTypeHttpCallResponseTrailers (wire 7) → Trailers
+//   - WasmBufferTypeHttpCallResponseBody        (wire 4) → Body
+//
+// # READ-ONLY
+//
+// This value is HOST-OWNED. Upstream documents the http-call response map as
+// read-only ("Only available during onHttpCallResponse"), and there is no
+// meaningful destination for a guest write: the response has already been
+// received and nothing downstream consumes a mutated copy. The guest-facing
+// mutators (proxy_add/replace/remove_header_map_value, proxy_set_header_map_
+// pairs, proxy_set_buffer_bytes) therefore return WasmResult::Unimplemented /
+// BadArgument for these types. The enforcement lives on the consumer side, at
+// internal/filter/http/wasm/abi_callbacks.go headerMapForType (which reports
+// writability per arm) and SetBuffer.
+//
+// Callers MUST treat a returned *HTTPCallResponse — and the http.Header maps
+// and Body slice inside it — as immutable. It is shared by pointer with every
+// concurrent reader on the RootVM.
+//
+// # Lifetime
+//
+// Written by the http-call dispatch goroutine immediately BEFORE it invokes
+// proxy_on_http_call_response under dispatchMu, so the guest observes the
+// response for the call it is being notified about. Absent (nil) before the
+// first completed call.
+type HTTPCallResponse struct {
+	// Headers is the response header map. Nil is legal and reads as an empty
+	// map (a degenerate response — dispatch error, or a nil *http.Response).
+	Headers http.Header
+
+	// Trailers is the response trailer map. Nil is legal and reads as empty.
+	Trailers http.Header
+
+	// Body is the fully-buffered response body. Nil is legal and reads as a
+	// zero-length buffer.
+	Body []byte
+}
+
+// HTTPCallResponse returns the cached response of the most recently completed
+// proxy_http_call on this RootVM, or nil if no call has completed yet.
+//
+// The returned value is READ-ONLY and shared by pointer — see the
+// HTTPCallResponse type doc. This is the SINGLE exported read accessor for the
+// cache (design decision C2): the 21-method ABICallbacks interface is
+// deliberately NOT widened, and the three ABI surfaces (headers / trailers /
+// body) are deliberately NOT given three separate methods.
+func (rv *RootVM) HTTPCallResponse() *HTTPCallResponse {
+	if rv == nil {
+		return nil
+	}
+	return rv.httpCallResp.Load()
+}
+
+// SetHTTPCallResponse publishes r as the cached http-call response. Passing
+// nil clears the cache.
+//
+// r and everything reachable from it MUST NOT be mutated after this call —
+// readers hold the same pointer. Build a fresh *HTTPCallResponse per call.
+func (rv *RootVM) SetHTTPCallResponse(r *HTTPCallResponse) {
+	if rv == nil {
+		return
+	}
+	rv.httpCallResp.Store(r)
+}
 
 // pendingHttpCall is the per-call state tracked in the per-`*RootVM`
 // httpCalls map. The map key is the monotonic call_id allocated at
@@ -382,6 +455,14 @@ func (rv *RootVM) handleHttpCallResponse(callID uint32, resp *http.Response, dis
 		// the http_call_response counter still increments since we
 		// successfully routed (the guest just chose to not consume). Wired
 		// per 25.2 IMPL Task 20 follow-up (Concern 2).
+		//
+		// Phase 82 DELIBERATELY LEAVES THIS SITE ALONE while moving the other
+		// HttpCallResponseInc below the guest call. The two sites count
+		// different things: phase 82 gates the OTHER site on "the guest
+		// returned without trapping", and on THIS path no guest code runs at
+		// all — there is no trap to gate on. Suppressing it here would silently
+		// zero the counter for every cap-denied / non-exporting deployment,
+		// a behavior change unrelated to the trap gate this row is fixing.
 		rv.stats.HttpCallResponseInc()
 		return
 	}
@@ -393,45 +474,141 @@ func (rv *RootVM) handleHttpCallResponse(callID uint32, resp *http.Response, dis
 		return
 	}
 
-	// Compute (num_headers, body_size, num_trailers) for the callback args.
-	// On dispatchErr OR nil resp, all three are 0 (the guest receives a
-	// degenerate response; it MUST inspect via proxy_get_buffer_bytes +
-	// proxy_get_header_map_pairs which return empty/NotFound for the
-	// HttpCallResponse* buffer + header-map types — Task 15 wires the
-	// consumer-side response-body + headers cache via the OnHttpCallResponse
-	// ABICallbacks method that lands at Task 15).
-	var numHeaders, bodySize, numTrailers uint32
+	// Materialize the host-side response cache + compute the (num_headers,
+	// body_size, num_trailers) callback args from it.
+	//
+	// On dispatchErr OR nil resp the cache is degenerate (nil maps, nil body)
+	// and all three counts are 0 — the guest's proxy_get_header_map_pairs
+	// returns NotFound and proxy_get_buffer_bytes returns an empty payload.
+	//
+	// The counts MUST be the VALUE counts, not the KEY counts: the consumer
+	// side (internal/filter/http/wasm abiCallbacks.GetHeaderMap) is
+	// value-EXPANDING — it emits one wire pair per (key, value) tuple, and
+	// GetHeaderMapSize likewise reports the value count. A guest that sizes a
+	// buffer from num_headers and then reads the pairs would under-allocate if
+	// we handed it the key count. See headerValueCount below.
+	var (
+		numHeaders, bodySize, numTrailers uint32
+		callResp                          = &HTTPCallResponse{}
+	)
 	if resp != nil {
-		numHeaders = uint32(len(resp.Header))
+		// The guest reads the response status out of the http-call response
+		// HEADER MAP (`for (k, v) in get_http_call_response_headers() { if k
+		// == ":status" ... }` — the proxy-wasm-rust-sdk shape), but Go's
+		// net/http keeps the status in resp.StatusCode and NEVER puts a
+		// `:status` pseudo-header in resp.Header. Synthesize it.
+		//
+		// Two constraints, both load-bearing:
+		//
+		//   1. Write into a COPY. resp.Header is not ours to mutate, and the
+		//      published cache is contractually immutable + shared by pointer.
+		//   2. Use DIRECT MAP ASSIGNMENT. The guest compares the key VERBATIM,
+		//      so it must be stored exactly ":status" — lowercase,
+		//      colon-prefixed, un-canonicalized. Header.Set/Add would happen to
+		//      work today only because textproto.CanonicalMIMEHeaderKey bails
+		//      out and returns its input unchanged when the key contains a
+		//      non-token byte (':' is one) — MEASURED, not assumed. Relying on
+		//      that bail-out is a trap for the next pseudo-header someone adds,
+		//      so we bypass canonicalization entirely rather than depend on it
+		//      declining to fire.
+		hdrs := resp.Header.Clone() // nil-safe: returns nil for a nil Header
+		if hdrs == nil {
+			hdrs = make(http.Header, 1)
+		}
+		hdrs[statusPseudoHeaderKey] = []string{strconv.Itoa(resp.StatusCode)}
+
+		// Trailers are populated on resp.Trailer once the body is fully read
+		// (which the io.ReadAll above has done). Clone for the same immutability
+		// reason; a nil clone is legal and reads as an empty map.
+		callResp.Headers = hdrs
+		callResp.Trailers = resp.Trailer.Clone()
+		callResp.Body = bodyBytes
+
+		// Counted AFTER the `:status` synthesis so the guest's pair count
+		// matches what GetHeaderMap will actually emit.
+		numHeaders = headerValueCount(callResp.Headers)
 		bodySize = uint32(len(bodyBytes))
-		// Trailers are part of resp.Trailer once the body is fully read.
-		numTrailers = uint32(len(resp.Trailer))
+		numTrailers = headerValueCount(callResp.Trailers)
 	}
 
-	// TODO Task 15: stash (resp.Header, bodyBytes, resp.Trailer) on the
-	// originating *StreamContext so the guest's proxy_get_buffer_bytes
-	// (HttpCallResponseBody) + proxy_get_header_map_pairs
-	// (HttpCallResponseHeaders / HttpCallResponseTrailers) hostcalls can
-	// fetch the materialized response. At Task 8 we only invoke the
-	// callback with the size/count tuple per §5.3 C19; consumer-side body+
-	// headers cache lands at Task 15 (abi_callbacks.go EXTEND OnHttpCall-
-	// Response + Task 16 body.go cache wiring).
+	// Publish the cache for the duration of the guest callback and clear it on
+	// the way out. The response is CALLBACK-SCOPED on the *RootVM (D-82-
+	// LIFETIME): it is readable only from inside proxy_on_http_call_response,
+	// matching the upstream "Only available during onHttpCallResponse"
+	// contract. The publish happens inside the dispatchMu-held frame, ordered
+	// before the guest invocation that reads it.
+	//
+	// The deferred clear runs even when the guest TRAPS: runCallWithPanicWrapper
+	// recovers inside its OWN frame, which cannot skip an outer defer.
+	rv.SetHTTPCallResponse(callResp)
+	defer rv.SetHTTPCallResponse(nil)
 
-	// envoy-go-strict counter increment per Q9 (counter 8 of 14 in §7.1).
-	// Wire name: `wasm.<plugin>.http_call_response`. Wired via
-	// RootStatsRecorder per 25.2 IMPL Task 20 follow-up (Concern 2).
-	rv.stats.HttpCallResponseInc()
-
-	_ = rv.runCallWithPanicWrapper(func() error {
-		_, callErr := fn.Call(ctx,
+	callErr := rv.runCallWithPanicWrapper(func() error {
+		_, err := fn.Call(ctx,
 			uint64(entry.streamCtxID), // plugin_context_id (= streamCtxID per §5.3 C19)
 			uint64(callID),
 			uint64(numHeaders),
 			uint64(bodySize),
 			uint64(numTrailers),
 		)
-		return callErr
+		return err
 	})
+	if callErr != nil {
+		// The guest TRAPPED (a wazero RuntimeError — e.g. a Rust panic! that
+		// aborted to `unreachable`). Mirror dispatchGuest at stream_context.go:
+		// poison the StreamContext so Close SKIPS the teardown triplet instead
+		// of re-entering a poisoned instance (BUG-3), and co-increment the
+		// generic envoy_go.failures counter per §2.25.
+		//
+		// Before phase 82 this error was DISCARDED (`_ = rv.runCall...`) — the
+		// lone swallowing site among the runCallWithPanicWrapper callers that
+		// have a *StreamContext in scope.
+		//
+		// sc is non-nil here (the sc == nil arm early-returned above); the
+		// guard is defensive.
+		if sc != nil {
+			sc.noteTrapOnError(callErr)
+		}
+		rv.stats.EnvoyGoFailuresInc()
+		return
+	}
+
+	// envoy-go-strict counter increment per Q9 (counter 8 of 14 in §7.1).
+	// Wire name: `wasm.<plugin>.http_call_response`. Wired via
+	// RootStatsRecorder per 25.2 IMPL Task 20 follow-up (Concern 2).
+	//
+	// Deliberately AFTER the dispatch, on the non-trapping path ONLY. Before
+	// phase 82 it fired BEFORE the call, so a guest callback that trapped still
+	// incremented it — which made the differential fixture's positive assertion
+	// `http_call_response >= 1` GREEN ON A TRAP, blind to the worst failure
+	// mode of this whole surface.
+	rv.stats.HttpCallResponseInc()
+}
+
+// statusPseudoHeaderKey is the HTTP/2 `:status` pseudo-header name as the
+// guest expects to read it out of the http-call response header map: exactly
+// lowercase, colon-prefixed, NOT MIME-canonicalized. It is stored by direct
+// map assignment so the stored key never depends on textproto's
+// canonicalization behavior — see the synthesis site above.
+const statusPseudoHeaderKey = ":status"
+
+// headerValueCount returns the total VALUE count for a header map — multi-value
+// keys contribute their full value count, matching the value-expanding wire
+// shape of the consumer-side abiCallbacks.GetHeaderMap / GetHeaderMapSize (one
+// pair per (key, value) tuple per §5.3 C16).
+//
+// DELIBERATE TWIN: internal/filter/http/wasm/decode_headers.go has an identical
+// unexported numHeaderValues. The duplication is intentional, not an oversight:
+// internal/filter/http/wasm depends on internal/wasm (and NOT the reverse — see
+// `go list -deps`), so importing the filter-package helper here would invert the
+// dependency direction. Keep the two in sync.
+func headerValueCount(h http.Header) uint32 {
+	var n uint32
+	for _, vs := range h {
+		//nolint:gosec // header count is bounded by http.Header invariants; will not exceed uint32.
+		n += uint32(len(vs))
+	}
+	return n
 }
 
 // cancelOutstandingHttpCalls is the StreamContext.Close-time path: walks

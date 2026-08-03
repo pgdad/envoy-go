@@ -28,6 +28,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	wasmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/wasm/v3"
 	"google.golang.org/protobuf/proto"
@@ -219,6 +222,46 @@ type filter struct {
 	// terminates the response early.
 	decodeBodyCapExceeded bool
 	encodeBodyCapExceeded bool
+
+	// -------------------------------------------------------------------------
+	// phase-82 S1 + S9: honored-Pause stream-control state (see pause.go).
+	// -------------------------------------------------------------------------
+
+	// decodePaused / encodePaused record that THIS filter returned
+	// StopIteration from proxy_on_{request,response}_headers and therefore
+	// OWES the chain exactly one resume.
+	//
+	// ATOMIC, NOT plain bool — LOAD-BEARING. S1 breaks the ADR-0071
+	// single-goroutine-per-stream invariant: the resume is fired from
+	// abiCallbacks.ContinueStream, which the http-call dispatch goroutine
+	// reaches via RootVM.handleHttpCallResponse -> proxy_on_http_call_response
+	// -> proxy_continue_stream, while the dispatch goroutine that wrote the
+	// flag is parked in FilterChain.parkDecode. A plain bool here is a real
+	// `-race` DATA RACE (measured: read by the http-call goroutine in
+	// ContinueStream, previous write by DecodeHeaders). The watchdog timer
+	// (pause.go) is a THIRD goroutine touching the same field.
+	//
+	// The flag is also the IDEMPOTENCE GATE: decodeResumeCh is CHAIN-scoped
+	// (internal/filter/http/chain.go), buffered-1, and shared by every
+	// parking filter on the chain (extauthz / ratelimit / oauth2 /
+	// bandwidthlimit). An UNMATCHED ContinueDecoding latches a token that
+	// spuriously un-parks a DIFFERENT filter, so the resume is gated on
+	// CompareAndSwap(true, false) — only the caller that observes the
+	// true->false transition may signal the chain.
+	decodePaused atomic.Bool
+	encodePaused atomic.Bool
+
+	// pauseMu guards the two watchdog timer handles below. The handles are
+	// written on the dispatch goroutine (the pause arm) and cleared from
+	// OnDestroy or from whichever goroutine wins the resume CAS.
+	pauseMu          sync.Mutex
+	decodePauseTimer *time.Timer
+	encodePauseTimer *time.Timer
+
+	// pauseWatchdog overrides defaultPauseWatchdog for this stream. Zero
+	// selects the default. Per-filter (NOT a package-level var) so parallel
+	// tests can shorten it without racing each other.
+	pauseWatchdog time.Duration
 }
 
 // capturedLocalResponse holds the proxy_send_local_response payload until the

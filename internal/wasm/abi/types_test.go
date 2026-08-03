@@ -143,10 +143,18 @@ func TestWasmHeaderMapType_Values(t *testing.T) {
 		{"HttpRequestTrailers", WasmHeaderMapTypeHttpRequestTrailers, 1},
 		{"HttpResponseHeaders", WasmHeaderMapTypeHttpResponseHeaders, 2},
 		{"HttpResponseTrailers", WasmHeaderMapTypeHttpResponseTrailers, 3},
-		{"HttpCallResponseHeaders", WasmHeaderMapTypeHttpCallResponseHeaders, 4},
-		{"HttpCallResponseTrailers", WasmHeaderMapTypeHttpCallResponseTrailers, 5},
-		{"GrpcReceiveInitialMetadata", WasmHeaderMapTypeGrpcReceiveInitialMetadata, 6},
-		{"GrpcReceiveTrailingMetadata", WasmHeaderMapTypeGrpcReceiveTrailingMetadata, 7},
+		// Values 4-7 CORRECTED at phase 82; the four rows below previously
+		// pinned Grpc*=6/7 + HttpCallResponse*=4/5, i.e. this golden was
+		// hand-written and shared the declaration's swap, so it passed on a
+		// WRONG value rather than catching it. Re-derived from the SDK the
+		// guest blobs compile against: proxy-wasm-rust-sdk v0.2.4
+		// src/types.rs `enum MapType` — GrpcReceiveInitialMetadata = 4,
+		// GrpcReceiveTrailingMetadata = 5, HttpCallResponseHeaders = 6,
+		// HttpCallResponseTrailers = 7.
+		{"GrpcReceiveInitialMetadata", WasmHeaderMapTypeGrpcReceiveInitialMetadata, 4},
+		{"GrpcReceiveTrailingMetadata", WasmHeaderMapTypeGrpcReceiveTrailingMetadata, 5},
+		{"HttpCallResponseHeaders", WasmHeaderMapTypeHttpCallResponseHeaders, 6},
+		{"HttpCallResponseTrailers", WasmHeaderMapTypeHttpCallResponseTrailers, 7},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

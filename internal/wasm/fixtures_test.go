@@ -86,7 +86,7 @@ const (
 	opUnreachable = 0x00
 	opEnd         = 0x0b
 	opCall        = 0x10
-	opLocalGet    = 0x20 // not used yet — reserved for future fixtures
+	opLocalGet    = 0x20
 	opI32Const    = 0x41
 	opI32Store    = 0x36
 	opDrop        = 0x1a
@@ -203,6 +203,11 @@ func funcBody(expr ...[]byte) []byte {
 // i32Const emits `i32.const N`.
 func i32Const(v int32) []byte {
 	return append([]byte{opI32Const}, sleb128(v)...)
+}
+
+// localGet emits `local.get idx`.
+func localGet(idx uint32) []byte {
+	return append([]byte{opLocalGet}, uleb128(idx)...)
 }
 
 // call emits `call funcIdx`.
@@ -1061,6 +1066,92 @@ var exportsAll25_2CallbacksModule = buildModule(
 		funcBody(),
 		// sentinel: no-op
 		funcBody(),
+	}),
+)
+
+// --- Fixture: httpCallResponseTrapsModule ---------------------------------
+//
+// Exports `proxy_on_http_call_response(ctx_id, call_id, num_headers,
+// body_size, num_trailers) -> ()` whose body is a single `unreachable` (a
+// wazero trap) — modeling a guest panic inside the http-call response
+// callback (e.g. a Rust panic! that aborts to `unreachable`).
+//
+// Unlike requestHeadersTrapsModule the teardown triplet is NOT exported, so
+// StreamContext.Close is a clean no-op and the test isolates the
+// proxy_on_http_call_response trap itself.
+//
+// Used by TestA4_HttpCallResponseTrap_PoisonsStreamContext (phase 82 Task 3 +
+// Task 4) to verify that a trapping http-call-response callback poisons the
+// StreamContext (sc.trapped), co-increments envoy_go.failures, and does NOT
+// increment http_call_response.
+var httpCallResponseTrapsModule = buildModule(
+	typeSection(
+		[2][]byte{nil, nil}, // type 0: () -> ()
+		[2][]byte{{wasmTypeI32, wasmTypeI32, wasmTypeI32, wasmTypeI32, wasmTypeI32}, nil}, // type 1: proxy_on_http_call_response (void, 5 args)
+	),
+	// fn 0: _initialize (type 0)
+	// fn 1: proxy_abi_version_0_2_1 (type 0)
+	// fn 2: proxy_on_http_call_response (type 1) — TRAPS
+	functionSection([]uint32{0, 0, 1}),
+	memorySection(1),
+	exportSection([]exportEntry{
+		{name: "_initialize", kind: wasmExtFunction, idx: 0},
+		{name: "proxy_abi_version_0_2_1", kind: wasmExtFunction, idx: 1},
+		{name: "proxy_on_http_call_response", kind: wasmExtFunction, idx: 2},
+		{name: "memory", kind: wasmExtMemory, idx: 0},
+	}),
+	codeSection([][]byte{
+		funcBody(),                      // _initialize
+		funcBody(),                      // proxy_abi_version_0_2_1
+		funcBody([]byte{opUnreachable}), // proxy_on_http_call_response TRAPS
+	}),
+)
+
+// --- Fixture: httpCallResponseLogsNumHeadersModule ------------------------
+//
+// Exports `proxy_on_http_call_response(ctx_id, call_id, num_headers,
+// body_size, num_trailers) -> ()` whose body calls the imported
+// `proxy_log(level, ptr, size)` with level := num_headers (local index 2) and
+// an empty message, then drops the result.
+//
+// This makes the num_headers argument the guest actually received OBSERVABLE
+// from the host side: the ABICallbacks.Log hook receives it as the LogLevel.
+// It also gives the test a re-entrancy point INSIDE the callback frame, so a
+// Log hook can snapshot rv.HTTPCallResponse() while the cache is published
+// (the clear only runs after the guest returns).
+//
+// Used by TestHttpCallResponse_CachePublishedDuringCallback (phase 82 Task 2).
+var httpCallResponseLogsNumHeadersModule = buildModule(
+	typeSection(
+		[2][]byte{{wasmTypeI32, wasmTypeI32, wasmTypeI32}, {wasmTypeI32}}, // type 0: proxy_log
+		[2][]byte{nil, nil}, // type 1: () -> ()
+		[2][]byte{{wasmTypeI32, wasmTypeI32, wasmTypeI32, wasmTypeI32, wasmTypeI32}, nil}, // type 2: proxy_on_http_call_response
+	),
+	importSection([]importEntry{
+		{module: "env", name: "proxy_log", kind: wasmExtFunction, idx: 0}, // fn 0
+	}),
+	// fn 1: _initialize (type 1)
+	// fn 2: proxy_abi_version_0_2_1 (type 1)
+	// fn 3: proxy_on_http_call_response (type 2)
+	functionSection([]uint32{1, 1, 2}),
+	memorySection(1),
+	exportSection([]exportEntry{
+		{name: "_initialize", kind: wasmExtFunction, idx: 1},
+		{name: "proxy_abi_version_0_2_1", kind: wasmExtFunction, idx: 2},
+		{name: "proxy_on_http_call_response", kind: wasmExtFunction, idx: 3},
+		{name: "memory", kind: wasmExtMemory, idx: 0},
+	}),
+	codeSection([][]byte{
+		funcBody(), // _initialize
+		funcBody(), // proxy_abi_version_0_2_1
+		// proxy_on_http_call_response: proxy_log(num_headers, 0, 0); drop
+		funcBody(
+			localGet(2), // num_headers → level
+			i32Const(0), // msg_ptr
+			i32Const(0), // msg_size
+			call(0),     // proxy_log
+			[]byte{opDrop},
+		),
 	}),
 )
 

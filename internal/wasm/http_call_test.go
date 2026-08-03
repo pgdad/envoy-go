@@ -40,6 +40,8 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -665,4 +667,344 @@ func TestHttpCall_DispatchOnClosedVM_InternalFailure(t *testing.T) {
 		t.Error("httpCalls map re-created after Close; want nil (sweep must be final)")
 	}
 	rv.httpCallsMu.Unlock()
+}
+
+// --- countingStatsRecorder -------------------------------------------------
+
+// countingStatsRecorder is a goroutine-safe RootStatsRecorder that counts
+// every increment, so tests can assert on the counter DELTAS a dispatch path
+// produced. Only the counters this file asserts on are read back; the rest
+// satisfy the interface.
+type countingStatsRecorder struct {
+	tickInvocations             atomic.Int64
+	httpCallDispatched          atomic.Int64
+	httpCallResponse            atomic.Int64
+	foreignFunctionDenied       atomic.Int64
+	bodyBufferCapExceeded       atomic.Int64
+	httpCallDispatchUnknownClus atomic.Int64
+	sharedDataCapExceeded       atomic.Int64
+	dynamicStatsCapExceeded     atomic.Int64
+	httpCallResponseAfterClose  atomic.Int64
+	envoyGoFailures             atomic.Int64
+}
+
+func (c *countingStatsRecorder) TickInvocationsInc()       { c.tickInvocations.Add(1) }
+func (c *countingStatsRecorder) HttpCallDispatchedInc()    { c.httpCallDispatched.Add(1) }
+func (c *countingStatsRecorder) HttpCallResponseInc()      { c.httpCallResponse.Add(1) }
+func (c *countingStatsRecorder) ForeignFunctionDeniedInc() { c.foreignFunctionDenied.Add(1) }
+func (c *countingStatsRecorder) BodyBufferCapExceededInc() { c.bodyBufferCapExceeded.Add(1) }
+func (c *countingStatsRecorder) HttpCallDispatchUnknownClusterInc() {
+	c.httpCallDispatchUnknownClus.Add(1)
+}
+func (c *countingStatsRecorder) SharedDataCapExceededInc()      { c.sharedDataCapExceeded.Add(1) }
+func (c *countingStatsRecorder) DynamicStatsCapExceededInc()    { c.dynamicStatsCapExceeded.Add(1) }
+func (c *countingStatsRecorder) HttpCallResponseAfterCloseInc() { c.httpCallResponseAfterClose.Add(1) }
+func (c *countingStatsRecorder) EnvoyGoFailuresInc()            { c.envoyGoFailures.Add(1) }
+
+var _ RootStatsRecorder = (*countingStatsRecorder)(nil)
+
+// --- TestA4_HttpCallResponseTrap_PoisonsStreamContext ---------------------
+
+// TestA4_HttpCallResponseTrap_PoisonsStreamContext is the phase-82 Task 3 +
+// Task 4 anchor: a guest whose proxy_on_http_call_response body is a single
+// `unreachable` TRAPS. The host must
+//
+//	(Task 3) poison the originating StreamContext (sc.trapped) so Close skips
+//	         the teardown triplet, and co-increment envoy_go.failures per
+//	         §2.25; and
+//	(Task 4) NOT increment http_call_response — that counter means "the guest
+//	         consumed the response", and the fixture's positive assertion
+//	         `http_call_response >= 1` would otherwise be GREEN ON A TRAP.
+//
+// Two negative controls keep the assertions non-vacuous:
+//
+//	NC1 the capability gate did NOT short-circuit the dispatch —
+//	    HasGlobalFunc("proxy_on_http_call_response") is true, so the guest
+//	    export was actually reached (a denied cap would take the early-return
+//	    arm and produce trapped=false for an unrelated reason).
+//	NC2 the httpCalls entry was CONSUMED by handleHttpCallResponse rather than
+//	    swept by cancel-at-destruction — the entry is present before the
+//	    response and absent after, with the stream context still open.
+func TestA4_HttpCallResponseTrap_PoisonsStreamContext(t *testing.T) {
+	ctx := context.Background()
+	mod := mustCompileForRootVM(t, ctx, httpCallResponseTrapsModule)
+
+	disp := newFakeHTTPDispatcher("cluster_a")
+	rec := &countingStatsRecorder{}
+	rv, err := NewRootVM(ctx, mod, 1,
+		WithRootSandboxConfig(allowAllSandbox()),
+		WithRootHTTPDispatcher(disp),
+		WithRootStats(rec),
+	)
+	if err != nil {
+		t.Fatalf("NewRootVM: %v", err)
+	}
+	defer func() { _ = rv.Close() }()
+	rv.RegisterABICallbacks(&fakeABICallbacks{})
+	if err := rv.Configure(ctx, nil, nil); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	// NC1: the callback is reachable — cap allowed AND exported. If this were
+	// false the dispatch would take the "no guest export / cap denied" arm and
+	// sc.trapped would be false for a reason that has nothing to do with the
+	// trap.
+	if !rv.HasGlobalFunc("proxy_on_http_call_response") {
+		t.Fatal("NC1: HasGlobalFunc(proxy_on_http_call_response) = false; the trap arm is unreachable and this test would be vacuous")
+	}
+
+	sc, err := rv.NewStreamContext(ctx)
+	if err != nil {
+		t.Fatalf("NewStreamContext: %v", err)
+	}
+
+	rv.dispatchMu.Lock()
+	callID, status := rv.DispatchHttpCall(ctx, sc.streamCtxID, "cluster_a", nil, nil, nil, 5000)
+	rv.dispatchMu.Unlock()
+	if status != abi.WasmResultOk {
+		t.Fatalf("DispatchHttpCall status=%v; want Ok", status)
+	}
+
+	// Wait for the dispatch goroutine to consume the entry (NC2's "after").
+	deadline := time.Now().Add(3 * time.Second)
+	consumed := false
+	for time.Now().Before(deadline) {
+		rv.httpCallsMu.Lock()
+		_, present := rv.httpCalls[callID]
+		rv.httpCallsMu.Unlock()
+		if !present {
+			consumed = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// NC2: the entry was consumed by handleHttpCallResponse, and the stream is
+	// still open — so the response reached the guest-dispatch arm rather than
+	// the token-miss / stream-gone early returns.
+	if !consumed {
+		t.Fatalf("NC2: httpCalls[%d] still present after 3s; the response never reached handleHttpCallResponse", callID)
+	}
+	if sc.closed.Load() {
+		t.Fatal("NC2: stream context closed; the response would have taken the stream-gone early-return arm")
+	}
+	if got := rec.httpCallResponseAfterClose.Load(); got != 0 {
+		t.Fatalf("NC2: http_call_response_after_close = %d; want 0 (a non-zero count means the response took an early-return arm, not the guest dispatch)", got)
+	}
+
+	// Task 3: the trap must poison the StreamContext.
+	if !sc.trapped.Load() {
+		t.Errorf("sc.trapped = false after proxy_on_http_call_response TRAPPED; want true")
+	}
+
+	// Task 3: §2.25 co-increment.
+	if got := rec.envoyGoFailures.Load(); got < 1 {
+		t.Errorf("envoy_go.failures = %d after a trapping proxy_on_http_call_response; want >= 1", got)
+	}
+
+	// Task 4: http_call_response counts CONSUMED responses. A trap did not
+	// consume anything.
+	if got := rec.httpCallResponse.Load(); got != 0 {
+		t.Errorf("http_call_response = %d after a trapping proxy_on_http_call_response; want 0 (the counter must not go green on a trap)", got)
+	}
+
+	// Task 2: the deferred cache-clear must run even on the trap path.
+	// runCallWithPanicWrapper recovers inside its OWN frame, which cannot skip
+	// an outer defer — this asserts that rather than assuming it.
+	if after := rv.HTTPCallResponse(); after != nil {
+		t.Errorf("rv.HTTPCallResponse() = %+v after a TRAPPING callback; want nil (the deferred clear must survive the recover)", after)
+	}
+}
+
+// --- TestHttpCallResponse_CachePublishedDuringCallback --------------------
+
+// logHookABICallbacks wraps fakeABICallbacks and fires onLog inside the
+// guest's proxy_log hostcall frame — i.e. WHILE proxy_on_http_call_response is
+// still on the stack. It is the re-entrancy point the cache-lifetime assertion
+// needs (the deferred clear only runs after the guest returns).
+type logHookABICallbacks struct {
+	*fakeABICallbacks
+	onLog func(level abi.LogLevel)
+}
+
+func (l *logHookABICallbacks) Log(ctx context.Context, ctxID uint32, level abi.LogLevel, msg string) {
+	if l.onLog != nil {
+		l.onLog(level)
+	}
+	l.fakeABICallbacks.Log(ctx, ctxID, level, msg)
+}
+
+// TestHttpCallResponse_CachePublishedDuringCallback is the phase-82 Task 2
+// anchor for the PRODUCER half of the http-call response cache. It asserts, on
+// a response whose header map deliberately has MORE VALUES THAN KEYS:
+//
+//	(a) the cache is PUBLISHED while proxy_on_http_call_response is running;
+//	(b) Headers carries a synthesized `:status` under the EXACT key ":status"
+//	    — lowercase, colon-prefixed, un-canonicalized (Go's net/http never puts
+//	    a `:status` in resp.Header, so a literal stash would be inert);
+//	(c) the num_headers argument the guest received is the VALUE count, not the
+//	    KEY count (GetHeaderMap is value-EXPANDING);
+//	(d) the source resp.Header was NOT mutated — the synthesis went into a copy;
+//	(e) the cache is CLEARED once the callback returns (callback-scoped
+//	    lifetime per D-82-LIFETIME).
+func TestHttpCallResponse_CachePublishedDuringCallback(t *testing.T) {
+	ctx := context.Background()
+	mod := mustCompileForRootVM(t, ctx, httpCallResponseLogsNumHeadersModule)
+
+	// 2 keys / 3 values, so the key count (2, +1 for :status = 3) and the
+	// value count (3, +1 for :status = 4) DIFFER — a key-count regression
+	// cannot pass this test.
+	//
+	// The response is built by dispatchFn rather than the canned path so the
+	// test RETAINS the exact http.Header map it handed to the host. The canned
+	// path Clones responseHdrs per call, which would make the (d)
+	// "source map not mutated" assertion vacuous — a no-copy implementation
+	// would mutate the per-call clone and the retained original would look
+	// pristine. VERIFIED by a deliberate break: with `hdrs := resp.Header`
+	// (no copy) and the canned path, (d) did NOT fire.
+	sourceHdrs := http.Header{
+		"X-Multi":  []string{"a", "b"},
+		"X-Single": []string{"c"},
+	}
+	disp := newFakeHTTPDispatcher("cluster_a")
+	disp.dispatchFn = func(_ context.Context, _ string, _ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			Status:     http.StatusText(201),
+			StatusCode: 201,
+			Header:     sourceHdrs, // the SAME map the assertions inspect
+			Body:       io.NopCloser(bytes.NewReader([]byte("hello-body"))),
+		}, nil
+	}
+
+	rec := &countingStatsRecorder{}
+	rv, err := NewRootVM(ctx, mod, 1,
+		WithRootSandboxConfig(allowAllSandbox()),
+		WithRootHTTPDispatcher(disp),
+		WithRootStats(rec),
+	)
+	if err != nil {
+		t.Fatalf("NewRootVM: %v", err)
+	}
+	defer func() { _ = rv.Close() }()
+
+	var (
+		seenLevel    atomic.Int64
+		seenSnapshot atomic.Pointer[HTTPCallResponse]
+		logFired     atomic.Bool
+	)
+	cb := &logHookABICallbacks{
+		fakeABICallbacks: &fakeABICallbacks{},
+		onLog: func(level abi.LogLevel) {
+			logFired.Store(true)
+			seenLevel.Store(int64(level))
+			// Snapshot the cache from INSIDE the callback frame.
+			seenSnapshot.Store(rv.HTTPCallResponse())
+		},
+	}
+	rv.RegisterABICallbacks(cb)
+	if err := rv.Configure(ctx, nil, nil); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	sc, err := rv.NewStreamContext(ctx)
+	if err != nil {
+		t.Fatalf("NewStreamContext: %v", err)
+	}
+
+	rv.dispatchMu.Lock()
+	callID, status := rv.DispatchHttpCall(ctx, sc.streamCtxID, "cluster_a", nil, nil, nil, 5000)
+	rv.dispatchMu.Unlock()
+	if status != abi.WasmResultOk {
+		t.Fatalf("DispatchHttpCall status=%v; want Ok", status)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		rv.httpCallsMu.Lock()
+		_, present := rv.httpCalls[callID]
+		rv.httpCallsMu.Unlock()
+		if !present && logFired.Load() {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// NC: the guest callback actually ran. Without this the remaining
+	// assertions would read a zero-valued snapshot and could go green
+	// vacuously.
+	if !logFired.Load() {
+		t.Fatal("NC: the guest's proxy_log never fired — proxy_on_http_call_response did not run, so every assertion below would be vacuous")
+	}
+
+	// (a) the cache was published for the duration of the callback.
+	snap := seenSnapshot.Load()
+	if snap == nil {
+		t.Fatal("(a) rv.HTTPCallResponse() = nil from INSIDE proxy_on_http_call_response; want the published cache")
+	}
+
+	// (b) `:status` under the exact key, and NOT under a canonicalized one.
+	vals, ok := snap.Headers[":status"]
+	if !ok {
+		keys := make([]string, 0, len(snap.Headers))
+		for k := range snap.Headers {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		t.Errorf("(b) no %q key in the published headers; keys = %q", ":status", keys)
+	} else if len(vals) != 1 || vals[0] != "201" {
+		t.Errorf("(b) headers[\":status\"] = %q; want [\"201\"]", vals)
+	}
+	for k := range snap.Headers {
+		if k != ":status" && strings.EqualFold(k, ":status") {
+			t.Errorf("(b) found a case-mangled status key %q; the key must be exactly %q", k, ":status")
+		}
+	}
+
+	// (c) num_headers is the VALUE count. 3 source values (X-Multi x2,
+	// X-Single x1) + 1 synthesized :status = 4. The KEY count would be 3.
+	const wantValueCount = 4
+	const keyCountWouldBe = 3
+	if got := seenLevel.Load(); got != wantValueCount {
+		t.Errorf("(c) guest received num_headers=%d; want %d (the VALUE count). %d would mean the KEY count was passed",
+			got, wantValueCount, keyCountWouldBe)
+	}
+	if got := headerValueCount(snap.Headers); got != wantValueCount {
+		t.Errorf("(c) headerValueCount(published headers) = %d; want %d", got, wantValueCount)
+	}
+	if got := len(snap.Headers); got != keyCountWouldBe {
+		t.Errorf("(c) published header KEY count = %d; want %d (test fixture invariant: key count and value count must differ)", got, keyCountWouldBe)
+	}
+
+	// Body readable through the cache.
+	if got := string(snap.Body); got != "hello-body" {
+		t.Errorf("published body = %q; want %q", got, "hello-body")
+	}
+
+	// (d) the source header map was not mutated by the synthesis. sourceHdrs
+	// is the very map handed to the host as resp.Header (see dispatchFn above).
+	if _, bad := sourceHdrs[":status"]; bad {
+		t.Error("(d) the source resp.Header was MUTATED with :status; the synthesis must write into a COPY")
+	}
+	if got := len(sourceHdrs); got != 2 {
+		t.Errorf("(d) source resp.Header grew to %d keys; want 2 (it must be untouched)", got)
+	}
+
+	// (f) THE DISCRIMINATING CONTROL for the `http_call_response == 0` reading
+	// in TestA4_HttpCallResponseTrap_PoisonsStreamContext. That test concludes
+	// "the trap suppressed the counter" from a ZERO — but a zero is also what a
+	// counter that never fires at all produces, and the phase-82 change MOVED
+	// this increment. This arm runs the identical dispatch path with a guest
+	// that RETURNS NORMALLY and asserts the counter does fire, so the zero over
+	// there is a suppression and not a dead measurement path.
+	if got := rec.httpCallResponse.Load(); got != 1 {
+		t.Errorf("(f) http_call_response = %d after a NON-trapping callback; want 1 (the move must not have killed the increment outright)", got)
+	}
+	if got := rec.envoyGoFailures.Load(); got != 0 {
+		t.Errorf("(f) envoy_go.failures = %d after a NON-trapping callback; want 0 (the trap arm must not fire on the success path)", got)
+	}
+
+	// (e) callback-scoped: cleared once the guest returned.
+	if after := rv.HTTPCallResponse(); after != nil {
+		t.Errorf("(e) rv.HTTPCallResponse() = %+v after the callback returned; want nil (the cache is callback-scoped)", after)
+	}
 }

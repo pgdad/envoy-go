@@ -34,6 +34,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	wasmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/wasm/v3"
@@ -93,6 +94,112 @@ func newTestCompiledConfig(t *testing.T, modBytes []byte, pluginName string, reg
 		t.Fatalf("anypb.New: %v", err)
 	}
 	cc, err := buildCompiledConfig(context.Background(), tc, envoyhttp.FactoryCtx{Stats: reg})
+	if err != nil {
+		t.Fatalf("buildCompiledConfig: %v", err)
+	}
+	return cc
+}
+
+// testLifecycleCapabilities is the proxy_on_* lifecycle + per-stream dispatch
+// capability set that must be ALLOWED for a guest to actually be invoked.
+//
+// Rationale (measured at phase 82): SandboxConfig is StrictDefaultDeny per
+// AMEND-A5, so a *compiledConfig built WITHOUT a CapabilityRestrictionConfig
+// (i.e. newTestCompiledConfig) never reaches the guest at all — StreamContext.
+// dispatchGuest short-circuits at `!rv.sandbox.IsAllowed(capKey)` and every
+// CallProxyOn* returns its benign per-callback default. A test built that way
+// can only ever observe the default arm of a post-dispatch action switch, which
+// silently makes any non-default arm (e.g. ProxyActionPause) DEAD CODE.
+var testLifecycleCapabilities = []string{
+	"proxy_on_vm_start",
+	"proxy_on_configure",
+	"proxy_on_context_create",
+	"proxy_on_request_headers",
+	"proxy_on_response_headers",
+	"proxy_on_request_body",
+	"proxy_on_response_body",
+	"proxy_on_http_call_response",
+	"proxy_on_done",
+	"proxy_on_log",
+	"proxy_on_delete",
+}
+
+// newTestCompiledConfigWithCaps is newTestCompiledConfig with a populated
+// CapabilityRestrictionConfig, so the guest is ACTUALLY DISPATCHED rather than
+// short-circuited by the StrictDefaultDeny sandbox posture.
+//
+// Prefer this helper over newTestCompiledConfig for ANY test whose assertion
+// depends on the guest running — a guest-return value, a hostcall side effect,
+// or a non-default arm of the ProxyAction switch. newTestCompiledConfig remains
+// correct only for tests that deliberately assert the cap-denied / no-dispatch
+// posture, or that never dispatch at all.
+//
+// testLifecycleCapabilities is always allowed. extraCaps adds hostcall
+// capabilities (e.g. "proxy_send_local_response", "proxy_get_header_map_pairs",
+// "proxy_add_header_map_value") for guests that invoke them; a hostcall whose
+// capability is denied is not even registered as a host import, so a guest that
+// imports it fails to instantiate.
+//
+// The vm_id is unique per call (testVMIDCounter), as in newTestCompiledConfig.
+// The caller owns the returned *compiledConfig and must Close it (typically
+// `t.Cleanup(func() { _ = cc.Close() })`), matching newTestCompiledConfig.
+func newTestCompiledConfigWithCaps(t *testing.T, modBytes []byte, pluginName string, reg *stats.Registry, extraCaps ...string) *compiledConfig {
+	t.Helper()
+	return newTestCompiledConfigWithCapsAndFactoryCtx(t, modBytes, pluginName,
+		envoyhttp.FactoryCtx{Stats: reg}, extraCaps...)
+}
+
+// newTestCompiledConfigWithCapsAndFactoryCtx is newTestCompiledConfigWithCaps
+// with a caller-supplied FactoryCtx, for tests that need more of the factory
+// surface than Stats.
+//
+// The motivating case (phase 82 Task 10): compiled_config.go wires the
+// production wasm.HTTPDispatcher ONLY when BOTH factoryCtx.ClusterManager and
+// factoryCtx.HTTPClient are non-nil. With the Stats-only FactoryCtx above,
+// proxy_http_call returns InternalFailure, the proxy-wasm-rust-sdk records no
+// token for the call, and a subsequent proxy_on_http_call_response TRAPS inside
+// the SDK's own token lookup (`expect` on a missing entry) before any of the
+// host's response wiring is reached. A test that wants the real guest to
+// receive a real http-call response must supply both pointers.
+func newTestCompiledConfigWithCapsAndFactoryCtx(t *testing.T, modBytes []byte, pluginName string, factoryCtx envoyhttp.FactoryCtx, extraCaps ...string) *compiledConfig {
+	t.Helper()
+	allowed := make(map[string]*wasmcommonv3.SanitizationConfig,
+		len(testLifecycleCapabilities)+len(extraCaps))
+	for _, c := range testLifecycleCapabilities {
+		allowed[c] = &wasmcommonv3.SanitizationConfig{}
+	}
+	for _, c := range extraCaps {
+		allowed[c] = &wasmcommonv3.SanitizationConfig{}
+	}
+	cfg := &wasmv3.Wasm{
+		Config: &wasmcommonv3.PluginConfig{
+			Name:   pluginName,
+			RootId: "test_root",
+			Vm: &wasmcommonv3.PluginConfig_VmConfig{
+				VmConfig: &wasmcommonv3.VmConfig{
+					VmId:    fmt.Sprintf("test_vm_%d", testVMIDCounter.Add(1)),
+					Runtime: "envoy.wasm.runtime.wazero",
+					Code: &corev3.AsyncDataSource{
+						Specifier: &corev3.AsyncDataSource_Local{
+							Local: &corev3.DataSource{
+								Specifier: &corev3.DataSource_InlineBytes{
+									InlineBytes: modBytes,
+								},
+							},
+						},
+					},
+				},
+			},
+			CapabilityRestrictionConfig: &wasmcommonv3.CapabilityRestrictionConfig{
+				AllowedCapabilities: allowed,
+			},
+		},
+	}
+	tc, err := anypb.New(cfg)
+	if err != nil {
+		t.Fatalf("anypb.New: %v", err)
+	}
+	cc, err := buildCompiledConfig(context.Background(), tc, factoryCtx)
 	if err != nil {
 		t.Fatalf("buildCompiledConfig: %v", err)
 	}
@@ -511,31 +618,62 @@ func TestFilter_ConcurrentStreams_NoSharedState(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 // -----------------------------------------------------------------------------
-// Test 7: PAUSE-w/o-local-response → log + Continue (stream-control deferred).
+// Test 7: PAUSE-w/o-local-response → StopIteration (phase-82 S1).
 // -----------------------------------------------------------------------------
 
-// TestFilter_DecodeHeaders_Pause_LogAndContinue exercises the PAUSE arm
-// per 25.1 SPEC §4.3 + parent §1 architectural primitive 6: the guest
-// returns ProxyActionPause without invoking proxy_send_local_response;
-// the dispatcher logs + Continues (stream-control deferred to 25.2).
-// Asserts: Continue returned; no SendLocalReply call; no envoy_go.failures
-// bump (PAUSE is not a failure, just a deferred surface).
-func TestFilter_DecodeHeaders_Pause_LogAndContinue(t *testing.T) {
+// TestFilter_DecodeHeaders_Pause_StopsIteration exercises the PAUSE arm: the
+// guest returns ProxyActionPause without invoking proxy_send_local_response and
+// the dispatcher STOPS ITERATION, parking the stream until the guest calls
+// proxy_continue_stream (or the S9 watchdog fires).
+//
+// FLIPPED AT PHASE 82 (this is the row's failing-first anchor, not a new test).
+// Until this row the arm logged "stream-control deferred (parent §1
+// architectural primitive 6)" and returned Continue — the guest's pause was
+// silently discarded. That blanket claim was FALSE: four of the six
+// abi.ProxyActionPause arms in this package (body.go x2, trailers.go x2) had
+// honored Pause all along; only the two HEADERS arms were deferred. The
+// assertion below was `want Continue` and now reads `want StopIteration`.
+//
+// Asserts: StopIteration returned; the paused flag is set (this filter owes
+// the chain exactly one resume); no SendLocalReply call; no envoy_go.failures
+// bump (PAUSE is not a failure).
+//
+// CAPABILITY-ENABLED (phase 82 Task 8). This test previously used
+// newTestCompiledConfig, whose StrictDefaultDeny sandbox meant the guest was
+// NEVER DISPATCHED: CallProxyOnRequestHeaders short-circuited at the capability
+// gate and returned the zero-value ProxyActionContinue, so the switch below
+// always took the `default:` arm and the ProxyActionPause arm this test claims
+// to exercise was DEAD CODE. Measured with a discriminating cross-product: a
+// panic injected into the ProxyActionPause arm did NOT fire (test still PASSed)
+// while a panic injected into the `default:` arm DID. It now uses
+// newTestCompiledConfigWithCaps so the guest actually runs and returns PAUSE.
+//
+// The executions assertion below is the liveness barrier that keeps this test
+// from silently regressing to the vacuous form: executions is incremented on
+// the decode-side dispatch path, so it is 1 only if dispatch actually happened.
+func TestFilter_DecodeHeaders_Pause_StopsIteration(t *testing.T) {
 	t.Parallel()
 	reg := stats.NewRegistry()
-	cc := newTestCompiledConfig(t, buildPauseProxyWasm(), "plugin_pause", reg)
+	cc := newTestCompiledConfigWithCaps(t, buildPauseProxyWasm(), "plugin_pause", reg)
 	t.Cleanup(func() { _ = cc.Close() })
 
 	rec := &recordingDecoderCb{}
 	f := &filter{cfg: cc}
+	// Keep the S9 watchdog out of this test's way — the park bound is asserted
+	// separately in pause_test.go.
+	f.pauseWatchdog = time.Hour
 	f.SetDecoderCallbacks(rec)
 	f.SetEncoderCallbacks(fakeEncoderCb{})
+	t.Cleanup(f.OnDestroy)
 
 	headers := gohttp.Header{}
 	headers.Set(":method", "GET")
 	got := f.DecodeHeaders(headers, true)
-	if got != envoyhttp.Continue {
-		t.Fatalf("DecodeHeaders = %v; want Continue (PAUSE w/o local-response → log + Continue per §1 primitive 6)", got)
+	if got != envoyhttp.StopIteration {
+		t.Errorf("DecodeHeaders = %v; want StopIteration (phase-82 S1 honors ProxyActionPause on request headers)", got)
+	}
+	if !f.decodePaused.Load() {
+		t.Errorf("decodePaused = false after the PAUSE arm; want true (the filter owes the chain exactly one resume)")
 	}
 	rec.mu.Lock()
 	calls := rec.calls
@@ -545,6 +683,13 @@ func TestFilter_DecodeHeaders_Pause_LogAndContinue(t *testing.T) {
 	}
 	if got := findStatCounterValue(reg, "wasm.plugin_pause.envoy_go.failures"); got != 0 {
 		t.Errorf("envoy_go.failures = %d; want 0 (PAUSE is not a failure)", got)
+	}
+	// LIVENESS BARRIER: proves the guest was actually dispatched (and hence
+	// that the guest's ProxyActionPause return reached the action switch).
+	// Under the pre-phase-82 StrictDefaultDeny fixture this was 0 while every
+	// other assertion above still passed — see the doc comment.
+	if got := findStatCounterValue(reg, "wasm.plugin_pause.executions"); got != 1 {
+		t.Errorf("executions = %d; want 1 (the guest MUST be dispatched — a 0 here means the capability gate short-circuited and the PAUSE arm was never reached)", got)
 	}
 	f.OnDestroy()
 }

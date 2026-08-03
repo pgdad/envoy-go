@@ -37,6 +37,10 @@ impl Context for Filter {
                 }
             }
         }
+        // Resume the request the on_http_request_headers Action::Pause halted.
+        // Without this the stream never continues: reference Envoy holds the
+        // request open until the downstream client times out.
+        self.resume_http_request();
     }
 }
 impl HttpContext for Filter {

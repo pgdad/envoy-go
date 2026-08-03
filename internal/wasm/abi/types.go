@@ -60,15 +60,31 @@ const (
 type WasmHeaderMapType int32
 
 // WasmHeaderMapType* constants per proxy-wasm v0.2.1.
+//
+// WIRE VALUES 4-7 CORRECTED at phase 82. They were previously declared
+// Grpc* = 6/7 and HttpCallResponse* = 4/5, which is SWAPPED relative to the
+// canonical ABI. Derived from the SDK the guest blobs are actually compiled
+// against — proxy-wasm-rust-sdk v0.2.4, src/types.rs `enum MapType`:
+//
+//	HttpRequestHeaders = 0, HttpRequestTrailers = 1,
+//	HttpResponseHeaders = 2, HttpResponseTrailers = 3,
+//	GrpcReceiveInitialMetadata = 4, GrpcReceiveTrailingMetadata = 5,
+//	HttpCallResponseHeaders = 6, HttpCallResponseTrailers = 7,
+//
+// A guest asking for its http-call response headers therefore sends 6, and
+// under the pre-82 declaration the host resolved that to
+// GrpcReceiveTrailingMetadata. Do NOT "correct" these against the Go code or
+// against the golden in types_test.go — that golden was hand-written and
+// carried the same swap until phase 82. Re-derive from the SDK source.
 const (
 	WasmHeaderMapTypeHttpRequestHeaders          WasmHeaderMapType = 0
 	WasmHeaderMapTypeHttpRequestTrailers         WasmHeaderMapType = 1
 	WasmHeaderMapTypeHttpResponseHeaders         WasmHeaderMapType = 2
 	WasmHeaderMapTypeHttpResponseTrailers        WasmHeaderMapType = 3
-	WasmHeaderMapTypeHttpCallResponseHeaders     WasmHeaderMapType = 4
-	WasmHeaderMapTypeHttpCallResponseTrailers    WasmHeaderMapType = 5
-	WasmHeaderMapTypeGrpcReceiveInitialMetadata  WasmHeaderMapType = 6
-	WasmHeaderMapTypeGrpcReceiveTrailingMetadata WasmHeaderMapType = 7
+	WasmHeaderMapTypeGrpcReceiveInitialMetadata  WasmHeaderMapType = 4
+	WasmHeaderMapTypeGrpcReceiveTrailingMetadata WasmHeaderMapType = 5
+	WasmHeaderMapTypeHttpCallResponseHeaders     WasmHeaderMapType = 6
+	WasmHeaderMapTypeHttpCallResponseTrailers    WasmHeaderMapType = 7
 )
 
 // LogLevel is the proxy_log severity.

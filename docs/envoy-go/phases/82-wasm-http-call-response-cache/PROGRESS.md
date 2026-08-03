@@ -101,3 +101,86 @@ Re-run mechanically with firing NCs at the start and again after the writes. **D
 ## Handoff
 
 **The phase-82 IMPL, sixteen tasks, in the stated order.** T1 (S0+S5 atomic, **with the mutator read-only guard**) -> T2 (cache via the single-method C2 accessor) -> T3 (trap propagation, **reusing `EnvoyGoFailuresInc()` so stat surface `+0` survives**) -> T4 (`HttpCallResponseInc` ordering) -> T5/T6 (S1, **decode only — do NOT touch `body.go`/`trailers.go`**) -> T7 (**S9, the parked-stream leak**) -> T8 (**the capability-enabled test harness — 122 of 128 dispatch gate-sites are cap-denied today**) -> T9-T12 (tests) -> T13 (**S7 blob AND the two pins**) -> T14 (fixture, +26 net measured) -> T15 (breaks; **BREAK-B mandatory, BREAK-C already green as the negative control, BREAK-D a coin flip until T5**) -> T16 (gates, ADR-0304 completion **carrying the ADR-0071 invariant break**, row 82 -> `done`).
+
+# IMPL record (2026-08-03)
+
+**Stage:** IMPL (lifecycle-state `3` -> `DONE`). **ROW 82 FLIPPED `in-progress` -> `done`; THE PHASE IS CLOSED.** Base master **`c0be319b`** (from `git rev-parse master`), branch `phase-82-impl`. Sentinel `want` **STAYS 114** — the IMPL adds no row, it updates `status` in place per §Schema `:18`.
+
+**Execution:** six agents, each in its own worktree with private scratch and disjoint port bands inside `42400-42799`. Three ran the sequential core chain in one worktree (the T1-T4-before-T5 ordering is a **correctness** constraint, not a preference); two ran the independent Rust/fixture streams in parallel detached worktrees and were cherry-picked in **clean, zero conflicts**; one ran the break roster in a detached worktree and **committed nothing** — its entire deliverable is evidence. All reported `git status --porcelain` = 0 lines.
+
+⚠️ **One deliberate reordering, recorded:** **T8 ran FIRST, before T1.** T1 owes the repair of two vacuous tests, and that repair needs the capability-enabled config T8 builds. The correctness ordering (T1-T4 before T5) is untouched.
+
+## Cost — a §6.1 CROSSING, recorded as a FINDING and NOT retro-split
+
+**Budget ~1050 net `.go`. Realized `+2675` net `.go` (2809 added / 134 deleted) across 24 files; all-files `+2887`.** That is **2.55x**, and across `:290`'s ~1500-line trigger.
+
+⚠️ **THE COMPOSITION INVERTED EXACTLY AS THE PLAN WARNED.** The PLAN priced the stream-control half at **30** measured lines and the tests at 600-900; the tests dominated. **A MEASURED PROTOTYPE IS A LOWER BOUND — this is the SECOND CONSECUTIVE ROW to demonstrate it** (phase 81: 3.07x over a nine-prototype measured basis). **No scope was reduced to conceal the crossing**, and the phase-81 precedent is followed: record, do not retroactively split.
+
+## Gates — MEASURED, each with its denominator
+
+| gate | result |
+|---|---|
+| full differential | **120/120 PASS in 388.961 s**, `INNER_EXIT=0`; FAIL/SKIP **empty**; `no driver registered` **0**; panic/DATA RACE/SIGSEGV **0**; fixture-roster `comm -3` **empty** |
+| `0036` alone | **PASS 18.87 s** — ⚠️ **DOWN from 34.2-35.3 s**, unforecast: the rebuilt guest resumes and retires a 15 s dead reference client-timeout |
+| h2spec | **53 tests, 53 passed, 0 skipped, 0 failed** — ⚠️ **ONE report, no reference arm; the PLAN's "106 passed" DOES NOT REPRODUCE at this tip** |
+| proxy-wasm conformance | PASS |
+| `go test ./cmd/envoy-go/` | ok 8.974 s |
+| touched packages | ok, and a **second** `-race` run ok |
+| `gofmt -l` | **empty OUTPUT** (never gated on exit code) |
+| `golangci-lint` | 0 findings, **negative-controlled** — an injected probe FIRED, then was restored to a 0-line `git status` |
+| **stat surface** | **+0 BY CALL-SITE ENUMERATION** — **145 registration code sites across 21 production files, IDENTICAL at base and at HEAD**, and `git diff --stat` over every stats source path returns **EMPTY**. ⚠️ Denominator is THIS session's matcher; it disagrees with the PLAN's 208/35. **Only the DELTA is asserted, and it is asserted two independent ways.** |
+
+**Six-gate posture, named not claimed:** (a)/(b) **GREEN, for real** — this is the first phase-82 stage to commit `.go`. (c) proxy-wasm PASS. (d) **VACUOUS** — this row adds no fuzzer. (e) `go.mod`/`go.sum` byte-untouched. (f) `REVIEW.md` **ABSENT — the STANDING LINEAGE DEPARTURE**, named rather than papered over.
+
+## The break roster — EVERY ARM LIVE, NONE VACUOUS
+
+Each arm quotes the assertion that **actually** fired, not merely that one did.
+
+| arm | injection | fired |
+|---|---|---|
+| **A** | side-asymmetric wrong header, ONE side only | byte divergence at offset 659 — **no stats leg fired** |
+| **B** (mandatory) | revert the map-type-6 arm | divergence at 641 **AND** `http_call_response = 0; want >= 1`. ⚠️ **NOT RUNNABLE before this row** — there was no arm to revert |
+| **C** (negative control) | flagrantly wrong value, **SYMMETRIC** | **PASSES**, as predicted — confirming a fixture-layer break MUST be side-asymmetric |
+| **D1** | suppress the success-path counter | **only** leg 1 |
+| **D2** | force the after-close path | **only** leg 2 |
+| **D2'** | re-introduce the historical pre-82 defect | both legs — and the **retired disjunction would have summed to 1 and read GREEN** |
+| **E** | re-introduce the swapped enum | 3 unit tests + the fixture; **the rest of the tree is BLIND** |
+| **F** | remove the `:status` synthesis | divergence at 659 — **all three stats legs stay GREEN** |
+
+⚠️ **THE TWO GATE-COVERAGE FINDINGS THAT MATTER MORE THAN THE GREENS.** (1) **BREAK-F is caught by the cross-side comparison ALONE.** The subject serves a wrong value while every counter reads success — so a counter proving a callback *ran* is structurally incapable of proving it returned the *right answer*. Had the cache landed without the fixture change, that defect would have shipped green. (2) **BREAK-E's prior explanation is REFUTED**: it is not "only numeric literals catch it" — a **real guest blob** catches it too, because its compiled SDK sends 6 regardless of what Go declares. The correct discriminator is *the wire value originates outside the Go declaration*.
+
+## Refutations — SEVENTEEN, of which SIX are load-bearing
+
+**Load-bearing:**
+1. ⚠️ **`reference_differential_log_lacks_subject_stderr` is REFUTED for this harness.** `test/differential/harness.go:258` sets `cmd.Stderr = os.Stderr`, so under `go test … > log 2>&1` the subject's stderr **does** land in the log — full wazero trap traces were read verbatim. **The PLAN recorded this as a failed CHANNEL; the channel works. The memory is now corrected.**
+2. ⚠️ **The PLAN's h2spec figure does not reproduce.** One report, **53/53/0/0**, no reference arm, and the per-group `X/X passed` figures sum to 53. **State your own denominator** — this stage's is 53.
+3. ⚠️ **"Removing all five `//nolint:unused` leaves zero findings" is REFUTED BY EXECUTION** — at base it emits **five** findings. The stated reason (transitive reachability) is a non-sequitur: reachability from an **unused root** is still unused. The removals are valid **only after** the row's own flip supplies a live caller.
+4. ⚠️ **`git grep '4e630adf\|139655' ⇒ zero hits repo-wide` was FALSE at the tip that asserted it** — it returns five, all of them the asserting stage's own prose. **The claim was self-invalidated by its own landing.** The substantive part (no roster, no size assertion, no golden, no Rust toolchain in CI) holds.
+5. ⚠️ **The blob link-failure framing was misleading.** Not `proxy_continue_stream` x15+: **43** undefined-symbol lines across **32 distinct** host imports, reproducing on the **unmodified** source. It has no causal connection to the symbol this row adds a call to.
+6. ⚠️ **The cap-denied population is 123/129, not 122/128** — stable across three runs; 13 distinct tests, 100 of the 123 from a single loop test.
+
+**Also refuted:** `Header.Set` would **not** mangle `":status"` (the canonicalizer returns non-token input verbatim) — the fix is still right, the stated *reason* was wrong · the PLAN's per-site fixture numstat **disagrees at every site** (predicted ~+26, realized **+118**), and the stats split **grew** where a shrink was predicted · one propagating trap site was cited at the wrong line and propagates by *returning* the error, not via the trap helper · the ContinueStream test is at a different line than cited and was misnamed for a method live since 25.2 · `next-prompt.txt` and `ROADMAP.md` carry **zero** occurrences of the four enum symbols, contra the brief · a first break arm proved **vacuous** (the fixture Cloned the map, so the assertion inspected an object the implementation never touched) and was rebuilt · a stubbed producer **cannot test this surface at all** — the Rust SDK traps in its own token lookup long before any host wiring is reached.
+
+**COULD NOT VERIFY, labelled rather than laundered:** the (l) counter's 3/5 intermittency (the row made the path deterministic, so the question is now moot rather than answered) · rustc 1.95.0 as a boundary (installed, but without the wasm target) · two prior figures reproduced at different coordinates after this row's own edits.
+
+## Deferred BY NAME — added by this row
+
+- ⚠️ **The body/trailers Pause arms set no paused flag**, so the resume gate will not release them. **No guest crate calls any resume hostcall today**, so nothing reaches it. Must land with a re-run of the body-cap scenario.
+- ⚠️ **The row's own trap arm is SILENT.** The failure counter cannot discriminate *which* callback trapped (one break produced three increments; two were downstream shrapnel). A log line would introduce a logging surface into a package that has **none** — measured, with a firing NC on the sibling package that has one. **Deferred with the evidence attached rather than smuggling a convention change onto the last task of an over-budget row.**
+- ⚠️ **A hardcoded test port collides** across parallel sessions and across back-to-back runs through `TIME-WAIT` — observed live.
+
+Everything the PLAN §7 deferred is carried forward unchanged.
+
+## Sentinel — re-run MECHANICALLY. It does **NOT** fire; `stop` was **NOT** created
+
+Input measured **230 lines / 114 data rows** before anything was written.
+
+- **(1) SILENT — and this row is what silenced it.** ⚠️ **Silence is otherwise indistinguishable from a broken check, so THREE negative controls were run and ALL THREE FIRED:** row 62 doctored on a scratch copy ⇒ `NOT DONE: row 62` with the doctored field printed first; **row 82 ITSELF doctored back ⇒ `NOT DONE: row 82`, proving the check sees THIS row**; `want=113` ⇒ `GATE FAIL: examined 114 data rows, expected 113`.
+- **(2) FIVE — `:192 :202 :212 :218 :226`, UNCHANGED. THIS ROW NARROWS NOTHING, STATED AND NOT FORECAST.** The **thirty-fifth** consecutive phase without a decrease.
+- **(3) `NEVER OPENED: gRPC` — ALONE.** This row retired the second of the two failures. NC: an invented slug fires.
+- **Leak check:** the diff to `ROADMAP.md` is **exactly one line, the status cell**; check (2)'s five fail-strings are unchanged at five and check (3)'s literal `WASM-family row` still occurs **exactly once, at line 144, in field 7**.
+- `ls stop` ⇒ `No such file or directory`. **`stop` MUST NOT be created — checks (2) and (3) are both still live.**
+
+## Document deltas
+
+`ROADMAP.md` **one cell** · `DECISIONS.md` **17824 -> 17858** (ADR-0304 PROPOSED -> COMPLETE; ⚠️ **the append shifted ZERO existing cites — PROVEN by `head -17824 | cmp -`, which reports exactly one differing line, the in-place STATUS flip at `:17800`**; 303 headings, `^---$` 216, STATUS census 17, retained footer intact, recurrence guard **disarmed to 0**).

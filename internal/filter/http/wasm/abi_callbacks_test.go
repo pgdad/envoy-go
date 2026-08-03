@@ -79,6 +79,7 @@ import (
 	"github.com/pgdad/envoy-go/internal/dynamicmetadata"
 	envoyhttp "github.com/pgdad/envoy-go/internal/filter/http"
 	"github.com/pgdad/envoy-go/internal/filterstate"
+	"github.com/pgdad/envoy-go/internal/stats"
 	internalwasm "github.com/pgdad/envoy-go/internal/wasm"
 	"github.com/pgdad/envoy-go/internal/wasm/abi"
 )
@@ -234,6 +235,19 @@ func TestAbiCallbacks_GetHeaderMap_NilHeaders_NotFound(t *testing.T) {
 	}
 }
 
+// TestAbiCallbacks_GetHeaderMap_DeferredMapTypes_NotFound pins the map types
+// that are STILL deferred after phase 82: request trailers (1), response
+// trailers (3), and the two grpc-receive-metadata types (4, 5).
+//
+// HttpCallResponseHeaders (6) + HttpCallResponseTrailers (7) were REMOVED from
+// this roster at phase 82 — they are now ACTIVE, and asserting "deferred" for
+// them here would have reported the opposite of the contract this row lands.
+// They are covered by TestAbiCallbacks_HttpCallResponseMapTypes_Readable and
+// TestAbiCallbacks_HttpCallResponseMapTypes_ReadOnly below.
+//
+// This test binds a nil-config filter deliberately: a deferred type must
+// answer NotFound irrespective of any VM state, and the arm it exercises
+// (headerMapForType's `default:`) is reached before any config lookup.
 func TestAbiCallbacks_GetHeaderMap_DeferredMapTypes_NotFound(t *testing.T) {
 	t.Parallel()
 	cb, _ := newTestABICallbacks(http.Header{"X": []string{"y"}}, http.Header{"X": []string{"y"}}, fakeDecoderCb{}, fakeEncoderCb{})
@@ -241,16 +255,234 @@ func TestAbiCallbacks_GetHeaderMap_DeferredMapTypes_NotFound(t *testing.T) {
 	deferred := []abi.WasmHeaderMapType{
 		abi.WasmHeaderMapTypeHttpRequestTrailers,
 		abi.WasmHeaderMapTypeHttpResponseTrailers,
-		abi.WasmHeaderMapTypeHttpCallResponseHeaders,
-		abi.WasmHeaderMapTypeHttpCallResponseTrailers,
 		abi.WasmHeaderMapTypeGrpcReceiveInitialMetadata,
 		abi.WasmHeaderMapTypeGrpcReceiveTrailingMetadata,
 	}
 	for _, mt := range deferred {
 		_, ok := cb.GetHeaderMap(context.Background(), 1, mt)
 		if ok {
-			t.Errorf("mapType %d: ok = true; want false (deferred to 25.2)", mt)
+			t.Errorf("mapType %d: ok = true; want false (still deferred after phase 82)", mt)
 		}
+	}
+	// Deferred types must also be CLOSED TO WRITES. Without this, a future
+	// activation of one of them silently opens a mutator surface.
+	for _, mt := range deferred {
+		if got := cb.AddHeaderMapValue(context.Background(), 1, mt, "X", "y"); got != abi.WasmResultUnimplemented {
+			t.Errorf("mapType %d: AddHeaderMapValue = %v; want Unimplemented", mt, got)
+		}
+	}
+}
+
+// newHttpCallResponseABICallbacks builds an *abiCallbacks bound to a filter
+// bound to a REAL *compiledConfig (hence a real *RootVM), with the RootVM's
+// http-call response cache set to resp.
+//
+// The nil-config fixture (newTestABICallbacks) CANNOT be used for the
+// http-call response map types: headerMapForType resolves them through
+// f.eff/f.cfg → rootVM, so a nil-config filter makes every such assertion pass
+// for the wrong reason (no VM ⇒ no data ⇒ NotFound) and would go vacuous-green
+// against a production surface that IS active. Pass resp == nil to exercise
+// the cache-absent control arm.
+func newHttpCallResponseABICallbacks(t *testing.T, pluginName string, resp *internalwasm.HTTPCallResponse) (*abiCallbacks, *filter) {
+	t.Helper()
+	reg := stats.NewRegistry()
+	cc := newTestCompiledConfigWithCaps(t, buildMinimalProxyWasm(), pluginName, reg)
+	t.Cleanup(func() { _ = cc.Close() })
+	if cc.rootVM == nil {
+		t.Fatalf("compiledConfig.rootVM is nil; the fixture cannot exercise the http-call response cache")
+	}
+	cc.rootVM.SetHTTPCallResponse(resp)
+
+	f := &filter{
+		cfg:             cc,
+		eff:             cc,
+		requestHeaders:  http.Header{"X-Req": []string{"r"}},
+		responseHeaders: http.Header{"X-Resp": []string{"s"}},
+		decoderCb:       fakeDecoderCb{},
+		encoderCb:       fakeEncoderCb{},
+	}
+	return &abiCallbacks{filter: f}, f
+}
+
+// TestAbiCallbacks_HttpCallResponseMapTypes_Readable asserts the phase-82
+// contract for the ACTIVATED http-call response map types: readable when the
+// per-RootVM cache holds a response, NotFound when it does not.
+//
+// The absent arm is a STACKED CONTROL, not a second-best assertion: it is what
+// makes the present arm meaningful. If headerMapForType's new arms were wired
+// to something that is always nil (or the enum values were still swapped, so
+// 6/7 landed on the grpc `default:`), the present arm below would fail while
+// the absent arm still passed.
+func TestAbiCallbacks_HttpCallResponseMapTypes_Readable(t *testing.T) {
+	t.Parallel()
+
+	t.Run("present", func(t *testing.T) {
+		t.Parallel()
+		cb, _ := newHttpCallResponseABICallbacks(t, "plugin_hcr_present", &internalwasm.HTTPCallResponse{
+			Headers:  http.Header{"X-Call-Hdr": []string{"h1", "h2"}},
+			Trailers: http.Header{"X-Call-Tlr": []string{"t1"}},
+			Body:     []byte("call-body"),
+		})
+
+		pairs, ok := cb.GetHeaderMap(context.Background(), 1, abi.WasmHeaderMapTypeHttpCallResponseHeaders)
+		if !ok {
+			t.Errorf("GetHeaderMap(HttpCallResponseHeaders): ok = false; want true (wire 6 is ACTIVE at phase 82)")
+		}
+		if len(pairs) != 2 {
+			t.Errorf("GetHeaderMap(HttpCallResponseHeaders) pairs = %v; want 2 (one per value)", pairs)
+		}
+		if v, ok := cb.GetHeaderMapValue(context.Background(), 1, abi.WasmHeaderMapTypeHttpCallResponseHeaders, "X-Call-Hdr"); !ok || v != "h1" {
+			t.Errorf("GetHeaderMapValue(HttpCallResponseHeaders) = (%q, %v); want (\"h1\", true)", v, ok)
+		}
+		if n := cb.GetHeaderMapSize(context.Background(), 1, abi.WasmHeaderMapTypeHttpCallResponseHeaders); n != 2 {
+			t.Errorf("GetHeaderMapSize(HttpCallResponseHeaders) = %d; want 2", n)
+		}
+
+		tpairs, ok := cb.GetHeaderMap(context.Background(), 1, abi.WasmHeaderMapTypeHttpCallResponseTrailers)
+		if !ok {
+			t.Errorf("GetHeaderMap(HttpCallResponseTrailers): ok = false; want true (wire 7 is ACTIVE at phase 82)")
+		}
+		if len(tpairs) != 1 {
+			t.Errorf("GetHeaderMap(HttpCallResponseTrailers) pairs = %v; want 1", tpairs)
+		}
+
+		// The body surface (WasmBufferType 4) resolves through the same cache.
+		buf, err := cb.GetBuffer(context.Background(), 1, abi.WasmBufferTypeHttpCallResponseBody)
+		if err != nil {
+			t.Errorf("GetBuffer(HttpCallResponseBody) err = %v; want nil", err)
+		}
+		if string(buf) != "call-body" {
+			t.Errorf("GetBuffer(HttpCallResponseBody) = %q; want %q", buf, "call-body")
+		}
+	})
+
+	// WIRE-LITERAL PIN. Every other assertion in this file names the map type
+	// SYMBOLICALLY (abi.WasmHeaderMapTypeHttpCallResponseHeaders), so it tracks
+	// the Go declaration whatever value that declaration happens to carry —
+	// measured: re-introducing the pre-82 swap (Grpc 6/7, HttpCallResponse 4/5)
+	// leaves every symbolic assertion in this package GREEN. Only a literal
+	// pins the contract that actually matters, which is a GUEST-side one: the
+	// proxy-wasm-rust-sdk v0.2.4 guest emits 6 for its http-call response
+	// headers and 7 for the trailers, and 4/5 for grpc-receive metadata.
+	//
+	// Derived from the SDK the guest blobs compile against — proxy-wasm-rust-sdk
+	// v0.2.4 src/types.rs `enum MapType` — NOT from the Go code under test.
+	t.Run("wire_literals", func(t *testing.T) {
+		t.Parallel()
+		cb, _ := newHttpCallResponseABICallbacks(t, "plugin_hcr_wire", &internalwasm.HTTPCallResponse{
+			Headers:  http.Header{"X-Call-Hdr": []string{"h1"}},
+			Trailers: http.Header{"X-Call-Tlr": []string{"t1"}},
+		})
+
+		// Literal 6 → http-call response HEADERS.
+		if v, ok := cb.GetHeaderMapValue(context.Background(), 1, abi.WasmHeaderMapType(6), "X-Call-Hdr"); !ok || v != "h1" {
+			t.Errorf("wire map type 6 = (%q, %v); want (\"h1\", true) — 6 is HttpCallResponseHeaders per proxy-wasm-rust-sdk v0.2.4 MapType", v, ok)
+		}
+		// Literal 7 → http-call response TRAILERS.
+		if v, ok := cb.GetHeaderMapValue(context.Background(), 1, abi.WasmHeaderMapType(7), "X-Call-Tlr"); !ok || v != "t1" {
+			t.Errorf("wire map type 7 = (%q, %v); want (\"t1\", true) — 7 is HttpCallResponseTrailers per proxy-wasm-rust-sdk v0.2.4 MapType", v, ok)
+		}
+		// Literals 4 + 5 are grpc-receive metadata: still DEFERRED, so NotFound.
+		for _, w := range []int32{4, 5} {
+			if _, ok := cb.GetHeaderMap(context.Background(), 1, abi.WasmHeaderMapType(w)); ok {
+				t.Errorf("wire map type %d: ok = true; want false — %d is GrpcReceive*Metadata per proxy-wasm-rust-sdk v0.2.4 MapType, still deferred", w, w)
+			}
+		}
+		// Literals 0 + 2 still resolve to the request/response header sides.
+		if v, ok := cb.GetHeaderMapValue(context.Background(), 1, abi.WasmHeaderMapType(0), "X-Req"); !ok || v != "r" {
+			t.Errorf("wire map type 0 = (%q, %v); want (\"r\", true) — 0 is HttpRequestHeaders", v, ok)
+		}
+		if v, ok := cb.GetHeaderMapValue(context.Background(), 1, abi.WasmHeaderMapType(2), "X-Resp"); !ok || v != "s" {
+			t.Errorf("wire map type 2 = (%q, %v); want (\"s\", true) — 2 is HttpResponseHeaders", v, ok)
+		}
+	})
+
+	t.Run("absent_stacked_control", func(t *testing.T) {
+		t.Parallel()
+		cb, _ := newHttpCallResponseABICallbacks(t, "plugin_hcr_absent", nil)
+
+		for _, mt := range []abi.WasmHeaderMapType{
+			abi.WasmHeaderMapTypeHttpCallResponseHeaders,
+			abi.WasmHeaderMapTypeHttpCallResponseTrailers,
+		} {
+			if _, ok := cb.GetHeaderMap(context.Background(), 1, mt); ok {
+				t.Errorf("mapType %d: ok = true with an EMPTY cache; want false", mt)
+			}
+			if n := cb.GetHeaderMapSize(context.Background(), 1, mt); n != 0 {
+				t.Errorf("mapType %d: size = %d with an EMPTY cache; want 0", mt, n)
+			}
+		}
+		if buf, err := cb.GetBuffer(context.Background(), 1, abi.WasmBufferTypeHttpCallResponseBody); err != nil || len(buf) != 0 {
+			t.Errorf("GetBuffer(HttpCallResponseBody) = (%q, %v) with an EMPTY cache; want (empty, nil)", buf, err)
+		}
+	})
+}
+
+// TestAbiCallbacks_HttpCallResponseMapTypes_ReadOnly asserts that activating
+// map types 6/7 did NOT open a guest write surface.
+//
+// headerMapForType's `active` flag has SEVEN consumers — three getters and
+// FOUR MUTATORS (AddHeaderMapValue, ReplaceHeaderMapValue,
+// RemoveHeaderMapValue, SetHeaderMapPairs). Before phase 82 the mutators
+// keyed off `active` alone, so activating an arm would have made the
+// host-owned http-call response map guest-WRITABLE: a probe measured
+// AddHeaderMapValue(HttpCallResponseHeaders) returning Ok (0) instead of
+// Unimplemented (12), with the guest actually mutating the stashed map.
+// Upstream documents the field read-only ("Only available during
+// onHttpCallResponse").
+//
+// The cache is POPULATED here on purpose. A read-only assertion made against
+// an EMPTY cache is vacuous — nil headers alone would produce a non-Ok result
+// (InternalFailure) and the test would pass with no guard present at all.
+func TestAbiCallbacks_HttpCallResponseMapTypes_ReadOnly(t *testing.T) {
+	t.Parallel()
+	cb, _ := newHttpCallResponseABICallbacks(t, "plugin_hcr_ro", &internalwasm.HTTPCallResponse{
+		Headers:  http.Header{"X-Call-Hdr": []string{"h1"}},
+		Trailers: http.Header{"X-Call-Tlr": []string{"t1"}},
+		Body:     []byte("call-body"),
+	})
+
+	for _, mt := range []abi.WasmHeaderMapType{
+		abi.WasmHeaderMapTypeHttpCallResponseHeaders,
+		abi.WasmHeaderMapTypeHttpCallResponseTrailers,
+	} {
+		// Precondition: the type IS readable, so a non-Ok mutator result below
+		// cannot be explained away by "there was nothing there".
+		if _, ok := cb.GetHeaderMap(context.Background(), 1, mt); !ok {
+			t.Errorf("mapType %d: precondition failed — not readable, so the read-only assertions below are vacuous", mt)
+		}
+		if got := cb.AddHeaderMapValue(context.Background(), 1, mt, "X-Evil", "1"); got != abi.WasmResultUnimplemented {
+			t.Errorf("mapType %d: AddHeaderMapValue = %v; want Unimplemented (host-owned, read-only)", mt, got)
+		}
+		if got := cb.ReplaceHeaderMapValue(context.Background(), 1, mt, "X-Evil", "1"); got != abi.WasmResultUnimplemented {
+			t.Errorf("mapType %d: ReplaceHeaderMapValue = %v; want Unimplemented (host-owned, read-only)", mt, got)
+		}
+		if got := cb.RemoveHeaderMapValue(context.Background(), 1, mt, "X-Call-Hdr"); got != abi.WasmResultUnimplemented {
+			t.Errorf("mapType %d: RemoveHeaderMapValue = %v; want Unimplemented (host-owned, read-only)", mt, got)
+		}
+		if got := cb.SetHeaderMapPairs(context.Background(), 1, mt, []internalwasm.HeaderPair{{Key: "X-Evil", Value: "1"}}); got != abi.WasmResultUnimplemented {
+			t.Errorf("mapType %d: SetHeaderMapPairs = %v; want Unimplemented (host-owned, read-only)", mt, got)
+		}
+	}
+
+	// The cache must be BYTE-IDENTICAL after all four mutator attempts — a
+	// result code alone would not catch a mutator that wrote and then reported
+	// Unimplemented.
+	pairs, _ := cb.GetHeaderMap(context.Background(), 1, abi.WasmHeaderMapTypeHttpCallResponseHeaders)
+	if len(pairs) != 1 || pairs[0].Key != "X-Call-Hdr" || pairs[0].Value != "h1" {
+		t.Errorf("headers after mutator attempts = %v; want exactly [{X-Call-Hdr h1}] (unmutated)", pairs)
+	}
+	tpairs, _ := cb.GetHeaderMap(context.Background(), 1, abi.WasmHeaderMapTypeHttpCallResponseTrailers)
+	if len(tpairs) != 1 || tpairs[0].Key != "X-Call-Tlr" || tpairs[0].Value != "t1" {
+		t.Errorf("trailers after mutator attempts = %v; want exactly [{X-Call-Tlr t1}] (unmutated)", tpairs)
+	}
+
+	// The body surface is write-closed too (host-written, not guest-written).
+	if got := cb.SetBuffer(context.Background(), 1, abi.WasmBufferTypeHttpCallResponseBody, 0, []byte("evil")); got != abi.WasmResultBadArgument {
+		t.Errorf("SetBuffer(HttpCallResponseBody) = %v; want BadArgument (host-owned)", got)
+	}
+	if buf, _ := cb.GetBuffer(context.Background(), 1, abi.WasmBufferTypeHttpCallResponseBody); string(buf) != "call-body" {
+		t.Errorf("body after SetBuffer attempt = %q; want %q (unmutated)", buf, "call-body")
 	}
 }
 
@@ -330,7 +562,15 @@ func TestAbiCallbacks_RemoveHeaderMapValue(t *testing.T) {
 		t.Errorf("Values after Remove = %v; want []", vs)
 	}
 	// Deferred map type returns Unimplemented.
-	if got := cb.RemoveHeaderMapValue(context.Background(), 1, abi.WasmHeaderMapTypeHttpCallResponseHeaders, "X"); got != abi.WasmResultUnimplemented {
+	//
+	// RETARGETED at phase 82 from HttpCallResponseHeaders to
+	// HttpRequestTrailers. HttpCallResponseHeaders is no longer deferred, and
+	// against this nil-config fixture it would have kept passing for the wrong
+	// reason (no VM ⇒ nil headers) rather than because of the read-only guard.
+	// The real read-only contract for types 6/7 — asserted against a POPULATED
+	// cache, across all four mutators — lives in
+	// TestAbiCallbacks_HttpCallResponseMapTypes_ReadOnly.
+	if got := cb.RemoveHeaderMapValue(context.Background(), 1, abi.WasmHeaderMapTypeHttpRequestTrailers, "X"); got != abi.WasmResultUnimplemented {
 		t.Errorf("Deferred Remove = %v; want Unimplemented", got)
 	}
 }
@@ -813,20 +1053,27 @@ func TestAbiCallbacks_GetBufferStatus_StubReturnsZeros(t *testing.T) {
 	}
 }
 
-func TestAbiCallbacks_ContinueStream_StubReturnsUnimplemented(t *testing.T) {
+// TestAbiCallbacks_ContinueStream_NilCallbackAndBadArgument covers the two
+// arms this file has always covered. RENAMED at phase 82: the old name
+// (..._StubReturnsUnimplemented) had been wrong since Task 16 activated the
+// method, and it described neither assertion below.
+//
+// The remaining four arms — decode/encode x {live-not-paused, live-and-paused}
+// — plus the idempotence and cross-filter-spurious-resume properties live in
+// pause_test.go (TestAbiCallbacks_ContinueStream_SixArms and
+// TestAbiCallbacks_ContinueStream_NoSpuriousCrossFilterResume). Until phase 82
+// NOTHING in this package asserted that ContinueDecoding actually fires.
+func TestAbiCallbacks_ContinueStream_NilCallbackAndBadArgument(t *testing.T) {
 	t.Parallel()
-	// Task 16 ACTIVATED ContinueStream (Task 15 stub replaced):
 	// streamType=0 (decode) routes to decoderCb.ContinueDecoding; nil cb
-	// returns InternalFailure. Test re-pinned at Task 16 activation:
-	// with nil decoderCb the activated method returns InternalFailure;
-	// streamType > 1 returns BadArgument.
+	// returns InternalFailure. streamType > 1 returns BadArgument.
 	cb, _ := newTestABICallbacks(nil, nil, nil, nil)
 
 	if got := cb.ContinueStream(context.Background(), 1, 0); got != abi.WasmResultInternalFailure {
-		t.Errorf("ContinueStream(streamType=0, nil decoderCb) = %v; want InternalFailure (Task 16 activated)", got)
+		t.Errorf("ContinueStream(streamType=0, nil decoderCb) = %v; want InternalFailure", got)
 	}
 	if got := cb.ContinueStream(context.Background(), 1, 99); got != abi.WasmResultBadArgument {
-		t.Errorf("ContinueStream(streamType=99) = %v; want BadArgument (Task 16 activated)", got)
+		t.Errorf("ContinueStream(streamType=99) = %v; want BadArgument", got)
 	}
 }
 

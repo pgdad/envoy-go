@@ -168,26 +168,85 @@ var _ internalwasm.ABICallbacks = (*abiCallbacks)(nil)
 // gracefully per proxy-wasm v0.2.1 ABI guidance.
 // -----------------------------------------------------------------------------
 
-// headerMapForType returns the per-side http.Header for the given map type
-// + a flag indicating whether the type is ACTIVE at 25.1 (types 0 + 2) vs
-// deferred-to-25.2/25.3 (types 1/3/4/5/6/7).
+// headerMapForType returns the per-side http.Header for the given map type,
+// whether the type is ACTIVE (vs still deferred), and whether the guest may
+// MUTATE it.
 //
-//   - active=true,  h!=nil   → ready (request or response headers captured)
-//   - active=true,  h==nil   → active type but uncaptured (pre-dispatch side)
+//   - active=true,  h!=nil   → ready (the map is captured/available)
+//   - active=true,  h==nil   → active type but uncaptured (pre-dispatch side,
+//     or an http-call response that has not arrived)
 //   - active=false, h==nil   → deferred type (return Unimplemented / NotFound)
-func (a *abiCallbacks) headerMapForType(mapType abi.WasmHeaderMapType) (h http.Header, active bool) {
+//
+// # writable
+//
+// writable is reported PER ARM rather than derived from active, and every arm
+// must state it explicitly. This is deliberate: activating a map type wires
+// SEVEN consumers at once — three getters (GetHeaderMap, GetHeaderMapValue,
+// GetHeaderMapSize) and FOUR MUTATORS (AddHeaderMapValue,
+// ReplaceHeaderMapValue, RemoveHeaderMapValue, SetHeaderMapPairs). Before
+// phase 82 the mutators keyed off `active` alone, so any newly-activated arm
+// silently opened a guest WRITE surface onto that map. Making writability a
+// return value of this function means a future arm CANNOT be added without
+// deciding, at the arm, whether guests may write it.
+//
+// Active map types and their writability:
+//
+//   - HttpRequestHeaders       (0) → request headers, WRITABLE (the guest's
+//     mutations propagate to the chain)
+//   - HttpResponseHeaders      (2) → response headers, WRITABLE
+//   - HttpCallResponseHeaders  (6) → http-call response, READ-ONLY
+//   - HttpCallResponseTrailers (7) → http-call response, READ-ONLY
+//
+// The http-call response map is host-owned and documented read-only upstream
+// ("Only available during onHttpCallResponse"); see the internalwasm.
+// HTTPCallResponse type doc. Types 1/3 (request/response trailers) and 4/5
+// (grpc receive metadata) remain deferred.
+func (a *abiCallbacks) headerMapForType(mapType abi.WasmHeaderMapType) (h http.Header, active, writable bool) {
 	if a.filter == nil {
-		return nil, false
+		return nil, false, false
 	}
 	switch mapType {
 	case abi.WasmHeaderMapTypeHttpRequestHeaders:
-		return a.filter.requestHeaders, true
+		return a.filter.requestHeaders, true, true
 	case abi.WasmHeaderMapTypeHttpResponseHeaders:
-		return a.filter.responseHeaders, true
+		return a.filter.responseHeaders, true, true
+	case abi.WasmHeaderMapTypeHttpCallResponseHeaders:
+		if r := a.httpCallResponse(); r != nil {
+			return r.Headers, true, false
+		}
+		return nil, true, false
+	case abi.WasmHeaderMapTypeHttpCallResponseTrailers:
+		if r := a.httpCallResponse(); r != nil {
+			return r.Trailers, true, false
+		}
+		return nil, true, false
 	default:
-		// Deferred map types (1/3/4/5/6/7).
-		return nil, false
+		// Deferred map types (1/3/4/5).
+		return nil, false, false
 	}
+}
+
+// httpCallResponse resolves the per-RootVM http-call response cache for this
+// stream, or nil when no call has completed (or the filter is not yet bound to
+// a VM).
+//
+// The VM is resolved through the EFFECTIVE per-stream compiledConfig (f.eff,
+// per-route override > listener default; see wasm.go) with a fallback to the
+// listener config (f.cfg) for the encode-only / never-decoded edge where eff
+// has not been resolved yet — the same precedence the rest of the per-stream
+// lifecycle uses.
+func (a *abiCallbacks) httpCallResponse() *internalwasm.HTTPCallResponse {
+	if a.filter == nil {
+		return nil
+	}
+	cfg := a.filter.eff
+	if cfg == nil {
+		cfg = a.filter.cfg
+	}
+	if cfg == nil || cfg.rootVM == nil {
+		return nil
+	}
+	return cfg.rootVM.HTTPCallResponse()
 }
 
 // GetHeaderMap returns sorted (key, value) pairs per parent §4.5 D6
@@ -198,7 +257,7 @@ func (a *abiCallbacks) headerMapForType(mapType abi.WasmHeaderMapType) (h http.H
 // Returns (nil, false) for deferred map types or uncaptured sides — the
 // host wrapper converts !ok to WasmResultNotFound for the guest.
 func (a *abiCallbacks) GetHeaderMap(_ context.Context, _ uint32, mapType abi.WasmHeaderMapType) ([]internalwasm.HeaderPair, bool) {
-	headers, active := a.headerMapForType(mapType)
+	headers, active, _ := a.headerMapForType(mapType)
 	if !active || headers == nil {
 		return nil, false
 	}
@@ -232,7 +291,7 @@ func (a *abiCallbacks) GetHeaderMap(_ context.Context, _ uint32, mapType abi.Was
 // expectation that guests pass keys as-stored (typically lowercase for
 // pseudo-headers).
 func (a *abiCallbacks) GetHeaderMapValue(_ context.Context, _ uint32, mapType abi.WasmHeaderMapType, key string) (string, bool) {
-	headers, active := a.headerMapForType(mapType)
+	headers, active, _ := a.headerMapForType(mapType)
 	if !active || headers == nil {
 		return "", false
 	}
@@ -254,8 +313,16 @@ func (a *abiCallbacks) GetHeaderMapValue(_ context.Context, _ uint32, mapType ab
 // map types; WasmResultInternalFailure if the side is uncaptured (active
 // type but no headers map — should-not-happen in production).
 func (a *abiCallbacks) AddHeaderMapValue(_ context.Context, _ uint32, mapType abi.WasmHeaderMapType, key, value string) abi.WasmResult {
-	headers, active := a.headerMapForType(mapType)
+	headers, active, writable := a.headerMapForType(mapType)
 	if !active {
+		return abi.WasmResultUnimplemented
+	}
+	// READ-ONLY GUARD (phase 82). An active-but-not-writable map type (the
+	// host-owned http-call response, wire 6/7) is closed to guest mutation.
+	// This check precedes the headers==nil check on purpose: a read-only type
+	// must answer Unimplemented whether or not the data happens to be present,
+	// so the guest cannot distinguish "not writable" from "not yet arrived".
+	if !writable {
 		return abi.WasmResultUnimplemented
 	}
 	if headers == nil {
@@ -269,8 +336,16 @@ func (a *abiCallbacks) AddHeaderMapValue(_ context.Context, _ uint32, mapType ab
 // value. Multi-value collapsed to one (http.Header.Set semantic). Returns
 // WasmResultUnimplemented for deferred map types.
 func (a *abiCallbacks) ReplaceHeaderMapValue(_ context.Context, _ uint32, mapType abi.WasmHeaderMapType, key, value string) abi.WasmResult {
-	headers, active := a.headerMapForType(mapType)
+	headers, active, writable := a.headerMapForType(mapType)
 	if !active {
+		return abi.WasmResultUnimplemented
+	}
+	// READ-ONLY GUARD (phase 82). An active-but-not-writable map type (the
+	// host-owned http-call response, wire 6/7) is closed to guest mutation.
+	// This check precedes the headers==nil check on purpose: a read-only type
+	// must answer Unimplemented whether or not the data happens to be present,
+	// so the guest cannot distinguish "not writable" from "not yet arrived".
+	if !writable {
 		return abi.WasmResultUnimplemented
 	}
 	if headers == nil {
@@ -284,8 +359,16 @@ func (a *abiCallbacks) ReplaceHeaderMapValue(_ context.Context, _ uint32, mapTyp
 // WasmResultOk even if the key is absent (idempotent — matches upstream
 // proxy-wasm semantics). WasmResultUnimplemented for deferred map types.
 func (a *abiCallbacks) RemoveHeaderMapValue(_ context.Context, _ uint32, mapType abi.WasmHeaderMapType, key string) abi.WasmResult {
-	headers, active := a.headerMapForType(mapType)
+	headers, active, writable := a.headerMapForType(mapType)
 	if !active {
+		return abi.WasmResultUnimplemented
+	}
+	// READ-ONLY GUARD (phase 82). An active-but-not-writable map type (the
+	// host-owned http-call response, wire 6/7) is closed to guest mutation.
+	// This check precedes the headers==nil check on purpose: a read-only type
+	// must answer Unimplemented whether or not the data happens to be present,
+	// so the guest cannot distinguish "not writable" from "not yet arrived".
+	if !writable {
 		return abi.WasmResultUnimplemented
 	}
 	if headers == nil {
@@ -302,8 +385,16 @@ func (a *abiCallbacks) RemoveHeaderMapValue(_ context.Context, _ uint32, mapType
 // Returns WasmResultUnimplemented for deferred map types; WasmResult
 // InternalFailure for uncaptured sides (should-not-happen in production).
 func (a *abiCallbacks) SetHeaderMapPairs(_ context.Context, _ uint32, mapType abi.WasmHeaderMapType, pairs []internalwasm.HeaderPair) abi.WasmResult {
-	headers, active := a.headerMapForType(mapType)
+	headers, active, writable := a.headerMapForType(mapType)
 	if !active {
+		return abi.WasmResultUnimplemented
+	}
+	// READ-ONLY GUARD (phase 82). An active-but-not-writable map type (the
+	// host-owned http-call response, wire 6/7) is closed to guest mutation.
+	// This check precedes the headers==nil check on purpose: a read-only type
+	// must answer Unimplemented whether or not the data happens to be present,
+	// so the guest cannot distinguish "not writable" from "not yet arrived".
+	if !writable {
 		return abi.WasmResultUnimplemented
 	}
 	if headers == nil {
@@ -328,7 +419,7 @@ func (a *abiCallbacks) SetHeaderMapPairs(_ context.Context, _ uint32, mapType ab
 //
 // Returns 0 for deferred map types, uncaptured sides, or nil filter.
 func (a *abiCallbacks) GetHeaderMapSize(_ context.Context, _ uint32, mapType abi.WasmHeaderMapType) uint32 {
-	headers, active := a.headerMapForType(mapType)
+	headers, active, _ := a.headerMapForType(mapType)
 	if !active || headers == nil {
 		return 0
 	}
@@ -634,12 +725,11 @@ func (a *abiCallbacks) Done(_ context.Context, _ uint32) abi.WasmResult {
 //
 //   - HttpRequestBody         (value 0) → f.decodeBody
 //   - HttpResponseBody        (value 1) → f.encodeBody
-//   - HttpCallResponseBody    (value 4) → nil (per-call response body
-//     stash lands at a future task
-//     alongside the http_call response
-//     headers/trailers cache; at Task
-//     16 the stash is empty + guest
-//     reads return empty payload + Ok)
+//   - HttpCallResponseBody    (value 4) → the per-RootVM http-call response
+//     cache's Body (ACTIVATED at phase
+//     82). Nil until a call completes;
+//     nil reads as an empty payload +
+//     WasmResult::Ok.
 //   - other values                       → (nil, nil) — defensive (the
 //     framework shim already rejected
 //     unknown types with WasmResult::
@@ -653,10 +743,17 @@ func (a *abiCallbacks) GetBuffer(_ context.Context, _ uint32, bufferType abi.Was
 		return a.filter.decodeBody, nil
 	case abi.WasmBufferTypeHttpResponseBody:
 		return a.filter.encodeBody, nil
+	case abi.WasmBufferTypeHttpCallResponseBody:
+		// Read-only, host-owned — the write side stays BadArgument in
+		// SetBuffer. Returning the cached slice directly is safe because
+		// *internalwasm.HTTPCallResponse is contractually immutable.
+		if r := a.httpCallResponse(); r != nil {
+			return r.Body, nil
+		}
+		return nil, nil
 	default:
-		// HttpCallResponseBody (value 4) + any other type: stash lands at
-		// a future task; at Task 16 returns empty buffer per AMEND-B1 clamp
-		// semantics.
+		// Any other type: not activated; returns an empty buffer per
+		// AMEND-B1 clamp semantics.
 		return nil, nil
 	}
 }
@@ -763,6 +860,30 @@ func (a *abiCallbacks) GetBufferStatus(_ context.Context, _ uint32, bufferType a
 // Defensive nil-tolerance: nil filter or nil per-side callback returns
 // InternalFailure (should-not-happen in production; preserved for test-
 // double paths that construct *filter without callbacks).
+//
+// # phase-82 S1: the resume is IDEMPOTENCE-GATED
+//
+// The per-side resume now routes through filter.resumeDecode /
+// filter.resumeEncode, which fire the framework callback only on a winning
+// CompareAndSwap(true, false) of the per-side paused flag. Rationale: the
+// resume channels are CHAIN-scoped, not filter-scoped
+// (internal/filter/http/chain.go declares decodeResumeCh/encodeResumeCh on
+// *FilterChain, one pair per stream, and every parking filter on the chain —
+// extauthz, ratelimit, oauth2, bandwidthlimit — waits on the same pair). The
+// channels are buffered-1 with a non-blocking send, so an UNMATCHED
+// ContinueDecoding does not vanish: it LATCHES a token that spuriously
+// un-parks whichever filter parks next. A guest calling proxy_continue_stream
+// twice, or calling it while this filter is not parked at all, would corrupt a
+// sibling filter's park. The CAS makes ContinueStream fire only a resume this
+// filter actually owes.
+//
+// The return value stays WasmResultOk on a losing CAS: from the guest's point
+// of view "the stream is not paused" is the state it asked for, and the
+// upstream ABI has no distinct result for a redundant resume.
+//
+// The same gate arbitrates against the S9 pause watchdog (pause.go), which
+// races ContinueStream to force-resume an abandoned park; exactly one of the
+// two signals the chain.
 func (a *abiCallbacks) ContinueStream(_ context.Context, _ uint32, streamType uint32) abi.WasmResult {
 	if a.filter == nil {
 		return abi.WasmResultInternalFailure
@@ -772,13 +893,13 @@ func (a *abiCallbacks) ContinueStream(_ context.Context, _ uint32, streamType ui
 		if a.filter.decoderCb == nil {
 			return abi.WasmResultInternalFailure
 		}
-		a.filter.decoderCb.ContinueDecoding()
+		a.filter.resumeDecode()
 		return abi.WasmResultOk
 	case 1: // encode side
 		if a.filter.encoderCb == nil {
 			return abi.WasmResultInternalFailure
 		}
-		a.filter.encoderCb.ContinueEncoding()
+		a.filter.resumeEncode()
 		return abi.WasmResultOk
 	default:
 		// Other streamType values (2 = downstream data, 3 = upstream data

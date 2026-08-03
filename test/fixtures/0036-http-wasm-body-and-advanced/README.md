@@ -68,9 +68,40 @@ reference-less path).
 | # | Name | Plugin call | Subject-side stat assertion |
 |---|---|---|---|
 | (k) | `k_tick_fires_counter` | `set_tick_period(50ms)` + `proxy_on_tick` increments counter | `wasm.plugin_k.tick_invocations >= 5` (after 250ms wait) |
-| (l) | `l_httpcall_success` | `dispatch_http_call("cluster_b", ...)` | `http_call_dispatched >= 1` + `http_call_response >= 1` |
+| (l) | `l_httpcall_success` | `dispatch_http_call("cluster_b", ...)` | `http_call_dispatched >= 1` **and** `http_call_response >= 1` **and** `http_call_response_after_close == 0` (three independent `t.Errorf` legs) |
 | (m) | `m_httpcall_unknown_cluster` | `dispatch_http_call("nonexistent_cluster", ...)` | `http_call_dispatch_unknown_cluster >= 1` |
 | (n) | `n_body_cap_exceeded` | `Action::Pause` on body callbacks; probe sends 2 KiB > 1 KiB cap | `body_buffer_cap_exceeded >= 1` + `envoy_go.failures >= 1` |
+
+### What the driver ACTUALLY emits today (phase 82)
+
+The tables above describe the SPEC partition, not the current emission.
+Read `inputs/driver.go` `driveProxy` for ground truth:
+
+- Arms **(a)-(j)** emit a **constant skip token** on BOTH sides
+  (`emitConstantSkipToken`), so their cross-side comparison is presently
+  **vacuous** — it cannot fail. Restoring it is deferred per PROGRESS.md
+  Task 20 Concern 1 and was explicitly out of phase-82 scope.
+- Arms **(k)**, **(m)**, **(n)** emit a constant `scenario <id>
+  subject-only` token; their real assertions are the StatsAsserter legs.
+- Arm **(l)** is **MIXED as of phase 82**: it keeps its stats legs AND is
+  compared cross-side. `driveProxy` emits each side's OBSERVED value,
+  `scenario l status=<n> body=x-httpcall-status=<v>`, so a subject that
+  reports a wrong status (notably the guest's initial `0`, which is what
+  a missing http-call response header cache yields) or omits the header
+  diverges byte-wise and `CompareBytes` fires. Probe errors are emitted
+  as an error CLASS (`body=ERR (timeout)`), never `%v` — the raw text
+  embeds the per-side listener address, which would make two
+  identically-failing sides diverge spuriously.
+
+| # | Name | Cross-side assertion (phase 82) |
+|---|---|---|
+| (l) | `l_httpcall_success` | Both sides report the same `x-httpcall-status` (the `:status` of the `cluster_b` http-call response) |
+
+A deliberate break of the (l) cross-side arm MUST be injected
+**asymmetrically**, keyed on `driveProxy`'s `side` parameter. One
+`driveProxy` serves both `DriveReference*` and `DriveSubject*`, so a
+symmetric injection changes both byte streams identically and
+`CompareBytes` stays GREEN — a vacuous break.
 
 ## Deliberate-break liveness verification
 

@@ -98,11 +98,34 @@ scenarios:
 
   - id: l
     crate: l_httpcall_success
-    kind: subject_only
+    # MIXED as of phase 82: both a cross-side comparison AND subject-only
+    # stats legs. Every other arm is exactly one of the two.
+    kind: mixed
     probe: GET /scenario_l
-    plugin_call: dispatch_http_call("cluster_b", ...)
+    plugin_call: dispatch_http_call("cluster_b", ...) -> Action::Pause;
+      on_http_call_response parses :status; on_http_response_headers sets
+      x-httpcall-status to it (guest initial value 0).
+    cross_side_assertion: |
+      driveProxy emits each side's OBSERVED value as
+        scenario l status=<n> body=x-httpcall-status=<v>
+      and CompareBytes requires the two sides to be byte-identical. A
+      subject reporting a WRONG status -- notably the guest's initial 0,
+      which is what a missing http-call response header cache yields --
+      or omitting the header entirely (emitted as
+      body=mismatch(x-httpcall-status_absent)) diverges and fails.
+      A probe error is emitted as an error CLASS, body=ERR (timeout),
+      not %v: the raw error text embeds the per-side listener address,
+      so two identically-failing sides would diverge spuriously.
     subject_assertion: |
-      wasm.plugin_l.http_call_dispatched >= 1 + wasm.plugin_l.http_call_response >= 1.
+      THREE independent legs, each reporting via t.Errorf (not t.Fatalf,
+      which would make the later legs dead code):
+        1. wasm.plugin_l.http_call_dispatched         >= 1
+        2. wasm.plugin_l.http_call_response           >= 1
+        3. wasm.plugin_l.http_call_response_after_close == 0
+      Legs 2 and 3 replace a SUM disjunction (response + after_close
+      >= 1) that was invariant under the phase-82 stream-control fix:
+      with Action::Pause unhonored the response landed in the after_close
+      branch and the sum was 1 either way.
 
   - id: m
     crate: m_httpcall_unknown_cluster

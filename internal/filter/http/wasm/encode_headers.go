@@ -111,11 +111,21 @@ func (f *filter) EncodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 		return envoyhttp.StopIteration
 	}
 
-	// ProxyAction handling — identical to the decode side.
+	// ProxyAction handling — identical to the decode side (phase-82 S1).
+	// Pause is HONORED: StopIteration parks the encode chain on the
+	// chain-scoped encodeResumeCh, and the guest resumes with
+	// proxy_continue_stream(1) -> abiCallbacks.ContinueStream ->
+	// filter.resumeEncode.
+	//
+	// UNEXERCISED. Zero of the 35 guest crates in this repository return
+	// Action::Pause from proxy_on_response_headers, so this half ships with
+	// NO differential coverage and NO exercising guest — it is covered only by
+	// the synthetic unit fixture buildPauseResponseProxyWasm. Do not read the
+	// decode side's differential coverage as covering this arm.
 	switch action {
 	case abi.ProxyActionPause:
-		logf("INFO wasm: proxy_on_response_headers returned PAUSE without captured local response — stream-control deferred (parent §1 architectural primitive 6); continuing")
-		return envoyhttp.Continue
+		f.beginEncodePause()
+		return envoyhttp.StopIteration
 	case abi.ProxyActionContinue:
 		fallthrough
 	default:
@@ -147,6 +157,13 @@ func (f *filter) SetEncoderCallbacks(cb envoyhttp.EncoderFilterCallbacks) { f.en
 //     multiplexer so stray hostcalls route to the no-op fallback.
 //   - Group-B active gauge decrements at the same site.
 func (f *filter) OnDestroy() {
+	// phase-82 S9: disarm both pause watchdogs FIRST, unconditionally (before
+	// the nil-streamCtx early return — a filter that paused on a chain whose
+	// stream context never materialized still has a live timer). A watchdog
+	// that survives the stream would hold the chain's filter callbacks alive
+	// through its closure for the remainder of the window.
+	f.stopPauseWatchdogs()
+
 	if f.streamCtx == nil {
 		return
 	}
