@@ -112,3 +112,49 @@ Input measured **231 lines / 115 data rows** first. **(1)** `NOT DONE: row 83` a
 ## Handoff
 
 **PLAN.** It owes an explicit **§6.1 re-evaluation against a MEASURED test side** (this SPEC's is analogue-scaled — the exact failure mode of phases 81 and 82), a task ordering that lands the generation guard **before or with** S1/S2, a disposition for the stale-token hazard, a remedy choice for the encode-side cap, and **a break roster whose arms are proven RED first** — because the differential cannot go red on this row and the package's existing guard is vacuous. **Revised band 950-1400 net `.go`, budget ~1150, 12-16 tasks.**
+
+---
+
+# PLAN record (2026-08-03)
+
+## What landed
+
+`PLAN.md` **NEW** (18 tasks). `STATE.md` rolled **IN PLACE** (63 -> 63). `STATE_HISTORY.md` **450 -> 452**. `PROGRESS.md` +1 stage record. `next-prompt.txt` rolled forward. ⚠️ **`ROADMAP.md`, `DECISIONS.md` and `BEHAVIOR_CONTRACT.md` BYTE-UNTOUCHED; sentinel `want` STAYS 115; the strict PROPOSED guard STAYS 1.** Docs-only: ZERO production `.go`, ZERO test `.go`.
+
+## Method
+
+**FIVE investigation agents**, each in its own **DETACHED** worktree off `e4563a49`, private scratch, private port bands inside `43800-44299`. Unlike a review stage, **every agent wrote real code and ran it** — that was the point: the SPEC's ~1070-line test figure was analogue-scaled, and analogue-scaling is precisely what made phases 81 and 82 overrun by 3.07x and 2.55x. All five reported `git status --porcelain` = **0 lines** and removed their own worktrees. One agent created five docker containers and tore all five down **BY NAME** plus its network; no `prune` and no `ancestor=`/image filter at any point. Nothing committed, nothing pushed.
+
+## The stage's headline
+
+⚠️ **THE §6.1 LoC TRIGGER IS CROSSED ON MEASUREMENT — ~1840-2080 net against ~1500 — AND IT CROSSED A BAND THE SPEC HAD ALREADY REVISED UP 2.4x IN ANTICIPATION OF EXACTLY THIS.** Measured per group: S1 test **679** vs 371 (1.83x) · S2 **453** vs 333 (1.36x) · S3 **237** vs 195 (1.22x) · S4 re-inverted **280** vs 113 (2.48x) · S8 **197 + 14 in-place** vs 60 (3.3x) · production **~140-230** vs 63-90. ⚠️ **The finding is not "the estimate was low" but "the estimate was UNDER-ENUMERATED"** — the SPEC's §13 S1 row prices seven items while its own §7 mandates three more (arm-once + two disarms), which measure **190 lines, 28% of S1's test side, priced at ZERO**; S8's 3.3x is driven by **14 pre-existing assertions pinning the old status** that no estimate counted. **A ratio-rescale is the wrong repair; the item lists had to be re-enumerated, and were.** **Disposition: RECORD, DO NOT RETRO-SPLIT** — the lineage precedent at both prior crossings, and here the scope items are coupled by measurement (S5/S6 and the `pause.go` half of S1/S2/S3 **do not apply independently**; S3 must precede S1), so **every available split axis cuts through a correctness constraint.**
+
+⚠️ **SECOND: THE SPEC'S 299-vs-1 A/B IS PACER-DEPENDENT AND TWO AGENTS MEASURED OPPOSITE RESULTS FOR THE SAME CELL** — 299 under `time.Sleep` pacing at pace == watchdog == 50 us, **1** under a spin pacer at the same real spacing, and **A=291 / B=298 (green on both arms)** at 0.2x. `time.Sleep` has a ~1 ms floor on this host. **NO NUMBER IS CARRIED.** What survives is structural: a fire-count gate must pin the pacer, the watchdog magnitude AND their ratio, and re-prove its RED arm at that configuration. Both agents nevertheless converge on `Stop()` contributing **zero** to the fire count (A≡D, B≡E) — confirming the SPEC's "resource hygiene, not correctness" and quantifying it at **0 vs 199 pending closures** over 200 pauses.
+
+⚠️ **THIRD: S3 HAS NO LIVE DEFECT AND THEREFORE NO RED ANCHOR OF ITS OWN.** SPEC §1.2's "reachable today" is refuted — `decodePauseGen=1` after `RunDecodeHeaders` x2 + `RunDecodeData` x3 + `RunDecodeTrailers` x2, because `beginDecodePause` has one call site and `c.decodeIdx` is monotone. **The SPEC's stated widening is itself the S3/S9 conflation it warns against**: two wasm filters give each its own generation, so a sibling filter produces the STALE-TOKEN hazard, never the TIMER-OVERWRITE one. ⇒ **SPEC §17 item 2's "BEFORE or WITH" collapses to WITH.**
+
+⚠️ **FOURTH: THE SPEC'S §7 SNIPPET HAS A HOLE, AND PLUGGING IT IS THE S9 FIX.** `stopPauseTimer`/`stopPauseWatchdogs` do not bump the generation, so an already-entered closure fires into a torn-down stream — **400/400**; with the bump, **0/400**. **6 production lines**, inside this row's file set. The residual chain-layer hazard is deferred BY NAME and now **PROVEN** unfixable filter-locally (the resume channels are unexported on `*FilterChain`; the filter holds an 8-method interface with no park-state predicate).
+
+## Refutation count: **NINETEEN**, of which **EIGHT are load-bearing**
+
+Beyond the four above: **CAS-first is catastrophic, not merely wrong** (0 fires, **299 LOST RESUMES**, chain parks forever) · **the S3 gate is NOT `-race`-safe** — with the correct fix loaded, `-race` reports 0 DATA RACE and **5 of 7 assertions FAIL** · **the encode-cap arm is GUEST-INDEPENDENT**, so the SPEC's blast-radius bound rests on the wrong fact · **the "seventh park" undercounts** — three more verified by execution, so S8 as chartered closes 1 of at least 3 · **setting `localReplyDone` would not rescue the encode side** (all six checks are decode-side) · **a watchdog `SendLocalReply` DEADLOCKS** · **a wrong wasm type-section entry INSTANTIATES FINE** and fails only at call time where the host fail-OPENs · **S5 is SIXTEEN sites, not eleven**, and `StopAllIteration` is a **phantom identifier declared nowhere** · **`pause.go:72-73` is wrong in both halves and (l) IS cross-side**, so S6's "not a verdict change" no longer follows.
+
+⚠️ **AN AGENT CLAIM DID NOT SURVIVE:** A5 concluded the two S3 mechanisms are "compensating, not complementary." Not adopted — A4's independent 2x2 refutes it, and A4's *pacer* finding explains A5's numbers without either agent being wrong. **The synthesis neither reported alone is that the A/B is configuration-dependent.**
+
+⚠️ **AND THE CONTROLLER'S OWN COUNT WAS WRONG, FOR A REASON THAT IS A LIVE DEFECT:** the router-prescribed archive-absence guard reads **163** where the truth is **175** — twelve annotated-label entries are invisible to it, all of them the four most recent phases' evictions. **It is FAIL-UNSAFE in its own direction** (it authorizes a duplicate append). Discriminated with a real-target cross-product ⚠️ **after a first probe used an invented phase name and read 0 on both arms for the wrong reason.**
+
+## The five owed items, disposed
+
+1. **§6.1 vs a MEASURED test side** — CROSSED; RECORD, DO NOT RETRO-SPLIT. 2. **Ordering** — WITH, not BEFORE; justified by measurement rather than the SPEC's refuted premise. 3. **Stale token** — 6-line filter-local fix ADOPTED inside S3; residual PROVEN unfixable and deferred BY NAME. 4. **S8 remedy** — **Option A, non-parking status**, with the reference MEASURED live across four arms: a cap breach draws an **immediate stream reset + `rs_too_large: 1`, never a stall**, while `stream_idle_timeout` bounds an indefinite pause separately — envoy-go has neither. `DataContinue` **rejected by measurement** (it silently disables the cap). 5. **Break roster** — **19 of 20 arms proven RED; the 20th proven NOT reddenable and named.**
+
+## Gates — a docs-only PLAN owes (a)-(f) only as a POSTURE STATEMENT
+
+(a)/(b) **NOT RUN, NOT CLAIMED** — inherited from the phase-82 IMPL. (c) proxy-wasm **INHERITED**; denominator when run is **10 of 16 (62.5%), 6 deferred**. (d) **VACUOUS** — no fuzzer added (**55**, `-- '*.go'`-scoped). (e) no `.go` committed here; agent-side prototypes were `gofmt`-clean (gated on OUTPUT), `golangci-lint` exit 0, with the **misspell liveness proof** performed and byte-identical restore verified **by checksum** at four of five agents. (f) `REVIEW.md` **ABSENT — the STANDING LINEAGE DEPARTURE**, named: **87 of 124** phase dirs carry none.
+
+## Sentinel
+
+Input measured **231 lines / 115 data rows** first. **(1)** `NOT DONE: row 83` at `want=115`, denominator printed — correct while the phase is open. **(2) FIVE, unchanged — the THIRTY-EIGHTH consecutive phase without a decrease**; this row narrows nothing and that is STRUCTURAL. **(3) `NEVER OPENED: gRPC` — alone.** `stop` **NOT** created. **FIVE negative controls, ALL FIRED**, including the doctored-copy NC with `NC LANDED? [ in-progress ]` inspected before the result was trusted, and the one-arm check-(2) strip moving **5 -> 4, NOT 5 -> 0**. **Leak check VERIFIED BY DIFF** — this PLAN writes no ROADMAP cell.
+
+## Handoff
+
+**IMPL.** Eighteen tasks in order. ⚠️ **Task 2 (S3 + the S9 fix) MUST precede Task 3 (S1)** — a correctness constraint. ⚠️ **The break roster needs BOTH flavors per arm** (status-flip never trips the flag assertions; drop-the-call never trips the status assertion). ⚠️ **Two break instructions do not compile as written** (`_ = gen` / `_ = old` substitutes required). ⚠️ **ADR-0305's completion also owes the in-place correction of its OWN now-stale STATUS sentence** — its "the loose form returns 4, ALL FOUR FALSE POSITIVES" was invalidated by its own landing (it is now **5**: four false positives **plus ADR-0305 itself**). ⚠️ **The differential CANNOT go RED on this row; a green is evidence the row broke nothing, not that it works.**
