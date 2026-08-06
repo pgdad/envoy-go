@@ -133,7 +133,23 @@ The PLAN recorded all three S3 single-arm breaks as green, making arm 19 *stacke
 
 **Pick the smallest defensible candidate**, record the pick AND the rejected alternatives with re-derived cost, register a new ROADMAP row `in-progress`, and ⚠️ **BUMP THE SENTINEL `want` 115 -> 116 IN THE SAME COMMIT.**
 
-**Candidate pool this row NAMED and DEFERRED — re-derive their cost at YOUR tip before adopting (`reference_deferred_candidate_cost_restale`):**
+**⚠️ THERE ARE TWO POOLS, AND THEY ARE DIFFERENT SIZES. PICK DELIBERATELY BETWEEN THEM.**
+
+**POOL A — THE PROJECT-LEVEL BACKLOG. This is what checks (2) and (3) are holding open, and it is the reason the sentinel does not fire.** Extracted MECHANICALLY from `ROADMAP.md` at the phase-83 IMPL close; ⚠️ **re-extract at YOUR tip and do not trust this transcription** (`feedback_brief_citations_not_evidence`):
+
+- **`:193` HTTP/3 + QUIC** — upstream H3 cluster · alt-svc advertisement · 0-RTT/early-data · h3spec conformance gate · `QuicProtocolOptions` tuning · full QUIC transport-socket options · QUIC robustness (migration / RESET_STREAM / GOAWAY / datagrams / WebTransport).
+- **`:203` xDS / dynamic config** — SDS rotation · upstream SDS (server-cert + validation_context) · CDS/EDS · LDS/RDS · ADS (muxed) · Delta xDS · RTDS/Runtime-layer · reconnection-backoff / `initial_fetch_timeout` edges · `google_grpc` transport.
+- **`:213` Observability** — the **DYNAMIC** half of the downstream TLS `ssl` stat family (ciphers / versions / curves / sigalgs). ⚠️ **`:213` is a 45,959-char line carrying SEVERAL deferred phrases; only ONE is the colon-terminated form the sentinel matches. Cite the offset, never "the `:213` sentence".**
+- **`:219` Runtime + hot restart** — RTDS layer · the `/runtime` and `POST /runtime_modify` admin endpoints (an ADR-0089 un-defer) · disk layer + its override dir · admin layer · lifting the six `runtime_key` filter parse-reject arms · honoring the silent-IGNORE runtime knobs already parsed-and-discarded.
+- **`:227` Operational tooling** — xDS-sourced (not just static-file) dry-validation · an admin-API-exposed live-reload-and-validate endpoint · an RTDS/SDS validate companion. ⚠️ **SHORT form only — this is the family the check-(2) broadening at phase 77 existed to catch.**
+- ⚠️ **`gRPC` is the ONE family check (3) reports as NEVER OPENED, and it is the ONLY candidate that can move a sentinel check.** The phase-83 BRAINSTORM recorded a **REFUTATION BY WORKING PROTOTYPE of the gRPC family's inherited HARD-BLOCKED verdict** — so the family is a live candidate, not a closed door. ⚠️ **RE-DERIVE THAT PROTOTYPE BEFORE RELYING ON IT; it is a BRAINSTORM claim, and this lineage has refuted a BRAINSTORM claim at every subsequent stage.**
+
+⚠️ **A POOL-A PICK IS FAMILY-SCALE AND WILL CROSS §6.1 UNLESS IT IS CARVED DELIBERATELY.** Four consecutive rows have crossed the LoC trigger, the last one against a band the PLAN had already MEASURED. **Carve the smallest defensible leg of a family rather than adopting a bullet whole.**
+
+⚠️ **AND ONLY A POOL-A PICK CAN EVER RETIRE THE SENTINEL.** Pool B is real work, but **no Pool-B row narrows check (2) or check (3)** — phase 83 was itself a WASM row and narrowed neither, structurally, because the `### WASM host family` heading owns none of the five check-(2) anchors. **If you pick from Pool B, state that it narrows nothing; do not forecast a decrease** (`reference_a_drift_correction_is_itself_a_claim`).
+
+
+**POOL B — SMALL, WELL-SPECIFIED CANDIDATES PHASE 83 NAMED AND DEFERRED. Cheaper and fully scoped, but none of them moves a sentinel check — re-derive their cost at YOUR tip before adopting (`reference_deferred_candidate_cost_restale`):**
 - **A `logf` swap gate for operator-facing log strings** — constructible today (`var logf = log.Printf` is swappable), closes ONE of the row's two ungated statements. **The smallest candidate on this list.**
 - **A probe for the `Add(1)`-before-`Store` ordering** — the row's other ungated statement.
 - ⚠️ **A trailers-paused guest is BLIND for TWO INDEPENDENT reasons** — `abi_callbacks.go` routes trailer map types 1/3/4/5 to its `default:` arm, **AND** `trailers.go` never captures the trailers at all (`_ = trailers`; the documented `requestTrailers`/`responseTrailers` fields **DO NOT EXIST**). ⚠️ **FIXING THE ROUTING ALONE WOULD STILL HAND THE GUEST AN EMPTY MAP — any row here must price BOTH seams.**
