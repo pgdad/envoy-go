@@ -37,6 +37,30 @@ const localReply413Body = "Payload Too Large" // 17 bytes
 // sentinel — wired in Tasks 15 + 16. Per ADR-0076.
 var errEncodeBufferOverflow = errors.New("chain: encode-side buffer overflow; resetting connection")
 
+// errStreamTerminatedByFilter is the sentinel returned by RunDecodeData /
+// RunEncodeData / RunDecodeTrailers / RunEncodeTrailers when a filter returns
+// DataTerminateStream / TrailersTerminateStream. Phase-83 S8.
+//
+// HCM dispatch needs no new arm: serveOneRequest already treats every
+// non-errCloseAfterAction error from dispatchRequest as "log it, flush, drain
+// and return keepAlive=false".
+//
+// ⚠️ DEPARTURE FROM THE REFERENCE, MEASURED AND RECORDED RATHER THAN PAPERED
+// OVER. Against pinned envoyproxy/envoy:contrib-v1.37.2, an encode-side
+// buffer-limit breach delivers 200 + the response HEADERS and only then resets
+// the stream (curl exit 18, SIZE_DOWNLOAD=0, http.<prefix>.rs_too_large: 1,
+// downstream_rq_tx_reset: 1). envoy-go runs the WHOLE encode chain before
+// writeH1Reply, so on this sentinel the client gets NOTHING — connection close,
+// no headers. Both dispositions are "no usable body + a torn-down connection";
+// the byte shape differs.
+var errStreamTerminatedByFilter = errors.New("chain: filter terminated the stream; no response can be served")
+
+// ErrStreamTerminatedByFilter is the exported alias of
+// errStreamTerminatedByFilter, so callers outside this package (HCM dispatch
+// classification, and the wasm filter's own park regressions) can match it with
+// errors.Is. Mirrors router.ErrCloseAfterAction's shape.
+var ErrStreamTerminatedByFilter = errStreamTerminatedByFilter
+
 // FilterChain is the per-stream state machine that drives iteration of HTTP
 // filters. Allocated by HCM dispatch (connection.go for H1, h2dispatch.go for
 // H2) at the start of each request via NewFilterChain.
@@ -358,6 +382,8 @@ func (c *FilterChain) RunDecodeHeaders(ctx context.Context, headers http.Header,
 				return false, err
 			}
 			c.decodeIdx++
+		case TerminateStream:
+			return false, errStreamTerminatedByFilter
 		default:
 			return false, fmt.Errorf("chain: filter %q returned unknown FilterHeadersStatus %d", c.filters[c.decodeIdx].Name, status)
 		}
@@ -436,6 +462,11 @@ func (c *FilterChain) RunDecodeData(ctx context.Context, data []byte, endStream 
 				return false, err
 			}
 			c.decodeIdx++
+		case DataTerminateStream:
+			// Phase-83 S8: abort WITHOUT parking. The filter has no resume to
+			// offer, so parking here would hold the dispatch goroutine and the
+			// connection forever.
+			return false, errStreamTerminatedByFilter
 		default:
 			return false, fmt.Errorf("chain: filter %q returned unknown FilterDataStatus %d on decode", c.filters[c.decodeIdx].Name, status)
 		}
@@ -475,6 +506,8 @@ func (c *FilterChain) RunDecodeTrailers(ctx context.Context, trailers http.Heade
 				return false, err
 			}
 			c.decodeIdx++
+		case TrailersTerminateStream:
+			return false, errStreamTerminatedByFilter
 		default:
 			return false, fmt.Errorf("chain: filter %q returned unknown FilterTrailersStatus %d on decode", c.filters[c.decodeIdx].Name, status)
 		}
@@ -504,6 +537,12 @@ func (c *FilterChain) RunEncodeHeaders(ctx context.Context, headers http.Header,
 				return false, err
 			}
 			c.encodeIdx--
+		case TerminateStream:
+			// Phase-83 S8: the LIVE headers-axis park. RunEncodeHeaders is
+			// driven by every HCM dispatcher, carries zero localReplyDone
+			// re-checks, and the wasm filter's captured-local-response arm
+			// parked on it with no resumer.
+			return false, errStreamTerminatedByFilter
 		default:
 			return false, fmt.Errorf("chain: filter %q returned unknown FilterHeadersStatus %d on encode", c.filters[c.encodeIdx].Name, status)
 		}
@@ -600,6 +639,12 @@ func (c *FilterChain) RunEncodeData(ctx context.Context, data []byte, endStream 
 				return false, err
 			}
 			c.encodeIdx--
+		case DataTerminateStream:
+			// Phase-83 S8, and the arm that motivated the status. An encode-side
+			// park has NO secondary escape: RunEncodeHeaders / RunEncodeData /
+			// RunEncodeTrailers carry zero localReplyDone re-checks, and none of
+			// the four parkEncode sites is guarded.
+			return false, errStreamTerminatedByFilter
 		default:
 			return false, fmt.Errorf("chain: filter %q returned unknown FilterDataStatus %d on encode", c.filters[c.encodeIdx].Name, status)
 		}
@@ -636,6 +681,8 @@ func (c *FilterChain) RunEncodeTrailers(ctx context.Context, trailers http.Heade
 				return false, err
 			}
 			c.encodeIdx--
+		case TrailersTerminateStream:
+			return false, errStreamTerminatedByFilter
 		default:
 			return false, fmt.Errorf("chain: filter %q returned unknown FilterTrailersStatus %d on encode", c.filters[c.encodeIdx].Name, status)
 		}

@@ -33,13 +33,18 @@ package wasm
 //  5. stats.executions.Inc() per AMEND-A2 Group-C envoy-go-strict per-
 //     `proxy_on_request_headers`-invocation counter.
 //
-//  6. CallProxyOnRequestHeaders → abi.ProxyAction. Per 25.2 SPEC §4.3:
+//  6. CallProxyOnRequestHeaders → abi.ProxyAction. Per 25.2 SPEC §4.3, as
+//     REVISED at phase-82 S1 + S9:
 //       - ProxyActionContinue → http.Continue
-//       - ProxyActionPause without captured-local-response → log +
+//       - ProxyActionPause without captured-local-response →
+//         filter.beginDecodePause (records the owed resume + arms the S9
+//         watchdog) + http.StopIteration. ⚠️ This step formerly read "log +
 //         http.Continue (stream-control deferred per parent §1 architectural
-//         primitive 6)
+//         primitive 6)" — that deferral ENDED at phase 82 and the sentence
+//         outlived it by a full phase. Pause is HONORED here.
 //       - sentLocalResponse non-nil → decoderCb.SendLocalReply +
-//         http.StopIteration (REUSE 5 per parent §3.3)
+//         http.StopIteration, or envoyhttp.TerminateStream when decoderCb is
+//         nil (REUSE 5 per parent §3.3)
 //
 //  7. On error (wazero trap, hostcall-denial chain, or panic-wrapped Go
 //     panic from a bridge callback) → envoy_go.failures.Inc() + log +
@@ -65,7 +70,9 @@ package wasm
 //   - ADR-0205 (root-VM lifecycle evolution; *RootVM long-lived per
 //     *compiledConfig; per-stream StreamContext children share runtime +
 //     module)
-//   - parent §1 architectural primitive 6 (stream-control deferred to 25.2)
+//   - parent §1 architectural primitive 6 (stream-control deferred to 25.2 —
+//     that deferral is DISCHARGED: phase-82 S1 honors Pause on the headers
+//     arms, phase-83 S1 + S2 on the body and trailers arms)
 //   - parent §3.5 (per-stream lifecycle)
 //   - ADR-0071 (single-goroutine-per-stream invariant — no synchronization
 //     on f.streamCtx / f.streamContextID / f.sentLocalResponse /
@@ -96,6 +103,19 @@ import (
 // Indirected via a package var to make test-side capture trivial.
 // Mirrors the phase-22.1 lua `logf` precedent.
 var logf = log.Printf
+
+// proxyOnRequestHeaders / proxyOnResponseHeaders are the byte-stable
+// proxy-wasm v0.2.1 guest-export names for the two headers callbacks, in the
+// same shape as body.go's proxyOnRequestBody / proxyOnResponseBody.
+//
+// Added at phase-83 S1 for the pause-watchdog attribution parameter: the
+// watchdog's operator-facing warning names the guest callback the pause came
+// from, and before S1 that name was a hard-coded literal inside pause.go —
+// correct for the headers arms, a misattribution for every other arm.
+const (
+	proxyOnRequestHeaders  = "proxy_on_request_headers"
+	proxyOnResponseHeaders = "proxy_on_response_headers"
+)
 
 // DecodeHeaders implements envoyhttp.StreamDecoderFilter per 25.2 SPEC §4.3.
 // See the file-header comment for the full step list + error-handling
@@ -240,10 +260,17 @@ func (f *filter) DecodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	if f.sentLocalResponse != nil {
 		captured := f.sentLocalResponse
 		f.sentLocalResponse = nil // consume; idempotent against double-dispatch
-		if f.decoderCb != nil {
-			addl := convertHeaderPairsToOrderedHeaders(captured.additionalHeaders)
-			f.decoderCb.SendLocalReply(int(captured.statusCode), captured.body, addl)
+		// Phase-83 S8: with a decoderCb, beginLocalReply sets localReplyDone
+		// synchronously and RunDecodeHeaders re-checks it BEFORE the status
+		// switch, so StopIteration is never read. With a nil one nothing sets
+		// the flag and the status parks with no resumer.
+		if f.decoderCb == nil {
+			logf("WARN wasm: captured local response from proxy_on_request_headers (stream=%d, status=%d) but decoderCb is nil — terminating the stream",
+				f.streamContextID, captured.statusCode)
+			return envoyhttp.TerminateStream
 		}
+		addl := convertHeaderPairsToOrderedHeaders(captured.additionalHeaders)
+		f.decoderCb.SendLocalReply(int(captured.statusCode), captured.body, addl)
 		return envoyhttp.StopIteration
 	}
 
@@ -253,12 +280,20 @@ func (f *filter) DecodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	//
 	// Pause is now HONORED. Before phase-82 this arm logged "stream-control
 	// deferred" and returned Continue, i.e. the guest's pause was silently
-	// discarded — while FOUR of the six ProxyActionPause arms in this package
-	// (body.go x2, trailers.go x2) had honored Pause all along. Returning
-	// StopIteration makes FilterChain.RunDecodeHeaders park the stream on the
-	// chain-scoped decodeResumeCh; the guest resumes it with
-	// proxy_continue_stream(0), which lands in abiCallbacks.ContinueStream ->
-	// filter.resumeDecode.
+	// discarded. Returning StopIteration makes FilterChain.RunDecodeHeaders
+	// park the stream on the chain-scoped decodeResumeCh; the guest resumes it
+	// with proxy_continue_stream(0), which lands in abiCallbacks.ContinueStream
+	// -> filter.resumeDecode.
+	//
+	// ⚠️ THE PHASE-82 CONSOLATION IN THIS PARAGRAPH WAS FALSE AND IS DELETED.
+	// It said the other "FOUR of the six ProxyActionPause arms in this package
+	// (body.go x2, trailers.go x2) had honored Pause all along." They returned
+	// a PARKING STATUS all along, which is not the same thing: none of them
+	// set decodePaused/encodePaused, so resumeDecode's CompareAndSwap failed
+	// and the guest's own proxy_continue_stream fired NOTHING while still
+	// returning WasmResult::Ok, and none of them armed a watchdog, so the park
+	// had no bound either. Those four arms were the WORSE half of the defect,
+	// not the honored half; phase-83 S1 + S2 close them.
 	//
 	// beginDecodePause records that THIS filter owes exactly one resume (the
 	// CAS gate against spuriously un-parking a sibling filter on the same
@@ -267,7 +302,7 @@ func (f *filter) DecodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	// park produces.
 	switch action {
 	case abi.ProxyActionPause:
-		f.beginDecodePause()
+		f.beginDecodePause(proxyOnRequestHeaders)
 		return envoyhttp.StopIteration
 	case abi.ProxyActionContinue:
 		fallthrough
@@ -354,8 +389,10 @@ func (f *filter) initStreamContext(ctx context.Context, eff *compiledConfig) err
 //
 // The vm_reload triplet counters are NOT touched here (ReloadDispatch owns
 // them). decoderCb may be nil on test-double / encode-only paths — the 503
-// branch then degrades to StopIteration without the reply (the chain still
-// stops). FAIL_RELOAD shares the FAIL_CLOSED disposition for the unavailable /
+// branch then returns TerminateStream instead (phase-83 S8: it used to degrade
+// to StopIteration, which PARKS with no resumer because nothing sets
+// localReplyDone when no reply is sent). FAIL_RELOAD shares the FAIL_CLOSED
+// disposition for the unavailable /
 // trapping request itself; the reload-or-backoff happens on the NEXT request.
 func (f *filter) applyFailureDisposition(eff *compiledConfig) envoyhttp.FilterHeadersStatus {
 	if eff.failurePolicy == internalwasm.FailurePolicyFailOpen {
@@ -372,9 +409,12 @@ func (f *filter) applyFailureDisposition(eff *compiledConfig) envoyhttp.FilterHe
 	}
 	logf("INFO wasm: FAIL_CLOSED 503 (stream=%d) — VM unavailable/trapped under failure_policy=%d",
 		f.streamContextID, eff.failurePolicy)
-	if f.decoderCb != nil {
-		f.decoderCb.SendLocalReply(gohttp.StatusServiceUnavailable, "", nil)
+	// Phase-83 S8: same asymmetry as the captured-local-response arm above.
+	if f.decoderCb == nil {
+		logf("WARN wasm: FAIL_CLOSED (stream=%d) but decoderCb is nil — cannot emit 503; terminating the stream", f.streamContextID)
+		return envoyhttp.TerminateStream
 	}
+	f.decoderCb.SendLocalReply(gohttp.StatusServiceUnavailable, "", nil)
 	return envoyhttp.StopIteration
 }
 

@@ -99,16 +99,30 @@ func (f *filter) EncodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	// EncoderFilterCallbacks does NOT expose SendLocalReply (only the
 	// decode side does, per the upstream contract: local replies entering
 	// from the encode side would loop back through the encode chain).
-	// At 25.2 we consume the capture + log a warning; the StopIteration
-	// return prevents the response from continuing through the chain so
-	// the guest's intent (do not emit this response) is honored even if
-	// the SendLocalReply itself is not.
+	// ⚠️ PHASE-83 S8 — THE ONE LIVE PARK IN THIS FAMILY, and the one neither
+	// the SPEC nor the PLAN names. The pre-83 comment claimed the StopIteration
+	// return "prevents the response from continuing through the chain so the
+	// guest's intent (do not emit this response) is honored". It did not:
+	// StopIteration PARKS RunEncodeHeaders in parkEncode, and that park has no
+	// resumer at all — RunEncodeHeaders carries ZERO c.localReplyDone re-checks
+	// (all six are decode-side), no watchdog is armed on this arm,
+	// EncoderFilterCallbacks exposes no SendLocalReply to set the flag through,
+	// and there is no stream idle timeout in this tree.
+	//
+	// MEASURED at phase-83 Task 6 with a guest that calls
+	// proxy_send_local_response from proxy_on_response_headers:
+	// RunEncodeHeaders did not return in 3 s and only a ctx-cancel reaped the
+	// dispatch goroutine. Unlike the trailers mirror, this one is LIVE —
+	// RunEncodeHeaders is driven by all three HCM dispatchers.
+	//
+	// TerminateStream aborts the iterator with errStreamTerminatedByFilter,
+	// which serveOneRequest already turns into a connection close.
 	if f.sentLocalResponse != nil {
 		captured := f.sentLocalResponse
 		f.sentLocalResponse = nil // consume; idempotent against double-dispatch
-		logf("WARN wasm: proxy_send_local_response from proxy_on_response_headers (stream=%d, status=%d) — EncoderFilterCallbacks does not expose SendLocalReply at 25.2; stopping iteration",
+		logf("WARN wasm: proxy_send_local_response from proxy_on_response_headers (stream=%d, status=%d) — EncoderFilterCallbacks does not expose SendLocalReply at 25.2; terminating the stream",
 			f.streamContextID, captured.statusCode)
-		return envoyhttp.StopIteration
+		return envoyhttp.TerminateStream
 	}
 
 	// ProxyAction handling — identical to the decode side (phase-82 S1).
@@ -124,7 +138,7 @@ func (f *filter) EncodeHeaders(headers gohttp.Header, endStream bool) envoyhttp.
 	// decode side's differential coverage as covering this arm.
 	switch action {
 	case abi.ProxyActionPause:
-		f.beginEncodePause()
+		f.beginEncodePause(proxyOnResponseHeaders)
 		return envoyhttp.StopIteration
 	case abi.ProxyActionContinue:
 		fallthrough

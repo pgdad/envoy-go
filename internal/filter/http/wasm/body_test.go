@@ -12,12 +12,13 @@ package wasm
 //   2. TestBody_DecodeData_CapExceeded_SendsLocalReply_413 — cap-exceeded
 //      fires sticky flag + body_buffer_cap_exceeded counter +
 //      envoy_go.failures counter + decoderCb.SendLocalReply(413) +
-//      DataStopIterationNoBuffer.
+//      DataStopIterationNoBuffer (whose value the chain never reads — the
+//      localReplyDone re-check fires first).
 //
 //   3. TestBody_DecodeData_StickyCapExceeded_NoReDispatch — after first
-//      cap-exceeded event, subsequent DecodeData calls return DataStop
-//      IterationNoBuffer WITHOUT re-bumping counters OR re-invoking
-//      SendLocalReply.
+//      cap-exceeded event, subsequent DecodeData calls return
+//      DataTerminateStream (phase-83 S8) WITHOUT re-bumping counters OR
+//      re-invoking SendLocalReply.
 //
 //   4. TestBody_DecodeData_NoOpWhenGuestNotExported — streamCtx is nil OR
 //      HasGlobalFunc returns false → DataContinue without dispatch attempt.
@@ -27,7 +28,9 @@ package wasm
 //      policy, not guest policy).
 //
 //   6. TestBody_EncodeData_MirrorsDecodeSide — encode-side cap-exceeded
-//      bumps counters + StopAllIteration but does NOT invoke SendLocalReply
+//      bumps counters + DataTerminateStream (phase-83 S8; pre-83 it was
+//      DataStopIterationNoBuffer, and the comment named the PHANTOM
+//      identifier StopAllIteration) but does NOT invoke SendLocalReply
 //      (EncoderFilterCallbacks does not expose it).
 //
 //   7. TestBody_EncodeData_StickyCapExceeded — encode-side sticky flag.
@@ -201,17 +204,18 @@ func TestBody_DecodeData_StickyCapExceeded_NoReDispatch(t *testing.T) {
 			rdcb.calls, findStatCounterValue(reg, "wasm.plugin_sticky.body_buffer_cap_exceeded"))
 	}
 
-	// Subsequent chunks: STILL StopAllIteration, but NO re-fire of counters
+	// Subsequent chunks: STILL a stop status (DataTerminateStream as of
+	// phase-83 S8), but NO re-fire of counters
 	// or SendLocalReply.
 	for i := 0; i < 3; i++ {
 		chunkN := make([]byte, 4)
-		if got := f.DecodeData(chunkN, false); got != envoyhttp.DataStopIterationNoBuffer {
-			t.Errorf("chunk %d (post-sticky) DecodeData = %v; want DataStopIterationNoBuffer", i+2, got)
+		if got := f.DecodeData(chunkN, false); got != envoyhttp.DataTerminateStream {
+			t.Errorf("chunk %d (post-sticky) DecodeData = %v; want DataTerminateStream (phase-83 S8 — the sticky arm has no resume to offer, so a parking status parked forever)", i+2, got)
 		}
 	}
 	endChunk := make([]byte, 0)
-	if got := f.DecodeData(endChunk, true); got != envoyhttp.DataStopIterationNoBuffer {
-		t.Errorf("end chunk DecodeData = %v; want DataStopIterationNoBuffer", got)
+	if got := f.DecodeData(endChunk, true); got != envoyhttp.DataTerminateStream {
+		t.Errorf("end chunk DecodeData = %v; want DataTerminateStream (phase-83 S8)", got)
 	}
 
 	// Counters STILL at 1; SendLocalReply STILL at 1 call.
@@ -289,7 +293,7 @@ func TestBody_DecodeData_CapEnforcedEvenWithoutGuestOptIn(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 // TestBody_EncodeData_MirrorsDecodeSide asserts that the encode-side cap-
-// exceeded bumps counters + StopAllIteration but does NOT invoke any
+// exceeded bumps counters + DataTerminateStream (phase-83 S8) but does NOT invoke any
 // decoderCb.SendLocalReply (EncoderFilterCallbacks does not expose it).
 func TestBody_EncodeData_MirrorsDecodeSide(t *testing.T) {
 	t.Parallel()
@@ -299,8 +303,8 @@ func TestBody_EncodeData_MirrorsDecodeSide(t *testing.T) {
 	f := &filter{cfg: cc, decoderCb: rdcb}
 
 	oversize := make([]byte, 16)
-	if got := f.EncodeData(oversize, false); got != envoyhttp.DataStopIterationNoBuffer {
-		t.Errorf("EncodeData over-cap = %v; want DataStopIterationNoBuffer", got)
+	if got := f.EncodeData(oversize, false); got != envoyhttp.DataTerminateStream {
+		t.Errorf("EncodeData over-cap = %v; want DataTerminateStream (phase-83 S8 — the encode side has no SendLocalReply and no localReplyDone re-check, so DataStopIterationNoBuffer here parked RunEncodeData forever)", got)
 	}
 
 	// Sticky flag on encode side.
@@ -334,13 +338,13 @@ func TestBody_EncodeData_StickyCapExceeded(t *testing.T) {
 	cc := newBodyTestCompiledConfig(t, 4, "plugin_enc_sticky", reg)
 	f := &filter{cfg: cc}
 
-	if got := f.EncodeData(make([]byte, 16), false); got != envoyhttp.DataStopIterationNoBuffer {
-		t.Fatalf("first over-cap EncodeData = %v; want DataStopIterationNoBuffer", got)
+	if got := f.EncodeData(make([]byte, 16), false); got != envoyhttp.DataTerminateStream {
+		t.Fatalf("first over-cap EncodeData = %v; want DataTerminateStream (phase-83 S8)", got)
 	}
 
 	for i := 0; i < 3; i++ {
-		if got := f.EncodeData(make([]byte, 4), false); got != envoyhttp.DataStopIterationNoBuffer {
-			t.Errorf("post-sticky chunk %d EncodeData = %v; want DataStopIterationNoBuffer", i+2, got)
+		if got := f.EncodeData(make([]byte, 4), false); got != envoyhttp.DataTerminateStream {
+			t.Errorf("post-sticky chunk %d EncodeData = %v; want DataTerminateStream (phase-83 S8)", i+2, got)
 		}
 	}
 
@@ -358,7 +362,9 @@ func TestBody_EncodeData_StickyCapExceeded(t *testing.T) {
 
 // TestBody_DecodeData_NilDecoderCb_GracefulDegrade asserts that when
 // decoderCb is nil, cap-exceeded still bumps counters + sets sticky flag +
-// returns StopAllIteration — only the SendLocalReply step is skipped (with
+// returns a stop status — DataTerminateStream as of phase-83 S8, because
+// with no decoderCb nothing sets localReplyDone — only the SendLocalReply
+// step is skipped (with
 // a warning log).
 func TestBody_DecodeData_NilDecoderCb_GracefulDegrade(t *testing.T) {
 	t.Parallel()
@@ -366,8 +372,8 @@ func TestBody_DecodeData_NilDecoderCb_GracefulDegrade(t *testing.T) {
 	cc := newBodyTestCompiledConfig(t, 4, "plugin_nil_dcb", reg)
 	f := &filter{cfg: cc} // decoderCb left nil
 
-	if got := f.DecodeData(make([]byte, 16), false); got != envoyhttp.DataStopIterationNoBuffer {
-		t.Errorf("DecodeData (nil decoderCb) = %v; want DataStopIterationNoBuffer", got)
+	if got := f.DecodeData(make([]byte, 16), false); got != envoyhttp.DataTerminateStream {
+		t.Errorf("DecodeData (nil decoderCb) = %v; want DataTerminateStream — phase-83 S8: with no decoderCb no 413 is sent, so nothing sets localReplyDone and RunDecodeData's pre-switch re-check cannot rescue the park", got)
 	}
 	if !f.decodeBodyCapExceeded {
 		t.Errorf("decodeBodyCapExceeded = false; want true (cap fires regardless of decoderCb)")
@@ -453,8 +459,8 @@ func TestBody_EncodeData_PerRouteOverride_UsesEffectiveConfig(t *testing.T) {
 	f := &filter{cfg: listener, eff: override}
 
 	chunk := make([]byte, 16)
-	if got := f.EncodeData(chunk, false); got != envoyhttp.DataStopIterationNoBuffer {
-		t.Fatalf("EncodeData over override cap = %v; want DataStopIterationNoBuffer (override cap must apply)", got)
+	if got := f.EncodeData(chunk, false); got != envoyhttp.DataTerminateStream {
+		t.Fatalf("EncodeData over override cap = %v; want DataTerminateStream (override cap must apply; phase-83 S8 changed the encode-side cap status)", got)
 	}
 	if got := findStatCounterValue(reg, "wasm.plugin_enc_route.body_buffer_cap_exceeded"); got != 1 {
 		t.Errorf("wasm.plugin_enc_route.body_buffer_cap_exceeded = %d; want 1", got)

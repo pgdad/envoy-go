@@ -21,15 +21,22 @@ package wasm
 //        failures counter aggregates every envoy-go-strict stream-fail
 //        surface).
 //      - On the decode side: decoderCb.SendLocalReply(413, "Payload Too
-//        Large", ...) per REUSE 5 (parent §3.3).
+//        Large", ...) per REUSE 5 (parent §3.3) + return DataStopIteration
+//        NoBuffer, whose value the chain never reads — beginLocalReply sets
+//        localReplyDone synchronously and RunDecodeData re-checks it BEFORE
+//        the status switch. When decoderCb is nil no reply is sent and
+//        nothing sets the flag, so that branch returns DataTerminateStream.
 //      - On the encode side: SendLocalReply is unavailable (EncoderFilter
-//        Callbacks does not expose it); log a warning + return DataStop
-//        IterationNoBuffer so the chain terminates the response early.
-//      Return DataStopIterationNoBuffer.
+//        Callbacks does not expose it); log a warning + return
+//        DataTerminateStream, which aborts RunEncodeData with
+//        errStreamTerminatedByFilter and closes the connection. Phase-83 S8:
+//        the pre-83 DataStopIterationNoBuffer here PARKED the encode chain
+//        forever, because no RunEncode* iterator carries a localReplyDone
+//        re-check and no watchdog bounds a host-initiated park.
 //
-//      Subsequent chunks on the SAME stream short-circuit to DataStop
-//      IterationNoBuffer WITHOUT re-invoking SendLocalReply OR re-bumping the
-//      counters (sticky flag).
+//      Subsequent chunks on the SAME stream short-circuit to
+//      DataTerminateStream WITHOUT re-invoking SendLocalReply OR re-bumping
+//      the counters (sticky flag).
 //
 //   3. proxy_on_*_body dispatch per Q1: if the guest exports proxy_on_request_
 //      body (decode side) OR proxy_on_response_body (encode side), invoke
@@ -38,10 +45,20 @@ package wasm
 //      cap-denied / not-exported guests get ProxyActionContinue + nil
 //      transparently. ProxyAction handling:
 //
-//        - Continue → DataContinue
-//        - Pause    → DataStopIterationAndBuffer
-//        - err      → cfg.stats.envoyGoFailures++ + log + DataContinue
-//                     (fail-OPEN per ADR-0072 per-stream posture).
+//        - Continue → filter.disarmDecodePause/disarmEncodePause (this arm
+//                     RELEASES the chain, so any pause an earlier chunk armed
+//                     must be retired here) + DataContinue
+//        - Pause    → filter.beginDecodePauseOnce/beginEncodePauseOnce +
+//                     DataStopIterationAndBuffer. ⚠️ Phase-83 S1: this status
+//                     PARKS the chain — it does NOT "buffer further chunks for
+//                     a later invocation", because the goroutine it parks is
+//                     the one that would deliver them. See the arm itself and
+//                     pause.go for the measured leak the missing bookkeeping
+//                     produced, and for why the `Once` form is required on a
+//                     per-CHUNK callback.
+//        - err      → cfg.stats.envoyGoFailures++ + log + disarm +
+//                     DataContinue (fail-OPEN per ADR-0072 per-stream
+//                     posture; the fail-OPEN arm releases the chain too).
 //
 // # NO-op disposition (guest not opted in to body callbacks)
 //
@@ -120,15 +137,25 @@ func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 		eff = f.cfg
 	}
 
-	// Sticky cap-exceeded short-circuit per Q2. Once the cap is exceeded on
-	// the decode side, subsequent chunks pass through StopAllIteration
-	// without re-invoking SendLocalReply or re-bumping the counters. The
-	// chain.go SendLocalReply path has already short-circuited iteration via
-	// f.sentLocalResponse capture; this branch covers the case where the
-	// framework still calls DecodeData with more chunks after the local
-	// reply (defensive against chain reentry).
+	// Sticky cap-exceeded short-circuit per Q2. Once the cap is exceeded on the
+	// decode side, subsequent chunks short-circuit here without re-invoking
+	// SendLocalReply or re-bumping the counters.
+	//
+	// Phase-83 S8: DataTerminateStream, not DataStopIterationNoBuffer. The
+	// stream is already unservable and this arm has NO resume to offer, so a
+	// parking status parks with no resumer: it sends no local reply, so
+	// RunDecodeData's pre-switch localReplyDone re-check cannot rescue it
+	// either. MEASURED, not read: with DataStopIterationNoBuffer here,
+	// RunDecodeData did not return in the probe budget (see
+	// encodecap_park_test.go, cell decode_sticky) and only the probe's own
+	// ctx-cancel reaped the goroutine.
+	//
+	// Reachable only by chain reentry today (the normal decode path stops at
+	// the localReplyDone re-check on the chunk that fired the cap), which makes
+	// this LATENT rather than live. It is closed anyway — "unreachable at this
+	// tip" is not a property to hang a held connection on.
 	if f.decodeBodyCapExceeded {
-		return envoyhttp.DataStopIterationNoBuffer
+		return envoyhttp.DataTerminateStream
 	}
 
 	// Step 1: append to per-stream accumulator. Per Q1: the accumulator
@@ -163,12 +190,22 @@ func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 		// headers.go consume; here we invoke decoderCb.SendLocalReply
 		// directly since the framework calls THIS file's DecodeData (not
 		// the abi_callbacks consume path).
-		if f.decoderCb != nil {
-			f.decoderCb.SendLocalReply(localReply413Status, localReply413Body, nil)
-		} else {
-			logf("WARN wasm: body cap exceeded (cap=%d, accumulated=%d) but decoderCb is nil — cannot emit 413; stopping iteration",
+		//
+		// Phase-83 S8: the two branches return DIFFERENT statuses, and the
+		// asymmetry is the point. With a decoderCb, beginLocalReply sets
+		// localReplyDone SYNCHRONOUSLY and RunDecodeData re-checks it BEFORE
+		// the status switch, so the returned status is never examined and the
+		// production decode path is genuinely rescued. With a nil decoderCb no
+		// reply is sent, nothing sets the flag, and DataStopIterationNoBuffer
+		// parked forever — MEASURED (encodecap_park_test.go, cell
+		// decode_cap_nil_cb). NewFilterChain always wires a real callback, so
+		// the nil shape is test-double-reachable only; it is closed regardless.
+		if f.decoderCb == nil {
+			logf("WARN wasm: body cap exceeded (cap=%d, accumulated=%d) but decoderCb is nil — cannot emit 413; terminating the stream",
 				eff.bodyBufferCapBytes, len(f.decodeBody))
+			return envoyhttp.DataTerminateStream
 		}
+		f.decoderCb.SendLocalReply(localReply413Status, localReply413Body, nil)
 		return envoyhttp.DataStopIterationNoBuffer
 	}
 
@@ -197,6 +234,10 @@ func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 		}
 		logf("ERROR wasm: CallProxyOnRequestBody(stream=%d, bodySize=%d, endStream=%v): %v",
 			f.streamContextID, len(f.decodeBody), endStream, err)
+		// DataContinue RELEASES the chain, so this arm owes the same disarm
+		// the Continue arm does — a pause left armed by an earlier chunk
+		// would fire an unmatched ContinueDecoding into an unparked stream.
+		f.disarmDecodePause()
 		return envoyhttp.DataContinue
 	}
 
@@ -209,25 +250,52 @@ func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 	if f.sentLocalResponse != nil {
 		captured := f.sentLocalResponse
 		f.sentLocalResponse = nil // consume; idempotent against double-dispatch
-		if f.decoderCb != nil {
-			addl := convertHeaderPairsToOrderedHeaders(captured.additionalHeaders)
-			f.decoderCb.SendLocalReply(int(captured.statusCode), captured.body, addl)
+		// Same asymmetry as the cap arm above: with a decoderCb the local reply
+		// sets localReplyDone and the chain's pre-switch re-check ends decode
+		// iteration before the status is read; with a nil one, nothing does.
+		if f.decoderCb == nil {
+			logf("WARN wasm: captured local response from proxy_on_request_body (stream=%d, status=%d) but decoderCb is nil — terminating the stream",
+				f.streamContextID, captured.statusCode)
+			return envoyhttp.DataTerminateStream
 		}
+		addl := convertHeaderPairsToOrderedHeaders(captured.additionalHeaders)
+		f.decoderCb.SendLocalReply(int(captured.statusCode), captured.body, addl)
 		return envoyhttp.DataStopIterationNoBuffer
 	}
 
 	// ProxyAction handling per Q1 + 25.2 SPEC §4.3:
-	//   - Continue → DataContinue (chain proceeds; guest will receive the
-	//                next chunk on the next DecodeData call)
-	//   - Pause    → DataStopIterationAndBuffer (chain accumulates further
-	//                chunks; guest's subsequent body-callback invocations
-	//                see the additional bytes)
+	//
+	//   - Continue → DataContinue. The chain advances to the next filter and
+	//     this filter sees the next chunk on the next DecodeData call.
+	//
+	//   - Pause → DataStopIterationAndBuffer, WHICH PARKS. Phase-83 S1.
+	//
+	// ⚠️ THE PRE-83 COMMENT HERE WAS FALSE, AND ITS FALSEHOOD IS THE WHOLE
+	// BUG. It read "chain accumulates further chunks; guest's subsequent
+	// body-callback invocations see the additional bytes." What
+	// FilterChain.RunDecodeData actually does with this status is append the
+	// CURRENT chunk to c.decodeBuf and then BLOCK in parkDecode — and the
+	// goroutine it blocks is the very one that would have delivered the next
+	// chunk. There are no "further chunks" and no "subsequent invocations";
+	// there is one parked dispatch goroutine and one held connection.
+	// MEASURED, not read: with no bookkeeping on this arm, RunDecodeData did
+	// not return in 10 s (pause_body_test.go's decode anchor) and the encode
+	// mirror behaved identically through parkEncode.
+	//
+	// beginDecodePauseOnce records that THIS filter owes the chain exactly one
+	// resume — without the flag the guest's own proxy_continue_stream loses
+	// resumeDecode's CompareAndSwap and fires NOTHING while still returning
+	// WasmResult::Ok — and arms the S9 watchdog that bounds the park. `Once`
+	// rather than the plain form because a body callback runs per CHUNK: see
+	// pause.go for why re-arming per chunk removes the bound entirely.
 	switch action {
 	case abi.ProxyActionPause:
+		f.beginDecodePauseOnce(proxyOnRequestBody)
 		return envoyhttp.DataStopIterationAndBuffer
 	case abi.ProxyActionContinue:
 		fallthrough
 	default:
+		f.disarmDecodePause()
 		return envoyhttp.DataContinue
 	}
 }
@@ -236,12 +304,19 @@ func (f *filter) DecodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 // Q1 + Q2. Mirror of DecodeData for the encode side; reads + writes
 // f.encodeBody + f.encodeBodyCapExceeded.
 //
-// Encode-side SendLocalReply unavailability per ADR-0071: EncoderFilter
-// Callbacks does NOT expose SendLocalReply (the local reply would loop back
-// through the encode chain). On cap-exceeded on the encode side we log a
-// warning + return DataStopIterationNoBuffer so the chain terminates the
-// response early; the operator-visible signal is the body_buffer_cap_
-// exceeded counter + envoy_go.failures counter.
+// Encode-side SendLocalReply unavailability: http.EncoderFilterCallbacks does
+// NOT declare SendLocalReply (it is declared on http.DecoderFilterCallbacks
+// only, internal/filter/http/callbacks.go). ⚠️ NOT "per ADR-0071" — that ADR
+// mentions SendLocalReply zero times in its 48 lines, and ADR-0075 §Context
+// says the opposite; see the full three-way correction at the cap arm below.
+//
+// On cap-exceeded on the encode side we log a warning + return
+// envoyhttp.DataTerminateStream — ⚠️ NOT DataStopIterationNoBuffer "so the
+// chain terminates the response early", which is what this comment said until
+// phase-83 S8 and which was false in both halves: that status PARKED
+// RunEncodeData rather than terminating anything, measurably forever. The
+// operator-visible signal is the body_buffer_cap_exceeded counter +
+// envoy_go.failures counter.
 //
 // REPLACES the 25.1 no-op EncodeData in encode_headers.go.
 func (f *filter) EncodeData(data []byte, endStream bool) envoyhttp.FilterDataStatus {
@@ -256,8 +331,12 @@ func (f *filter) EncodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 		eff = f.cfg
 	}
 
+	// Phase-83 S8, encode mirror of the decode sticky arm — and the LIVE one.
+	// The encode side has no localReplyDone re-check anywhere, so a parking
+	// status here parked forever. MEASURED: encodecap_park_test.go, cell
+	// encode_sticky.
 	if f.encodeBodyCapExceeded {
-		return envoyhttp.DataStopIterationNoBuffer
+		return envoyhttp.DataTerminateStream
 	}
 
 	f.encodeBody = append(f.encodeBody, data...)
@@ -274,12 +353,54 @@ func (f *filter) EncodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 			}
 		}
 
-		// SendLocalReply unavailable on the encode side per ADR-0071. Log
-		// the cap-exceeded event so the operator sees a per-stream trace +
-		// return StopAllIteration so the chain terminates the response early.
-		logf("WARN wasm: encode-side body cap exceeded (cap=%d, accumulated=%d) — EncoderFilterCallbacks does not expose SendLocalReply; stopping iteration",
+		// ⚠️ PHASE-83 S8 — THE ARM THAT MOTIVATED DataTerminateStream. The
+		// comment that stood here was false three ways and each falsehood is
+		// corrected, not softened:
+		//
+		//  1. It named `StopAllIteration`, an identifier DECLARED NOWHERE in
+		//     this repository. The real roster is DataContinue /
+		//     DataStopIterationAndBuffer / DataStopIterationNoBuffer, plus
+		//     DataTerminateStream as of this commit.
+		//  2. It attributed "SendLocalReply is unavailable on the encode side"
+		//     to ADR-0071. Bounded extraction of ADR-0071 (heading
+		//     DECISIONS.md:2586, next `^## ADR-` at :2634, 48-line
+		//     denominator) returns ZERO hits for SendLocalReply. The ADR that
+		//     actually speaks to it is ADR-0075 §Context (:2733), and it says
+		//     the OPPOSITE — SendLocalReply is called "from any callback
+		//     (decode OR ENCODE side)". The real constraint is narrower and
+		//     lives in this tree, not in an ADR: EncoderFilterCallbacks simply
+		//     does not expose the method.
+		//  3. It claimed the return "terminates the response early". It did
+		//     not: DataStopIterationNoBuffer PARKS RunEncodeData in
+		//     parkEncode, forever. MEASURED (encodecap_park_test.go, cell
+		//     cap): the iterator did not return, no watchdog was armed, and
+		//     only the probe's ctx-cancel reaped the goroutine.
+		//
+		// DataContinue is NOT the alternative and this too is measured, not
+		// reasoned: flipping this arm to DataContinue yields terminated=true,
+		// err=nil and no encode-body override, so HCM writes resp.Body IN FULL
+		// and the cap is silently disabled.
+		//
+		// THE REFERENCE, MEASURED against pinned envoyproxy/envoy:
+		// contrib-v1.37.2 (four arms, fresh container each, with an NC): an
+		// encode-side buffer-limit breach against a paused encoder filter
+		// delivers 200 + headers and then RESETS THE STREAM with ZERO body
+		// bytes in 1.007 s, emitting http.<prefix>.rs_too_large: 1 and
+		// downstream_rq_tx_reset: 1. The NC (same limit, guest Continue)
+		// served 65536 bytes in 0.003 s with rs_too_large: 0. Upstream never
+		// stalls on a cap breach; it also bounds any indefinite encode pause
+		// separately, with stream_idle_timeout (arm 3b terminated at 4.005 s
+		// with downstream_rq_idle_timeout: 1). Two mechanisms for two
+		// failures; envoy-go had neither.
+		//
+		// ⚠️ DEPARTURE, RECORDED NOT PAPERED OVER: upstream flushes the
+		// response HEADERS before resetting. envoy-go runs the whole encode
+		// chain before writeH1Reply, so on this sentinel the client gets
+		// NOTHING — connection close, no headers. Both are "no usable body +
+		// a torn-down connection"; the byte shape differs.
+		logf("WARN wasm: encode-side body cap exceeded (cap=%d, accumulated=%d) — EncoderFilterCallbacks does not expose SendLocalReply; terminating the stream",
 			eff.bodyBufferCapBytes, len(f.encodeBody))
-		return envoyhttp.DataStopIterationNoBuffer
+		return envoyhttp.DataTerminateStream
 	}
 
 	if f.streamCtx == nil || !f.streamCtx.HasGlobalFunc(proxyOnResponseBody) {
@@ -295,26 +416,44 @@ func (f *filter) EncodeData(data []byte, endStream bool) envoyhttp.FilterDataSta
 		}
 		logf("ERROR wasm: CallProxyOnResponseBody(stream=%d, bodySize=%d, endStream=%v): %v",
 			f.streamContextID, len(f.encodeBody), endStream, err)
+		// Fail-OPEN releases the chain — same disarm obligation as Continue.
+		f.disarmEncodePause()
 		return envoyhttp.DataContinue
 	}
 
-	// captured-local-response on the encode side: SendLocalReply unavailable;
-	// consume + log + StopIteration matches the encode_headers.go REUSE-5
-	// disposition for proxy_on_response_headers.
+	// Captured-local-response on the encode side: EncoderFilterCallbacks does
+	// not expose SendLocalReply, so the guest's reply cannot be delivered and
+	// the response it wanted suppressed must not go out either.
+	//
+	// Phase-83 S8: DataTerminateStream. The host has decided the stream is
+	// unservable and owes no resume; the previous DataStopIterationNoBuffer
+	// parked RunEncodeData forever — MEASURED (encodecap_park_test.go, cell
+	// TestFilterChain_EncodeLocalResponse_TerminatesStream/body).
 	if f.sentLocalResponse != nil {
 		captured := f.sentLocalResponse
 		f.sentLocalResponse = nil
-		logf("WARN wasm: proxy_send_local_response from proxy_on_response_body (stream=%d, status=%d) — EncoderFilterCallbacks does not expose SendLocalReply at 25.2; stopping iteration",
+		logf("WARN wasm: proxy_send_local_response from proxy_on_response_body (stream=%d, status=%d) — EncoderFilterCallbacks does not expose SendLocalReply at 25.2; terminating the stream",
 			f.streamContextID, captured.statusCode)
-		return envoyhttp.DataStopIterationNoBuffer
+		return envoyhttp.DataTerminateStream
 	}
 
+	// Phase-83 S1, encode mirror. See the DecodeData arm above for the full
+	// rationale and for the false comment this replaces.
+	//
+	// The encode side is the harsher of the two: all SIX of chain.go's
+	// in-iterator c.localReplyDone.Load() re-checks sit in RunDecodeHeaders /
+	// RunDecodeData / RunDecodeTrailers (the seventh occurrence is the
+	// exported LocalReplyDone accessor). The three RunEncode* iterators carry
+	// ZERO, so an encode-side park has no secondary escape at all — the
+	// watchdog is the only bound that exists.
 	switch action {
 	case abi.ProxyActionPause:
+		f.beginEncodePauseOnce(proxyOnResponseBody)
 		return envoyhttp.DataStopIterationAndBuffer
 	case abi.ProxyActionContinue:
 		fallthrough
 	default:
+		f.disarmEncodePause()
 		return envoyhttp.DataContinue
 	}
 }

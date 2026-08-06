@@ -118,6 +118,18 @@ var testLifecycleCapabilities = []string{
 	"proxy_on_response_headers",
 	"proxy_on_request_body",
 	"proxy_on_response_body",
+	// ⚠️ THE TWO TRAILERS CAPABILITIES WERE MISSING UNTIL PHASE-83 S2, AND
+	// THEIR ABSENCE WAS SILENT. StrictDefaultDeny is enforced INSIDE
+	// StreamContext.dispatchGuest, so a denied trailers callback returns
+	// (ProxyActionContinue, nil) — no error, no envoy_go.failures bump, no
+	// log. Any S2 test built on newTestCompiledConfigWithCaps without naming
+	// them explicitly would have read GREEN with the Pause arm never executed.
+	// Adding them is NOT a global change: measured at this tip, 462 → 462 PASS
+	// with a ZERO-LINE per-test result diff, because none of the pre-existing
+	// fixture builders in wasm_fixtures_test.go exports either trailers
+	// callback.
+	"proxy_on_request_trailers",
+	"proxy_on_response_trailers",
 	"proxy_on_http_call_response",
 	"proxy_on_done",
 	"proxy_on_log",
@@ -1012,7 +1024,8 @@ func TestFilter_RootVM_LifecycleViaStreamContext(t *testing.T) {
 // TestFilter_RootVM_BodyCapEnforcement_DecodeSide exercises the body
 // cap-enforcement path under the root-VM model: a body chunk over the
 // 16-byte cap fires SendLocalReply(413) + body_buffer_cap_exceeded +
-// envoy_go.failures + DataStopIterationNoBuffer. Subsequent chunks
+// envoy_go.failures + DataStopIterationNoBuffer. Subsequent chunks (phase-83
+// S8: the sticky short-circuit returns DataTerminateStream)
 // short-circuit via the sticky flag.
 func TestFilter_RootVM_BodyCapEnforcement_DecodeSide(t *testing.T) {
 	t.Parallel()
@@ -1060,8 +1073,8 @@ func TestFilter_RootVM_BodyCapEnforcement_DecodeSide(t *testing.T) {
 
 	// Subsequent chunk short-circuits via sticky flag — NO re-bump of
 	// counters or re-invoke of SendLocalReply.
-	if got := f.DecodeData(oversize, true); got != envoyhttp.DataStopIterationNoBuffer {
-		t.Errorf("DecodeData (post-sticky) = %v; want DataStopIterationNoBuffer", got)
+	if got := f.DecodeData(oversize, true); got != envoyhttp.DataTerminateStream {
+		t.Errorf("DecodeData (post-sticky) = %v; want DataTerminateStream (phase-83 S8)", got)
 	}
 	rec.mu.Lock()
 	calls = rec.calls

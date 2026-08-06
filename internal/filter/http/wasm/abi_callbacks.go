@@ -707,10 +707,20 @@ func (a *abiCallbacks) Done(_ context.Context, _ uint32) abi.WasmResult {
 //   - CloseStream:     WasmResultUnimplemented — early stream-close
 //                      coordination lands at Task 16
 //
-// The stubs are intentional + documented; Task 16 deletes the stub
-// comments + wires the real impl. The unit tests at Task 15 pin the stub
-// behavior (so any regression in Task 16's wiring re-fails the unit tests
-// + the implementer notices at TDD time).
+// ⚠️ READ THIS BLOCK AS HISTORY ONLY. All five stubs above were replaced at
+// 25.2 Task 16 and NOT ONE of them still behaves as described — read each
+// method's own doc comment for its live behavior. Re-derived at this tip
+// rather than asserted: GetBuffer and GetBufferStatus now serve the real
+// decodeBody / encodeBody accumulators, SetBuffer returns Ok on the two live
+// arms, ContinueStream returns Ok, and the only surviving Unimplemented is
+// CloseStream's ENCODE arm alone — a deliberate per-arm return, not a stub.
+// ContinueStream in
+// particular acquired a real PAUSE/RESUME state machine at phase-82 and its
+// scope widened again at phase-83; the "lands at Task 16 body.go" pointer has
+// been stale for several phases. The paragraph that used to follow — "the
+// stubs are intentional + documented; Task 16 deletes the stub comments +
+// wires the real impl" — described a deletion that never happened, which is
+// how the block survived to be misleading.
 // -----------------------------------------------------------------------------
 
 // GetBuffer returns the per-(stream, bufferType) buffer bytes per 25.2 SPEC
@@ -851,11 +861,30 @@ func (a *abiCallbacks) GetBufferStatus(_ context.Context, _ uint32, bufferType a
 // The streamType discriminator selects which side (0 = decode, 1 = encode);
 // other values return BadArgument.
 //
-// Per ADR-0071 + envoyhttp framework: ContinueDecoding / ContinueEncoding
-// resume the per-side iteration after a previous DataStopIterationAndBuffer
-// return; the chain re-enters the next-filter-after-this-one dispatch with
-// the accumulated buffer. The guest call is fire-and-forget at the host
-// side (no return value beyond WasmResult::Ok).
+// Per ADR-0071 §Decision 2 + 5 + envoyhttp framework: ContinueDecoding /
+// ContinueEncoding do a non-blocking send on the chain's buffered-1 resume
+// channel, which releases whichever Run* iterator is parked. After a
+// DataStopIterationAndBuffer in particular, RunDecodeData has already appended
+// the current chunk to c.decodeBuf, so on release it advances its cursor and
+// the next filter sees the accumulated buffer. The guest call is
+// fire-and-forget at the host side (no return value beyond WasmResult::Ok).
+//
+// ⚠️ THE PHASE-82 FORM OF THAT SENTENCE WAS LOAD-BEARING-FALSE, AND THE ARM IT
+// NAMED WAS PRECISELY THE ONE THAT DID NOT WORK. It described the
+// DataStopIterationAndBuffer resume as though it worked, while the body arms
+// that returned that status set NO paused flag — so resumeDecode's
+// CompareAndSwap below failed and NOTHING was signaled. Confirmed one layer up
+// by execution at phase-83, not read: with a guest paused from
+// proxy_on_request_body, ContinueStream returned WasmResult::Ok while the
+// count of ContinueDecoding calls that actually fired was ZERO. The guest had
+// no way to observe the loss.
+//
+// GROUND TRUTH AT THIS TIP, re-derived rather than inherited: phase-83 S1 and
+// S2 gave the body and trailers arms the same bookkeeping the headers arms
+// got at phase-82, so all SIX ProxyActionPause arms now book a pause through
+// pause.go before returning their parking status, and the sentence above is
+// true for every one of them. It was NOT true of any arm but the headers pair
+// between phase 82 and phase 83.
 //
 // Defensive nil-tolerance: nil filter or nil per-side callback returns
 // InternalFailure (should-not-happen in production; preserved for test-

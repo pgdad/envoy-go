@@ -6,9 +6,6 @@ package wasm
 // Test inventory:
 //
 //	T9  TestFilter_EncodeHeaders_Pause_StopsIteration
-//	    TestFilter_Pause_CensusOfHonoredArms                (documents the
-//	                                                         four pre-existing
-//	                                                         honored arms)
 //	T11 TestAbiCallbacks_ContinueStream_SixArms             (counting cbs)
 //	    TestAbiCallbacks_ContinueStream_NoSpuriousCrossFilterResume
 //	T12 TestFilter_PauseFlag_CrossGoroutineResume_NoRace
@@ -117,31 +114,16 @@ func TestFilter_EncodeHeaders_Pause_StopsIteration(t *testing.T) {
 	}
 }
 
-// TestFilter_Pause_CensusOfHonoredArms pins the phase-82 finding that FOUR of
-// the SIX production abi.ProxyActionPause arms already honored Pause before
-// this row, so the blanket "stream control is deferred" claim was false. The
-// four are body.go x2 (DataStopIterationAndBuffer) and trailers.go x2
-// (TrailersStopIteration); this row moved only the two headers arms.
-//
-// This is a behavioral assertion, not a grep: it drives the real dispatch and
-// reads the returned status. It is also the guard that keeps a future edit from
-// silently changing the frozen body/trailers dispositions — differential
-// fixture 0036 scenario (n) depends on the decode-body arm pausing.
-func TestFilter_Pause_CensusOfHonoredArms(t *testing.T) {
-	t.Parallel()
-	// Statuses the four frozen arms return. Asserting the CONSTANTS keeps this
-	// cheap and makes an accidental change to the returned disposition a
-	// compile-or-assert failure at this site rather than a differential red.
-	if envoyhttp.DataStopIterationAndBuffer == envoyhttp.DataContinue {
-		t.Errorf("DataStopIterationAndBuffer == DataContinue; the body pause arms would be no-ops")
-	}
-	if envoyhttp.TrailersStopIteration == envoyhttp.TrailersContinue {
-		t.Errorf("TrailersStopIteration == TrailersContinue; the trailers pause arms would be no-ops")
-	}
-	if envoyhttp.StopIteration == envoyhttp.Continue {
-		t.Errorf("StopIteration == Continue; the headers pause arms would be no-ops")
-	}
-}
+// TestFilter_Pause_CensusOfHonoredArms was DELETED at phase-83 S4. It was
+// broken-gate shape 25: its docstring claimed "this is a behavioral assertion,
+// not a grep: it drives the real dispatch and reads the returned status" while
+// its body compared three pairs of package constants, constructing no filter
+// and dispatching nothing. Proven vacuous by break at the pre-S1/S2 tip —
+// flipping all four body+trailers arms to their Continue dispositions left it
+// PASS and the whole package at 445 PASS / 0 FAIL. Its replacement is
+// TestFilter_Pause_CensusOfHonoredArms_Behavioral in p83_census_test.go, which
+// drives all six arms through a real six-callback guest and additionally
+// asserts the post-S1/S2 flag + watchdog contract the old test predates.
 
 // -----------------------------------------------------------------------------
 // T11 — ContinueStream, all six arms.

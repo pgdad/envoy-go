@@ -2859,3 +2859,177 @@ func TestFilterChain_RouteMetaLookup(t *testing.T) {
 		}
 	})
 }
+
+// -----------------------------------------------------------------------------
+// Phase-83 S8 — DataTerminateStream / TrailersTerminateStream.
+// -----------------------------------------------------------------------------
+
+// p83TerminateBudget is how long the table below waits for a Run* iterator to
+// return before declaring it PARKED.
+//
+// ⚠️ IT IS THE PROBE'S DEADLINE, NOT A BOUND ON THE PARK. The ctx handed to
+// each iterator below is derived from context.Background() and carries NO
+// deadline, exactly as the production HCM connection ctx does; nothing on the
+// encode side sets localReplyDone and no watchdog is armed on a host-initiated
+// park. A failure here means the goroutine would have stayed parked forever —
+// only the deferred cancel() reaps it.
+const p83TerminateBudget = 2 * time.Second
+
+// TestChain_TerminateStream_AbortsWithoutParking is the phase-83 S8 chain-level
+// gate for the three new statuses, over the full {decode, encode} x {headers,
+// data, trailers} cross-product — all SIX Run* iterators.
+//
+// It asserts THREE properties per cell, each with its own t.Errorf so a failure
+// in one does not make the others dead code:
+//
+//  1. the iterator RETURNS (it does not park);
+//  2. the error is errStreamTerminatedByFilter, matched with errors.Is;
+//  3. terminated is false, and the SECOND filter in the chain was never
+//     invoked — iteration aborted at the terminating filter.
+//
+// NEGATIVE CONTROL, run by deleting either `case ...TerminateStream:` arm from
+// chain.go: the status then falls to the untouched `default:` arm and the
+// iterator returns the "unknown FilterDataStatus 3" / "unknown
+// FilterTrailersStatus 2" / "unknown FilterHeadersStatus 2" error instead of
+// the sentinel. Property 2 fails while
+// properties 1 and 3 still hold — which is what distinguishes "the arm is
+// missing" from "the arm parks".
+func TestChain_TerminateStream_AbortsWithoutParking(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		// mk builds the two-filter chain; the FIRST filter reached by the
+		// iteration order terminates, the SECOND must never run.
+		mk  func() (*FilterChain, *recordingFilter)
+		run func(*FilterChain, context.Context) (bool, error)
+		// downstream returns the invocation count of the filter that must NOT
+		// have been reached.
+		downstream func(*recordingFilter) int32
+	}{
+		{
+			name: "decode_data",
+			mk: func() (*FilterChain, *recordingFilter) {
+				// Decode order is declaration order, so the terminator is first
+				// and "unreached" is the second entry.
+				term := &recordingFilter{name: "term", dataStatus: DataTerminateStream}
+				next := &recordingFilter{name: "next", dataStatus: DataContinue}
+				c, _ := newChainOf(term, next)
+				return c, next
+			},
+			run: func(c *FilterChain, ctx context.Context) (bool, error) {
+				return c.RunDecodeData(ctx, []byte("payload"), true)
+			},
+			downstream: func(f *recordingFilter) int32 { return f.decodeData.Load() },
+		},
+		{
+			name: "encode_data",
+			mk: func() (*FilterChain, *recordingFilter) {
+				// Encode order is REVERSE declaration order, so the terminator
+				// must be declared LAST to be reached first.
+				next := &recordingFilter{name: "next", encDataStatus: DataContinue}
+				term := &recordingFilter{name: "term", encDataStatus: DataTerminateStream}
+				c, _ := newChainOf(next, term)
+				return c, next
+			},
+			run: func(c *FilterChain, ctx context.Context) (bool, error) {
+				return c.RunEncodeData(ctx, []byte("payload"), true)
+			},
+			downstream: func(f *recordingFilter) int32 { return f.encodeData.Load() },
+		},
+		{
+			name: "decode_headers",
+			mk: func() (*FilterChain, *recordingFilter) {
+				term := &recordingFilter{name: "term", headersStatus: TerminateStream}
+				next := &recordingFilter{name: "next", headersStatus: Continue}
+				c, _ := newChainOf(term, next)
+				return c, next
+			},
+			run: func(c *FilterChain, ctx context.Context) (bool, error) {
+				return c.RunDecodeHeaders(ctx, http.Header{"X-H": []string{"1"}}, true)
+			},
+			downstream: func(f *recordingFilter) int32 { return f.decodeHeaders.Load() },
+		},
+		{
+			name: "encode_headers",
+			mk: func() (*FilterChain, *recordingFilter) {
+				next := &recordingFilter{name: "next", encHeadersStatus: Continue}
+				term := &recordingFilter{name: "term", encHeadersStatus: TerminateStream}
+				c, _ := newChainOf(next, term)
+				return c, next
+			},
+			run: func(c *FilterChain, ctx context.Context) (bool, error) {
+				return c.RunEncodeHeaders(ctx, http.Header{"X-H": []string{"1"}}, true)
+			},
+			downstream: func(f *recordingFilter) int32 { return f.encodeHeaders.Load() },
+		},
+		{
+			name: "decode_trailers",
+			mk: func() (*FilterChain, *recordingFilter) {
+				term := &recordingFilter{name: "term", trailersStatus: TrailersTerminateStream}
+				next := &recordingFilter{name: "next", trailersStatus: TrailersContinue}
+				c, _ := newChainOf(term, next)
+				return c, next
+			},
+			run: func(c *FilterChain, ctx context.Context) (bool, error) {
+				return c.RunDecodeTrailers(ctx, http.Header{"X-T": []string{"1"}})
+			},
+			downstream: func(f *recordingFilter) int32 { return f.decodeTrailers.Load() },
+		},
+		{
+			name: "encode_trailers",
+			mk: func() (*FilterChain, *recordingFilter) {
+				next := &recordingFilter{name: "next", encTrailersStatus: TrailersContinue}
+				term := &recordingFilter{name: "term", encTrailersStatus: TrailersTerminateStream}
+				c, _ := newChainOf(next, term)
+				return c, next
+			},
+			run: func(c *FilterChain, ctx context.Context) (bool, error) {
+				return c.RunEncodeTrailers(ctx, http.Header{"X-T": []string{"1"}})
+			},
+			downstream: func(f *recordingFilter) int32 { return f.encodeTrailers.Load() },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			chain, unreached := tc.mk()
+			t.Cleanup(chain.Destroy)
+
+			// NO DEADLINE on the ctx, so a park is a real park and not a
+			// ctx-cancel masquerading as one.
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+
+			type result struct {
+				terminated bool
+				err        error
+			}
+			done := make(chan result, 1)
+			go func() {
+				term, err := tc.run(chain, ctx)
+				done <- result{term, err}
+			}()
+
+			var got result
+			select {
+			case got = <-done:
+			case <-time.After(p83TerminateBudget):
+				t.Errorf("PARKED: the iterator did not return within %v. The %v is this probe's DEADLINE, not the park's bound — the ctx carries none and nothing resumes the chain; only the deferred cancel() reaps the goroutine",
+					p83TerminateBudget, p83TerminateBudget)
+				return
+			}
+
+			if !errors.Is(got.err, errStreamTerminatedByFilter) {
+				t.Errorf("err = %v; want errStreamTerminatedByFilter (an \"unknown Filter*Status\" error here means the case arm is missing and the status fell through to default:)", got.err)
+			}
+			if got.terminated {
+				t.Errorf("terminated = true; want false — a terminated stream did not complete iteration")
+			}
+			if n := tc.downstream(unreached); n != 0 {
+				t.Errorf("the downstream filter ran %d time(s); want 0 — iteration must abort AT the terminating filter", n)
+			}
+		})
+	}
+}

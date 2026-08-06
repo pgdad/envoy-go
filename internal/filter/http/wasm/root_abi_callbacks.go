@@ -40,14 +40,20 @@ package wasm
 //
 // # Nil-tolerance per ADR-0085
 //
-// Lookup miss returns a no-op fallback ABICallbacks (allCallbacksNoOp). A
-// miss can happen if (a) the stream context has been removed (OnDestroy
-// ran but a stray hostcall slipped through), or (b) the dispatch is on the
-// root context (rootCtxID, used for proxy_on_vm_start / proxy_on_configure
-// / proxy_on_tick). The root-context dispatch never reads per-stream state
-// (the guest fires these hooks against the root context which has no
-// per-stream filter); the no-op fallback returns sensible defaults so the
-// host-side dispatch completes without a panic.
+// A lookup miss can happen if (a) the stream context has been removed
+// (OnDestroy ran but a stray hostcall slipped through), or (b) the dispatch is
+// on the root context (rootCtxID, used for proxy_on_vm_start /
+// proxy_on_configure / proxy_on_tick). The root-context dispatch never reads
+// per-stream state (the guest fires these hooks against the root context which
+// has no per-stream filter), so a miss must still complete without a panic.
+//
+// ⚠️ THERE IS NO FALLBACK OBJECT. This comment used to say a miss "returns a
+// no-op fallback ABICallbacks (allCallbacksNoOp)"; `allCallbacksNoOp` is
+// DECLARED NOWHERE IN THIS REPOSITORY — the only occurrence of the identifier
+// was that sentence. The real mechanism is that `lookup` returns
+// (*abiCallbacks, bool) and every method below returns its OWN inline zero
+// value on !ok. That is a weaker guarantee than a shared no-op type would give:
+// the defaults are per-method and are not pinned anywhere by construction.
 
 import (
 	"context"

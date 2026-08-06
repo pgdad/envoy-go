@@ -21,6 +21,16 @@ const (
 	Continue FilterHeadersStatus = iota
 	// StopIteration parks the chain; resume via cb.ContinueDecoding/ContinueEncoding.
 	StopIteration
+	// TerminateStream is the headers-axis mirror of DataTerminateStream:
+	// RunDecodeHeaders / RunEncodeHeaders abort and return
+	// errStreamTerminatedByFilter instead of parking. Same append-at-the-end
+	// constraint — see DataTerminateStream below.
+	//
+	// It exists because the wasm filter's encode-side captured-local-response
+	// arm returned StopIteration with no resumer: MEASURED at phase-83 Task 6,
+	// RunEncodeHeaders did not return in 3 s and only a ctx-cancel reaped the
+	// dispatch goroutine.
+	TerminateStream
 )
 
 // FilterDataStatus is returned by DecodeData / EncodeData to signal iteration
@@ -35,6 +45,27 @@ const (
 	DataStopIterationAndBuffer
 	// DataStopIterationNoBuffer parks the chain without accumulating body bytes.
 	DataStopIterationNoBuffer
+	// DataTerminateStream tears the stream down WITHOUT parking: RunDecodeData
+	// and RunEncodeData abort iteration and return errStreamTerminatedByFilter,
+	// which HCM dispatch turns into "log + close the connection" (see
+	// serveOneRequest — every non-errCloseAfterAction error closes).
+	//
+	// Phase-83 S8. It exists because a filter can detect a condition that makes
+	// the stream unservable while having NO resume to offer, and every other
+	// status is wrong for that case: the two StopIteration* statuses PARK, and
+	// on the encode side a park is unbounded (all six of the chain's
+	// localReplyDone re-checks are decode-side, and no RunEncode* iterator
+	// carries one), while DataContinue was REJECTED BY MEASUREMENT — driving
+	// the real chain with the wasm encode-cap arm flipped to DataContinue gives
+	// terminated=true, err=nil and no body override, so HCM writes the
+	// over-cap body in full and the cap is silently disabled.
+	//
+	// ⚠️ APPENDED AT THE END OF THE BLOCK DELIBERATELY. These values are
+	// iota-derived; inserting anywhere else silently renumbers the three
+	// pre-existing statuses. Nothing serializes them (no proto field, no
+	// config key, no persisted record — they are returned by a Go method and
+	// consumed by a switch in the same process), so appending is safe.
+	DataTerminateStream
 )
 
 // FilterTrailersStatus is returned by DecodeTrailers / EncodeTrailers.
@@ -46,6 +77,11 @@ const (
 	TrailersContinue FilterTrailersStatus = iota
 	// TrailersStopIteration parks the chain; resume via cb.Continue*.
 	TrailersStopIteration
+	// TrailersTerminateStream is the trailers-axis mirror of
+	// DataTerminateStream: RunDecodeTrailers / RunEncodeTrailers abort and
+	// return errStreamTerminatedByFilter instead of parking. Same append-at-
+	// the-end constraint as DataTerminateStream above.
+	TrailersTerminateStream
 )
 
 // StreamDecoderFilter is implemented by filters that participate in the

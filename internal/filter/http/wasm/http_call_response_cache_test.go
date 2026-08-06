@@ -133,19 +133,26 @@ func newCachedHTTPCallResponse() *internalwasm.HTTPCallResponse {
 // Layer 1 — the real vendored guest, driven by the REAL PRODUCER end to end.
 // -----------------------------------------------------------------------------
 
-// httpCallBackendPort is drawn from this agent's reserved port band
-// (42550-42599) so a concurrent sibling agent cannot collide with it.
-const httpCallBackendPort = 42552
-
 // startHttpCallBackend brings up the upstream the guest's proxy_http_call
 // reaches. It answers 207 with a MULTI-VALUE header so the value count and the
 // key count of the response differ, and the 207 is a status nothing else in
 // this test could produce.
-func startHttpCallBackend(t *testing.T) {
+//
+// It listens on "127.0.0.1:0" (OS-assigned port) and returns the assigned
+// port, HOLDING the listener for the test's lifetime rather than closing it
+// and rebinding the same number later. Do NOT copy this pattern from
+// freeTCPPort (cmd/envoy-go/main_test.go, test/conformance/h2spec/h2spec_test.go,
+// test/differential/harness_test.go): that helper's close-then-rebind exists
+// only because ITS caller then hands the port to a SUBPROCESS, which opens a
+// window between the probe closing and the subprocess binding. This backend
+// binds IN-PROCESS — the same *net.Listener returned by net.Listen is the one
+// gohttp.Server.Serve uses — so there is no such window and nothing to guard
+// against.
+func startHttpCallBackend(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:"+itoa(httpCallBackendPort))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("listening on the reserved backend port %d: %v", httpCallBackendPort, err)
+		t.Fatalf("listening on an OS-assigned backend port: %v", err)
 	}
 	srv := &gohttp.Server{
 		ReadHeaderTimeout: 5 * time.Second,
@@ -158,26 +165,12 @@ func startHttpCallBackend(t *testing.T) {
 	}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
-}
-
-// itoa avoids pulling strconv in for one call site.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [8]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
+	return ln.Addr().(*net.TCPAddr).Port
 }
 
 // mkHttpCallClusterMgr builds a *cluster.Manager carrying a single STATIC
-// cluster named `name` pointing at the local backend.
-func mkHttpCallClusterMgr(t *testing.T, name string) *cluster.Manager {
+// cluster named `name` pointing at the local backend on `port`.
+func mkHttpCallClusterMgr(t *testing.T, name string, port int) *cluster.Manager {
 	t.Helper()
 	bs := &bootstrapv3.Bootstrap{
 		StaticResources: &bootstrapv3.Bootstrap_StaticResources{
@@ -194,7 +187,7 @@ func mkHttpCallClusterMgr(t *testing.T, name string) *cluster.Manager {
 								Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
 									SocketAddress: &corev3.SocketAddress{
 										Address:       "127.0.0.1",
-										PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: httpCallBackendPort},
+										PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: uint32(port)},
 									},
 								}},
 							}},
@@ -240,13 +233,13 @@ func mkHttpCallClusterMgr(t *testing.T, name string) *cluster.Manager {
 // assert anything about the cache at all.
 func TestHttpCallResponseCache_RealGuest_ReadsStatusThroughHostcalls(t *testing.T) {
 	t.Parallel()
-	startHttpCallBackend(t)
+	port := startHttpCallBackend(t)
 
 	reg := stats.NewRegistry()
 	factoryCtx := envoyhttp.FactoryCtx{
 		Stats:          reg,
 		StatPrefix:     "ingress_http",
-		ClusterManager: mkHttpCallClusterMgr(t, "cluster_b"),
+		ClusterManager: mkHttpCallClusterMgr(t, "cluster_b", port),
 		HTTPClient:     httpclient.New(httpclient.Options{Timeout: 10 * time.Second}),
 	}
 

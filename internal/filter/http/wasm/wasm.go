@@ -218,8 +218,14 @@ type filter struct {
 	// counter on every chunk past the cap — the sticky flag ensures the
 	// counter increments exactly once per stream). On the encode side
 	// SendLocalReply is unavailable (EncoderFilterCallbacks does not expose
-	// it); the sticky flag short-circuits to StopAllIteration so the chain
-	// terminates the response early.
+	// it).
+	//
+	// Phase-83 S8: the sticky flag short-circuits to DataTerminateStream, which
+	// aborts the chain iterator with errStreamTerminatedByFilter. It formerly
+	// said "short-circuits to StopAllIteration so the chain terminates the
+	// response early" — an identifier declared NOWHERE and an outcome that did
+	// not happen: the status actually returned (DataStopIterationNoBuffer)
+	// PARKED the iterator, measurably forever on the encode side.
 	decodeBodyCapExceeded bool
 	encodeBodyCapExceeded bool
 
@@ -227,9 +233,17 @@ type filter struct {
 	// phase-82 S1 + S9: honored-Pause stream-control state (see pause.go).
 	// -------------------------------------------------------------------------
 
-	// decodePaused / encodePaused record that THIS filter returned
-	// StopIteration from proxy_on_{request,response}_headers and therefore
-	// OWES the chain exactly one resume.
+	// decodePaused / encodePaused record that THIS filter returned a PARKING
+	// status from a guest Action::Pause and therefore OWES the chain exactly
+	// one resume.
+	//
+	// Phase-83 widened the set of arms that write them. It is no longer just
+	// proxy_on_{request,response}_headers: all SIX ProxyActionPause arms
+	// (headers, body and trailers, both sides) book through pause.go now, so
+	// these flags are written from DecodeHeaders / EncodeHeaders /
+	// DecodeData / EncodeData / DecodeTrailers / EncodeTrailers. The body arms
+	// route through the arm-once variant because a body callback fires per
+	// CHUNK; see pause.go.
 	//
 	// ATOMIC, NOT plain bool — LOAD-BEARING. S1 breaks the ADR-0071
 	// single-goroutine-per-stream invariant: the resume is fired from
@@ -257,6 +271,15 @@ type filter struct {
 	pauseMu          sync.Mutex
 	decodePauseTimer *time.Timer
 	encodePauseTimer *time.Timer
+
+	// decodePauseGen / encodePauseGen supersede watchdog closures. A closure
+	// captures the generation current when it was armed and returns early if a
+	// later pause — or a DISARM — has since bumped it. Bumping on disarm is what
+	// makes stopPauseTimer authoritative against an already-entered closure:
+	// Timer.Stop() cannot cancel one, and without the bump it fires into a
+	// torn-down stream (measured 400/400; with the bump, 0/400).
+	decodePauseGen atomic.Uint64
+	encodePauseGen atomic.Uint64
 
 	// pauseWatchdog overrides defaultPauseWatchdog for this stream. Zero
 	// selects the default. Per-filter (NOT a package-level var) so parallel
