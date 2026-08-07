@@ -14,7 +14,7 @@ Evaluate it MECHANICALLY, not by eye. All three checks must print NOTHING:
 #     FAIL-UNSAFE -- see the section-(1) note below. This form parses FIELDS
 #     instead of matching a pattern, and asserts the row DENOMINATOR so a
 #     deleted row is itself an error.
-awk -F'|' -v want=115 '
+awk -F'|' -v want=116 '
   /^\| *[0-9]/ { n++; id=$2; st=$5
     gsub(/^[ \t]+|[ \t]+$/,"",id); gsub(/^[ \t]+|[ \t]+$/,"",st)
     if (st !~ /^done/) print "NOT DONE: row " id }
