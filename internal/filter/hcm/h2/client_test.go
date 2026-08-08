@@ -347,6 +347,37 @@ func (p *fakeH2ServerPeer) writeResponse(streamID uint32, status int, extra []hp
 	return nil
 }
 
+// writeResponseWithTrailers writes a HEADERS frame with :status + supplied
+// headers (no END_STREAM), an optional DATA frame (no END_STREAM), then a
+// trailing HEADERS frame carrying trailers with END_STREAM set. Unlike
+// writeResponse, END_STREAM never lands on the leading HEADERS/DATA — the
+// trailing HEADERS block is always the stream terminator.
+func (p *fakeH2ServerPeer) writeResponseWithTrailers(streamID uint32, status int, extra []hpack.HeaderField, body []byte, trailers []hpack.HeaderField) error {
+	headers := []hpack.HeaderField{{Name: ":status", Value: strconv.Itoa(status)}}
+	headers = append(headers, extra...)
+	block := p.encodeHeaders(headers)
+	if err := p.fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      streamID,
+		BlockFragment: block,
+		EndStream:     false,
+		EndHeaders:    true,
+	}); err != nil {
+		return err
+	}
+	if len(body) > 0 {
+		if err := p.fr.WriteData(streamID, false, body); err != nil {
+			return err
+		}
+	}
+	trailerBlock := p.encodeHeaders(trailers)
+	return p.fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      streamID,
+		BlockFragment: trailerBlock,
+		EndStream:     true,
+		EndHeaders:    true,
+	})
+}
+
 // runHandshakeAsync starts the handshake on a goroutine; the returned
 // channel emits any error encountered. Tests should range/select on the
 // channel as part of their teardown.
@@ -470,6 +501,99 @@ func TestClientConn_RoundTrip_HappyPath_WithBody(t *testing.T) {
 	}
 	if string(resp.Body) != "created" {
 		t.Errorf("Body = %q, want %q", resp.Body, "created")
+	}
+}
+
+// TestClientConn_RoundTrip_CapturesTrailingHEADERS — peer responds with a
+// leading HEADERS+DATA (no END_STREAM) followed by a trailing HEADERS block
+// carrying grpc-status, END_STREAM on the trailing block. RoundTrip must
+// capture the trailing block into resp.Trailers, and grpc-status must NOT
+// leak into resp.Headers (which only holds the leading block per ADR-0058).
+func TestClientConn_RoundTrip_CapturesTrailingHEADERS(t *testing.T) {
+	cc, peer, cleanup := dialClientConn(t)
+	defer cleanup()
+
+	peerDone := make(chan error, 1)
+	go func() {
+		hf, _, err := peer.readRequestHeaders()
+		if err != nil {
+			peerDone <- fmt.Errorf("readRequestHeaders: %w", err)
+			return
+		}
+		if !hf.StreamEnded() {
+			peerDone <- fmt.Errorf("expected END_STREAM on bodyless GET HEADERS")
+			return
+		}
+		peerDone <- peer.writeResponseWithTrailers(hf.StreamID, 200,
+			[]hpack.HeaderField{{Name: "content-type", Value: "text/plain"}},
+			[]byte("hello"),
+			[]hpack.HeaderField{{Name: "grpc-status", Value: "0"}},
+		)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := cc.RoundTrip(ctx, H2Request{
+		Method: "GET", Path: "/", Scheme: "https", Authority: "example.test",
+	})
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatalf("peer: %v", err)
+	}
+	if len(resp.Trailers) != 1 {
+		t.Errorf("len(Trailers) = %d, want 1: %+v", len(resp.Trailers), resp.Trailers)
+	} else if resp.Trailers[0].Name != "grpc-status" || resp.Trailers[0].Value != "0" {
+		t.Errorf("Trailers[0] = %+v, want {grpc-status 0}", resp.Trailers[0])
+	}
+	for _, hf := range resp.Headers {
+		if hf.Name == "grpc-status" {
+			t.Errorf("grpc-status leaked into Headers: %+v", resp.Headers)
+		}
+	}
+}
+
+// TestClientConn_RoundTrip_NoTrailers_TrailersEmpty is the STACKED CONTROL for
+// TestClientConn_RoundTrip_CapturesTrailingHEADERS: a response with no trailing
+// HEADERS block must leave resp.Trailers empty. This catches an over-firing
+// capture (e.g. an unconditional assignment that runs on every HEADERS frame,
+// not just the trailing one) that the positive test alone cannot distinguish
+// from correct behavior — see reference_positive_arm_cannot_catch_overfiring.
+func TestClientConn_RoundTrip_NoTrailers_TrailersEmpty(t *testing.T) {
+	cc, peer, cleanup := dialClientConn(t)
+	defer cleanup()
+
+	peerDone := make(chan error, 1)
+	go func() {
+		hf, _, err := peer.readRequestHeaders()
+		if err != nil {
+			peerDone <- fmt.Errorf("readRequestHeaders: %w", err)
+			return
+		}
+		if !hf.StreamEnded() {
+			peerDone <- fmt.Errorf("expected END_STREAM on bodyless GET HEADERS")
+			return
+		}
+		peerDone <- peer.writeResponse(hf.StreamID, 200,
+			[]hpack.HeaderField{{Name: "content-type", Value: "text/plain"}},
+			[]byte("hello"),
+		)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := cc.RoundTrip(ctx, H2Request{
+		Method: "GET", Path: "/", Scheme: "https", Authority: "example.test",
+	})
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatalf("peer: %v", err)
+	}
+	if len(resp.Trailers) != 0 {
+		t.Errorf("len(Trailers) = %d, want 0: %+v", len(resp.Trailers), resp.Trailers)
 	}
 }
 

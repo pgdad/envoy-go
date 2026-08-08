@@ -349,6 +349,33 @@ func buildH2Request(headers []hpack.HeaderField, body []byte) H2Request {
 	return out
 }
 
+// teTrailersValue is the ONLY value RFC 9113 §8.2.2 permits for the `te`
+// header field on an HTTP/2 message. Any other value is a violation on
+// either direction of the wire.
+const teTrailersValue = "trailers"
+
+// isConnectionSpecificField reports whether name is one of the RFC 9113
+// §8.2.2 connection-specific header fields, which MUST NOT appear in an
+// HTTP/2 message.
+//
+// `te` is deliberately NOT in this set: it is CONDITIONALLY legal (permitted
+// with the single value teTrailersValue), so it cannot be answered by a
+// name-only predicate. Callers must test `te`'s VALUE separately — see
+// buildRequest below and validateResponseTrailers in client.go.
+//
+// This is the ONE source of truth for the RFC list. It is shared by the
+// request-decode path (buildRequest, server side) and the response-trailer
+// validation path (validateResponseTrailers, client side) so a member can
+// never be dropped from one copy and survive in the other.
+func isConnectionSpecificField(name string) bool {
+	switch name {
+	case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
 // buildRequest constructs an *http.Request from decoded pseudo-headers,
 // regular headers, and the body pipe reader. Per SPEC §10 #3: reuse stdlib
 // *http.Request so the route-table machinery stays single-shape.
@@ -415,13 +442,11 @@ func buildRequest(headers []hpack.HeaderField, body io.Reader) (*http.Request, e
 		}
 
 		// RFC 9113 §8.2.2: connection-specific header fields are PROTOCOL_ERROR.
-		switch name {
-		case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
+		if isConnectionSpecificField(name) {
 			return nil, &Error{Code: ErrProtocolError, Msg: "connection-specific header field: " + name}
-		case "te":
-			if h.Value != "trailers" {
-				return nil, &Error{Code: ErrProtocolError, Msg: "TE header field value not 'trailers'"}
-			}
+		}
+		if name == "te" && h.Value != teTrailersValue {
+			return nil, &Error{Code: ErrProtocolError, Msg: "TE header field value not 'trailers'"}
 		}
 
 		regular.Add(name, h.Value)

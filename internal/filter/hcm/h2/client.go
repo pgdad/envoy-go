@@ -15,6 +15,7 @@ package h2
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -48,9 +49,10 @@ type H2Request struct {
 //
 //nolint:revive // ADR-0048 reserves the H2Response name.
 type H2Response struct {
-	Status  int
-	Headers []hpack.HeaderField // includes :status as the first element
-	Body    []byte
+	Status   int
+	Headers  []hpack.HeaderField // includes :status as the first element
+	Body     []byte
+	Trailers []hpack.HeaderField // populated from a trailing HEADERS block, if any
 }
 
 // ClientConn is the per-upstream-conn H2 connection manager. One ClientConn
@@ -169,6 +171,7 @@ type clientStream struct {
 	respHeaders     []hpack.HeaderField // populated on inbound HEADERS (first block)
 	respHeadersSeen bool                // true after the first HEADERS block has been observed
 	respStatus      int                 // populated on inbound HEADERS (parsed from :status)
+	respTrailers    []hpack.HeaderField // populated on a trailing HEADERS block, if any (capture-only; ADR-0058)
 	respBody        bytes.Buffer
 	doneCh          chan error // buffered 1; receives nil on END_STREAM, *Error on stream-error
 	closedOnce      sync.Once
@@ -436,8 +439,64 @@ func (cc *ClientConn) dispatchFrame(f http2.Frame) error {
 					break
 				}
 			}
+		} else {
+			// Trailing HEADERS (RFC 9113 §8.1 trailer section). VALIDATE BEFORE
+			// RETAINING: the reference books this reject in the upstream codec
+			// (measured: rx_messaging_error / upstream_rq_tx_reset) and the
+			// downstream consequence is a stream reset, never a "cleaned" 200.
+			//
+			// A violation fails THIS STREAM ONLY. cs.finish carries the
+			// stream-scoped *Error out through RoundTrip, and
+			// serverStream.dispatch reads err.Code to emit RST_STREAM with the
+			// carried code downstream. Nothing here touches the CONNECTION: no
+			// GOAWAY, no connection-scoped error return (which would cancel
+			// cc.ctx and tear the pooled conn down) — the reference resets the
+			// stream, not the conn.
+			//
+			// ⚠️ THERE IS DELIBERATELY NO SECOND-TRAILING-BLOCK RULE, and none
+			// may be re-added. The END_STREAM leg inside validateResponseTrailers
+			// makes one unreachable by its PRESENCE (not by being checked first):
+			// a first trailing block that does not terminate the stream is
+			// rejected here whatever else is wrong with it, and after a LEGAL
+			// END_STREAM block cs.finish has already returned RoundTrip — so no
+			// second block can ever reach this branch. Leg ORDER only selects
+			// which message a doubly-malformed block reports. The reference
+			// behaves identically. (PLAN-84.1 §1.8, broken-gate shape 35: a
+			// validation leg no wire sequence can reach still reads as coverage
+			// in a direct table.)
+			//
+			// ⚠️ NAMED NON-GOAL — 1xx INTERIM RESPONSES ARE NOT SUPPORTED BY THIS
+			// CODEC AND NOW FAIL THE STREAM. A leading 1xx HEADERS block sets
+			// respHeadersSeen, so the REAL final HEADERS lands in this branch and
+			// is rejected as a pseudo-header violation (it carries :status). That
+			// is a change from the pre-validation tip, which silently mis-captured
+			// the final block as trailers; the reference FORWARDS 1xx. Failing
+			// loudly is preferred to mis-capturing, but this is a known divergence
+			// — do not read it as accidental.
+			if verr := validateResponseTrailers(fr.StreamID, decoded, fr.StreamEnded()); verr != nil {
+				// Reset the UPSTREAM stream too, copying RoundTrip's ctx-cancel
+				// pattern exactly. markReset FIRST (before the RST write and
+				// before cs.finish releases RoundTrip, whose deferred
+				// cc.streams.Delete removes the map entry) so any further peer
+				// frames on this id — guaranteed when the rejected block did not
+				// carry END_STREAM, since the peer never terminated the stream —
+				// are discarded per RFC 9113 §5.1 instead of falling through to
+				// the "stream gone" arms, which return CONNECTION-level errors
+				// and would tear the pooled conn down. onTxReset is what books
+				// the reference's upstream_rq_tx_reset; it fires OUTSIDE cc.mu so
+				// the codec mutex is never held across a cluster callback.
+				cc.markReset(fr.StreamID)
+				cc.mu.Lock()
+				_ = cc.fr.WriteRSTStream(fr.StreamID, http2.ErrCodeInternal)
+				cc.mu.Unlock()
+				if cc.onTxReset != nil {
+					cc.onTxReset()
+				}
+				cs.finish(verr)
+				return nil
+			}
+			cs.respTrailers = decoded
 		}
-		// else: trailing HEADERS — observed-and-discarded per ADR-0058.
 		if fr.StreamEnded() {
 			cs.finish(nil)
 		}
@@ -585,6 +644,116 @@ func (cc *ClientConn) dispatchFrame(f http2.Frame) error {
 	}
 }
 
+// ErrMalformedTrailers is the sentinel every response-trailer rejection carries
+// in the Underlying field of its stream-scoped *Error, so callers can
+// discriminate with errors.Is.
+//
+// ⚠️ THE ERROR CODE ALONE IS NOT A DISCRIMINATOR. A peer RST_STREAM whose code
+// happens to be INTERNAL_ERROR finishes the stream with an identically-coded
+// *Error (see the RSTStreamFrame arm above), and that case must keep its
+// existing handling. The router layer needs errors.Is(err, ErrMalformedTrailers)
+// — not err.Code == ErrInternalError — to tell a locally-detected malformed
+// trailer block from a peer-originated reset.
+var ErrMalformedTrailers = errors.New("malformed response trailers")
+
+// malformedTrailersError builds the stream-scoped rejection: INTERNAL_ERROR (so
+// serverStream.dispatch emits RST_STREAM(INTERNAL_ERROR) downstream), carrying
+// the stream id (never 0 — a connection-scoped error would reset the CONN) and
+// the ErrMalformedTrailers sentinel. NewStreamError takes no Underlying, hence
+// the struct literal.
+func malformedTrailersError(streamID uint32, msg string) *Error {
+	return &Error{
+		Code:       ErrInternalError,
+		Stream:     streamID,
+		Msg:        msg,
+		Underlying: ErrMalformedTrailers,
+	}
+}
+
+// validateResponseTrailers enforces the HTTP/2 trailer rules on an inbound
+// trailing HEADERS block, returning nil when the block is legal and a
+// STREAM-SCOPED *Error (INTERNAL_ERROR, carrying streamID) when it is not.
+//
+// The enforced set is MEASURED against the ADR-0008 reference pin
+// (envoyproxy/envoy contrib-v1.37.2), not derived from the RFC text, because
+// the two disagree:
+//
+//   - RFC 9113 §8.2.2 connection-specific fields (`connection`, `keep-alive`,
+//     `proxy-connection`, `transfer-encoding`, `upgrade`, and `te` with any
+//     value other than teTrailersValue) — REJECT. The name set comes from
+//     isConnectionSpecificField in stream.go, shared with the request path so
+//     the RFC list has exactly one source of truth.
+//   - `content-length` — REJECT. A trailer section carries no framing.
+//   - any pseudo-header (name starting ':') — REJECT. Pseudo-headers are
+//     defined for the leading block only.
+//   - RFC 9113 §8.2.1: any header field name containing an uppercase ASCII
+//     letter — REJECT. This leg runs BEFORE the member/content-length checks
+//     below, which are case-sensitive string comparisons: without it, an
+//     uppercase spelling of a barred name (e.g. "Content-Length") falls
+//     through every other leg untouched. Task 13's fix round: pre-Task-3 the
+//     trailer block was discarded outright (no forward path); this
+//     function's capture+emit creates the conduit, so an unvalidated
+//     uppercase name reaching H2Response.Trailers is capture-without-
+//     validation — the exact smuggling conduit this row's charter forbids.
+//     Mirrors the request-side guard in buildRequest (stream.go ~:437-442).
+//   - a trailing block that does not carry END_STREAM — REJECT. Its PRESENCE
+//     in the rule set (not its position in the checks) is what makes a
+//     second-trailing-block rule unreachable — see the capture site's comment.
+//     It is evaluated first only so that a doubly-malformed block reports the
+//     framing violation rather than a field violation.
+//
+// ⚠️ `host` and `trailer` are barred by RFC 9110 §6.5.1 but are FORWARDED
+// VERBATIM by the reference (measured, 16 paths). They deliberately PASS here:
+// filtering them would diverge from the reference on a correct implementation.
+// Do not "complete" this list against RFC 9110.
+//
+// The message names the offending field, QUOTED and in trailing position. The
+// quoting is load-bearing for the tests: an unquoted name is unfalsifiable when
+// it also appears inside the message's own fixed prefix (dropping "+name" from
+// "connection-specific header field: connection" leaves a string that still
+// contains ": connection" via the prefix), so the assertion could not tell a
+// message that names the field from one that does not.
+// hasUppercaseHeaderChar reports whether name contains an uppercase ASCII
+// letter. RFC 9113 §8.2.1 requires header field names to be lowercase on the
+// wire; this mirrors the inline uppercase-rejection loop in buildRequest
+// (stream.go ~:437-442) on the response-trailer side.
+func hasUppercaseHeaderChar(name string) bool {
+	for _, c := range name {
+		if c >= 'A' && c <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+func validateResponseTrailers(streamID uint32, fields []hpack.HeaderField, endStream bool) *Error {
+	// Framing first: a trailing block MUST terminate the stream.
+	if !endStream {
+		return malformedTrailersError(streamID, "trailing HEADERS block without END_STREAM")
+	}
+	for _, hf := range fields {
+		name := hf.Name
+		switch {
+		case len(name) > 0 && name[0] == ':':
+			return malformedTrailersError(streamID,
+				"pseudo-header field not permitted in a trailer section: "+strconv.Quote(name))
+		case hasUppercaseHeaderChar(name):
+			return malformedTrailersError(streamID,
+				"uppercase character in header field name not permitted in a trailer section: "+strconv.Quote(name))
+		case isConnectionSpecificField(name):
+			return malformedTrailersError(streamID,
+				"connection-specific header field not permitted in a trailer section: "+strconv.Quote(name))
+		case name == "te" && hf.Value != teTrailersValue:
+			return malformedTrailersError(streamID,
+				"te header field value not 'trailers': te="+strconv.Quote(hf.Value))
+		case name == "content-length":
+			return malformedTrailersError(streamID,
+				"content-length not permitted in a trailer section: "+strconv.Quote(name))
+		}
+	}
+	return nil
+}
+
 // RoundTrip allocates a fresh stream id, encodes the request HEADERS (with
 // optional DATA + END_STREAM), waits on cs.doneCh for the response, and
 // returns the assembled H2Response.
@@ -644,9 +813,10 @@ func (cc *ClientConn) RoundTrip(ctx context.Context, req H2Request) (H2Response,
 			return H2Response{}, err
 		}
 		return H2Response{
-			Status:  cs.respStatus,
-			Headers: cs.respHeaders,
-			Body:    cs.respBody.Bytes(),
+			Status:   cs.respStatus,
+			Headers:  cs.respHeaders,
+			Body:     cs.respBody.Bytes(),
+			Trailers: cs.respTrailers,
 		}, nil
 	case <-ctx.Done():
 		// Emit RST_STREAM(CANCEL) on the upstream stream; return ctx error.

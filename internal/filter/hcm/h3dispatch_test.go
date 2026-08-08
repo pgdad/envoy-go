@@ -1,11 +1,17 @@
 package hcm
 
 import (
+	"bytes"
+	"context"
 	stdtls "crypto/tls"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
+
+	"golang.org/x/net/http2/hpack"
 
 	filter_http "github.com/pgdad/envoy-go/internal/filter/http"
 )
@@ -190,5 +196,179 @@ func TestWriteH3Reply_ActionSuppliedHeadersNotOverridden(t *testing.T) {
 	}
 	if got := res.Header.Get("content-length"); got != "99" {
 		t.Errorf("content-length = %q, want 99 (action-supplied value must not be overridden)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 84.1 Task 11 — the H3 BEHAVIORAL non-change regression, paired with an
+// H2 positive arm IN THIS FILE.
+// ---------------------------------------------------------------------------
+//
+// ⚠️ WHY THE PAIR IS IN ONE FILE. An H3 "no Trailer key gained" assertion is
+// green under TWO different worlds: (a) ActionResponse.Trailers is populated
+// and the H3 projection correctly ignores it — the contract this row lands;
+// and (b) Trailers is never populated or never emitted ANYWHERE, i.e. the
+// feature is dead. A one-sided gate cannot tell those apart
+// (reference_one_sided_gate_for_a_two_sided_fix,
+// reference_liveness_break_needs_failing_baseline). The H2 positive arm at the
+// bottom of this file is the failing baseline for world (b). Read the two
+// tests as ONE gate.
+
+// writeH3Reply stays 4-arg (h3dispatch.go). This compile-time pin fails the
+// build if a later change widens it with a trailer block — the shape phase
+// 84.1 deliberately did NOT give it (the trailing block is H2-only; H1/H3
+// ignore it).
+var _ func(http.ResponseWriter, int, filter_http.OrderedHeaders, []byte) error = writeH3Reply
+
+// runH3TrailerDispatch drives one H3 request through runH3 against a route
+// whose action returns an ActionResponse with the given trailing block, and
+// returns the recorder holding everything the ResponseWriter was told.
+// trailerCarryingAction is defined in codec_test.go (same package) — its
+// H1-flavored asRouterAction is the closure runH3 installs, exactly as
+// dispatchRequest does on H1.
+func runH3TrailerDispatch(t *testing.T, trailers []hpack.HeaderField) *httptest.ResponseRecorder {
+	t.Helper()
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/grpc"), action: &trailerCarryingAction{trailers: trailers}},
+	}}
+	f := mkFilterForTable(t, tt)
+
+	req := httptest.NewRequest(http.MethodPost, "https://example.test/grpc", nil)
+	req.TLS = &stdtls.ConnectionState{Version: stdtls.VersionTLS13, HandshakeComplete: true, NegotiatedProtocol: "h3"}
+	rec := httptest.NewRecorder()
+
+	status, err := f.runH3(context.Background(), rec, req)
+	if err != nil {
+		t.Fatalf("runH3: %v", err)
+	}
+	if status != 200 {
+		t.Fatalf("runH3 status = %d, want 200", status)
+	}
+	return rec
+}
+
+// headerDump renders an http.Header as a deterministic, diffable, WHOLE-map
+// projection: keys sorted, every value listed.
+//
+// ⚠️ It walks the map directly rather than calling http.Header.Write, which is
+// FAIL-UNSAFE for this assertion: writeSubset silently `continue`s over any key
+// that is not a valid header field token, and a trailer-projection key such as
+// "Trailer:grpc-status" contains a colon and is therefore invalid. Break B11-a
+// (below, in the report) confirmed this empirically — with Header.Write, the
+// whole-map comparison stayed GREEN while the response had in fact gained two
+// Trailer-prefixed keys. Never dump a header map through a writer that filters.
+func headerDump(t *testing.T, h http.Header) string {
+	t.Helper()
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var buf bytes.Buffer
+	for _, k := range keys {
+		fmt.Fprintf(&buf, "%s: %q\n", k, h[k])
+	}
+	return buf.String()
+}
+
+// TestRunH3_TrailersProduceIdenticalResponse is the phase-84.1 Task 11
+// behavioral non-change regression. An ActionResponse carrying a non-empty
+// trailing block must project onto writeH3Reply's http.ResponseWriter
+// identically to the same response with Trailers nil.
+//
+// Properties, one t.Errorf each (a t.Fatalf would make the later ones dead
+// code):
+//  1. the WHOLE header map is unchanged (not a per-key subset);
+//  2. no "Trailer" key and no "Trailer:"-prefixed key is gained by EITHER arm
+//     — the stacked control, which catches a break that declares trailers on
+//     both arms (property 1 alone stays green on that);
+//  3. the declared-trailer set surfaced by http.Response.Trailer is empty;
+//  4. the body bytes and status code are unchanged.
+func TestRunH3_TrailersProduceIdenticalResponse(t *testing.T) {
+	trailerBlock := []hpack.HeaderField{
+		{Name: "grpc-status", Value: "0"},
+		{Name: "grpc-message", Value: "ok"},
+	}
+
+	with := runH3TrailerDispatch(t, trailerBlock)
+	without := runH3TrailerDispatch(t, nil)
+
+	if gotWith, gotWithout := headerDump(t, with.Header()), headerDump(t, without.Header()); gotWith != gotWithout {
+		t.Errorf("H3 response headers differ when ActionResponse.Trailers is populated.\n with trailers:\n%s\n  nil trailers:\n%s", gotWith, gotWithout)
+	}
+
+	for _, arm := range []struct {
+		name string
+		rec  *httptest.ResponseRecorder
+	}{
+		{"trailers-populated", with},
+		{"trailers-nil", without},
+	} {
+		for k := range arm.rec.Header() {
+			if strings.EqualFold(k, "Trailer") {
+				t.Errorf("%s arm: H3 response gained a %q header (%q); H3 must never declare trailers", arm.name, k, arm.rec.Header().Get(k))
+			}
+			if strings.HasPrefix(strings.ToLower(k), "trailer:") {
+				t.Errorf("%s arm: H3 response gained a Trailer-prefixed key %q; H3 must never emit a trailing block", arm.name, k)
+			}
+		}
+		if tr := arm.rec.Result().Trailer; len(tr) != 0 {
+			t.Errorf("%s arm: http.Response.Trailer = %v; want empty", arm.name, tr)
+		}
+	}
+
+	if !bytes.Equal(with.Body.Bytes(), without.Body.Bytes()) {
+		t.Errorf("H3 body bytes differ when Trailers is populated: with = %q, without = %q", with.Body.Bytes(), without.Body.Bytes())
+	}
+	if with.Code != without.Code {
+		t.Errorf("H3 status code differs when Trailers is populated: with = %d, without = %d", with.Code, without.Code)
+	}
+}
+
+// TestWriteH2Reply_TrailingBlockLiveness is the POSITIVE ARM that makes the H3
+// non-change test above two-sided. It is deliberately in THIS FILE.
+//
+// It drives writeH2Reply — the ONE seam that emits a trailing HEADERS block —
+// with a populated trailer slice and asserts the block reaches the wire with
+// END_STREAM on it. If the trailing emit is deleted or the carrier stops being
+// consumed, THIS test reddens while the H3 non-change test above stays green:
+// exactly the discrimination a one-sided gate lacks.
+//
+// Compact by design: one cell. The full
+// {trailers, no trailers} x {body, no body} matrix is Task 7's
+// TestWriteH2Reply_FrameSequence in h2dispatch_test.go; this is a liveness
+// baseline, not a second copy of it.
+func TestWriteH2Reply_TrailingBlockLiveness(t *testing.T) {
+	trailerBlock := []hpack.HeaderField{
+		{Name: "grpc-status", Value: "0"},
+		{Name: "grpc-message", Value: "ok"},
+	}
+	hdrs := filter_http.OrderedHeaders{{Name: "content-type", Value: "application/grpc"}}
+
+	w := &captureH2Writer{}
+	if err := writeH2Reply(w, 200, hdrs, []byte("hello"), trailerBlock); err != nil {
+		t.Fatalf("writeH2Reply: %v", err)
+	}
+
+	if got := strings.Join(w.order, ","); got != "headers,data,headers" {
+		t.Errorf("H2 frame order = [%s]; want [headers,data,headers] — the trailing HEADERS block is not reaching the wire", got)
+	}
+	if len(w.headers) != 2 {
+		t.Fatalf("HEADERS frame count = %d; want 2 (response block + trailing block)", len(w.headers))
+	}
+	got := w.headers[1]
+	if len(got) != len(trailerBlock) {
+		t.Fatalf("trailing block = %v (len %d); want %v (len %d)", got, len(got), trailerBlock, len(trailerBlock))
+	}
+	for i := range got {
+		if got[i] != trailerBlock[i] {
+			t.Errorf("trailing block[%d] = %+v; want %+v", i, got[i], trailerBlock[i])
+		}
+	}
+	if n := len(w.endStream); n != 3 {
+		t.Fatalf("end_stream flag count = %d (%v); want 3", n, w.endStream)
+	}
+	if !w.endStream[2] {
+		t.Errorf("trailing HEADERS block end_stream = false; want true (it must terminate the stream). full seq %v", w.endStream)
 	}
 }

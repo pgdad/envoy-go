@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -362,6 +363,73 @@ func TestH2Dispatcher_Status0Sentinel_SkipsAccessLog(t *testing.T) {
 	}
 }
 
+// TestH2Dispatcher_ActionError_MalformedTrailers_NoHeadersWritten is the hcm-
+// layer half of the phase 84.1 Task 7 routed obligation ("downstream
+// RST_STREAM(INTERNAL_ERROR) on malformed trailers is REASONED not
+// MEASURED"). The actual RST_STREAM wire write happens one layer down, in
+// h2.serverStream.dispatch (proved directly against a fakeConn by
+// TestServerStream_Dispatch_MalformedTrailersError_EmitsRSTStreamInternalError
+// in internal/filter/hcm/h2/stream_test.go — captureH2Writer has no
+// WriteRSTStream method, so this layer cannot observe the RST frame itself).
+// What THIS layer can and must prove is the other half of the obligation:
+// chainDispatchAction.WriteH2 propagates the *h2.Error UNCHANGED (so
+// serverStream.dispatch's bare `writeErr.(*Error)` type assertion — the
+// thing that selects the RST code — actually fires on it) and, per the
+// `rf.ActionRan() && actionErr == nil && status > 0` guard in WriteH2 above
+// writeH2Reply's call site, writes NO HEADERS/DATA frame at all — i.e. no
+// 502 local reply rides the wire alongside (or instead of) the reset.
+//
+// sentinel is built the same way router_h2.go's doH2ClusterAction returns it
+// unwrapped from its errors.Is(err, h2.ErrMalformedTrailers) arm: an
+// *h2.Error whose Underlying is the exported h2.ErrMalformedTrailers
+// sentinel, constructed via the h2 package's exported *Error struct fields
+// (malformedTrailersError itself is unexported outside the h2 package).
+func TestH2Dispatcher_ActionError_MalformedTrailers_NoHeadersWritten(t *testing.T) {
+	sentinel := &h2.Error{
+		Code:       h2.ErrInternalError,
+		Stream:     11,
+		Msg:        "trailing HEADERS block without END_STREAM",
+		Underlying: h2.ErrMalformedTrailers,
+	}
+	if !errors.Is(sentinel, h2.ErrMalformedTrailers) {
+		t.Fatalf("errors.Is(sentinel, h2.ErrMalformedTrailers) = false, want true (test fixture does not match the production shape)")
+	}
+
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/trailers"), action: &faultyAction{sentinel: sentinel}},
+	}}
+	f := newH2DispatchFilter(t, tt, routerOnlyChain(t), nil /* no sinks */)
+
+	disp := newH2Dispatcher(f)
+	req, _ := http.NewRequest("GET", "/trailers", nil)
+	req.Proto = "HTTP/2.0"
+	action, ok := disp.Match(req)
+	if !ok {
+		t.Fatal("Match returned ok=false; want true on matched route")
+	}
+
+	w := &captureH2Writer{}
+	h2req := h2.H2Request{Method: "GET", Path: "/trailers"}
+	err := action.WriteH2(context.Background(), h2req, w)
+	if err == nil {
+		t.Fatal("WriteH2 returned nil; want the malformed-trailers *h2.Error to propagate")
+	}
+	if !errors.Is(err, h2.ErrMalformedTrailers) {
+		t.Errorf("errors.Is(err, h2.ErrMalformedTrailers) = false for %v, want true (dispatch must propagate the sentinel unchanged)", err)
+	}
+	hErr, isH2Err := err.(*h2.Error)
+	if !isH2Err {
+		t.Fatalf("WriteH2 error type = %T, want *h2.Error (serverStream.dispatch's bare type assertion needs this exact shape to select the RST code)", err)
+	}
+	if hErr.Code != h2.ErrInternalError {
+		t.Errorf("propagated *h2.Error.Code = %v, want INTERNAL_ERROR", hErr.Code)
+	}
+
+	if len(w.order) != 0 {
+		t.Errorf("frames written to the downstream H2 writer = %v, want none (malformed-trailers rejection must not write a 502 HEADERS frame)", w.order)
+	}
+}
+
 // TestH2Dispatcher_Match_IncDownstreamRqTotal verifies that Match Inc's the
 // HCM-scope downstream_rq_total counter unconditionally — once per request,
 // even on no-match. Per SPEC §12 #1 site (a)'s H2 analog (the once-per-request
@@ -497,5 +565,347 @@ func TestH2Dispatch_runH2_seeds_nil_for_plaintext_symmetric(t *testing.T) {
 
 	if capture.captured != nil {
 		t.Errorf("plaintext H2: captured = %#v; want nil", capture.captured)
+	}
+}
+
+// TestWriteH2Reply_FrameSequence pins the FRAME SEQUENCE writeH2Reply emits as
+// an ordered (frame-kind, end_stream) tuple, over the full
+// {trailers, no trailers} x {body, no body} matrix. Phase 84.1 Task 6 landed
+// the two body-bearing cells; Task 7 adds the two bodyless cells (this table
+// is the extension point — add rows, not a second test).
+//
+// D-84-ENDSTREAM: END_STREAM moves off the last body-bearing frame ONLY when a
+// trailer block is present. The no-trailers rows are the byte-identical-to-
+// today control: frame kinds, flags and ordering must be unchanged by this row.
+//
+// ⚠️ LOAD-BEARING: the "no_body_with_trailers" cell is the ONLY cell in this
+// table that discriminates the `&& !hasTrailers` conjunct in
+// `endStream := len(body) == 0 && !hasTrailers` (h2dispatch.go writeH2Reply).
+// Every with-body cell has len(body)==0 evaluate to false regardless of
+// hasTrailers, so a break that drops the conjunct is invisible to them.
+//
+// Dual indexing convention (captureH2Writer): w.headers is indexed by
+// HEADERS-FRAME ORDINAL (0 = response block, 1 = trailing block when
+// present), while w.order / w.endStream index ALL frames written (HEADERS
+// and DATA interleaved) in wire order — the two index spaces are NOT the
+// same length when a DATA frame is emitted.
+func TestWriteH2Reply_FrameSequence(t *testing.T) {
+	trailerBlock := []hpack.HeaderField{
+		{Name: "grpc-status", Value: "0"},
+		{Name: "grpc-message", Value: "ok"},
+	}
+
+	cases := []struct {
+		name          string
+		body          []byte
+		trailers      []hpack.HeaderField
+		wantOrder     []string
+		wantEndStream []bool
+	}{
+		{
+			// Control: today's behavior, must stay byte-identical.
+			name:          "body_no_trailers",
+			body:          []byte("hello"),
+			trailers:      nil,
+			wantOrder:     []string{"headers", "data"},
+			wantEndStream: []bool{false, true},
+		},
+		{
+			name:          "body_with_trailers",
+			body:          []byte("hello"),
+			trailers:      trailerBlock,
+			wantOrder:     []string{"headers", "data", "headers"},
+			wantEndStream: []bool{false, false, true},
+		},
+		{
+			// Control: bodyless, no trailers — a single HEADERS frame carries
+			// END_STREAM itself (no DATA, no trailing block).
+			name:          "no_body_no_trailers",
+			body:          nil,
+			trailers:      nil,
+			wantOrder:     []string{"headers"},
+			wantEndStream: []bool{true},
+		},
+		{
+			// ⚠️ LOAD-BEARING (see func doc): the only cell where
+			// len(body)==0 is true, so this is the only cell that can
+			// discriminate the `&& !hasTrailers` conjunct. No DATA frame is
+			// emitted (body is empty); END_STREAM rides the trailing HEADERS
+			// block, and the response HEADERS block carries end_stream=false.
+			name:          "no_body_with_trailers",
+			body:          nil,
+			trailers:      trailerBlock,
+			wantOrder:     []string{"headers", "headers"},
+			wantEndStream: []bool{false, true},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &captureH2Writer{}
+			hdrs := filter_http.OrderedHeaders{
+				{Name: "content-type", Value: "application/grpc"},
+			}
+			if err := writeH2Reply(w, 200, hdrs, tc.body, tc.trailers); err != nil {
+				t.Fatalf("writeH2Reply: %v", err)
+			}
+
+			if got := strings.Join(w.order, ","); got != strings.Join(tc.wantOrder, ",") {
+				t.Errorf("frame order = [%s]; want [%s]", got, strings.Join(tc.wantOrder, ","))
+			}
+			if len(w.endStream) != len(tc.wantEndStream) {
+				t.Fatalf("end_stream flag count = %d (%v); want %d (%v)", len(w.endStream), w.endStream, len(tc.wantEndStream), tc.wantEndStream)
+			}
+			for i, want := range tc.wantEndStream {
+				if w.endStream[i] != want {
+					t.Errorf("frame %d (%s): end_stream = %v; want %v (full seq %v)", i, w.order[i], w.endStream[i], want, w.endStream)
+				}
+			}
+
+			// The response HEADERS block must never carry the trailer fields,
+			// and the trailing block must carry exactly them (no :status, no
+			// date/server defaults) when present.
+			for _, h := range w.headers[0] {
+				if h.Name == "grpc-status" || h.Name == "grpc-message" {
+					t.Errorf("response HEADERS block carries trailer field %q; trailers must ride the trailing block only", h.Name)
+				}
+			}
+			if len(tc.trailers) > 0 {
+				if len(w.headers) != 2 {
+					t.Fatalf("HEADERS frame count = %d; want 2 (response block + trailing block)", len(w.headers))
+				}
+				got := w.headers[1]
+				if len(got) != len(tc.trailers) {
+					t.Fatalf("trailing block len = %d (%v); want %d (%v)", len(got), got, len(tc.trailers), tc.trailers)
+				}
+				for i := range got {
+					if got[i] != tc.trailers[i] {
+						t.Errorf("trailing block[%d] = %+v; want %+v", i, got[i], tc.trailers[i])
+					}
+				}
+			} else if len(w.headers) != 1 {
+				t.Errorf("HEADERS frame count = %d; want 1 (no trailers ⇒ no trailing block)", len(w.headers))
+			}
+		})
+	}
+}
+
+// encodeSignalFilter is an encode-side spy that records the (callback,
+// end_stream) tuple of every encode-chain event it observes, in invocation
+// order, as "EncodeHeaders(<bool>)" / "EncodeData(<bool>)" strings. It is the
+// chain-side counterpart of captureH2Writer: captureH2Writer observes what the
+// WIRE is told, this observes what the encode FILTERS are told.
+//
+// Phase 84.1 Task 8. Deliberately records the boolean rather than a count —
+// the defect this fixture exists to catch (an encode filter observing
+// end_stream=true while a trailing HEADERS block is still to come) is
+// invisible to a call COUNT: the counts are identical with and without the
+// fix (see reference: a COUNTER cannot gate a VALUE).
+type encodeSignalFilter struct {
+	mu     *sync.Mutex
+	events *[]string
+}
+
+func (f *encodeSignalFilter) record(s string) {
+	f.mu.Lock()
+	*f.events = append(*f.events, s)
+	f.mu.Unlock()
+}
+
+func (f *encodeSignalFilter) DecodeHeaders(http.Header, bool) filter_http.FilterHeadersStatus {
+	return filter_http.Continue
+}
+func (f *encodeSignalFilter) DecodeData([]byte, bool) filter_http.FilterDataStatus {
+	return filter_http.DataContinue
+}
+func (f *encodeSignalFilter) DecodeTrailers(http.Header) filter_http.FilterTrailersStatus {
+	return filter_http.TrailersContinue
+}
+func (f *encodeSignalFilter) SetDecoderCallbacks(filter_http.DecoderFilterCallbacks) {}
+
+func (f *encodeSignalFilter) EncodeHeaders(_ http.Header, endStream bool) filter_http.FilterHeadersStatus {
+	f.record(fmt.Sprintf("EncodeHeaders(%v)", endStream))
+	return filter_http.Continue
+}
+func (f *encodeSignalFilter) EncodeData(_ []byte, endStream bool) filter_http.FilterDataStatus {
+	f.record(fmt.Sprintf("EncodeData(%v)", endStream))
+	return filter_http.DataContinue
+}
+func (f *encodeSignalFilter) EncodeTrailers(http.Header) filter_http.FilterTrailersStatus {
+	f.record("EncodeTrailers")
+	return filter_http.TrailersContinue
+}
+func (f *encodeSignalFilter) SetEncoderCallbacks(filter_http.EncoderFilterCallbacks) {}
+func (f *encodeSignalFilter) OnDestroy()                                             {}
+
+// encodeSignalChain builds a two-entry chainConfig: the encode-signal spy
+// ahead of the terminal router. The events slice + mutex are captured by
+// closure so the per-request fresh instance writes into the test's slice.
+func encodeSignalChain(t *testing.T, events *[]string, mu *sync.Mutex) []chainEntry {
+	t.Helper()
+	rfFactory, err := router.New(nil, filter_http.FactoryCtx{})
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+	spy := func() filter_http.HTTPFilter {
+		f := &encodeSignalFilter{mu: mu, events: events}
+		return filter_http.HTTPFilter{Name: "encode_signal", Decoder: f, Encoder: f}
+	}
+	return []chainEntry{
+		{name: "encode_signal", factory: spy},
+		{name: "envoy.filters.http.router", factory: rfFactory},
+	}
+}
+
+// trailerStubAction is a routeAction whose H2Action returns a fixed
+// ActionResponse with a caller-chosen body and trailing block. It exists so a
+// dispatch-level test can drive the encode chain over all four cells of the
+// {trailers, no trailers} x {body, no body} matrix WITHOUT standing up a real
+// upstream (the production populator is doH2ClusterAction, phase 84.1 Task 5).
+//
+// The H1 arm (asRouterAction) returns a bodyless 200 with NO trailers: the
+// Trailers carrier is H2-only (router.ActionResponse doc) and this action is
+// never routed on the H1 path by any test here.
+type trailerStubAction struct {
+	body     []byte
+	trailers []hpack.HeaderField
+}
+
+func (a *trailerStubAction) asRouterAction() router.Action {
+	return func(context.Context, *http.Request) (router.ActionResponse, cluster.Endpoint, error) {
+		return router.ActionResponse{Status: 200}, cluster.Endpoint{}, nil
+	}
+}
+
+func (a *trailerStubAction) asRouterActionH2() router.H2Action {
+	return func(context.Context, h2.H2Request) (router.ActionResponse, cluster.Endpoint, error) {
+		return router.ActionResponse{
+			Status:   200,
+			Headers:  filter_http.OrderedHeaders{{Name: "content-type", Value: "application/grpc"}},
+			Body:     a.body,
+			Trailers: a.trailers,
+		}, cluster.Endpoint{}, nil
+	}
+}
+
+// TestH2Dispatch_EncodeChain_EndStreamSignal pins what the ENCODE CHAIN is
+// told about end-of-stream, across the same four cells
+// TestWriteH2Reply_FrameSequence pins for the wire. Phase 84.1 Task 8,
+// disposition (ii) (fix) per the PLAN's recommendation.
+//
+// The contract: no encode filter may observe end_stream=true while more
+// response data (the trailing HEADERS block) is still to come. Because
+// ADR-0273's boot-reject keeps RunEncodeTrailers deliberately unwired, the
+// honest signal in the two trailers cells is that the chain's LAST observed
+// event carries end_stream=false — the chain is simply never told the stream
+// ended, rather than being told it ended early. Asserting a false-tail is the
+// point, not an oversight.
+//
+// ⚠️ LOAD-BEARING: the two trailers rows are the RED anchors. The two
+// no-trailers rows are the controls — they must stay byte-identical to the
+// pre-84.1 signal (EncodeHeaders(len(body)==0), EncodeData(true)), so a fix
+// that unconditionally passes `false` reddens them.
+//
+// A call-COUNT assertion cannot decide any of this: all four cells emit the
+// same number of encode events before and after the fix. The assertion is on
+// the ordered (callback, end_stream) SEQUENCE.
+func TestH2Dispatch_EncodeChain_EndStreamSignal(t *testing.T) {
+	trailerBlock := []hpack.HeaderField{
+		{Name: "grpc-status", Value: "0"},
+		{Name: "grpc-message", Value: "ok"},
+	}
+
+	cases := []struct {
+		name     string
+		body     []byte
+		trailers []hpack.HeaderField
+		want     []string
+	}{
+		{
+			// Control: today's signal, must be unchanged by this row.
+			name:     "body_no_trailers",
+			body:     []byte("hello"),
+			trailers: nil,
+			want:     []string{"EncodeHeaders(false)", "EncodeData(true)"},
+		},
+		{
+			// RED anchor: pre-fix this reads EncodeData(true) while the
+			// trailing HEADERS block is still to come.
+			name:     "body_with_trailers",
+			body:     []byte("hello"),
+			trailers: trailerBlock,
+			want:     []string{"EncodeHeaders(false)", "EncodeData(false)"},
+		},
+		{
+			// Control: bodyless, no trailers — HEADERS is the whole response,
+			// so end_stream=true on it is honest. No EncodeData (the dispatch
+			// site skips RunEncodeData on an empty body).
+			name:     "no_body_no_trailers",
+			body:     nil,
+			trailers: nil,
+			want:     []string{"EncodeHeaders(true)"},
+		},
+		{
+			// RED anchor: pre-fix this reads EncodeHeaders(true) with a whole
+			// trailing block still to come — the filter-visible contract break
+			// the PLAN cites as the reason to pick disposition (ii).
+			name:     "no_body_with_trailers",
+			body:     nil,
+			trailers: trailerBlock,
+			want:     []string{"EncodeHeaders(false)"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []string
+			var mu sync.Mutex
+
+			tt := &routeTable{routes: []routeEntry{
+				{match: matchPath("/grpc"), action: &trailerStubAction{body: tc.body, trailers: tc.trailers}},
+			}}
+			f := newH2DispatchFilter(t, tt, encodeSignalChain(t, &events, &mu), nil /* no sinks */)
+
+			disp := newH2Dispatcher(f)
+			req, _ := http.NewRequest("POST", "/grpc", nil)
+			req.Proto = "HTTP/2.0"
+			action, ok := disp.Match(req)
+			if !ok {
+				t.Fatal("Match returned ok=false; want true on matched route")
+			}
+
+			w := &captureH2Writer{}
+			h2req := h2.H2Request{Method: "POST", Path: "/grpc", Authority: "localhost"}
+			if err := action.WriteH2(context.Background(), h2req, w); err != nil {
+				t.Fatalf("WriteH2: %v", err)
+			}
+
+			mu.Lock()
+			got := append([]string(nil), events...)
+			mu.Unlock()
+
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("encode-chain signal = [%s]; want [%s]", strings.Join(got, ","), strings.Join(tc.want, ","))
+			}
+
+			// Cross-check against the wire: whatever the chain is told, the
+			// wire sequence Task 6/7 landed must be unchanged by Task 8. This
+			// is the guard that a Task-8 fix did not reach into writeH2Reply.
+			wantWireEnd := []bool{len(tc.trailers) == 0}
+			if len(tc.body) > 0 {
+				wantWireEnd = []bool{false, len(tc.trailers) == 0}
+			}
+			if len(tc.trailers) > 0 {
+				wantWireEnd = append(wantWireEnd, true)
+			}
+			if len(w.endStream) != len(wantWireEnd) {
+				t.Fatalf("wire end_stream flags = %v; want %v", w.endStream, wantWireEnd)
+			}
+			for i, want := range wantWireEnd {
+				if w.endStream[i] != want {
+					t.Errorf("wire frame %d (%s): end_stream = %v; want %v (full seq %v)", i, w.order[i], w.endStream[i], want, w.endStream)
+				}
+			}
+		})
 	}
 }

@@ -122,7 +122,10 @@ func (a *directResponseAction) writeH1(w io.Writer) error {
 // RFC 9113 §8.3, then regular headers in deterministic order) + DATA + END_STREAM
 // via the streamWriter. Phase 07.1 Task 19 (I-3 prereq): hdrs is OrderedHeaders;
 // .Get is the carrier-friendly accessor mirroring http.Header.Get's
-// canonical-name semantics.
+// canonical-name semantics. Phase 84.1 Task 9: test-only-reachable —
+// `.writeH2(` has exactly one caller tree-wide, actions_test.go:86;
+// production direct_response over H2 goes through asRouterActionH2 →
+// ActionResponse → writeH2Reply instead.
 func (a *directResponseAction) writeH2(sw h2.StreamWriter) error {
 	status, hdrs, body := a.body()
 	headers := []hpack.HeaderField{

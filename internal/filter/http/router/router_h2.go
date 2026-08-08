@@ -154,6 +154,40 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 
 	resp, err := cc.RoundTrip(ctx, req)
 	if err != nil {
+		// 84.1 Task 5 (ADR-0306): a LOCALLY-DETECTED malformed response-trailer
+		// block is a STREAM fault, not a conn fault and not a gateway error.
+		// The reference resets the stream and leaves the upstream connection in
+		// service, so this arm sits BEFORE the evict below and returns neither a
+		// 502 local reply nor a poisoned-conn eviction. The h2 codec has already
+		// RST_STREAM(INTERNAL_ERROR)'d the UPSTREAM stream at the capture site;
+		// what is left is to make the DOWNSTREAM stream reset the same way.
+		//
+		// ⚠️ THE DISCRIMINATOR IS THE SENTINEL, NOT THE CODE. A peer
+		// RST_STREAM(INTERNAL_ERROR) finishes the client stream with an
+		// identically-coded *h2.Error (h2/client.go's RSTStreamFrame arm) and
+		// MUST keep the 502 + evict disposition below. errors.Is against the
+		// exported h2.ErrMalformedTrailers sentinel is what separates them;
+		// err.Code == h2.ErrInternalError would silently swallow every peer
+		// reset into this arm.
+		//
+		// ⚠️ THE ERROR IS RETURNED UNWRAPPED, DELIBERATELY. serverStream.dispatch
+		// reads the RST code via a BARE TYPE ASSERTION — writeErr.(*Error) — so a
+		// fmt.Errorf("...: %w", err) wrap would still satisfy errors.Is at every
+		// intermediate layer while falling through to dispatch's default and
+		// losing the carried code. Return the original value; do not decorate it.
+		//
+		// Status:0 mirrors the ctx-cancel sentinel one arm down: no response is
+		// finalized, HCM's h2dispatch skips the wire-write and the access-log
+		// submission, and the reset is signaled purely by the returned *h2.Error.
+		// No IncStatusClass / RecordUpstreamResult here for the same reason the
+		// ctx-cancel arm books neither: this is not an upstream HTTP outcome. The
+		// sent RST_STREAM is already booked at the capture site via the pool's
+		// onTxReset hook, which in THIS tree Inc's cluster.<name>.http2.tx_reset
+		// (the reference books the same event under a different name; do not go
+		// looking for the reference's spelling here).
+		if errors.Is(err, h2.ErrMalformedTrailers) {
+			return ActionResponse{Status: 0}, picked, err
+		}
 		// 43.2a Task 7: a RoundTrip transport error means the pooled conn is
 		// poisoned — evict it from the pool so a later acquire does not ride a
 		// broken conn. The deferred release() still accounts THIS stream's slot;
@@ -199,10 +233,21 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 		}
 		respHeaders = append(respHeaders, envoyhttp.HeaderField{Name: hf.Name, Value: hf.Value})
 	}
+	// 84.1 Task 5 (ADR-0306): THE ONE populate site. resp.Trailers is the
+	// validated trailing HEADERS block captured by h2.RoundTrip (nil when the
+	// upstream sent none — the zero value IS "no trailers", so this assignment
+	// is unconditional and the no-trailers control still observes an empty
+	// carrier). The fields ride through as hpack.HeaderField, NOT projected
+	// onto OrderedHeaders like the leading block above: a trailer section has
+	// no pseudo-headers to strip and does not pass through the encode chain.
+	// Every other ActionResponse return in this file — and in retry.go /
+	// hedge.go / router_weighted.go, which propagate the struct BY VALUE with
+	// no edit — leaves Trailers nil.
 	return ActionResponse{
-		Status:  resp.Status,
-		Headers: respHeaders,
-		Body:    resp.Body,
+		Status:   resp.Status,
+		Headers:  respHeaders,
+		Body:     resp.Body,
+		Trailers: resp.Trailers,
 	}, picked, nil
 }
 
@@ -250,11 +295,18 @@ func h2HeaderVal(req h2.H2Request) func(name string) (string, bool) {
 //	RoundTrip protocol error    → 502 local reply
 //	Upstream HTTP status (5xx)  → forwarded verbatim (NOT translated)
 //
-// Per ADR-0058: trailers are observed but NOT forwarded. The upstream-side
-// observe-discard is implemented in h2.RoundTrip (the second HEADERS block
-// is dropped on the floor); the downstream-side observe-discard is in
-// serverStream.recvTrailingHeaders. The router itself emits END_STREAM on
-// the response HEADERS or final DATA, never via a trailing HEADERS frame.
+// Per ADR-0058: REQUEST trailers (downstream client → envoy-go) are observed
+// and discarded — that half is unchanged, and the discard remains in
+// serverStream.recvTrailingHeaders. RESPONSE trailers (upstream → envoy-go)
+// are a different story as of phase 84.1: h2.RoundTrip (h2/client.go)
+// captures the trailing HEADERS block, validates it against the RFC 9113
+// §8.2.2 set, and populates it onto ActionResponse.Trailers at the ONE
+// populate site above (:250). The router itself does not decide how the
+// block reaches the wire — h2dispatch.go's writeH2Reply conditionally holds
+// END_STREAM off the response HEADERS/DATA and emits the trailers as a
+// second, trailing HEADERS frame when ActionResponse.Trailers is non-empty;
+// with no trailers, END_STREAM still lands on the response HEADERS (bodyless
+// case) or the final DATA frame exactly as before.
 //
 // The live H2 dispatch runs through the H2ClusterAction closure →
 // doH2ClusterAction (a package function, not a method). The legacy defensive

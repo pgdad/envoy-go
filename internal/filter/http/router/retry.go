@@ -149,6 +149,70 @@ func (rp *RetryPolicy) perTryTimeoutRetriable() bool {
 	return rp.matches(504, false) || rp.on&retryReset != 0
 }
 
+// perTryTimedOutH2 reports whether an H2 attempt's outcome must be booked as a
+// per-try timeout — which means Inc'ing upstream_rq_per_try_timeout, REPLACING
+// the driver's ActionResponse with a synthesized 504 and DISCARDING its error.
+// That is a destructive reclassification, so the predicate has to be exactly
+// right; `now` is a parameter (rather than an inline time.Now()) so the
+// decision is a pure function of its inputs and can be gated deterministically.
+//
+// Split out of retryExecutorH2 (phase 84.1 Task 5 fix) because it stopped being
+// a predicate over timing alone. It was written when Status:0 had exactly ONE
+// producer in doH2ClusterAction — the ctx-cancel CANCEL sentinel, for which a
+// 504 is correct. Task 5 added a SECOND Status:0 producer: the locally-detected
+// malformed-response-trailers rejection, which must reset the downstream stream
+// and must NOT become a gateway error. Without the attemptErr exclusion below, a
+// rejection landing at or after the per-try deadline is laundered into a 504
+// with err=nil and the *h2.Error carrying the RST code is dropped on the floor —
+// the exact pair the row's charter forbids, reached through a code path Task 5
+// never touched.
+//
+// MEASURED, not reasoned — with a DISCRIMINATING probe, which matters because a
+// bare 504 count cannot tell a LAUNDERED rejection from a LEGITIMATE per-try
+// timeout: evaluating both the old and the new predicate over the SAME sample,
+// the unnarrowed form mis-booked 551/2000 requests (27.6%) at a 300µs per-try
+// timeout and 33-45/2000 at 400µs, falling to 0 at >=1.2ms. The window is
+// SHORT-timeout-heavy and much wider there than a 504-count survey suggests.
+// Any NEW Status:0 producer must revisit this list.
+//
+// The H1 sibling in retryExecutorH1 keeps its inline predicate deliberately: it
+// tests `resp.localOrigin` ALONE and H1 has no Status:0 producer at all, so it
+// cannot reach this failure mode and sharing a helper would only couple them.
+func (rp *RetryPolicy) perTryTimedOutH2(parentCtxErr error, resp ActionResponse, attemptErr error, attemptDeadline, now time.Time) bool {
+	if rp.perTryTimeout <= 0 {
+		return false // no per-attempt bound configured
+	}
+	if parentCtxErr != nil {
+		return false // a PARENT client-cancel is not a per-try timeout (42.1 invariant)
+	}
+	if !resp.localOrigin && resp.Status != 0 {
+		return false // a clean upstream reply is never misclassified
+	}
+	if errors.Is(attemptErr, h2.ErrMalformedTrailers) {
+		return false // stream-scoped reset, NOT a timeout — see the doc above
+	}
+	// Deadline elapse, by wall clock. Read BEFORE the caller's explicit cancel(),
+	// which would stamp Canceled and lose the signal. This leg (not a ctx-error
+	// check) is the load-bearing one: the driver propagates the child deadline
+	// onto the upstream socket, so a stalled read can break via socket I/O
+	// slightly BEFORE context's timer goroutine stamps Err(), and the wall clock
+	// is immune to that lag.
+	//
+	// A second leg, `errors.Is(attemptCtxErr, context.DeadlineExceeded) || …`,
+	// stood here until phase 84.1 Task 5 fix 2 and was deleted as PROVABLY
+	// REDUNDANT — it could never be the deciding term. Proof: context.WithTimeout
+	// derives its deadline from time.Now().Add(d), which retains the monotonic
+	// reading, and Go's runtime timers never fire early. So attemptCtxErr ==
+	// DeadlineExceeded implies the timer fired at some t0 >= attemptDeadline; the
+	// caller reads attemptCtx.Err() BEFORE time.Now() (Go evaluates call arguments
+	// left to right), hence now >= t0 >= attemptDeadline and the wall-clock leg is
+	// already true. The converse does NOT hold — which is why the wall-clock leg is
+	// the one that survives. It was also UNGATED: deleting it left the whole
+	// package green, because every want:true case necessarily has an elapsed
+	// deadline. A term that cannot decide anything reads as coverage; it is gone.
+	return !now.Before(attemptDeadline)
+}
+
 // retryExecutorH1 wraps doH1ClusterAction with the retry loop (phase 42.1 Task 7,
 // D-S42-7). Each iteration is ONE driver call — which itself re-runs the phase-41
 // max_requests admission (TryAcquireRequest) + RecordUpstreamResult + bumps
@@ -292,19 +356,13 @@ func retryExecutorH2(ctx context.Context, a *routerActionH2, req h2.H2Request) (
 			attemptDeadline, _ = attemptCtx.Deadline()
 		}
 		resp, ep, err = doH2ClusterAction(attemptCtx, a, req)
-		// per-try-timeout discrimination (AMEND-PT4), H2 form: the CHILD attemptCtx
-		// deadline fired while the PARENT ctx is alive ⇒ a per-try-timeout. The H2
-		// driver returns Status:0 (the CANCEL sentinel) when it observes the ctx
-		// deadline, OR a localOrigin 502 if RoundTrip breaks via socket I/O before
-		// context's timer stamps Err() — so we accept EITHER manifestation
-		// (resp.Status == 0 || resp.localOrigin) and detect the deadline via the
-		// wall-clock fallback (immune to the timer-goroutine lag), read BEFORE the
-		// explicit cancel() (which would stamp Canceled). A PARENT client-cancel has
-		// ctx.Err() != nil ⇒ NOT a per-try-timeout (the 42.1 Status:0-not-retried
-		// invariant). A clean upstream reply has Status != 0 && !localOrigin ⇒ never
-		// misclassified.
-		timedOut := rp.perTryTimeout > 0 && ctx.Err() == nil && (resp.localOrigin || resp.Status == 0) &&
-			(errors.Is(attemptCtx.Err(), context.DeadlineExceeded) || !time.Now().Before(attemptDeadline))
+		// per-try-timeout discrimination (AMEND-PT4), H2 form. The predicate lives
+		// in perTryTimedOutH2 (phase 84.1 Task 5 fix) — it is a destructive
+		// reclassification with four exclusions, one of which distinguishes the two
+		// different Status:0 producers doH2ClusterAction now has, so it is gated as
+		// a pure function rather than inline. Every argument is read BEFORE the
+		// explicit cancel() below, which would stamp Canceled and lose the signal.
+		timedOut := rp.perTryTimedOutH2(ctx.Err(), resp, err, attemptDeadline, time.Now())
 		if cancel != nil {
 			cancel()
 		}

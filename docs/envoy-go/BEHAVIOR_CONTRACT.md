@@ -13,7 +13,7 @@ The contract is the contract. Do **not** consult Envoy C++ source to resolve amb
 | Response status | Exact |
 | Response body | Byte-exact for deterministic handlers; semantically equal for filter-modified bodies |
 | Response headers | Set-equal modulo documented allow-list (`server`, `date`, timing/identity headers explicitly listed) |
-| Response trailers | Set-equal under the same allow-list discipline |
+| Response trailers | Set-equal under the same allow-list discipline (asserted on the H2 downstream response path since phase 84.1 per ADR-0306; still unreachable on H1/H3) |
 | HTTP/2 & HTTP/3 framing | Structurally equivalent (same frame types/order on equivalent events); not byte-equal |
 | Access log records | Semantically equal after field-mapping |
 | Stats output | Per-stat behavioral delta after defined load is equal between envoy-go and reference Envoy. Gauges are snapshot-equal after drain. Names + label keys + types byte-equal; HELP text ignored. Allow-list: 46 stats listed in § Stat-name mapping. All other Envoy stat names in /stats/prometheus output are ignored by the differential. |
@@ -679,7 +679,7 @@ The block above is paste-verbatim-synchronized with `docs/envoy-go/phases/06.2-a
 - Sinks other than `envoy.access_loggers.file` + `envoy.access_loggers.http_grpc` + `envoy.access_loggers.open_telemetry` (stdout / tcp_grpc — silently-ignored per ADR-0041 06.2 amendment). The gRPC ALS sink (`http_grpc`) is SUPPORTED as of phase 44.1 (ADR-0255 — see `### Access log — gRPC Access Log Service (ALS) streaming sink` below). The OTLP sink (`open_telemetry`) is SUPPORTED as of phase 45.1 (ADR-0258 — see `### Access log — OpenTelemetry (OTLP) access-log sink` below).
 - Per-route access-log filters (`access_log[].filter` — silently-ignored).
 - Log rotation, fsync, durability ceilings (out of scope per SPEC §2.1).
-- Trailers in access logs (deferred to gRPC family per ADR-0058).
+- Trailers in access logs (still deferred; the gRPC family opened at phase 84.1 but wired H2 response-trailer *forwarding* only, not access-log capture — per ADR-0058, ADR-0306).
 - Access-log records for ctx-cancelled requests (skipped per the H2 zero-status sentinel, SPEC §2.1).
 - SIGTERM-while-record-pending drain semantics (Phase 08's deliverable).
 
@@ -2040,7 +2040,7 @@ Phase 05.1 introduced envoy-go's downstream HTTP/2 dataplane; phase 05.2 closes 
 - SETTINGS values byte-for-byte — unchanged from 05.1.
 - WINDOW_UPDATE timing or count — unchanged from 05.1; ADR-0055's tightening adds frame counts that depend on body size and peer window behaviour, which are inherently non-deterministic across the two proxies.
 - Stream id allocation pattern — unchanged from 05.1.
-- Trailers — observed but not forwarded per ADR-0058 (formalises the upstream-side discard rule; the 05.1 server-side rule was already trailers-not-forwarded).
+- Trailers — the upstream-side discard rule of ADR-0058 is superseded by ADR-0306: H2 response trailers are now captured, validated and forwarded (phase 84.1); the 05.1 server-side rule (locally-generated H2 responses forward no trailers) still holds.
 - 0-RTT TLS early-data behaviour — unchanged from 05.1.
 - NEW (05.2): connection re-use upstream (per ADR-0056) — Envoy pools, envoy-go does not; both produce the same per-request `:status`/body output; cross-conn frame counts differ.
 - NEW (05.2): cross-side request body bytes for routed-to-upstream requests (mirror of phase-04's ADR-K relaxation extended to H2) — fixture 0004's 9 `/api` request bodies are bodyless GETs, so this rule is unexercised in 05.2; carried forward as the rule for any future POST/PUT-bearing fixture.
@@ -2065,7 +2065,7 @@ Sections 3, 4, 5, 6 (excluding 6.6 PUSH_PROMISE), 7, 8 — all `failed == 0`. Pi
 - HTTP/3 (later).
 - Server push (out of scope permanently in 05.1; potentially out of scope project-wide).
 - gRPC framing.
-- Trailer forwarding (deferred to phase 07 framework + gRPC family per ADR-0058).
+- Request-trailer forwarding, and response-trailer forwarding on H1/H3 (still deferred to phase 07 framework per ADR-0058; H2 response-trailer forwarding landed at phase 84.1 per ADR-0306).
 - Upstream H2 stream pooling (upstream-robustness family per ADR-0056).
 - h2c production fixtures (test-only path).
 - mTLS over h2 (deferred).
@@ -4290,7 +4290,7 @@ Registered at filter-parse time (not per-stream), so it reads `0` with zero taps
 
 #### Trailers and `:scheme` coverage boundaries
 
-Trailers are structurally invisible to envoy-go's HTTP filters — `RunDecodeTrailers`/`RunEncodeTrailers` exist with ZERO non-test callers (the never-done HCM "Task 18", written at phase 04) — so the 2 trailer `MatchPredicate` arms boot-reject and `Message.trailers` is NEVER populated. This is invisible in the differential because `EmitDefaultValues` renders an empty repeated field as `[]` byte-identically on both sides, so `trailers == []` is cross-side-EXACT despite the coverage boundary. `:scheme` is never injected into the filter-visible request header map (only `:method`/`:authority`/`:path` are) — an UNasserted cross-side boundary, not a rejected field. `record_headers_received_time: true` is REJECTED (not merely deferred): no accessor anywhere exposes the per-direction header-arrival instant (neither `DecoderFilterCallbacks` nor `EncoderFilterCallbacks` returns a `time.Time`; `FilterChain` has no time field; `chain.go` does not import `"time"`). `record_downstream_connection` IS honored (both address fields plumbable via `DownstreamLocalAddr()`/`DownstreamRemoteAddr()`).
+Trailers are invisible to envoy-go's HTTP filter chain — even though H2 response trailers are now captured, validated and forwarded on the downstream wire (phase 84.1, ADR-0306), the filter chain never observes them: `RunDecodeTrailers`/`RunEncodeTrailers` exist with ZERO non-test callers (the never-done HCM "Task 18", written at phase 04) — so the 2 trailer `MatchPredicate` arms boot-reject and `Message.trailers` is NEVER populated. This is invisible in the differential because `EmitDefaultValues` renders an empty repeated field as `[]` byte-identically on both sides, so `trailers == []` is cross-side-EXACT despite the coverage boundary. `:scheme` is never injected into the filter-visible request header map (only `:method`/`:authority`/`:path` are) — an UNasserted cross-side boundary, not a rejected field. `record_headers_received_time: true` is REJECTED (not merely deferred): no accessor anywhere exposes the per-direction header-arrival instant (neither `DecoderFilterCallbacks` nor `EncoderFilterCallbacks` returns a `time.Time`; `FilterChain` has no time field; `chain.go` does not import `"time"`). `record_downstream_connection` IS honored (both address fields plumbable via `DownstreamLocalAddr()`/`DownstreamRemoteAddr()`).
 
 #### PARSE-REJECT roster (per ADR-0080) — PARITY vs DEPARTURE
 
@@ -5898,3 +5898,58 @@ Both orderings are valid; the contract documents the trade-off without prescribi
 **Stat surface: +0.** No metric name is added, moved or removed. Trap propagation deliberately reuses the existing generic failure counter; a dedicated trap counter would have made the delta non-zero. Asserted two independent ways: registration call sites are identical in count and file spread at base and at this tip, and every stats source path is byte-untouched.
 
 ⚠️ **THE SUCCESS COUNTER PREVIOUSLY FIRED BEFORE THE GUEST CALL**, so a callback that trapped still incremented it. It now fires only on a non-trapping return. **Any historical reading of that counter is a claim that the callback was *reached*, not that it *succeeded*** — and no counter on this surface can establish that the guest received the right answer. That property is guarded only by cross-side comparison.
+
+## HTTP/2 response trailer forwarding (phase 84.1)
+
+Phase 84.1 makes the `| Response trailers |` equivalence row reachable on the **H2 downstream response path only**. A trailing HEADERS block observed on an upstream H2 response is now captured, validated, carried through the router action, and re-emitted downstream as a second HEADERS frame. This supersedes the ADR-0058 upstream-side observe-but-discard rule in the `### Not asserted (05.1 + 05.2 scope)` block for H2 responses; ADR-0306 is the governing decision. H1, H3, and locally-generated H2 responses are unchanged.
+
+**The path — capture → validate → carry → emit (one populate site).**
+
+- **Capture.** `internal/filter/hcm/h2/client.go` records a trailing HEADERS block into `clientStream.respTrailers` and surfaces it on `H2Response.Trailers`. A block bearing END_STREAM whose validation passes is retained; the DATA-then-trailers ordering is preserved.
+- **Validate.** `validateResponseTrailers` runs **at capture time** in the client read loop, before the field is populated. A rejection finishes the stream with a stream-scoped `*h2.Error` carrying `INTERNAL_ERROR`, not a value.
+- **Carry.** `router_h2.go` copies `resp.Trailers` onto `ActionResponse.Trailers` at the **single** populate site inside `doH2ClusterAction` (84.1 Task 5). `retryExecutorH2`/`hedgeExecutorH2`/`router_weighted.go` propagate the whole `ActionResponse` by value, so trailers ride through with no per-site edits; `retry.go`'s synthesized 504 replaces the value and correctly drops them.
+- **Emit.** `internal/filter/hcm/h2dispatch.go` `writeH2Reply` takes the trailer slice; when `len(trailers) > 0` it writes the response HEADERS frame with `end_stream=false`, then a DATA frame (also `end_stream=false`) when a body is present, then a **second, trailing HEADERS frame** carrying `end_stream=true` to terminate the stream (RFC 9113 §8.1). With no trailers the frame sequence is byte-for-byte the pre-84.1 behaviour.
+
+**Validation legs (D-84-VALIDATE), all enforced at capture in `validateResponseTrailers`.**
+
+- **END_STREAM** — a trailing HEADERS block that does not terminate the stream is REJECTED. Its mere presence without END_STREAM is malformed framing.
+- **Pseudo-headers** — any field whose name begins with `:` is REJECTED; pseudo-headers may not appear in a trailer section.
+- **RFC 9113 §8.2.1 uppercase** — any field name containing an uppercase ASCII letter is REJECTED. This leg runs BEFORE the connection-specific and content-length checks, so an uppercase spelling of a barred name is caught here.
+- **RFC 9113 §8.2.2 connection-specific** — `connection`, `keep-alive`, `proxy-connection`, `transfer-encoding`, `upgrade` are REJECTED.
+- **`content-length`** — REJECTED; a trailer section carries no framing length.
+- **`te`** — permitted only with the exact value `trailers`; any other value is REJECTED.
+
+**Malformed → RST_STREAM(INTERNAL_ERROR), not 502.** A validation failure does not degrade to a 502 status: the stream-scoped error carries `INTERNAL_ERROR` so `serverStream.dispatch` emits `RST_STREAM(INTERNAL_ERROR)` downstream. The `h2.ErrMalformedTrailers` sentinel is what the router matches on (`router_h2.go` `errors.Is`) to distinguish this from an ordinary transport error.
+
+**The HTTP filter chain still does not see trailers.** `RunEncodeTrailers` stays **unwired** and `Message.trailers` is **never populated** — the `#### Trailers and :scheme coverage boundaries` clause and the `| 2 trailer match arms | REJECT |` DEPARTURE row in the `#### PARSE-REJECT roster (per ADR-0080)` table both remain true. Forwarding happens on the wire, below the filter surface; the encode chain is told `end_stream=false` on both the HEADERS and DATA events when trailers follow, and no `RunEncodeTrailers` event is synthesized to stand in for the trailing block (silence, not a false end_stream=true).
+
+**H1 and H3 ignore the field.** `writeH1Reply` and the H3 response path do not read `ActionResponse.Trailers`; populating it changes their serialized bytes not at all. This is asserted behaviourally by the Task 10/11 non-change regressions (full serialized-byte equality with the field populated vs nil), not by a signature check.
+
+**Frame-sequence matrix (body × trailers).** The emit path is a 2×2 over "response has a body" and "response has trailers". Only the bottom row is new at 84.1; the top row reproduces pre-84.1 bytes exactly.
+
+| body | trailers | frame sequence | terminating END_STREAM on |
+|---|---|---|---|
+| — | — | HEADERS(end_stream=true) | the HEADERS frame |
+| present | — | HEADERS(false) · DATA(end_stream=true) | the DATA frame |
+| — | present | HEADERS(false) · HEADERS(end_stream=true) | the trailing HEADERS frame |
+| present | present | HEADERS(false) · DATA(false) · HEADERS(end_stream=true) | the trailing HEADERS frame |
+
+On an **empty** trailer block (`len(trailers) == 0`) no trailing HEADERS frame is emitted at all — the field is treated as absent, so the sequence collapses to the top row. (The pinned reference instead emits an extra `DATA len=0 END_STREAM` on an empty block; the two are semantically identical but frame-sequence divergent — a note carried for the 84.2 differential, which is where a fixture exercises it.)
+
+**Three `writeH2Reply` call sites; one passes trailers.** `writeH2Reply` is reached from three places in `h2dispatch.go`: the local-response path, the direct-response path, and the cluster-action success path. Only the cluster-action success return passes a non-nil trailer slice; the local-response and `write500H2`/`directResponseAction.writeH2` sites pass `nil` and are byte-untouched (their non-change is asserted by Task 9's sentences). The conditional `end_stream` logic lives inside `writeH2Reply` itself (`hasTrailers := len(trailers) > 0`), so every caller inherits the correct framing without duplicating it.
+
+**Encode-chain END_STREAM signal (Task 8).** When trailers follow, the encode chain is told `end_stream=false` on BOTH the `RunEncodeHeaders` and `RunEncodeData` events. The last event the chain observes carries `end_stream=false` and no further event follows, because `RunEncodeTrailers` is not wired — silence rather than a false terminal signal. `end_stream=true` with a trailing block still to come would be the lie; `end_stream=false` with nothing after it is merely an under-signal that no wired filter can observe.
+
+**Second-block / `alreadySeen` rule dropped.** An earlier design retained a "last-one-wins on a second trailing block" rule; it is unreachable in production (a conformant peer sends at most one trailing block, and a second block after END_STREAM is already a stream error) and was dropped, not gated. The capture is first-and-only: one validated trailing block per stream.
+
+**RST_STREAM disposition reuses existing plumbing.** The stream-scoped `*h2.Error` built by `malformedTrailersError` carries `INTERNAL_ERROR` as its code, and `serverStream.dispatch` reads that code to emit the downstream `RST_STREAM` — the same code-into-`writeRSTStream` path already used for other stream errors. No new RST plumbing is introduced; the trailer-rejection case rides an established pattern. The `h2.ErrMalformedTrailers` sentinel lets the router classify the rejection as a validation failure rather than a transport fault.
+
+**Additive fan-out, two new struct fields.** The forwarding surface adds exactly two fields: `H2Response.Trailers` (`internal/filter/hcm/h2/client.go`) and `ActionResponse.Trailers`. Because the router executors (`retryExecutorH2`, `hedgeExecutorH2`, `router_weighted.go`) copy `ActionResponse` by value, no propagation edits are needed beyond the single populate site — trailers ride through the whole action-fan-out for free. `go build ./...` and `go vet ./...` are clean.
+
+**Vehicle.** ADR-0306 is the governing decision, landed as the mandated vehicle per ADR-0052 `:1821` (which requires H2-equivalence extensions to arrive via a new ADR, not by silently editing the 05.1 `### Not asserted` block). **Stat surface: +0** — no metric name is added, moved or removed by this row.
+
+**Not discriminated cross-side by stats.** A stats-only differential is vacuous on both sides (broken-gate shape 31): the moved-name set is identical with and without trailers, and the reference books `2xx` counters even for streams it RESETs. Only the frame-sequence and byte-level assertions catch an unconditional-END_STREAM regression; the 84.2 fixture `0119-grpc-unary-trailers` does that work.
+
+**Coverage.** The path is guarded by a TDD spine across capture (`h2`), carry (`router`), and emit (`hcm`) layers, with the frame sequence asserted through `captureH2Writer`'s `order` field, plus break arms that independently redden the capture (B1a/B1b), the carrier (B2), the emit (B3), the conditional END_STREAM (B4), the END_STREAM-off emit (B5), and an over-firing capture (B6) — the last caught only by a stacked control, not by the positive arms.
+
+**Still deferred after 84.1.** Three things remain out of this row's scope and are carried forward: (1) **request-trailer** forwarding (the decode side; deferred to the phase 07 framework per ADR-0058); (2) **response-trailer forwarding on H1 and H3**, which continue to ignore the populated field; and (3) **filter-chain visibility** of trailers — `RunEncodeTrailers`/`RunDecodeTrailers` stay unwired and `Message.trailers` unpopulated, so no HTTP filter can read or rewrite a forwarded trailer. 84.1 forwards on the wire only; it does not open the filter surface.

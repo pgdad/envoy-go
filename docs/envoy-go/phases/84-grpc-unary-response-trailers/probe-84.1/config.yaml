@@ -1,0 +1,67 @@
+# Phase 84.1 Task 1 — RED anchor probe subject bootstrap.
+#
+# Downstream: TLS listener l_h2 on 127.0.0.1:45801, alpn_protocols ["h2",
+# "http/1.1"], codec_type AUTO (the 0079-h2-multiplex-pool / 0004-h2-routing
+# shape). PEMs referenced by filename (relative to this file's directory —
+# internal/tls.loadDataSource resolves DataSource_Filename against baseDir =
+# filepath.Dir(-c)).
+#
+# Upstream: cluster c_grpc, STATIC, one endpoint at 127.0.0.1:45810 (the
+# probe's in-process grpc-go health server, h2c — NO transport_socket).
+# explicit_http_config.http2_protocol_options{} forces the H2 upstream path
+# (router_h2.go doH2ClusterAction) regardless of ALPN, per PLAN-84.1 §1.2.
+node: { id: envoy-go-probe-84.1, cluster: envoy-go-probe }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 45802 }
+static_resources:
+  listeners:
+    - name: l_h2
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 45801 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                alpn_protocols: ["h2", "http/1.1"]
+                tls_certificates:
+                  - certificate_chain:
+                      filename: pki/listener.pem
+                    private_key:
+                      filename: pki/listener.key.pem
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: AUTO
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: vh_default
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: c_grpc }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: c_grpc
+      type: STATIC
+      connect_timeout: 1s
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: c_grpc
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 45810 } } }

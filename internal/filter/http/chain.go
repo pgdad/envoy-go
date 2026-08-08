@@ -480,9 +480,13 @@ func (c *FilterChain) RunDecodeData(ctx context.Context, data []byte, endStream 
 // via dcb.ContinueDecoding). HCM dispatch (connection.go / h2dispatch.go)
 // does not yet drive trailers — H1 trailers are gated on chunked transfer-
 // encoding which the phase-04..07.1 fixture set does not exercise; H2
-// trailers are observed-and-discarded in the codec layer per ADR-0058.
-// envoygotest's chain-direct test exercises this method without HCM
-// dispatch.
+// REQUEST trailers (downstream client → envoy-go, the decode direction this
+// method serves) are observed-and-discarded in the codec layer per
+// ADR-0058. RESPONSE trailers (upstream → envoy-go) are a separate,
+// encode-side path as of phase 84.1 — see h2/client.go's capture+validate
+// and h2dispatch.go's writeH2Reply — and are unaffected by this method or
+// its non-invocation here. envoygotest's chain-direct test exercises this
+// method without HCM dispatch.
 func (c *FilterChain) RunDecodeTrailers(ctx context.Context, trailers http.Header) (bool, error) {
 	c.decodeIdx = 0
 	for c.decodeIdx < len(c.filters) {

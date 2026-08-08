@@ -113,8 +113,10 @@ func (d *h2Dispatcher) Match(req *http.Request) (h2.Action, bool) {
 	entry, routeIdx, ok := d.f.table.match(req)
 	if !ok {
 		// No matching route — synthesize 404 with empty body. The chain is
-		// NOT built; we surface the 404 via a directResponseAction-equivalent
-		// closure (writeH2 invocation) so HCM's chain-completion hook +
+		// NOT built; we surface the 404 via notFound.asRouterActionH2(), an
+		// H2Action closure that chainDispatchAction.WriteH2's no-match branch
+		// (below) invokes and serializes through writeH2Reply — NOT via
+		// directResponseAction.writeH2 — so HCM's chain-completion hook +
 		// access-log emit fire on a single uniform shape. routeIdx=-1
 		// signals "no chain" to chainDispatchAction.WriteH2.
 		notFound := &directResponseAction{status: 404, bodyText: ""}
@@ -308,7 +310,10 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	if c.routeIdx < 0 {
 		resp, picked, err := c.action(ctx, h2req)
 		if err == nil && resp.Status > 0 {
-			err = writeH2Reply(sw, resp.Status, resp.Headers, resp.Body)
+			// nil trailers: the synthesized no-route 404 never carries a
+			// trailing HEADERS block (phase 84.1 Task 6 — Trailers is
+			// populated only at doH2ClusterAction's success site).
+			err = writeH2Reply(sw, resp.Status, resp.Headers, resp.Body, nil)
 		}
 		c.f.emitAccessLogH2(h2req, resp.Status, int64(len(resp.Body)), picked, startTime, resp.Headers, c.traceDecision, nil, nil)
 		if cnt := c.f.downstreamStatusClassCounter(resp.Status); cnt != nil {
@@ -498,10 +503,15 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	// the dispatch goroutine — see stream.go), so we know if a body is
 	// present from h2req.Body length and feed it as a single chunk via
 	// RunDecodeData with endStream=true. If the body is empty, RunDecodeHeaders
-	// fires with endStream=true. RunDecodeTrailers is not invoked: SPEC §2.1
-	// observes-and-discards request trailers in the codec layer (per ADR-0058);
-	// the FilterChain does not yet expose RunDecodeTrailers (Task 18 will
-	// extend if needed for cors/probe).
+	// fires with endStream=true. RunDecodeTrailers is not invoked here: this
+	// H2 dispatch path does not drive decode-side (REQUEST) trailers, which
+	// SPEC §2.1 observes-and-discards in the codec layer per ADR-0058.
+	// FilterChain.RunDecodeTrailers already exists (phase 07.1 Task 19,
+	// exercised only by envoygotest's chain-direct test — not by this
+	// dispatch path); it is simply not called from here. RESPONSE trailers
+	// are the separate, encode-side concern phase 84.1 adds: captured and
+	// validated on the upstream side in h2/client.go and emitted downstream
+	// via writeH2Reply's conditional trailing block below (:634).
 	hasBody := len(h2req.Body) > 0
 	endStreamOnHeaders := !hasBody
 
@@ -524,7 +534,9 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 			// Task 18 review fix + Task 19 unification: ordered carrier
 			// preserves caller insertion order (e.g. SPEC §11.2 6-header pin
 			// from cors.go) on the H2 HEADERS frame.
-			werr = writeH2Reply(sw, lrStatus, lrHeaders, lrBody)
+			// nil trailers: a SendLocalReply response is filter-synthesized
+			// and never proxies an upstream trailing block (phase 84.1 Task 6).
+			werr = writeH2Reply(sw, lrStatus, lrHeaders, lrBody, nil)
 		}
 		// Phase 46.1b Task 8: POST-Decide site — pass c.traceDecision.
 		c.f.emitAccessLogH2(h2req, lrStatus, int64(len(lrBody)), cluster.Endpoint{}, startTime, lrHeaders, c.traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
@@ -572,14 +584,34 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 		// side classifying filters (e.g. admission_control) observe resp.Status,
 		// which the encode header map does not carry (:status is not present).
 		chain.SetEncodeResponseStatus(status)
-		if _, err := chain.RunEncodeHeaders(ctx, merged, len(resp.Body) == 0); err != nil {
+		// D-84-ENDSTREAM, encode-chain arm (phase 84.1 Task 8, disposition
+		// (ii)): the end_stream flag handed to the encode chain must mean the
+		// same thing it means on the wire — "nothing further is coming". A
+		// trailing HEADERS block IS something further, so its presence
+		// suppresses end_stream on BOTH the headers and the data event; the
+		// pre-84.1 signal (headers: len(body)==0, data: true) is reproduced
+		// exactly when no trailer block is present.
+		//
+		// Consequence, deliberate and load-bearing: with trailers present the
+		// chain's LAST observed event carries end_stream=false and no further
+		// event follows, because RunEncodeTrailers is NOT wired here —
+		// ADR-0273's boot-reject keeps the encode-trailers hook dead on
+		// purpose and 84.1 does not disturb it. So an encode filter never
+		// learns the stream ended on a trailers response. That is the honest
+		// signal available: silence is not a lie, whereas end_stream=true with
+		// a whole HEADERS block still to come is one, and it is filter-visible
+		// (a bodyless gRPC error raised after headers reaches the second arm).
+		// If the encode-trailers hook is ever un-deadened, the fix is to add a
+		// RunEncodeTrailers call HERE, not to flip these booleans back.
+		hasRespTrailers := len(resp.Trailers) > 0
+		if _, err := chain.RunEncodeHeaders(ctx, merged, len(resp.Body) == 0 && !hasRespTrailers); err != nil {
 			// Phase 46.1b Task 8: POST-Decide site — pass c.traceDecision.
 			c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime, resp.Headers, c.traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 			return err
 		}
 		resp.Headers = filter_http.ReconcileOrderedHeaders(resp.Headers, merged)
 		if len(resp.Body) > 0 {
-			if _, err := chain.RunEncodeData(ctx, resp.Body, true); err != nil {
+			if _, err := chain.RunEncodeData(ctx, resp.Body, !hasRespTrailers); err != nil {
 				// Phase 46.1b Task 8: POST-Decide site — pass c.traceDecision.
 				c.f.emitAccessLogH2(h2req, status, int64(len(resp.Body)), picked, startTime, resp.Headers, c.traceDecision, chain.DynamicMetadata().Get, chain.RouteMetaLookup)
 				return err
@@ -599,7 +631,7 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	// beginLocalReply wrote the response through the encode chain inline but
 	// did NOT emit wire bytes — that is THIS layer's responsibility on H2 too).
 	if rf.ActionRan() && actionErr == nil && status > 0 {
-		if werr := writeH2Reply(sw, resp.Status, resp.Headers, resp.Body); werr != nil {
+		if werr := writeH2Reply(sw, resp.Status, resp.Headers, resp.Body, resp.Trailers); werr != nil {
 			actionErr = werr
 		}
 	}
@@ -651,7 +683,7 @@ func upsertH2Header(fields []hpack.HeaderField, name, value string) []hpack.Head
 }
 
 // writeH2Reply emits an HTTP/2 response on sw from a pre-built ordered header
-// set + body. Phase 07.1 Task 18 prereq P2: the chain-mediated H2 dispatch
+// set + body + optional trailer block. Phase 07.1 Task 18 prereq P2: the chain-mediated H2 dispatch
 // path serializes the action's (post-encode-chain-mutated) response here.
 // Phase 07.1 Task 19 (I-3 prereq): unified path — the SendLocalReply path and
 // action-driven path BOTH use this single helper (collapsed from
@@ -666,9 +698,26 @@ func upsertH2Header(fields []hpack.HeaderField, name, value string) []hpack.Head
 //     Content-Length is overridden inline to match len(body).
 //  3. date, server defaults appended if absent in the carrier.
 //
-// HEADERS frame is emitted with end_stream=false (body follows) when
-// len(body)>0; end_stream=true when body is empty.
-func writeH2Reply(sw h2.StreamWriter, status int, headers filter_http.OrderedHeaders, body []byte) error {
+// Frame sequence and END_STREAM placement (phase 84.1, decision
+// D-84-ENDSTREAM). END_STREAM always rides the LAST frame of the stream; which
+// frame that is depends on whether a trailer block was supplied:
+//
+//   - len(trailers)==0 — unchanged from pre-84.1. The response HEADERS frame
+//     carries end_stream=false when len(body)>0 (a DATA frame with
+//     end_stream=true follows) and end_stream=true when the body is empty (no
+//     DATA frame at all). No trailing HEADERS frame is emitted.
+//   - len(trailers)>0 — the response HEADERS frame carries end_stream=false
+//     unconditionally; a DATA frame with end_stream=false follows when
+//     len(body)>0; and a SECOND HEADERS frame carrying the trailer block
+//     verbatim terminates the stream with end_stream=true (RFC 9113 §8.1
+//     trailer section).
+//
+// The trailer block is emitted exactly as supplied: no :status pseudo-header
+// and no date/server defaults are injected, and Content-Length is not
+// recomputed against it. Trailer well-formedness (no pseudo-headers, no
+// connection-specific fields) is enforced upstream at capture time in the h2
+// package, not here.
+func writeH2Reply(sw h2.StreamWriter, status int, headers filter_http.OrderedHeaders, body []byte, trailers []hpack.HeaderField) error {
 	hf := []hpack.HeaderField{{Name: ":status", Value: strconv.Itoa(status)}}
 	hasServer := false
 	hasDate := false
@@ -695,12 +744,27 @@ func writeH2Reply(sw h2.StreamWriter, status int, headers filter_http.OrderedHea
 	if !hasDate {
 		hf = append(hf, hpack.HeaderField{Name: "date", Value: dateHeader()})
 	}
-	endStream := len(body) == 0
+	// D-84-ENDSTREAM (phase 84.1): END_STREAM rides the LAST frame of the
+	// stream, which is the trailing HEADERS block when one is present and the
+	// last body-bearing frame otherwise. hasTrailers==false reproduces the
+	// pre-84.1 frame sequence byte-for-byte (frame kinds, flags, ordering).
+	hasTrailers := len(trailers) > 0
+	endStream := len(body) == 0 && !hasTrailers
 	if err := sw.WriteHeaders(hf, endStream); err != nil {
 		return err
 	}
-	if !endStream {
-		if err := sw.WriteData(body, true); err != nil {
+	if len(body) > 0 {
+		if err := sw.WriteData(body, !hasTrailers); err != nil {
+			return err
+		}
+	}
+	if hasTrailers {
+		// Second WriteHeaders on an already-headers-written stream: the h2
+		// serverStream encodes it as a plain HEADERS frame with END_STREAM,
+		// which is exactly RFC 9113 §8.1's trailer section. Emitted verbatim
+		// — the block was validated at capture (phase 84.1 Task 3), so no
+		// :status / date / server defaults are injected here.
+		if err := sw.WriteHeaders(trailers, true); err != nil {
 			return err
 		}
 	}
@@ -711,7 +775,11 @@ func writeH2Reply(sw h2.StreamWriter, status int, headers filter_http.OrderedHea
 // H2 stream writer. Used only on the defensive non-*router.Filter terminal
 // branch above (unreachable in well-formed bootstraps because ValidateChainShape
 // pins the terminal type_url to router.TypeURL). Body is empty to match the
-// phase-04 H1 convention for synthesized 500s.
+// phase-04 H1 convention for synthesized 500s. Phase 84.1 Task 9: this
+// terminal branch fires before any upstream call is made, so there is
+// nothing captured as trailers to emit — unlike writeH2Reply, write500H2
+// never accepts a trailers parameter and never writes a trailing HEADERS
+// block.
 func (f *Filter) write500H2(sw h2.StreamWriter) error {
 	hdrs := []hpack.HeaderField{
 		{Name: ":status", Value: "500"},

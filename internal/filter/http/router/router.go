@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"golang.org/x/net/http2/hpack"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/pgdad/envoy-go/internal/cluster"
@@ -86,6 +87,13 @@ type ActionResponse struct {
 	// shadowing real errors. Phase 07.1 Task 18 prereq P1 surfaces this
 	// alongside the response struct.
 	Close bool
+	// Trailers carries the H2 trailing-HEADERS-block fields to emit after the
+	// response body (H2 only; H1/H3 ignore). Populated from
+	// h2.H2Response.Trailers on the H2 cluster-proxying path (phase 84.1 Task
+	// 5); a nil/empty value means no trailers. Consumed by the H2 wire-write
+	// path (phase 84.1 Task 6) to conditionally emit a trailing HEADERS frame
+	// instead of setting END_STREAM on the final DATA frame.
+	Trailers []hpack.HeaderField
 	// localOrigin marks a router-synthesized dial/connection/write/read failure
 	// (NOT a proxied upstream response, and NOT the CB-overflow 503). The retry
 	// executor (phase 42.1 Task 7) feeds it into RetryPolicy.matches so a
