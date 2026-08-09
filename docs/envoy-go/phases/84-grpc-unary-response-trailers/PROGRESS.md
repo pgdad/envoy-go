@@ -240,3 +240,84 @@ Input measured **234 lines / 116 data rows** BEFORE anything was written. **(1)*
 ## Handoff
 
 **Next: the 84.2 IMPL** — the twelve-task spine in `PLAN-84.2.md`. It lands fixture `0119-grpc-unary-trailers` with **FOUR arms** (the plain trailer-less arm is the D-84-ENDSTREAM gate), re-derives the §5 break roster at its tip (expect F2-minus-plain-arm to stay GREEN — that vacuity is the finding, not a defect to fix), runs the 121-fixture suite with `INNER_EXIT`, and **flips ROADMAP row 84 `done`** (ONE line, update-in-place, whole-file leak check live, `want` STAYS 116). ⚠️ **After the flip: check (1) silent, check (2) — six family backlogs — is the SOLE sentinel blocker, and the roller SELF-PICKS the next subject per the 2026-07-12 standing directive.** ⚠️ Do NOT wire `RunEncodeTrailers`; no empty-trailer arm; no custom response headers (the response-HEADER conduit stays un-stumbled-into); `BEHAVIOR_CONTRACT.md` expected byte-untouched; `ADR-0306` amended in place only if the IMPL learns something it states wrongly.
+
+---
+
+## IMPL-84.2 — done 2026-08-08
+
+## What landed
+
+**The differential leg, and the stage that CLOSES the phase.** Fixture `test/fixtures/0119-grpc-unary-trailers/` NEW — `driver/driver.go` **669** lines, `driver/driver_test.go` **196**, `README.md` **137**, `expectations.yaml` **106** (both documentary), plus 0079's three PEMs copied into `pki/` with **sha256 asserted pair-by-pair** (`ca` 10 lines, `listener` 11, `listener.key` 5). Registration is **ONE blank-import line** at `test/differential/runner_test.go:146`. `ROADMAP.md` row 84 flipped `in-progress` -> **`done`** at `:146` — ONE line, `git diff --numstat` = **`1 1`**, no row added or removed, sentinel `want` **STAYS 116**. ⚠️ **`DECISIONS.md` and `BEHAVIOR_CONTRACT.md` are BYTE-UNTOUCHED this leg** — the fixture surfaced **zero** new contract statements and `ADR-0306` needed no amendment. Proof, run at this tip rather than asserted:
+
+```
+$ git diff 35e3933e..HEAD -- docs/envoy-go/DECISIONS.md docs/envoy-go/BEHAVIOR_CONTRACT.md | wc -c
+0
+$ git diff --numstat 35e3933e..HEAD -- docs/envoy-go/ROADMAP.md    # the CONTROL, same command form
+1	1	docs/envoy-go/ROADMAP.md
+```
+
+The whole-leg change set is **nine files before the stage-close docs commit**: `ROADMAP.md` (1/1), `runner_test.go` (1/0), and the seven new fixture files. **ZERO production `.go`.**
+
+## Method
+
+Base master **`35e3933e`**, branch `phase-84-impl-84.2`. **TWELVE tasks, subagent-driven**, each committing locally only; the verification-only tasks (1, 8, 9, 10) committed nothing by design. Commits: `984230c3`, `91bfd1dc` (T2/3) · `a53e66a5`, `43bab3f9` (T4/5) · `6185a5d0`, `b637f656` (T6/7) · `ff71318d` (T11) · this stage-close commit (T12). Every touched package gofmt/golangci-clean per task; every break arm restored with **sha256 verified against the base blob**, never by eye, and the controller re-verified `git status --porcelain` = 0 lines after the roster ran.
+
+## The stage's headline
+
+**THE FOUR-ARM FIXTURE LANDED AND THE FOURTH ARM IS THE ONLY REASON THE ROW'S HIGHEST-LEVERAGE DECISION IS MEASURED AT ALL.** The arms are `success` / `notfound` / `unimplemented` / **`plain`** — a trailer-less non-gRPC H2 GET through the same listener (`driver.go:334-348`). The one-liner rationale, reproduced at this tip rather than inherited: **every gRPC response carries trailers, so "always emit a trailing block" is behaviour-identical on all three gRPC arms** — only a response that *should* carry no trailing HEADERS block can see an unconditional END_STREAM regression. Break F2 (variant B with the plain arm disabled) went **vacuously GREEN** exactly as the PLAN predicted; F2′ with the arm restored went **RED at offset 940**. The PLAN's blindness finding is therefore **REPRODUCED, not "fixed"** — the arm is the fix.
+
+Two further headlines: the driver drives raw `x/net/http2` **Framer + hpack** through a shared `drive()` — **first-of-kind among all fixture drivers**, permitted by the harness comment at `runner_test.go:3311`, because `helpers.H2RoundTrip` structurally cannot carry trailers or frame shape. And **canonicalization stayed CLOSED at three — ZERO new rules were forced**: the two mandated name-drops (`x-envoy-upstream-service-time`, `date`) plus the never-fired READ-ERR addr scrub absorb every divergence including wire order, **the sort stays vacuous, and NO sort was written**. The PLAN's zero-iteration claim is REPRODUCED at this tip; a forced rule would have been a recorded FINDING and there was none.
+
+## The discriminating findings
+
+- ⚠️ **THE `AssertStats` LEG WAS STRENGTHENED AGAINST THE PLAN, AND IT IS A RECORDED REVIEW-DRIVEN DEVIATION** (task-4/5 review finding **I-1**). The PLAN chartered subject `http.ingress_http.downstream_rq_2xx >= 1`; the landed leg asserts **`>= len(arms())` = 4** (`driver.go:618-621`). The reason is a real vacuity: **READ-ERR is recorded INTO the transcript**, so a failure hitting BOTH sides identically yields byte-equal transcripts and `CompareBytes` passes — a vacuous green. The subject-side `>= 4` floor is the committed liveness guard. A minor deviation was accepted with it: `wantMin` is `len(arms())` rather than a literal `4` (robustness).
+- ⚠️ **FINDING — PATH CORRECTION, recorded so a future re-derivation does not conclude the site vanished.** The F3 populate site is **`internal/filter/http/router/router_h2.go:250`** (`Trailers: resp.Trailers,`). A task brief mis-inferred `internal/filter/hcm/`; the PLAN's own cite for the site was **path-less**, so nothing in writing contradicted the wrong inference. Re-verified at this tip.
+- **F1 and F3 produce BYTE-IDENTICAL divergence text** (both RED at offset **192**). The fixture localises the **symptom**, not the **layer** — as chartered; 84.1's unit arms own layer localisation. Stated, not hidden.
+- **The registration silent-green is real and is now a RED that was observed, not reasoned about**: F6 (blank import removed) produced `no driver registered` + **SKIP + exit 0 in 0.85 s**.
+
+## Break/control roster — REPRODUCED at tip `b637f656` (Task 8, no commits)
+
+| arm | injection | result |
+| --- | --- | --- |
+| **F1** | drop the emit (`h2dispatch.go:751`) | **RED @ offset 192** — only `CompareBytes` fired; subject transcript **0** `TRAILERS` lines vs reference **3**, measured |
+| **F2** | variant B (unconditional END_STREAM), plain arm DISABLED | **vacuous GREEN** — the PLAN's blindness finding REPRODUCED |
+| **F2′** | variant B, plain arm RESTORED | **RED @ offset 940** |
+| **F3** | drop the carrier (`router_h2.go:250`) | **RED @ offset 192**, byte-identical to F1 |
+| **F4** | SYMMETRIC control — same bogus line in BOTH transcripts | **PASS** (line verified present in both dumps) |
+| **F5** | VACUITY control — broken tree | `AssertStats` **GREEN** (`downstream_rq_2xx` = **4** measured under F1 via a nested NC) while `CompareBytes` **RED** — **broken-gate shape 31 LIVE on this fixture** |
+| **F6** | registration removed | **SKIP + exit 0 in 0.85 s** |
+
+Every restore sha256-verified; `-count=1` throughout; the firing assertion confirmed per arm rather than assumed.
+
+## Gates
+
+**(a)** — ⚠️ **NOT vacuous for the first time in the row: the leg IS gate (a).** `0119` raises the downstream-ALPN-h2 fixture count **3 -> 4** and is the only fixture asserting frame-level `end_stream` placement cross-side. **(b)** — full differential, **two launches**: launch 1 **120/121** with a NEW flake (below); launch 2 **121/121 PASS, `INNER_EXIT=0`, 0 FAIL/SKIP, 0 `no driver registered`, anchored panic gate 0, wall 391.189 s** (`0119` PASS on BOTH launches). `go test ./... -count=1`: run 1 `INNER_EXIT=1` on a NEW flake, run 2 **`INNER_EXIT=0`**. `-race` on `hcm`, `hcm/h2`, `http/router` and the `0119` driver: **`RACE_EXIT=0`**, four packages ok. `go vet ./...` 0 · `gofmt -l` empty · `golangci-lint` 0. **(c)** — `test/conformance/grpc/` **stays DEFERRED IN WRITING**; h2spec **53/53 stated WITH the scope caveat** (the gate has never run RFC 9113 §6; nine slash-form selectors; the missing `Tests == 0` guard is at `h2spec_test.go:310`, re-verified). **(d)** — **VACUOUS, and the word is "vacuous"**: a fixture driver is not a parser/codec/filter; fuzzers stay **55**. **(e)** — `INNER_EXIT` recorded on every launch. **(f)** — **STANDING LINEAGE DEPARTURE, named not claimed**: no `REVIEW.md`; **37 of 125** phase dirs carry one, none since 25.3.
+
+⚠️ **TWO NEW FLAKES, verbatim one-line signatures, BOTH OUTSIDE THIS LEG'S CODE and both cleared on re-run within budget:**
+
+1. `0079-h2-multiplex-pool`, differential launch 1 — `runner_test.go:1350: subject: ceil[0]: status 502, want 200 (held stream not served after drain)` (same for `ceil[2]`). ⚠️ **NOT the documented driver-receiver port-race class** — no panic, no `bind: address already in use`, not `0081`/`0084`; a genuine assertion failure on an unrelated fixture. Did not reproduce on launch 2.
+2. `internal/wasm TestA4_HttpCallResponseTrap_PoisonsStreamContext` under full `go test ./...` run 1 — `sc.trapped = false after proxy_on_http_call_response TRAPPED; want true`. **Passes standalone** (0.003 s) and on the clean re-run. Not one of the three documented Gate-2 flake classes.
+
+**Both belong in the flake register as NEW classes; a recurrence of either is worth recording.**
+
+## Stat surface
+
+**+0.** **ARM 1** (added production registration sites in the row's diff) printed **nothing**, and the **INPUT MEASURE is asserted** because a test-only leg makes ARM 1 empty-by-construction: the production-scoped diff measured **0** while the raw diff measured **675** lines (the 669-line fixture driver plus the test-side remainder), all **8** changed `.go`/doc files under `test/`; the NC — one registration line injected into a scratch clone of the pipeline — **fired 6**. **ARM 2**, the canonical matcher from `PLAN-84.1:473-477`, reads **208 sites / 36 production files at BOTH base and tip, delta 0/0** (re-run at this close: 208, 36). ⚠️ **NEVER via `TestNoNewStat*`** — proven blind by execution at the 84.1 PLAN; neither run nor cited here. The absolute **1207** stays DOC-SOURCED; **only the delta is asserted**.
+
+## Sentinel — the row flip, and the first SILENT check (1) in the project's history
+
+Input measured **234 lines / 116 data rows** BEFORE editing. **BEFORE the flip:** (1) `NOT DONE: row 84` at `want=116` with the denominator printed · (2) **SIX** `:194 :200 :206 :216 :222 :230` · (3) **SILENT**. **AFTER the flip (Task 11, `ff71318d`, controller-re-run and re-run again at this stage close):**
+
+- **(1) SILENT** — for the first time; all 116 rows read `done`, denominator `116` intact.
+- **(2) SIX** — `:194 :200 :206 :216 :222 :230`, unchanged.
+- **(3) SILENT.**
+
+⇒ the condition is a **CONJUNCTION** and (2) prints ⇒ **the sentinel does NOT fire**, and **`stop` was NOT created** (`ls stop` => `No such file or directory`, checked at both the repo root and the worktree root).
+
+⚠️ **WITH TWO SILENT CHECKS THE DOCTORING NEGATIVE CONTROLS ARE THE ONLY THING DISTINGUISHING SUCCESS FROM A BROKEN CHECK. ALL FOUR FIRED, post-flip:** row 62 doctored ⇒ `NOT DONE: row 62` (with `NC LANDED? [ in-progress ]` inspected BEFORE trusting the result) · `want=115` ⇒ `GATE FAIL: examined 116 data rows, expected 115` · the mandatory check-(3) doctoring (residual occurrences confirmed **0** first) ⇒ `NEVER OPENED: gRPC` while `WASM` correctly stays silent · check-(2) **one-arm** strip ⇒ stripping the SHORT arm leaves **5**, stripping the LONG arm leaves **1** — **never 0** (a one-arm strip is NOT an NC for the union; the long form does not contain the short substring).
+
+**LEAK CHECK — run as a WHOLE-FILE BEFORE/AFTER count with `--` before every hyphen-leading pattern, never a grep of the diff's `+` lines. EVERY AXIS INVARIANT:** **234** lines / **116** data rows · the check-(2) union **6** · the hyphen-leading family-summary pattern **95 occurrences / 67 LINES** · its gRPC-slug form **2**. No sentinel matcher string was written into `ROADMAP.md`. The escape-aware **ARM-A** well-formedness gate flags **lines 119 and 131 ONLY** at this tip, exactly as recorded — **row 84 at `:146` is NOT flagged** (8 pieces). ⚠️ An ad-hoc ARM-B reconstruction attempted at this close **over-fires on ~74 rows** and is therefore **NOT** the documented arm; no ARM-B number is carried, and the documented arm's 140-only reading stands unre-derived here rather than restated from a broken probe.
+
+## Handoff — PHASE 84 IS CLOSED
+
+**Row 84 is `done`; there is NO banked mid-lifecycle work left.** ⇒ the next session **SELF-PICKS** its subject per the 2026-07-12 standing directive — smallest defensible candidate first, with the pick **and the rejected alternatives** recorded in its BRAINSTORM. Two candidates are already in writing and neither is chartered: the **six family backlog paragraphs** that check (2) matches (`ROADMAP.md`, the check-(2) lines), and the **h2spec-selector repair row** — nine malformed slash-form selectors matching zero cases, **42** unrun RFC 9113 §6 cases, **4** pre-existing failures on the correct selector, and the missing `Tests == 0` guard at `h2spec_test.go:310`, which SPEC-84 §13 item 1 calls **"one coherent future row"**. ⚠️ **A BRAINSTORM that charters a row bumps `want` 116 -> 117 in its OWN commit** — whether or not it opens a new family (the phase-84 BRAINSTORM's 115 -> 116 is the precedent). ⚠️ **Baselines for the next session, all to be RE-DERIVED MECHANICALLY and never copied:** fixtures **121** (tail `0119-grpc-unary-trailers`, next-free `0120`) · full-suite wall **391.2 s** · `ROADMAP.md` **234 / 116** · `DECISIONS.md` **17990**, tail **ADR-0306 COMPLETE**, next-free **ADR-0307 derived FROM THE TAIL** · `BEHAVIOR_CONTRACT.md` **5955** · `STATE_HISTORY.md` **466** · stat census **208 / 36**.

@@ -1,0 +1,106 @@
+# Phase-84 fixture 0119-grpc-unary-trailers: differential expectations.
+#
+# A cross-side [http_connection_manager + router] fixture over ONE H2 upstream
+# cluster c_grpc (explicit_http_config.http2_protocol_options{}), pointed at
+# the existing GRPCHealthResponder backend (BackendKind 34, a real grpc-go
+# health server behind an h2c mux). It proves H2 response-TRAILER forwarding
+# on the gRPC unary path (ADR-0306) by speaking raw HTTP/2 (golang.org/x/net/
+# http2 Framer + hpack, no gRPC/H2 client library) through each side's
+# TLS+ALPN-h2 downstream listener l_h2, and byte-comparing the observed
+# response frame sequence.
+#
+# # Four arms — see driver/driver.go's arms() doc comment for the exact
+# # measured per-arm shapes (frame kinds, end_stream flags, byte lengths and
+# # hex payloads); NOT restated here, since the plain arm's body/content-length
+# # derive from the backend index and request path and a second copy would
+# # drift independently of the code.
+#
+#   success        Check("")     -> HEADERS + DATA(SERVING) + TRAILERS grpc-status=0
+#   notfound       Check("nope") -> HEADERS + TRAILERS grpc-message/grpc-status=5, no DATA
+#   unimplemented  /Nope         -> HEADERS + TRAILERS grpc-message/grpc-status=12
+#   plain          GET /plain    -> HEADERS + DATA(end_stream=true), NO trailing block
+#
+# # Why the plain arm exists — the D-84-ENDSTREAM gate
+#
+# Every gRPC unary response, success or error, carries a trailing HEADERS
+# block, so the three gRPC arms are structurally BLIND to a regression that
+# unconditionally emits one regardless of whether the real response has
+# trailers: measured by injection against the landed seam, that regression
+# passed all three gRPC arms AND all three pre-existing downstream-ALPN-h2
+# fixtures (0004/0079/0080) — Go's x/net client tolerates an empty trailing
+# HEADERS block. The plain arm's real response has NO trailing block at all,
+# so it is the only arm the regression reddens (a deterministic first
+# divergence partway through the transcript). The PLAN mandates all FOUR arms
+# for exactly this reason.
+#
+# # The discriminating gate is CompareBytes, not stats (shape 31)
+#
+# The runner byte-compares the two Drive-hook transcripts (CompareBytes) —
+# that comparison is what discriminates a broken trailer emit, not the stats
+# leg. AssertStats here is a NON-discriminating liveness guard only: it
+# asserts the subject served http.ingress_http.downstream_rq_2xx >= 4 (one
+# per arm — success/notfound/unimplemented/plain all answer :status=200 even
+# on the gRPC-error arms, since the gRPC status rides in the trailers, not
+# :status). The reference books downstream_rq_2xx even for a stream whose
+# trailers are wrong, so a stats-only leg would stay green under the very
+# regression this fixture exists to catch. The floor exists to catch a
+# DIFFERENT failure mode: drive() records every per-arm failure INTO the
+# transcript as a READ-ERR line rather than returning an error, so a defect
+# hitting both sides identically the same way would otherwise produce a
+# byte-equal, all-READ-ERR transcript and a vacuous CompareBytes green.
+#
+# # Canonicalization — CLOSED at three rules
+#
+#   1. x-envoy-upstream-service-time dropped by exact name from response
+#      HEADERS (a per-request latency, unavoidably side-specific).
+#   2. date dropped by exact name from response HEADERS (a wall-clock
+#      timestamp).
+#   3. the dial address is scrubbed out of READ-ERR lines (the reference
+#      dials a Docker-mapped container port, the subject a local one).
+#
+# No sort anywhere: response HEADERS are wire order after the two drops,
+# TRAILERS are verbatim wire order (grpc-message before grpc-status, per
+# grpc-go) — a sort was measured vacuous and deliberately not added.
+#
+# # Topology — one cluster, one backend
+#
+#   - c_grpc: H2 upstream (typed_extension_protocol_options
+#     explicit_http_config.http2_protocol_options{}). Reference STRICT_DNS /
+#     host.docker.internal; subject STATIC / 127.0.0.1 (the shared-bridge
+#     shape, reference_docker_probe_bridge_network).
+#   - backend: 1 GRPCHealthResponder (BackendKind 34, existing — no new
+#     BackendKind added by this fixture).
+#   - l_h2: TLS+ALPN-h2 downstream listener (the 0004/0079 PKI shape),
+#     routed "/" -> c_grpc.
+#   - reference container listener port: 10119 (the 10<fixture index>
+#     convention, 0103+ era).
+#
+# # No standalone YAML mirrors
+#
+# Per the differential-fixture convention there are no standalone envoy.yaml
+# / envoy-go.yaml files — both bootstraps are Go string templates from
+# driver.ReferenceBootstrap / driver.SubjectConfig. This matches 3 of this
+# fixture's 4 closest analogues (0068/0079/0080, the other Go-built-bootstrap
+# fixtures over an H2 upstream cluster); 0004-h2-routing is the exception in
+# that set and DOES ship both mirrors plus a PKI generator — the no-mirrors
+# decision here stands on the narrower 3-of-4 ground, not a whole-corpus one.
+#
+# response-body: byte-exact required, but over the raw H2 frame transcript
+# produced by drive() (four ARM blocks of HEADERS/DATA/TRAILERS lines), which
+# is address-independent after canonicalization -> byte-equal cross-side.
+# response-status: N/A — this fixture records H2 frames, not HTTP status
+# lines; the analogous signal is the :status pseudo-header captured inside
+# each ARM's HEADERS line.
+# response-headers / response-trailers: captured verbatim (after the two
+# by-name drops on HEADERS only) as part of the byte-compared transcript,
+# not asserted separately from it.
+#
+# Admin /ready observation is exercised by the runner's compareAdminResponses
+# path (the phase-01 baseline; same allow-list as fixture 0000).
+#
+# Non-additions: NO new BackendKind (GRPCHealthResponder = 34, existing);
+# NO DistributionAsserter (single-backend topology; the four-arm frame
+# comparison carries the proof, not a request-distribution count).
+response-body:
+  applicable: true
+  scope: byte-exact
