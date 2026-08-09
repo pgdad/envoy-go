@@ -39,3 +39,17 @@ Docs-only: **ZERO production `.go`, ZERO test `.go`; `ROADMAP.md` BYTE-UNTOUCHED
 ## NEXT
 
 **PLAN** — task decomposition of the single leg in TDD order; refute the §10 enumeration by execution; the 6.5.2/2 accidental-pass probe; the IWS=0 seeding-quirk probe; guard NCs (a doctored selector MUST redden the harness); CI enrollment mechanics.
+
+## PLAN — done 2026-08-09
+
+Docs-only: **ZERO production `.go`, ZERO test `.go`; `ROADMAP.md` BYTE-UNTOUCHED** (verified by empty diff), **`DECISIONS.md` and `BEHAVIOR_CONTRACT.md` BYTE-UNTOUCHED**, `want` stays 117, strict `PROPOSED` guard stays **1**. Landed: `PLAN.md` (the nine-finding re-derivation ledger, the two probe verdicts, the seven-task single-leg decomposition with measured code, the executed break roster, the measured cost table) · `STATE.md` rolled in place · `next-prompt.txt` rolled to the IMPL.
+
+**Method:** TWO probe agents in DETACHED worktrees off `be018027` (bands 46700-46799 / 46800-46899; `p2p85-*` containers removed by name; both worktrees destroyed with byte-exact sha256 proof; nothing committed or pushed by either). **P1 built and ran the ENTIRE change set** — 11 unit arms RED on the unfixed tree, fixes green, harness repaired, the corrected gate **95/94/1/0 FIVE times**, three guard NCs fired. **P2 measured the two open questions at the frame level** (standalone raw-framer probe + h2spec `--verbose` + an instrumented-subject IWS census).
+
+**The four moved claims:** (1) the 6.5.2/2 pass is **GENUINE** — x/net's `parseSettingsFrame` rejects IWS>2^31-1 at parse time (SPEC's conditional validator arm dissolves into 3-line defense-in-depth; a REAL wrong-code handshake defect surfaces instead: `readClientSettings` blanket-wraps parse errors as PROTOCOL_ERROR where RFC wants FLOW_CONTROL_ERROR — new RED anchor + plumbing fix). (2) the IWS=0 quirk is REAL but **unit-only-discriminable** — the two probe agents CONFLICTED (P2: "co-requisite for 95-green"; P1: 95/94/1/0 three times WITHOUT it) and execution resolved it: a consistent clamp in seeding + effective-old compensates, `pendingDispatch` closes the timing hole; the announced-flag fix is IN, gated by its unit arm. (3) the SPEC's layer-2 guard is **deletable one roster entry at a time** — the roster-drop NC did NOT fire as SPEC'd; a REVERSE check (every running http2/* suite must be rostered) repairs it. (4) the roster is **31 http2/* suites, not 24** (49 total incl. 13 generic + 5 hpack, id collision re-confirmed). **Cost: measured net +757 `.go`** (production +127, harness +126, tests +504) vs the SPEC's ~420-750 band — the SEVENTH consecutive lower-bound firing, cause under-enumeration; IMPL budget ~760-900.
+
+**Sentinel (measured at this tip, `ROADMAP.md` untouched):** (1) `NOT DONE: row 85` — the single expected line at `want=117` · (2) SIX at `:195 :201 :207 :217 :223 :231` · (3) SILENT ⇒ does NOT fire; `stop` NOT created. All four NCs fired; every leak axis invariant (235/117, union 6, `-family row` 95/67, ARM-A 119+131 only).
+
+## NEXT
+
+**IMPL — the single leg** per PLAN §5: unit arms RED (11 measured reds re-proven at the IMPL tip), production fixes (validator + plumbing + announced flag + `window.adjust` + walk), harness repair (selectors, JUnit parse, three-layer guard WITH the reverse direction, 31-entry roster), guard NCs re-fired, ci.yml enrollment, the D-85-SWEEP doc set, ADR-0307 completed in place (guard 1 -> 0), row 85 flipped `done`, gate evidence `95 tests, 94 passed, 1 skipped, 0 failed` run LAST and quoted in the commit.
