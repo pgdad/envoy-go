@@ -25,3 +25,15 @@ BEFORE at `want=117`: (1) SILENT · (2) SIX `:195 :201 :207 :217 :223 :231` · (
 ## NEXT
 
 **SPEC** — the seven BRAINSTORM §4 open questions (Q2 boot-parity surface and Q3 reference-container run need EXECUTION); ADR-0308 §Context drafted STATUS `PROPOSED` (re-arms the strict guard 0 -> 1); cost ENUMERATION by prototype (the §3.3 floor is a floor — eighth consecutive lower-bound firing).
+
+## SPEC — done 2026-08-10
+
+Docs-only: **ZERO production `.go`, ZERO test `.go`.** `SPEC.md` (new) · `DECISIONS.md` +ADR-0308 §Context STATUS `PROPOSED` (18050 -> 18066, strictly append-only, strict guard ARMED 0 -> 1, tail ADR-0308, next-free ADR-0309) · `STATE.md` rolled in place · `STATE_HISTORY.md` 476 -> 478 (IMPL-84.2 evicted, two-way tie resolved by list position) · `next-prompt.txt` rolled to the PLAN. `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` **BYTE-UNTOUCHED**.
+
+**Method:** the BRAINSTORM's named departure CONTINUED — probes inline, no agents; PLUS a **compiling, test-green prototype of the chosen mechanism** in a detached worktree (deleted at close, diff in session scratch). All seven §4 questions DISPOSED: Q1 decided by MEASUREMENT (no-fetch sentinel provider; net +88 production across 4 files; option (b) dead at ~108 call sites); Q2 by EXECUTION (six build-time parity arms — incl. the NEW n7 `http2_protocol_options` arm — + the fetch-time exempt class); Q3 by EXECUTION (reference validates all three arms OK; node-absent is a BOTH-sides reject; no new departure minted); Q4 sweep (the `BEHAVIOR_CONTRACT.md:1062` "stays that way" REVERSAL rides ADR-0308); Q5 placement; Q6 zero landed strings change; Q7 all +0 verified post-change. Cost floors REFUTED as central (ninth `reference_measured_prototype_is_a_lower_bound` firing): IMPL budget ~110-160 net production + ~400-680 test.
+
+**Sentinel (measured):** (1) `NOT DONE: row 86` at `want=118` alone · (2) SIX `:196 :202 :208 :218 :224 :232` · (3) SILENT ⇒ no fire; `stop` NOT created. All four NCs fired.
+
+## NEXT
+
+**PLAN** — task decomposition of the four edit sites + test placement under D-86-SEQ (one leg); TDD order with RED anchors re-proven at the IMPL tip; guard-preservation NC roster; the contract-edit text riding ADR-0308; the budget carried as a FLOOR.
