@@ -2,6 +2,8 @@ package h2
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -113,9 +115,16 @@ func (s *ServerConn) Run() error {
 		return err
 	}
 
-	// Step 3: read client initial SETTINGS.
+	// Step 3: read client initial SETTINGS. Emit GOAWAY with the returned
+	// error's OWN code (e.g. a parse-rejected INITIAL_WINDOW_SIZE surfaces
+	// FLOW_CONTROL_ERROR, not a hardcoded PROTOCOL_ERROR) — phase 85.
 	if err := readClientSettings(s.fr, &s.clientS); err != nil {
-		s.emitGoaway(ErrProtocolError)
+		code := ErrProtocolError
+		var h2err *Error
+		if errors.As(err, &h2err) {
+			code = h2err.Code
+		}
+		s.emitGoaway(code)
 		return err
 	}
 
@@ -370,7 +379,13 @@ func (s *ServerConn) onHeaders(f *http2.HeadersFrame) error {
 	// the setting. The recv window initial size is OUR own announced value
 	// (governs how much the peer can send us before WINDOW_UPDATE).
 	peerInitWindow := int32(s.clientS.InitialWindowSize)
-	if peerInitWindow <= 0 {
+	if !s.clientS.InitialWindowSizeAnnounced {
+		// The client has never sent SETTINGS_INITIAL_WINDOW_SIZE — default
+		// per RFC 9113 §6.5.2. An explicitly announced 0 is a deliberate
+		// "hold all response DATA" instruction and must NOT be conflated
+		// with this default (phase 85 quirk fix; must share this exact
+		// computation with onSettings's walk effective-old, or h2spec
+		// 6.9.2/1 reds).
 		peerInitWindow = 65535
 	}
 	ss := newServerStream(streamID, s, peerInitWindow, int32(s.settings.InitialWindowSize))
@@ -505,19 +520,60 @@ func (s *ServerConn) onData(f *http2.DataFrame) error {
 }
 
 // onSettings handles an incoming SETTINGS frame.
+//
+// Validation runs strictly before application (phase 85): a first
+// ForeachSetting pass runs validateSetting over every parameter (first error
+// wins, captured outside the closure); only if that pass finds nothing wrong
+// does a second pass apply the values, so an invalid frame applies none of
+// its values. The apply pass's INITIAL_WINDOW_SIZE case additionally "walks"
+// every live stream's send window by the delta (RFC 9113 §6.9.2) — a change
+// discovered only during application (it depends on the streams open at
+// apply time), so it is reported via walkErr rather than the pre-pass.
 func (s *ServerConn) onSettings(f *http2.SettingsFrame) error {
 	if f.IsAck() {
 		// ACK for our server-initial SETTINGS — discard.
 		return nil
 	}
 
+	var validateErr *Error
+	_ = f.ForeachSetting(func(setting http2.Setting) error {
+		if validateErr == nil {
+			validateErr = validateSetting(setting)
+		}
+		return nil
+	})
+	if validateErr != nil {
+		return validateErr
+	}
+
 	// Apply new settings.
+	var walkErr error
 	_ = f.ForeachSetting(func(setting http2.Setting) error {
 		switch setting.ID {
 		case http2.SettingMaxConcurrentStreams:
 			s.clientS.MaxConcurrentStreams = setting.Val
 		case http2.SettingInitialWindowSize:
+			// Effective previous value MUST be computed the same way stream
+			// seeding computes it (the announced-flag form in onHeaders) or
+			// never-announced connections walk with a wrong delta.
+			old := int32(s.clientS.InitialWindowSize)
+			if !s.clientS.InitialWindowSizeAnnounced {
+				old = 65535
+			}
 			s.clientS.InitialWindowSize = setting.Val
+			s.clientS.InitialWindowSizeAnnounced = true
+			if delta := int32(setting.Val) - old; delta != 0 {
+				s.mu.Lock()
+				for id, ss := range s.streams {
+					if !ss.sendW.adjust(delta) {
+						s.mu.Unlock()
+						walkErr = connError(ErrFlowControlError,
+							fmt.Sprintf("SETTINGS_INITIAL_WINDOW_SIZE adjustment overflows stream %d send window", id))
+						return nil
+					}
+				}
+				s.mu.Unlock()
+			}
 		case http2.SettingMaxFrameSize:
 			s.clientS.MaxFrameSize = setting.Val
 		case http2.SettingHeaderTableSize:
@@ -530,6 +586,9 @@ func (s *ServerConn) onSettings(f *http2.SettingsFrame) error {
 		}
 		return nil
 	})
+	if walkErr != nil {
+		return walkErr
+	}
 
 	// ACK the peer's SETTINGS.
 	s.mu.Lock()

@@ -58,6 +58,17 @@ jobs:
         # is exactly the bug being fixed here. It still bounds a genuine hang.
         # Re-check this when the corpus grows substantially.
         run: go test ./test/differential/... -timeout 20m -v
+      - name: h2spec conformance (phase 85 / ADR-0307)
+        # The repaired 95-case strict gate (was 53/53 under nine silently
+        # no-op slash-form selectors since 2026-04-25 — ADR-0307). Joins this
+        # job because docker + testcontainers are already proven here; the
+        # gate's internal timeouts (5m overall / 3m container,
+        # h2spec_test.go) sit inside this job's 30-minute cap alongside the
+        # ~6.5-minute differential suite. Measured deterministic at n=3
+        # locally (95/90/1/4 identical, 5 ms inner spread); a CI-side flake,
+        # if one ever appears, is a recordable finding, not a license to
+        # unenroll silently.
+        run: go test ./test/conformance/h2spec/ -timeout 5m -v
     # Bound the job itself too: without this a hung suite would occupy a runner
     # for GitHub's 6-hour default instead of failing fast.
     timeout-minutes: 30

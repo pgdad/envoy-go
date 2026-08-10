@@ -2,6 +2,7 @@ package h2
 
 import (
 	"context"
+	"math"
 	"sync"
 )
 
@@ -35,6 +36,31 @@ func (w *window) replenish(delta int32) {
 	case w.ch <- struct{}{}:
 	default:
 	}
+}
+
+// adjust applies an INITIAL_WINDOW_SIZE delta (RFC 9113 §6.9.2) atomically.
+// Reports false when the adjusted window would leave int32 range (the caller
+// treats that as a connection error FLOW_CONTROL_ERROR). A negative result is
+// legal — reserveBlocking blocks until a WINDOW_UPDATE replenishes. On a
+// positive delta that leaves the window > 0, signal a blocked reserver the
+// same way replenish does.
+func (w *window) adjust(delta int32) bool {
+	w.mu.Lock()
+	sum := int64(w.n) + int64(delta)
+	if sum > math.MaxInt32 || sum < math.MinInt32 {
+		w.mu.Unlock()
+		return false
+	}
+	w.n = int32(sum)
+	wake := delta > 0 && w.n > 0
+	w.mu.Unlock()
+	if wake {
+		select {
+		case w.ch <- struct{}{}:
+		default:
+		}
+	}
+	return true
 }
 
 // reserveBlocking atomically waits for window > 0 and decrements up to max

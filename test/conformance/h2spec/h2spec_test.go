@@ -261,16 +261,21 @@ type junitTestSuites struct {
 // junitTestSuite represents a single <testsuite> in the JUnit XML.
 type junitTestSuite struct {
 	Name      string          `xml:"name,attr"`
+	Package   string          `xml:"package,attr"` // e.g. "http2/6.5.2" — the guard key; id COLLIDES across families
+	ID        string          `xml:"id,attr"`
 	Tests     int             `xml:"tests,attr"`
 	Failures  int             `xml:"failures,attr"`
 	Errors    int             `xml:"errors,attr"`
+	Skipped   int             `xml:"skipped,attr"`
 	TestCases []junitTestCase `xml:"testcase"`
 }
 
 // junitTestCase represents a single <testcase> in a testsuite.
 type junitTestCase struct {
-	Name    string        `xml:"name,attr"`
-	Failure *junitFailure `xml:"failure"`
+	Name      string        `xml:"name,attr"`      // EMPTY in h2spec output — kept for generic-JUnit tolerance
+	ClassName string        `xml:"classname,attr"` // h2spec puts the case description here
+	Failure   *junitFailure `xml:"failure"`
+	Error     *junitFailure `xml:"error"` // h2spec's actual failure element
 }
 
 // junitFailure is the <failure> element inside a test case.
@@ -295,6 +300,53 @@ func parseJUnitXML(data []byte) ([]junitTestSuite, error) {
 func assertThreshold(t *testing.T, suites []junitTestSuite) {
 	t.Helper()
 
+	// Guard (phase 85): three layers, keyed on the <testsuite> package attribute.
+	// The report also carries hpack/* and generic/* suites whose id values COLLIDE
+	// with http2 ones (id="6.1" twice in the captured XML) — filter FIRST.
+	var httpSuites []junitTestSuite
+	for _, s := range suites {
+		if strings.HasPrefix(s.Package, "http2/") {
+			httpSuites = append(httpSuites, s)
+		}
+	}
+	// Layer 1: every declared selector matched >= 1 case (a selector like
+	// "http2/5" fans out: match pkg == sel || HasPrefix(pkg, sel+".")).
+	for _, sel := range thresholdSections {
+		total := 0
+		for _, s := range httpSuites {
+			if s.Package == sel || strings.HasPrefix(s.Package, sel+".") {
+				total += s.Tests
+			}
+		}
+		if total == 0 {
+			t.Errorf("h2spec guard layer 1: declared selector %q matched ZERO cases — a silent no-op selector (the phase-85 defect shape)", sel)
+		}
+	}
+	// Layers 2+3: the pinned roster.
+	seen := make(map[string]int, len(httpSuites))
+	for _, s := range httpSuites {
+		seen[s.Package] += s.Tests
+	}
+	for pkg, minCases := range expectedSuites {
+		got, ok := seen[pkg]
+		switch {
+		case !ok:
+			t.Errorf("h2spec guard layer 2: suite %q absent from the report (image drift?)", pkg)
+		case got < minCases:
+			t.Errorf("h2spec guard layer 3: suite %q ran %d case(s), pinned minimum is %d", pkg, got, minCases)
+		}
+	}
+	// Layer 2 REVERSE direction (§1.2 — without this, the roster is deletable
+	// one entry at a time: a removed key is simply never iterated, measured):
+	// every http2/* suite that actually ran must be rostered.
+	for pkg, got := range seen {
+		if got > 0 {
+			if _, ok := expectedSuites[pkg]; !ok {
+				t.Errorf("h2spec guard layer 2: suite %q ran %d case(s) but has no expectedSuites roster entry", pkg, got)
+			}
+		}
+	}
+
 	type suiteResult struct {
 		name     string
 		tests    int
@@ -307,21 +359,26 @@ func assertThreshold(t *testing.T, suites []junitTestSuite) {
 	totalFailures := 0
 
 	for _, s := range suites {
-		if s.Tests == 0 {
-			continue
-		}
 		res := suiteResult{
 			name:     s.Name,
 			tests:    s.Tests,
 			failures: s.Failures + s.Errors,
 		}
 		for _, tc := range s.TestCases {
-			if tc.Failure != nil {
-				msg := tc.Failure.Message
+			fail := tc.Failure
+			if fail == nil {
+				fail = tc.Error
+			}
+			if fail != nil {
+				msg := fail.Message
 				if msg == "" {
-					msg = strings.TrimSpace(tc.Failure.Text)
+					msg = strings.TrimSpace(fail.Text)
 				}
-				res.failed = append(res.failed, fmt.Sprintf("%s: %s", tc.Name, msg))
+				name := tc.ClassName
+				if name == "" {
+					name = tc.Name
+				}
+				res.failed = append(res.failed, fmt.Sprintf("%s: %s", name, msg))
 			}
 		}
 		results = append(results, res)

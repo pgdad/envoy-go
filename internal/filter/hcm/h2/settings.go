@@ -35,6 +35,13 @@ type clientSettings struct {
 	MaxFrameSize         uint32
 	HeaderTableSize      uint32
 	EnablePush           uint32
+	// InitialWindowSizeAnnounced distinguishes "the client explicitly
+	// announced SETTINGS_INITIAL_WINDOW_SIZE=0" (a legal RFC 9113 §6.9.2
+	// value that must hold all response DATA) from "the client has never
+	// sent the setting" (the zero Go value, which must default to 65535).
+	// Set at both assignment sites: readClientSettings (handshake path) and
+	// ServerConn.onSettings (mid-connection path). Phase 85; ADR-0307.
+	InitialWindowSizeAnnounced bool
 }
 
 // writeServerInitialSettings writes a single SETTINGS frame (no ACK flag) to
@@ -72,14 +79,52 @@ func writeClientInitialSettings(fr *framer, s ServerSettings) error {
 	)
 }
 
+// validateSetting enforces the RFC 9113 §6.5.2 value constraints for one
+// SETTINGS parameter. nil means acceptable. The returned error carries the
+// RFC-mandated connection-error code: PROTOCOL_ERROR for ENABLE_PUSH and
+// MAX_FRAME_SIZE violations, FLOW_CONTROL_ERROR for an INITIAL_WINDOW_SIZE
+// above 2^31-1. Called from BOTH the handshake path (readClientSettings) and
+// the mid-connection path (ServerConn.onSettings) — phase 85; ADR-0307.
+func validateSetting(st http2.Setting) *Error {
+	switch st.ID {
+	case http2.SettingEnablePush:
+		if st.Val > 1 {
+			return &Error{Code: ErrProtocolError, Msg: "SETTINGS_ENABLE_PUSH must be 0 or 1"}
+		}
+	case http2.SettingMaxFrameSize:
+		if st.Val < 16384 || st.Val > 16777215 {
+			return &Error{Code: ErrProtocolError, Msg: "SETTINGS_MAX_FRAME_SIZE outside [2^14, 2^24-1]"}
+		}
+	case http2.SettingInitialWindowSize:
+		// Values > 2^31-1 are rejected at frame-PARSE time by the vendored
+		// x/net framer (parseSettingsFrame returns
+		// ConnectionError(ErrCodeFlowControl) before this code runs), so this
+		// arm is defense-in-depth against an x/net behavior change, not a
+		// live rejection path. Measured cost: 3 code lines (PLAN §2.1).
+		if st.Val > 2147483647 {
+			return &Error{Code: ErrFlowControlError, Msg: "SETTINGS_INITIAL_WINDOW_SIZE exceeds 2^31-1"}
+		}
+	}
+	return nil
+}
+
 // readClientSettings reads one SETTINGS frame from fr and applies its values
 // to applyTo. Returns *Error{Code: PROTOCOL_ERROR} if the first frame is a
 // SETTINGS_ACK (RFC 9113 §6.5: server must read client's initial SETTINGS
 // before reading the ACK to its own).
+//
+// Validation runs strictly before application: a first ForeachSetting pass
+// runs validateSetting over every parameter (first error wins, captured
+// outside the closure); only if that pass finds nothing wrong does a second
+// pass apply the values, so an invalid frame applies none of its values.
 func readClientSettings(fr *framer, applyTo *clientSettings) error {
 	frame, err := fr.ReadFrame()
 	if err != nil {
-		return &Error{Code: ErrProtocolError, Msg: "read client SETTINGS", Underlying: err}
+		// Preserve the framer's own ConnectionError/StreamError code (e.g. an
+		// x/net parse-time reject of INITIAL_WINDOW_SIZE > 2^31-1 surfaces
+		// FLOW_CONTROL_ERROR) instead of blanket-wrapping every read failure
+		// as PROTOCOL_ERROR.
+		return translateFramerErr(err)
 	}
 	sf, ok := frame.(*http2.SettingsFrame)
 	if !ok {
@@ -88,12 +133,25 @@ func readClientSettings(fr *framer, applyTo *clientSettings) error {
 	if sf.IsAck() {
 		return &Error{Code: ErrProtocolError, Msg: "ACK on first client SETTINGS"}
 	}
+
+	var firstErr *Error
+	_ = sf.ForeachSetting(func(s http2.Setting) error {
+		if firstErr == nil {
+			firstErr = validateSetting(s)
+		}
+		return nil
+	})
+	if firstErr != nil {
+		return firstErr
+	}
+
 	_ = sf.ForeachSetting(func(s http2.Setting) error {
 		switch s.ID {
 		case http2.SettingMaxConcurrentStreams:
 			applyTo.MaxConcurrentStreams = s.Val
 		case http2.SettingInitialWindowSize:
 			applyTo.InitialWindowSize = s.Val
+			applyTo.InitialWindowSizeAnnounced = true
 		case http2.SettingMaxFrameSize:
 			applyTo.MaxFrameSize = s.Val
 		case http2.SettingHeaderTableSize:
