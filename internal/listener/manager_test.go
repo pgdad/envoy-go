@@ -675,6 +675,86 @@ func mkDownstreamTSRequireClientCert(t *testing.T) *corev3.TransportSocket {
 	}
 }
 
+// mkSDSDownstreamTS builds a corev3.TransportSocket carrying a
+// DownstreamTlsContext whose common_tls_context has a single valid
+// tls_certificate_sds_secret_configs entry (api_config_source GRPC/V3),
+// mirroring internal/tls/config_test.go's sdsSecretConfig helper. Used by
+// phase-86 (ADR-0308) NC-6: listener.NewManager and NewManagerWithBaseDir
+// (exported, test-only constructors) hardcode sdsProvider=nil regardless of
+// bootstrap contents, so an SDS-carrying bootstrap through either must keep
+// rejecting even though phase-86 introduces a validate-mode sentinel
+// elsewhere (validate.Bootstrap) — these two constructors are not that path.
+func mkSDSDownstreamTS(t *testing.T) *corev3.TransportSocket {
+	t.Helper()
+	cs := &corev3.ConfigSource{
+		ConfigSourceSpecifier: &corev3.ConfigSource_ApiConfigSource{
+			ApiConfigSource: &corev3.ApiConfigSource{
+				ApiType:             corev3.ApiConfigSource_GRPC,
+				TransportApiVersion: corev3.ApiVersion_V3,
+				GrpcServices: []*corev3.GrpcService{
+					{
+						TargetSpecifier: &corev3.GrpcService_EnvoyGrpc_{
+							EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{ClusterName: "sds_cluster"},
+						},
+					},
+				},
+			},
+		},
+		ResourceApiVersion: corev3.ApiVersion_V3,
+	}
+	inner := &tlsv3.DownstreamTlsContext{
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			TlsCertificateSdsSecretConfigs: []*tlsv3.SdsSecretConfig{
+				{Name: "server_cert", SdsConfig: cs},
+			},
+		},
+	}
+	a, err := anypb.New(inner)
+	if err != nil {
+		t.Fatalf("anypb.New DownstreamTlsContext (SDS): %v", err)
+	}
+	return &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.tls",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: a},
+	}
+}
+
+// TestManager_SDSBootstrap_NilProviderRejects_NC6 (PLAN §4 NC-6, phase 86,
+// ADR-0308): NewManager and NewManagerWithBaseDir both hardcode
+// sdsProvider=nil at their NewManagerWithBaseDirAndAllowH2C call site
+// (manager.go), independent of any caller's mode — an SDS-carrying bootstrap
+// through EITHER exported constructor must keep rejecting with the
+// byte-identical arm-A nil-provider string.
+func TestManager_SDSBootstrap_NilProviderRejects_NC6(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	filter := mkTcpProxyFilter(t, "c_echo")
+	chain := mkTLSChain(nil, mkSDSDownstreamTS(t), filter)
+	l := mkTLSListener("l_sds", "127.0.0.1", 0, []*listenerv3.FilterChain{chain})
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+
+	const want = "requires a live SDS provider"
+
+	t.Run("NewManager", func(t *testing.T) {
+		_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+		}
+	})
+
+	t.Run("NewManagerWithBaseDir", func(t *testing.T) {
+		_, err := NewManagerWithBaseDir(boot, cm, "", stats.NewRegistry(), testHTTPRegistry())
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+		}
+	})
+}
+
 // mkTLSChain builds a filter chain with the given server_names and transport_socket.
 // Pass a nil transport_socket for a plaintext chain.
 func mkTLSChain(serverNames []string, ts *corev3.TransportSocket, filter *listenerv3.Filter) *listenerv3.FilterChain {

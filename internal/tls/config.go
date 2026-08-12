@@ -121,6 +121,12 @@ func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string, provider xd
 			// (FuzzTLSContextParse).
 			return nil, fmt.Errorf("tls: downstream: %w", err)
 		}
+		if xds.IsNoFetch(provider) {
+			// validate mode (phase 86, ADR-0308): structural validation
+			// (ParseSDSConfig) already ran; no fetch, no installPool, no
+			// fabricated pool. ClientCAs/ClientAuth stay at their zero values.
+			return &DownstreamConfig{TLSConfig: cfg}, nil
+		}
 		pool, err := provider.FetchInitialValidationContext(context.Background(), secretName)
 		if err != nil {
 			// A timeout / unreachable management server boot-FAILS the listener — the
@@ -180,6 +186,13 @@ func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string, provider xd
 			// xds: -prefixed -> wrap to preserve the `tls: ` invariant
 			// (FuzzTLSContextParse).
 			return nil, fmt.Errorf("tls: downstream: %w", err)
+		}
+		if xds.IsNoFetch(provider) {
+			// validate mode (phase 86, ADR-0308): structural validation
+			// (ParseSDSConfig, plus commonTLSContextToConfig's E1/E2 presence
+			// checks that already ran) is complete; no fetch, no installPool, no
+			// fabricated pool.
+			return &DownstreamConfig{TLSConfig: cfg}, nil
 		}
 		pool, err := provider.FetchInitialValidationContext(context.Background(), secretName)
 		if err != nil {
@@ -343,7 +356,15 @@ func loadTrustedCAPool(vc *tlsv3.CertificateValidationContext, baseDir, side str
 // "downstream" or "upstream" and prefixes every error. provider is the
 // phase-60.2 (ADR-0280) SDS seam — consulted only when side=="downstream" and
 // the config carries a tls_certificate_sds_secret_configs entry; nil for
-// upstream/validate callers, which never fetch SDS.
+// upstream callers, which never fetch SDS. Phase 86 (ADR-0308): when the
+// bootstrap carries any SDS-bound downstream TLS context, validate's
+// pre-scan (boot.NewValidateSDSProvider) detects it and passes the
+// xds.IsNoFetch sentinel here instead of nil — still never fetching SDS,
+// but letting structural validation run and the nil-provider reject below
+// distinguish "no provider" from "provider present, fetch deferred to
+// boot". At seen==0 (no SDS-bound shape anywhere) validate still threads a
+// literal nil here, exactly like the boot path; nil remains the value that
+// reject exists to catch.
 //
 // Phase-03 forbids the following; each errors with a clear message:
 //   - tls_certificate_sds_secret_configs set (upstream/validate only — see
@@ -376,6 +397,12 @@ func commonTLSContextToConfig(c *tlsv3.CommonTlsContext, baseDir, side string, p
 	// here → the listener build FAILS → boot FAILS (the documented envoy-go
 	// DEPARTURE from the reference's serve-cert-less behavior, SPEC §3.4).
 	var sdsCert *stdtls.Certificate
+	// sdsCertPromised (phase 86, ADR-0308 — D-86-NOFETCH-CERT): true when a
+	// no-fetch (validate-mode) sentinel provider skipped this arm's fetch. The
+	// leaf never lands in cfg.Certificates, but the listener's ONLY certificate
+	// source is legitimately SDS, so the mandatory-TLS empty-cert reject below
+	// must not fire — the leaf arrives at runtime, not at validate time.
+	var sdsCertPromised bool
 	if len(c.GetTlsCertificateSdsSecretConfigs()) > 0 {
 		if side != "downstream" {
 			return nil, fmt.Errorf("tls: %s: SDS-bound tls_certificate_sds_secret_configs is not supported in phase 03", side)
@@ -387,11 +414,19 @@ func commonTLSContextToConfig(c *tlsv3.CommonTlsContext, baseDir, side string, p
 		if provider == nil {
 			return nil, fmt.Errorf("tls: downstream: SDS-delivered certificate requires a live SDS provider (unavailable in this mode)")
 		}
-		cert, err := provider.FetchInitialCertificate(context.Background(), secretName)
-		if err != nil {
-			return nil, fmt.Errorf("tls: downstream: SDS secret %q: %w", secretName, err)
+		if xds.IsNoFetch(provider) {
+			// validate mode: the sentinel is non-nil so the nil-provider reject
+			// above did not fire, but there is no live SDS stream to fetch from.
+			// Structural validation (ParseSDSConfig) already ran; the leaf is
+			// promised to arrive at runtime.
+			sdsCertPromised = true
+		} else {
+			cert, err := provider.FetchInitialCertificate(context.Background(), secretName)
+			if err != nil {
+				return nil, fmt.Errorf("tls: downstream: SDS secret %q: %w", secretName, err)
+			}
+			sdsCert = cert
 		}
-		sdsCert = cert
 	}
 
 	if c.GetValidationContextType() != nil {
@@ -404,7 +439,7 @@ func commonTLSContextToConfig(c *tlsv3.CommonTlsContext, baseDir, side string, p
 			// not on this CommonTlsContext). Here it is a NO-OP for the
 			// downstream+provider path.
 			//
-			// The guard below has TWO live production consumers plus TWO exported
+			// The guard below has ONE live production consumer plus TWO exported
 			// test-only constructors (verified by walking every caller of
 			// NewDownstreamConfig/NewQUICDownstreamConfig/NewManagerWithBaseDirAndAllowH2C
 			// repo-wide, including cmd/ and validate/, not just internal/):
@@ -414,11 +449,19 @@ func commonTLSContextToConfig(c *tlsv3.CommonTlsContext, baseDir, side string, p
 			//     pre-scan (it matches only the plain DownstreamTlsContext type_url,
 			//     never QUIC's wrapper), so this fires independent of any other
 			//     listener's SDS shape;
-			//   - validate.Bootstrap (validate/validate.go), which threads a LITERAL
-			//     nil sdsProvider into boot.Construct unconditionally — no pre-scan
-			//     gates it;
 			//   - listener.NewManager / NewManagerWithBaseDir (exported, test-only):
 			//     both hardcode sdsProvider=nil regardless of bootstrap contents.
+			// Phase 86 (ADR-0308): when the bootstrap carries an SDS-bound
+			// validation_context_sds_secret_config, validate.Bootstrap's pre-scan
+			// (boot.NewValidateSDSProvider) detects that same shape — this oneof
+			// arm always increments seen on a non-QUIC listener, the same
+			// detection commonTLSContextToConfig uses here — and threads the
+			// no-fetch sentinel into boot.Construct instead of nil, so it LEAVES
+			// this roster in that case. At seen==0 no such shape exists anywhere
+			// in the bootstrap (this arm cannot be selected on a non-QUIC
+			// listener without tripping seen), so nil cannot reach THIS reject
+			// via validate.Bootstrap either way; QUIC and the two test-only
+			// constructors above remain the only nil-passing consumers.
 			// main.go's ordinary boot path is NOT a consumer of THIS arm — unlike the
 			// combined_validation_context arm below (whose pure-inline shape the
 			// pre-scan deliberately excludes from its seen count),
@@ -444,12 +487,22 @@ func commonTLSContextToConfig(c *tlsv3.CommonTlsContext, baseDir, side string, p
 			// DownstreamTlsContext, not on this CommonTlsContext). Here it is a NO-OP
 			// for the downstream+provider path.
 			//
-			// The guard below is retained BYTE-IDENTICAL (ADR-0080). It has THREE live
-			// consumers: NewQUICDownstreamConfig (literal nil provider),
-			// validate.Bootstrap (nil), and main.go's ordinary path when
-			// boot.NewSDSProvider returns (nil, nil) at seen==0. It MUST precede the
-			// E1/E2 checks below, or those consumers would receive E1/E2's message
-			// instead of this byte-identical one.
+			// The guard below is retained BYTE-IDENTICAL (ADR-0080). It has TWO live
+			// consumers: NewQUICDownstreamConfig (literal nil provider), and
+			// main.go's ordinary path when boot.NewSDSProvider returns (nil, nil)
+			// at seen==0 — including a pure-inline combined_validation_context
+			// (no SDS half), which the pre-scan deliberately excludes from seen
+			// (internal/boot's newSDSProviderAndClient, D2). Phase 86 (ADR-0308):
+			// when the bootstrap carries any SDS-bound shape, validate.Bootstrap's
+			// pre-scan (boot.NewValidateSDSProvider) detects it and threads the no-fetch
+			// sentinel into boot.Construct instead of nil, so it LEAVES this
+			// roster in that case. At seen==0 — including the pure-inline
+			// combined_validation_context case above — validate still threads
+			// (nil, nil) through boot.Construct exactly like the boot path, so
+			// validate.Bootstrap remains a THIRD consumer of this reject there,
+			// same as pre-86. It MUST precede the E1/E2 checks below, or those
+			// consumers would receive E1/E2's message instead of this
+			// byte-identical one.
 			if side != "downstream" || provider == nil {
 				return nil, fmt.Errorf("tls: %s: combined_validation_context is not supported in phase 03", side)
 			}
@@ -515,7 +568,7 @@ func commonTLSContextToConfig(c *tlsv3.CommonTlsContext, baseDir, side string, p
 		cfg.Certificates = append(cfg.Certificates, pair)
 	}
 
-	if side == "downstream" && len(cfg.Certificates) == 0 {
+	if side == "downstream" && len(cfg.Certificates) == 0 && !sdsCertPromised {
 		return nil, fmt.Errorf("tls: downstream: no tls_certificates configured")
 	}
 

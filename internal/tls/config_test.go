@@ -880,6 +880,53 @@ func sdsUpstreamTS(t *testing.T, secret, cluster string) *corev3.TransportSocket
 	})
 }
 
+// sdsOnlyCertCTC builds a *tlsv3.CommonTlsContext carrying ONLY a
+// tls_certificate_sds_secret_configs entry — no static tls_certificates at
+// all. It exercises the phase-86 (ADR-0308) D-86-NOFETCH-CERT interplay: with
+// no static cert AND the SDS fetch skipped under the no-fetch sentinel, the
+// mandatory-TLS empty-cert reject (`no tls_certificates configured`) in
+// commonTLSContextToConfig must NOT fire, because the
+// listener's only certificate source legitimately IS SDS.
+func sdsOnlyCertCTC() *tlsv3.CommonTlsContext {
+	return &tlsv3.CommonTlsContext{
+		TlsCertificateSdsSecretConfigs: []*tlsv3.SdsSecretConfig{sdsSecretConfig("server_cert", "sds_cluster")},
+	}
+}
+
+// TestCommonTLSContext_ArmA_NoFetchSentinel_Accepted pins the phase-86
+// (ADR-0308) post-fix contract: the no-fetch sentinel provider ACCEPTS the
+// arm-A shape (SDS-bound tls_certificate_sds_secret_configs) with NO fetch —
+// xds.IsNoFetch short-circuits FetchInitialCertificate — and fabricates no
+// certificate material.
+func TestCommonTLSContext_ArmA_NoFetchSentinel_Accepted(t *testing.T) {
+	cfg, err := commonTLSContextToConfig(sdsOnlyCertCTC(), "", "downstream", xds.NoFetchProvider())
+	if err != nil {
+		t.Fatalf("sentinel provider must accept the arm-A shape without fetching: %v", err)
+	}
+	if len(cfg.Certificates) != 0 {
+		t.Errorf("no material may be fabricated: got %d certificates, want 0", len(cfg.Certificates))
+	}
+}
+
+// TestCommonTLSContext_ArmA_SDSOnlyCert_NoEmptyCertReject is the D-86-NOFETCH-CERT
+// interplay pin: an SDS-ONLY-cert listener (no static tls_certificates at all)
+// must NOT hit the mandatory-TLS empty-cert reject (`no tls_certificates configured` in
+// commonTLSContextToConfig) once the SDS
+// fetch is skipped under the sentinel — sdsCertPromised must gate that reject.
+// On failure this distinguishes the mandatory-TLS empty-cert reject specifically
+// (the regression this test exists to catch) from any OTHER unexpected error at
+// this site, via a dedicated Fatalf message per case — the substring check runs
+// on the actual error path, not after a bare err==nil gate.
+func TestCommonTLSContext_ArmA_SDSOnlyCert_NoEmptyCertReject(t *testing.T) {
+	_, err := commonTLSContextToConfig(sdsOnlyCertCTC(), "", "downstream", xds.NoFetchProvider())
+	if err != nil {
+		if strings.Contains(err.Error(), "no tls_certificates configured") {
+			t.Fatalf("the mandatory-TLS empty-cert reject fired despite sdsCertPromised: %v", err)
+		}
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestNewDownstreamConfig_SDS exercises the phase-60.2 (ADR-0280) downstream
 // SDS lift: a well-formed tls_certificate_sds_secret_configs entry is parsed
 // via xds.ParseSDSConfig, then (given a live provider) blocks on
@@ -1181,6 +1228,165 @@ func TestNewQUICDownstreamConfig_WrongTypeURL(t *testing.T) {
 	_, err := NewQUICDownstreamConfig(ts, "")
 	if err == nil || !strings.Contains(err.Error(), "unexpected quic transport_socket type_url") {
 		t.Fatalf("expected wrong-type-URL error, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 86 (ADR-0308): the no-fetch (validate-mode) sentinel — VC-SDS and CVC
+// accept arms, plus the guard-preservation NC roster (NC-1..NC-5; NC-6 lives
+// in internal/listener, NC-7 in internal/boot, NC-8/NC-9 in internal/xds).
+// ---------------------------------------------------------------------------
+
+// TestNewDownstreamConfig_VCSDS_NoFetchSentinel_Accepted pins the phase-86
+// post-fix contract for arm B: a well-formed validation_context_sds_secret_config
+// downstream listener, given a static cert and the no-fetch sentinel, builds
+// with NO fetch and NO fabricated pool — ClientCAs stays nil.
+func TestNewDownstreamConfig_VCSDS_NoFetchSentinel_Accepted(t *testing.T) {
+	cfg, err := NewDownstreamConfig(sdsVCDownstreamTS(t, nil), "", xds.NoFetchProvider())
+	if err != nil {
+		t.Fatalf("sentinel provider must accept the arm-B shape without fetching: %v", err)
+	}
+	if cfg == nil || cfg.TLSConfig == nil {
+		t.Fatal("expected non-nil DownstreamConfig with non-nil TLSConfig")
+	}
+	if cfg.TLSConfig.ClientCAs != nil {
+		t.Error("no material may be fabricated: ClientCAs must stay nil under the sentinel")
+	}
+}
+
+// TestNewDownstreamConfig_CVC_NoFetchSentinel_Accepted pins the phase-86
+// post-fix contract for arm C: a well-formed combined_validation_context
+// downstream listener, given the no-fetch sentinel, builds with NO fetch and
+// NO fabricated pool. The E1/E2 presence checks inside commonTLSContextToConfig
+// run BEFORE this skip and stay enforced under the sentinel — a CVC missing
+// default_validation_context still rejects with the E1 message.
+func TestNewDownstreamConfig_CVC_NoFetchSentinel_Accepted(t *testing.T) {
+	t.Run("accepted", func(t *testing.T) {
+		cfg, err := NewDownstreamConfig(cvcDownstreamTS(t, nil), "", xds.NoFetchProvider())
+		if err != nil {
+			t.Fatalf("sentinel provider must accept the arm-C shape without fetching: %v", err)
+		}
+		if cfg == nil || cfg.TLSConfig == nil {
+			t.Fatal("expected non-nil DownstreamConfig with non-nil TLSConfig")
+		}
+		if cfg.TLSConfig.ClientCAs != nil {
+			t.Error("no material may be fabricated: ClientCAs must stay nil under the sentinel")
+		}
+	})
+
+	t.Run("E1 missing default_validation_context still rejects under the sentinel", func(t *testing.T) {
+		ts := makeTransportSocket(t, &tlsv3.DownstreamTlsContext{
+			CommonTlsContext: cvcCTC(func(c *tlsv3.CommonTlsContext_CombinedCertificateValidationContext) {
+				c.DefaultValidationContext = nil
+			}),
+		})
+		_, err := NewDownstreamConfig(ts, "", xds.NoFetchProvider())
+		if err == nil {
+			t.Fatal("expected E1, got nil")
+		}
+		const want = "combined_validation_context.default_validation_context is required"
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q — the sentinel must not bypass structural presence checks", err.Error(), want)
+		}
+	})
+}
+
+// TestArmA_NilProvider_GuardPreserved_NC1 (PLAN §4 NC-1): adjacent to the new
+// xds.IsNoFetch skip, a genuinely nil provider (not the sentinel) must still
+// hit the arm-A reject — beyond the pin at TestNewDownstreamConfig_SDS's "nil
+// provider with valid SDS config" subtest, exercised here directly against
+// commonTLSContextToConfig at the arm-A call site.
+func TestArmA_NilProvider_GuardPreserved_NC1(t *testing.T) {
+	_, err := commonTLSContextToConfig(sdsOnlyCertCTC(), "", "downstream", nil)
+	if err == nil {
+		t.Fatal("expected the arm-A nil-provider reject, got nil")
+	}
+	const want = "requires a live SDS provider"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+}
+
+// TestVCSDS_NilProvider_GuardPreserved_NC2 (PLAN §4 NC-2): a genuinely nil
+// provider on the arm-B (VC-SDS) shape, driven through the FULL
+// NewDownstreamConfig entry point, must still reject — commonTLSContextToConfig's
+// oneof gate fires BEFORE the new xds.IsNoFetch skip inside NewDownstreamConfig's
+// own VC-SDS block is ever reached, so nil never reaches the new skip site.
+func TestVCSDS_NilProvider_GuardPreserved_NC2(t *testing.T) {
+	_, err := NewDownstreamConfig(sdsVCDownstreamTS(t, nil), "", nil)
+	if err == nil {
+		t.Fatal("expected the phase-03 VC-SDS reject, got nil")
+	}
+	const want = "SDS-bound validation_context_sds_secret_config is not supported in phase 03"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+}
+
+// TestCVC_NilProvider_GuardPreserved_NC3 (PLAN §4 NC-3): a genuinely nil
+// provider on the arm-C (CVC) shape, driven through the FULL
+// NewDownstreamConfig entry point, must still reject — commonTLSContextToConfig's
+// CVC gate fires BEFORE the new xds.IsNoFetch skip inside NewDownstreamConfig's
+// own CVC block is ever reached, so nil never reaches the new skip site.
+func TestCVC_NilProvider_GuardPreserved_NC3(t *testing.T) {
+	_, err := NewDownstreamConfig(cvcDownstreamTS(t, nil), "", nil)
+	if err == nil {
+		t.Fatal("expected the retained phase-03 CVC reject, got nil")
+	}
+	if !strings.Contains(err.Error(), cvcRetainedReject) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), cvcRetainedReject)
+	}
+}
+
+// mkQUICDownstreamTSWithCTC wraps an arbitrary *tlsv3.CommonTlsContext in a
+// QuicDownstreamTransport + TransportSocket, for probing shapes
+// mkQUICDownstreamTS's cert/key/alpn-only signature cannot build (SDS,
+// validation_context_sds_secret_config, combined_validation_context).
+func mkQUICDownstreamTSWithCTC(t *testing.T, ctc *tlsv3.CommonTlsContext) *corev3.TransportSocket {
+	t.Helper()
+	inner := &quicv3.QuicDownstreamTransport{
+		DownstreamTlsContext: &tlsv3.DownstreamTlsContext{CommonTlsContext: ctc},
+	}
+	a, err := anypb.New(inner)
+	if err != nil {
+		t.Fatalf("anypb.New QuicDownstreamTransport: %v", err)
+	}
+	return &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.quic",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: a},
+	}
+}
+
+// TestNewQUICDownstreamConfig_SDSCert_NilProviderGuardPreserved_NC4 (PLAN §4
+// NC-4): a QUIC-wrapped listener whose inner DownstreamTlsContext carries
+// tls_certificate_sds_secret_configs must keep rejecting REGARDLESS of mode —
+// NewQUICDownstreamConfig hardcodes a literal nil provider (config.go, the
+// commonTLSContextToConfig call inside NewQUICDownstreamConfig), so it can
+// never inherit the validate-mode sentinel.
+func TestNewQUICDownstreamConfig_SDSCert_NilProviderGuardPreserved_NC4(t *testing.T) {
+	ts := mkQUICDownstreamTSWithCTC(t, sdsOnlyCertCTC())
+	_, err := NewQUICDownstreamConfig(ts, "")
+	if err == nil {
+		t.Fatal("expected the arm-A nil-provider reject, got nil")
+	}
+	const want = "requires a live SDS provider"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+}
+
+// TestNewQUICDownstreamConfig_CVC_NilProviderGuardPreserved_NC5 (PLAN §4 NC-5):
+// a QUIC-wrapped listener whose inner DownstreamTlsContext carries a
+// combined_validation_context must keep rejecting REGARDLESS of mode — same
+// hardcoded-nil rationale as NC-4.
+func TestNewQUICDownstreamConfig_CVC_NilProviderGuardPreserved_NC5(t *testing.T) {
+	ts := mkQUICDownstreamTSWithCTC(t, cvcCTC())
+	_, err := NewQUICDownstreamConfig(ts, "")
+	if err == nil {
+		t.Fatal("expected the retained phase-03 CVC reject, got nil")
+	}
+	if !strings.Contains(err.Error(), cvcRetainedReject) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), cvcRetainedReject)
 	}
 }
 

@@ -566,10 +566,18 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 				// envoy.transport_sockets.quic wraps an inline DownstreamTlsContext.
 				dc, derr = internaltls.NewQUICDownstreamConfig(ts, baseDir)
 			} else {
-				// sdsProvider: nil at all pre-60.2 call sites (NewManager,
-				// NewManagerWithBaseDir, and test callers), so an
-				// SDS-bound tls_certificate_sds_secret_configs here still errors
-				// ("requires a live SDS provider"), matching pre-60.2 behavior.
+				// sdsProvider: nil at NewManager and NewManagerWithBaseDir
+				// (exported, test-only constructors that still hardcode nil), so
+				// an SDS-bound tls_certificate_sds_secret_configs here still
+				// errors ("requires a live SDS provider"), matching pre-60.2
+				// behavior. Phase 86 (ADR-0308): when the bootstrap carries any
+				// SDS-bound shape, the validate-mode caller (validate.Bootstrap,
+				// via boot.Construct) threads boot.NewValidateSDSProvider's
+				// no-fetch sentinel through Construct instead of nil, so this
+				// branch no longer sees nil there in that case. At seen==0 (no
+				// SDS-bound shape anywhere) validate still threads (nil, nil)
+				// through Construct exactly like the boot path — nil remains the
+				// value that triggers the reject above.
 				dc, derr = internaltls.NewDownstreamConfig(ts, baseDir, sdsProvider)
 			}
 			if derr != nil {

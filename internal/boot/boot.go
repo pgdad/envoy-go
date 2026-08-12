@@ -104,20 +104,27 @@ func NewTracingProvider(dialer *grpcclient.Dialer, httpClient *httpclient.Client
 	return tracing.NewExporterProvider(tracesDialerAdapter{dialer}, zipkinTransportAdapter{httpClient, cm}, registry, 16384, time.Second)
 }
 
-// NewSDSProvider pre-scans bs for the (single, MVP) downstream SDS-bound TLS
-// context and, when present, builds the blocking xds.SecretProvider that
-// internal/tls consults at listener construction (phase 60.2, ADR-0280). It
-// mirrors NewTracingProvider: built once at boot from the shared dialer, then
-// threaded through Construct into the listener build. Returns (nil, nil) when no
-// SDS cert is configured (the nil provider threads harmlessly — the tls lift
-// only engages when a listener actually carries tls_certificate_sds_secret_configs).
+// newSDSProviderAndClient pre-scans bs for the (single, MVP) downstream
+// SDS-bound TLS context and, when present, builds the blocking
+// xds.SecretProvider that internal/tls consults at listener construction
+// (phase 60.2, ADR-0280), ALONG WITH the *grpcclient.SDSClient the provider's
+// opener wraps. Both NewSDSProvider (the ordinary boot path, which keeps the
+// client open for the provider's lifetime) and NewValidateSDSProvider
+// (--mode validate, which closes the never-dialed client and substitutes the
+// no-fetch sentinel) share this ENTIRE pre-scan, so every present and future
+// pre-scan arm is inherited by construction — parity by CODE-PATH, not by
+// re-derivation (phase 86, ADR-0308).
+//
+// Returns (nil, nil, nil) when no SDS cert is configured anywhere (the nil
+// provider threads harmlessly — the tls lift only engages when a listener
+// actually carries tls_certificate_sds_secret_configs).
 //
 // Enforces the NODE boot-requirement (arm 7, SPEC §6/§11 Arm A-pre): SDS
 // configured while bootstrap node.id/node.cluster are empty ⇒ boot-fail. The
 // cluster/secret/timeout are extracted via xds.ParseSDSConfig (arms 1-4,8,9);
 // the *grpcclient.SDSClient edge is carried by xdsgrpc.NewOpener so internal/xds
 // stays grpcclient-free (the ADR-0278 cycle guard).
-func NewSDSProvider(dialer *grpcclient.Dialer, bs *bootstrap.Bootstrap, baseDir string, registry *stats.Registry) (xds.SecretProvider, error) {
+func newSDSProviderAndClient(dialer *grpcclient.Dialer, bs *bootstrap.Bootstrap, baseDir string, registry *stats.Registry) (xds.SecretProvider, *grpcclient.SDSClient, error) {
 	dtcTypeURL := "type.googleapis.com/" + string(proto.MessageName(&tlsv3.DownstreamTlsContext{}))
 	var found []*tlsv3.SdsSecretConfig
 	seen := 0
@@ -180,33 +187,66 @@ func NewSDSProvider(dialer *grpcclient.Dialer, bs *bootstrap.Bootstrap, baseDir 
 		}
 	}
 	if seen == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if seen > 1 {
-		return nil, fmt.Errorf("xds: sds: multiple SDS-bound downstream TLS contexts unsupported (MVP takes one)")
+		return nil, nil, fmt.Errorf("xds: sds: multiple SDS-bound downstream TLS contexts unsupported (MVP takes one)")
 	}
 	node := bs.Proto.GetNode()
 	if node.GetId() == "" || node.GetCluster() == "" {
-		return nil, fmt.Errorf("xds: sds: node.id and node.cluster are required for SDS")
+		return nil, nil, fmt.Errorf("xds: sds: node.id and node.cluster are required for SDS")
 	}
 	secretName, clusterName, timeout, err := xds.ParseSDSConfig(found)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// The reject MUST precede the dial. Placed after NewSDSClient, an
 	// unreachable-cluster or absent-SDS-server config fails at the dial
 	// first and MASKS this error, which would force every observation of
 	// the name reject to stand up a live SDS server (phase 80, T5).
 	if err := validateSDSSecretName(secretName); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	client, err := grpcclient.NewSDSClient(dialer, clusterName)
 	if err != nil {
-		return nil, fmt.Errorf("xds: sds: dial cluster %q: %w", clusterName, err)
+		return nil, nil, fmt.Errorf("xds: sds: dial cluster %q: %w", clusterName, err)
 	}
 	opener := xdsgrpc.NewOpener(client)
 	sdsStats := xds.RegisterSDSStats(registry, secretName)
-	return xds.NewProvider(opener, xds.Node{ID: node.GetId(), Cluster: node.GetCluster()}, baseDir, timeout, sdsStats), nil
+	return xds.NewProvider(opener, xds.Node{ID: node.GetId(), Cluster: node.GetCluster()}, baseDir, timeout, sdsStats), client, nil
+}
+
+// NewSDSProvider pre-scans bs for the (single, MVP) downstream SDS-bound TLS
+// context and, when present, builds the blocking xds.SecretProvider that
+// internal/tls consults at listener construction (phase 60.2, ADR-0280). It
+// mirrors NewTracingProvider: built once at boot from the shared dialer, then
+// threaded through Construct into the listener build. Returns (nil, nil) when no
+// SDS cert is configured (the nil provider threads harmlessly — the tls lift
+// only engages when a listener actually carries tls_certificate_sds_secret_configs).
+func NewSDSProvider(dialer *grpcclient.Dialer, bs *bootstrap.Bootstrap, baseDir string, registry *stats.Registry) (xds.SecretProvider, error) {
+	p, _, err := newSDSProviderAndClient(dialer, bs, baseDir, registry)
+	return p, err // the client stays open — the boot path's provider owns it via the opener
+}
+
+// NewValidateSDSProvider runs the ENTIRE boot pre-scan (parity by CODE-PATH:
+// every present and future pre-scan arm is inherited by construction), then
+// CLOSES the never-dialed lazy client (D-86-CONN: validate is a library
+// consumed by long-running Gateway controllers; leaking one lazy
+// *grpc.ClientConn per reconcile call is not acceptable hygiene) and returns
+// the no-fetch sentinel. Returns (nil, nil) at seen==0 exactly like the boot
+// path — the nil provider threads harmlessly. Every reject returned here is a
+// BOOT-PARITY reject: byte-identical to what NewSDSProvider returns for the
+// same bootstrap (phase 86, ADR-0308).
+func NewValidateSDSProvider(dialer *grpcclient.Dialer, bs *bootstrap.Bootstrap, baseDir string, registry *stats.Registry) (xds.SecretProvider, error) {
+	p, client, err := newSDSProviderAndClient(dialer, bs, baseDir, registry)
+	if err != nil {
+		return nil, err // these ARE the boot-parity rejects
+	}
+	if p == nil {
+		return nil, nil // no SDS anywhere: the nil provider threads harmlessly
+	}
+	_ = client.Close() // idempotent + nil-safe (grpcclient_test.go:1911/:1982)
+	return xds.NoFetchProvider(), nil
 }
 
 // sdsStatSuffixes is the five-counter sds.<secret>.* suffix set that

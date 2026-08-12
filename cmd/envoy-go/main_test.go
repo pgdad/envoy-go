@@ -1053,6 +1053,132 @@ static_resources:
 	}
 }
 
+// sdsArmACfgYAML is the arm-A shape (SDS-delivered downstream server cert
+// only, GRPC api_type) shared by TestEnvoyGoBinary_ModeValidate_SDSArmA and,
+// minus the `node:` block, by TestEnvoyGoBinary_ModeValidate_SDSMissingNode
+// (phase 86, ADR-0308 — mirrors validate/validate_test.go's sdsSingleArmYAML
+// recipe, PLAN §6).
+const sdsArmACfgYAML = `
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  listeners:
+    - name: l_sds_tls
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - name: server_cert
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc:
+                              cluster_name: sds_cluster
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_sds_tls
+                cluster: c_backend
+  clusters:
+    - name: c_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 0 }
+    - name: sds_cluster
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: sds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 0 }
+`
+
+// TestEnvoyGoBinary_ModeValidate_SDSArmA is the phase-86 (ADR-0308) CLI
+// end-to-end arm for --mode validate against an SDS-cert-only config: the
+// no-fetch sentinel must let this validate cleanly even though nothing
+// dials the SDS cluster.
+func TestEnvoyGoBinary_ModeValidate_SDSArmA(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "envoy-go")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = "."
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "arm_a.yaml")
+	yaml := "node: { id: envoygo-node, cluster: envoygo-cluster }\n" + sdsArmACfgYAML
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "-c", cfgPath, "--mode", "validate")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("arm A: --mode validate failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "configuration OK") {
+		t.Errorf("arm A: stdout = %q, want it to contain %q", out, "configuration OK")
+	}
+}
+
+// TestEnvoyGoBinary_ModeValidate_SDSMissingNode is n1 (PLAN §6): the same
+// SDS-cert-only shape minus `node:`. Pre-fix this exits 1 with the MASKED
+// arm-A nil-provider string; post-fix it must exit 1 with the boot
+// pre-scan's node-requirement string — byte-identical (modulo the
+// log.Fatalf "sds provider: " + timestamp prefix) to normal-mode boot's
+// rejection of the same shape.
+func TestEnvoyGoBinary_ModeValidate_SDSMissingNode(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "envoy-go")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = "."
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "n1.yaml")
+	if err := os.WriteFile(cfgPath, []byte(sdsArmACfgYAML), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "-c", cfgPath, "--mode", "validate")
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("n1 missing node: got err=%v, want *exec.ExitError with exit code 1 (out=%s)", err, out)
+	}
+	if !strings.Contains(string(out), "xds: sds: node.id and node.cluster are required for SDS") {
+		t.Errorf("n1 missing node: output = %q, want it to contain the boot node-requirement string", out)
+	}
+}
+
 // bootPanicVisibleDeadline bounds the trigger process. MEASURED: on a tree
 // carrying the phase-78 fix the binary panics and dies in 0.009-0.011 s wall
 // (5 consecutive runs), so this is ~2700x headroom and exists only to bound a

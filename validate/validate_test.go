@@ -1,6 +1,15 @@
 package validate
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -429,4 +438,399 @@ func settledGoroutineCount(t *testing.T) int {
 		}
 	}
 	return min
+}
+
+// --- Phase 86 (ADR-0308): SDS no-fetch sentinel — end-to-end arms ---------
+//
+// These exercise validate.Bootstrap against the eleven-shape probe battery
+// (PLAN §6): three positive "arm" shapes (cert-only SDS, SDS-bound
+// validation_context with a static server cert, SDS-bound
+// combined_validation_context), the D-86-N5 dead-SDS-endpoint accept, and
+// five negative "n" shapes whose reject must come from the boot SDS
+// pre-scan (internal/boot.newSDSProviderAndClient / NewValidateSDSProvider)
+// rather than from the tls apply-point's nil-provider guard. n3
+// (DELTA_GRPC) is a REGRESSION PIN, not a red: its reject fires inside
+// xds.ParseSDSConfig, which commonTLSContextToConfig (internal/tls/config.go)
+// calls directly BEFORE ever consulting the provider — so it already
+// carried the boot-parity string pre-fix (Task 0 census, confirmed by
+// direct execution).
+
+// genServerCertPEM builds a self-signed ServerAuth leaf for cn, mirroring
+// internal/boot/boot_sds_e2e_test.go's helper of the same name (that helper
+// is package-private to internal/boot and not importable here).
+func genServerCertPEM(t *testing.T, cn string) (certPEM, keyPEM []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: cn},
+		DNSNames:     []string{cn},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate: %v", err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("x509.MarshalPKCS8PrivateKey: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+}
+
+// deadPort returns a TCP port on 127.0.0.1 guaranteed to have nothing
+// listening: a listener is opened and immediately closed. validate mode
+// never dials SDS (D-86-N5), so a config whose sds_cluster endpoint names
+// this port must still validate cleanly.
+func deadPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatalf("Listener.Close: %v", err)
+	}
+	return port
+}
+
+// sdsClusterYAML renders the shared upstream `sds_cluster` block. withH2
+// controls whether typed_extension_protocol_options{http2_protocol_options}
+// is present (n7 omits it to exercise grpcclient.Dialer.DialContext's UseH2
+// PARSE-REJECT). port is the cluster's own listed endpoint (n5 supplies a
+// dead, closed port — never dialed by validate).
+func sdsClusterYAML(withH2 bool, port int) string {
+	h2 := ""
+	if withH2 {
+		h2 = `
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}`
+	}
+	return fmt.Sprintf(`    - name: sds_cluster
+      type: STATIC
+      lb_policy: ROUND_ROBIN%s
+      load_assignment:
+        cluster_name: sds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: %d }
+`, h2, port)
+}
+
+// cBackendYAML renders the shared downstream tcp_proxy target cluster.
+const cBackendYAML = `    - name: c_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 0 }
+`
+
+// sdsCertListenerYAML renders a single listener whose downstream TLS
+// certificate is entirely SDS-delivered (arm A's shape): the tls apply-point
+// consults the provider (nil pre-fix / the sentinel post-fix), never a
+// static tls_certificates entry. secretName/sdsRefCluster/apiType are varied
+// by the n1/n3/n4/n5/n6/n7 negative arms below.
+func sdsCertListenerYAML(name, secretName, sdsRefCluster, apiType string) string {
+	return fmt.Sprintf(`    - name: %s
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - name: %s
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: %s
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc:
+                              cluster_name: %s
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_%s
+                cluster: c_backend
+`, name, secretName, apiType, sdsRefCluster, name)
+}
+
+// sdsSingleArmYAML renders the shared single-listener, SDS-cert-only shape
+// used by arm A and the n1/n3/n4/n5/n6/n7 arms (PLAN §6's recipe): withNode
+// toggles the node: block (n1), secretName varies (n6), sdsRefCluster is the
+// cluster_name the SDS grpc_service points AT (n4: "missing_cluster", never
+// defined among static_resources.clusters), apiType varies (n3: DELTA_GRPC),
+// sdsClusterH2 toggles the upstream sds_cluster's http2_protocol_options
+// (n7: false), sdsClusterPort is sds_cluster's own listed endpoint port (n5:
+// a dead, closed port).
+func sdsSingleArmYAML(withNode bool, secretName, sdsRefCluster, apiType string, sdsClusterH2 bool, sdsClusterPort int) string {
+	node := ""
+	if withNode {
+		node = "node: { id: envoygo-node, cluster: envoygo-cluster }\n"
+	}
+	return node + `admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  listeners:
+` + sdsCertListenerYAML("l_sds_tls", secretName, sdsRefCluster, apiType) + `
+  clusters:
+` + cBackendYAML + sdsClusterYAML(sdsClusterH2, sdsClusterPort)
+}
+
+// n2YAML renders n2's cross-context cap shape: TWO listeners, each with its
+// own single SDS-bound downstream certificate. newSDSProviderAndClient's
+// seen>1 guard (boot.go:192-194) only trips ACROSS filter chains/listeners —
+// each individual context's own xds.ParseSDSConfig call (len(configs)!=1)
+// never sees more than one entry, so this is a distinct arm from the
+// within-one-context "n2-aside" shape retained only as a census datapoint.
+func n2YAML() string {
+	return `
+node: { id: envoygo-node, cluster: envoygo-cluster }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  listeners:
+` + sdsCertListenerYAML("l_sds_tls_1", "server_cert_1", "sds_cluster", "GRPC") +
+		sdsCertListenerYAML("l_sds_tls_2", "server_cert_2", "sds_cluster", "GRPC") + `
+  clusters:
+` + cBackendYAML + sdsClusterYAML(true, 0)
+}
+
+// armBYAML renders arm B: a static (inline) downstream server certificate
+// PLUS an SDS-bound validation_context (mTLS), inline_string-quoted via %q
+// so PEM newlines are `\n`-escaped C-style rather than depending on
+// hand-counted YAML block-scalar indentation.
+func armBYAML(t *testing.T) string {
+	certPEM, keyPEM := genServerCertPEM(t, "armb.envoy-go.test")
+	return fmt.Sprintf(`
+node: { id: envoygo-node, cluster: envoygo-cluster }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  listeners:
+    - name: l_sds_mtls
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      inline_string: %s
+                    private_key:
+                      inline_string: %s
+                validation_context_sds_secret_config:
+                  name: validation_ca
+                  sds_config:
+                    resource_api_version: V3
+                    api_config_source:
+                      api_type: GRPC
+                      transport_api_version: V3
+                      grpc_services:
+                        - envoy_grpc:
+                            cluster_name: sds_cluster
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_sds_mtls
+                cluster: c_backend
+  clusters:
+`, fmt.Sprintf("%q", string(certPEM)), fmt.Sprintf("%q", string(keyPEM))) + cBackendYAML + sdsClusterYAML(true, 0)
+}
+
+// armCYAML renders arm C: an inline downstream server certificate PLUS an
+// SDS-bound combined_validation_context (default_validation_context.trusted_ca
+// inline + validation_context_sds_secret_config).
+func armCYAML(t *testing.T) string {
+	leafCert, leafKey := genServerCertPEM(t, "armc-leaf.envoy-go.test")
+	caCert, _ := genServerCertPEM(t, "armc-ca.envoy-go.test") // self-signed; only the cert half is used, as trusted_ca
+	return fmt.Sprintf(`
+node: { id: envoygo-node, cluster: envoygo-cluster }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 0 }
+static_resources:
+  listeners:
+    - name: l_sds_cvc
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 0 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      inline_string: %s
+                    private_key:
+                      inline_string: %s
+                combined_validation_context:
+                  default_validation_context:
+                    trusted_ca:
+                      inline_string: %s
+                  validation_context_sds_secret_config:
+                    name: validation_ca
+                    sds_config:
+                      resource_api_version: V3
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc:
+                              cluster_name: sds_cluster
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_sds_cvc
+                cluster: c_backend
+  clusters:
+`, fmt.Sprintf("%q", string(leafCert)), fmt.Sprintf("%q", string(leafKey)), fmt.Sprintf("%q", string(caCert))) + cBackendYAML + sdsClusterYAML(true, 0)
+}
+
+func TestBootstrap_SDSArmA_AcceptedWithSentinelProvider(t *testing.T) {
+	yaml := sdsSingleArmYAML(true, "server_cert", "sds_cluster", "GRPC", true, 0)
+	if err := Bootstrap(strings.NewReader(yaml), t.TempDir(), false); err != nil {
+		t.Fatalf("Bootstrap(arm A): got %v, want nil", err)
+	}
+}
+
+func TestBootstrap_SDSArmB_AcceptedWithSentinelProvider(t *testing.T) {
+	if err := Bootstrap(strings.NewReader(armBYAML(t)), t.TempDir(), false); err != nil {
+		t.Fatalf("Bootstrap(arm B): got %v, want nil", err)
+	}
+}
+
+func TestBootstrap_SDSArmC_AcceptedWithSentinelProvider(t *testing.T) {
+	if err := Bootstrap(strings.NewReader(armCYAML(t)), t.TempDir(), false); err != nil {
+		t.Fatalf("Bootstrap(arm C): got %v, want nil", err)
+	}
+}
+
+// TestBootstrap_SDSDeadEndpoint_AcceptedWithoutDialing pins D-86-N5: a
+// structurally valid SDS-bound config whose sds_cluster endpoint is dead
+// (nothing listening) must still validate cleanly, because --mode validate
+// never dials or fetches SDS — the reject-classification a genuinely
+// unreachable SDS server would trigger at boot/runtime is out of scope for
+// validate (PLAN §6 / SPEC Q2's fetch-time exemption).
+func TestBootstrap_SDSDeadEndpoint_AcceptedWithoutDialing(t *testing.T) {
+	yaml := sdsSingleArmYAML(true, "server_cert", "sds_cluster", "GRPC", true, deadPort(t))
+	if err := Bootstrap(strings.NewReader(yaml), t.TempDir(), false); err != nil {
+		t.Fatalf("Bootstrap(dead SDS endpoint, n5): got %v, want nil (validate never dials)", err)
+	}
+}
+
+// --- Negative arms: message-transition (pre-fix: masked by the arm-A
+// nil-provider string; post-fix: the boot pre-scan's own byte-identical
+// boot-parity string) plus n3's regression pin. ---
+
+func TestBootstrap_SDSMissingNode_RejectsWithBootParityString(t *testing.T) {
+	yaml := sdsSingleArmYAML(false, "server_cert", "sds_cluster", "GRPC", true, 0)
+	err := Bootstrap(strings.NewReader(yaml), t.TempDir(), false)
+	if err == nil {
+		t.Fatal("Bootstrap(n1 missing node): want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "xds: sds: node.id and node.cluster are required for SDS") {
+		t.Errorf("Bootstrap(n1 missing node): got %q, want it to contain the boot node-requirement string", err.Error())
+	}
+}
+
+func TestBootstrap_SDSCrossContextCap_RejectsWithBootParityString(t *testing.T) {
+	err := Bootstrap(strings.NewReader(n2YAML()), t.TempDir(), false)
+	if err == nil {
+		t.Fatal("Bootstrap(n2 cross-context cap): want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "xds: sds: multiple SDS-bound downstream TLS contexts unsupported (MVP takes one)") {
+		t.Errorf("Bootstrap(n2 cross-context cap): got %q, want it to contain the boot one-secret-cap string", err.Error())
+	}
+}
+
+// TestBootstrap_SDSDeltaGRPC_RegressionPin is n3 (PLAN §6): api_type
+// DELTA_GRPC. UNLIKE n1/n2/n4/n6/n7 this is NOT a message-transition arm:
+// xds.ParseSDSConfig runs directly inside commonTLSContextToConfig
+// (internal/tls/config.go), BEFORE that function ever consults the
+// provider, so this reject already carried the boot-parity string pre-fix
+// (Task 0 census, confirmed by direct execution — census.log's "=== n3
+// (rc=1) ===" line already reads the DELTA_GRPC string, not the masking
+// arm-A string). Pinned here as a regression guard, not claimed as a red.
+func TestBootstrap_SDSDeltaGRPC_RegressionPin(t *testing.T) {
+	yaml := sdsSingleArmYAML(true, "server_cert", "sds_cluster", "DELTA_GRPC", true, 0)
+	err := Bootstrap(strings.NewReader(yaml), t.TempDir(), false)
+	if err == nil {
+		t.Fatal("Bootstrap(n3 DELTA_GRPC): want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "xds: sds: DELTA_GRPC api_type unsupported (only GRPC / State-of-the-World)") {
+		t.Errorf("Bootstrap(n3 DELTA_GRPC): got %q, want it to contain the ParseSDSConfig DELTA_GRPC string", err.Error())
+	}
+}
+
+func TestBootstrap_SDSUnknownCluster_RejectsWithBootParityString(t *testing.T) {
+	yaml := sdsSingleArmYAML(true, "server_cert", "missing_cluster", "GRPC", true, 0)
+	err := Bootstrap(strings.NewReader(yaml), t.TempDir(), false)
+	if err == nil {
+		t.Fatal("Bootstrap(n4 unknown cluster): want error, got nil")
+	}
+	if !strings.Contains(err.Error(), `xds: sds: dial cluster "missing_cluster"`) {
+		t.Errorf("Bootstrap(n4 unknown cluster): got %q, want it to contain the verbatim `dial cluster` prefix", err.Error())
+	}
+	if !strings.Contains(err.Error(), "unknown cluster") {
+		t.Errorf("Bootstrap(n4 unknown cluster): got %q, want it to name the unknown-cluster failure", err.Error())
+	}
+}
+
+func TestBootstrap_SDSInvalidSecretName_RejectsWithBootParityString(t *testing.T) {
+	yaml := sdsSingleArmYAML(true, "bad/name", "sds_cluster", "GRPC", true, 0)
+	err := Bootstrap(strings.NewReader(yaml), t.TempDir(), false)
+	if err == nil {
+		t.Fatal("Bootstrap(n6 invalid secret name): want error, got nil")
+	}
+	if !strings.Contains(err.Error(), `xds: sds: invalid secret name: "bad/name"`) {
+		t.Errorf("Bootstrap(n6 invalid secret name): got %q, want it to contain the boot secret-name-charset string", err.Error())
+	}
+}
+
+func TestBootstrap_SDSMissingHTTP2Options_RejectsWithBootParityString(t *testing.T) {
+	yaml := sdsSingleArmYAML(true, "server_cert", "sds_cluster", "GRPC", false, 0)
+	err := Bootstrap(strings.NewReader(yaml), t.TempDir(), false)
+	if err == nil {
+		t.Fatal("Bootstrap(n7 missing http2_protocol_options): want error, got nil")
+	}
+	if !strings.Contains(err.Error(), `xds: sds: dial cluster "sds_cluster"`) {
+		t.Errorf("Bootstrap(n7 missing http2_protocol_options): got %q, want it to contain the verbatim `dial cluster` prefix", err.Error())
+	}
+	if !strings.Contains(err.Error(), "does not have http2_protocol_options{} set") {
+		t.Errorf("Bootstrap(n7 missing http2_protocol_options): got %q, want it to name the missing-h2 failure", err.Error())
+	}
 }
