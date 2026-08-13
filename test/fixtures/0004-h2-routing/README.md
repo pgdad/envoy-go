@@ -1,8 +1,8 @@
 # Fixture 0004 — HTTP/2 routing (HCM AUTO + ALPN h2 + upstream H/2 + TLS termination + TLS origination)
 
-**Purpose:** end-to-end exercise the phase-05.2 dataplane (HCM(AUTO) + route match + router → upstream-H/2 client codec + upstream-TLS validation) and prove byte-equivalent decoded response bodies + per-side RR distribution + status-code equivalence between upstream Envoy and envoy-go on a 27-request workload, all over TLS-terminated downstream H/2 + TLS-originated upstream H/2.
+**Purpose:** end-to-end exercise the phase-05.2 dataplane (HCM(AUTO) + route match + router → upstream-H/2 client codec + upstream-TLS validation) and prove byte-equivalent decoded response bodies + per-side RR distribution + status-code equivalence between upstream Envoy and envoy-go on a 29-request workload, all over TLS-terminated downstream H/2 + TLS-originated upstream H/2.
 
-**Differential surface:** concatenated decoded response bodies for the 9 `/health` direct_response requests (`"OK\n"` x 9) are byte-equivalent. The `/api/v1/<n>` router-action bodies are NOT concatenated into the diff stream (RR-pick ordering may diverge between STATIC and STRICT_DNS); routing correctness is covered by per-side `[3,3,3]` distribution + status-200. The 404 catch-all bodies are NOT compared (envoy-go: `not found\n`; Envoy: HTML/JSON local reply per its default config).
+**Differential surface:** concatenated decoded response bodies for the 9 `/health` direct_response requests (`"OK\n"` x 9) followed by the two phase-87 leading-`//` arms (`"edge-ok"` x 2) are byte-equivalent. The `/api/v1/<n>` router-action bodies are NOT concatenated into the diff stream (RR-pick ordering may diverge between STATIC and STRICT_DNS); routing correctness is covered by per-side `[3,3,3]` distribution + status-200. The 404 catch-all bodies are NOT compared (envoy-go: `not found\n`; Envoy: HTML/JSON local reply per its default config).
 
 **Local-correctness surface:** each proxy's per-cluster accept counts over the 9 router-action requests must be exactly `[3, 3, 3]` (RR witness per ADR-0028's `--concurrency 1` reference pin). Counts are derived from parsing the response body's `"backend-<idx>:"` prefix — the H/2 backend is a subprocess, so the runner's in-process accept counters do NOT see these requests; the driver implements `DistributionAsserter` from the response bytes instead.
 
@@ -20,13 +20,25 @@ The 3 backends are subprocesses spawned from `test/fixtures/0004-h2-routing/back
 
 1. `match.path: "/health"` → direct_response 200 `"OK\n"`
 2. `match.prefix: "/api"` → router → cluster `c_h2_backend` (3 endpoints, RR)
-3. `match.prefix: "/"` → direct_response 404 `"not found\n"` (explicit catch-all)
+3. `match.prefix: "//edge"` → direct_response 200 `"edge-ok"` (phase 87 — leading-`//` origin-form routing)
+4. `match.prefix: "/"` → direct_response 404 `"not found\n"` (explicit catch-all)
 
-**Driver request schedule (27 requests per side):**
+**Driver request schedule (29 requests per side):**
 
 - 9 × `GET /health` → expect 200, body `"OK\n"` (concatenated into the byte stream)
 - 9 × `GET /api/v1/<n>` for n=0..8 → expect 200, body `"backend-<idx>:v1/<n>"` (not concatenated; distribution counted)
 - 9 × `GET /missing/<n>` for n=0..8 → expect 404 (body NOT concatenated)
+- 1 × `GET //edge` → expect 200, body `"edge-ok"` (concatenated)
+- 1 × `GET //edge/health` → expect 200, body `"edge-ok"` (concatenated)
+
+The first 27 requests are unchanged from phase 05.2, and the two new arms are appended after them, so the pre-existing transcript prefix stays byte-identical.
+
+**Leading-`//` origin-form arms (phase 87):** a leading `//` in an HTTP/2 `:path` is an ordinary origin-form path, but under the full RFC-3986 URI grammar it reads as a network-path reference whose first segment is an authority. A codec that parses `:path` with `url.Parse` peels the first segment into the host and routes on the remainder. **Both assertions on both arms are load-bearing; neither arm alone catches both failure modes:**
+
+- `GET //edge` — the **status** assertion is load-bearing. Under the defect the path degrades to `""`, a route MISS (an empty path matches neither `//edge` nor the `/` catch-all), so the reply is 404 with an **empty** body — not the catch-all's `not found\n`. A body-only check would compare `""` against `""` and read green.
+- `GET //edge/health` — the **body** assertion is load-bearing. Under the same defect the path degrades to `/health`, which matches route 1 and replies 200 `"OK\n"` — a silent mis-route. A status-only check would see 200 and read green.
+
+The two arms are `direct_response` and touch no backend, so the per-side `[3,3,3]` RR distribution over the 9 router-action requests is unchanged.
 
 **STATIC vs STRICT_DNS divergence (ADR-0027 inherited):** subject is host-side STATIC; reference is container-side STRICT_DNS with `dns_lookup_family: V4_ONLY` per ADR-0010.
 

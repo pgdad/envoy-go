@@ -7,9 +7,12 @@
 # helper used is test/helpers.H2RoundTrip per Task 12).
 #
 # Asserted equivalence (per ADR-0044 carry-forward + ADR-0057):
-#   - response status code per request, across all 27 requests/side
+#   - response status code per request, across all 29 requests/side
 #   - decoded response body bytes for /health direct_response (200, "OK\n")
 #     — 9 x "OK\n" concatenated into the Drive byte stream, compared byte-for-byte
+#   - decoded response body bytes for the two leading-`//` arms (200, "edge-ok")
+#     — 2 x "edge-ok" appended to the Drive byte stream after the 9 x "OK\n"
+#     prefix, compared byte-for-byte (phase 87)
 #   - per-side per-cluster RR distribution for the 9 router-action requests:
 #     each side independently witnesses [3, 3, 3] (counted by the driver via
 #     parsing the response body's "backend-<idx>:..." prefix; subprocess
@@ -49,9 +52,10 @@
 # Route table (declaration order; first-match-wins):
 #   1. match.path: "/health"   -> direct_response 200 "OK\n"
 #   2. match.prefix: "/api"    -> router -> cluster c_h2_backend (3 endpoints, RR)
-#   3. match.prefix: "/"       -> direct_response 404 "not found\n" (catch-all)
+#   3. match.prefix: "//edge"  -> direct_response 200 "edge-ok" (phase 87)
+#   4. match.prefix: "/"       -> direct_response 404 "not found\n" (catch-all)
 #
-# Driver request schedule (27 requests/side, deterministic ordering; driver
+# Driver request schedule (29 requests/side, deterministic ordering; driver
 # issues them serially over fresh TLS+H/2 connections per call so RR slots are
 # consumed one-per-request):
 #   9 x GET /health                  -> expect 200, body "OK\n" (concatenated)
@@ -60,6 +64,21 @@
 #                                        asserted from body "backend-<idx>:"
 #                                        prefix counts)
 #   9 x GET /missing/<n> n=0..8      -> expect 404 (body NOT concatenated)
+#   1 x GET //edge                   -> expect 200, body "edge-ok" (concatenated)
+#   1 x GET //edge/health            -> expect 200, body "edge-ok" (concatenated)
+#
+# Leading-`//` origin-form arms (phase 87 — both assertions on both arms are
+# load-bearing; neither arm alone catches both failure modes):
+#   - GET //edge:        the STATUS assertion is load-bearing. A codec that
+#     parses :path with the full RFC-3986 grammar peels "//edge" into an
+#     authority, leaving path "" — a route MISS (an empty path matches neither
+#     "//edge" nor the "/" catch-all), so the reply is 404 with an EMPTY body,
+#     NOT the catch-all's "not found\n". A body-only check would compare "" to
+#     "" and read green.
+#   - GET //edge/health: the BODY assertion is load-bearing. Under the same
+#     defect the path degrades to "/health", which matches route 1 and replies
+#     200 "OK\n" — a silent mis-route. A status-only check would see 200 and
+#     read green.
 #
 # Container concurrency:
 #   --concurrency 1 inherited from phase-02 ADR-0028 via test/differential/harness.go

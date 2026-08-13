@@ -9,7 +9,8 @@
 #   - 1 listener l_h2 on 0.0.0.0:15004 with:
 #       * downstream TLS termination (alpn_protocols: ["h2","http/1.1"])
 #       * HCM with codec_type=AUTO (ALPN drives the per-conn codec choice)
-#       * 3 routes (/health direct_response, /api prefix → cluster, /missing 404)
+#       * 4 routes (/health direct_response, /api prefix → cluster, //edge
+#         direct_response (phase 87 leading-`//` origin form), /missing 404)
 #   - Cluster c_h2_backend: STRICT_DNS (ADR-0010 V4_ONLY); 3 endpoints reaching
 #     backends via host.docker.internal:{{BACKEND_PORT_N}}; upstream TLS with
 #     ALPN h2; trusted_ca: the fixture-local CA (driver-rendered inline_string).
@@ -59,6 +60,10 @@ static_resources:
                             body: { inline_string: "OK\n" }
                         - match: { prefix: "/api" }
                           route: { cluster: c_h2_backend }
+                        - match: { prefix: "//edge" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "edge-ok" }
                         - match: { prefix: "/" }
                           direct_response:
                             status: 404

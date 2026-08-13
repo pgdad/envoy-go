@@ -605,3 +605,172 @@ func TestBuildRequest_ConnectionSpecificFields(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildRequest_PathForms is the per-FORM table over the other half of
+// buildRequest: the parse of the :path pseudo-header into req.URL. (Cited by
+// SYMBOL deliberately — that call's line number has already drifted :440 ->
+// :465 -> :478 across this row's own lineage.) The table exists because the
+// two grammars that meet at that one call disagree about exactly one byte
+// sequence.
+//
+// In HTTP/2 an origin-form :path is a request-target: RFC 9113 §8.3.1 says it
+// carries the path-and-query of the target URI, and RFC 9110 §7.1 defines
+// origin-form as absolute-path [ "?" query ] — so a leading "//" is simply
+// PATH BYTES (an absolute-path whose first segment is empty). The generic
+// RFC 3986 §4.2 URI-reference grammar reads the same bytes differently: a
+// relative-reference beginning "//" is a NETWORK-PATH reference, and the
+// segment after the slashes is an AUTHORITY, not a path segment. A parser
+// that accepts the full URI-reference grammar therefore peels the first
+// segment off the path and into u.Host. The routing consequences are two
+// distinct failures, which is why the double-slash rows below are split by
+// FORM rather than collapsed into one "some double-slash path" row (the same
+// reason Table B — TestBuildRequest_ConnectionSpecificFields — takes one case
+// per member: a single representative case cannot catch a form that regresses
+// on its own):
+//
+//   - "//foo" peels ENTIRELY into the authority, leaving an EMPTY path, so
+//     the request routes as if no path were sent at all (404).
+//   - "//foo/bar" peels only "foo", leaving "/bar" — the request is SILENTLY
+//     MIS-ROUTED to a different, existing route. No error, wrong backend.
+//
+// Reject rows: an origin-form :path has no fragment component at all (RFC
+// 9110 §7.1: fragments are never sent on the wire), and a rootless or
+// query-only target is not an origin-form request-target either. Both
+// families must be rejected, and the table keeps them DISTINGUISHABLE by
+// asserting Msg exactly plus Underlying for NIL-NESS ONLY: the parse-reject
+// family wraps whatever net/url returned (non-nil Underlying), the
+// fragment-reject family is a first-party check with nothing to wrap (nil).
+// The wrapped stdlib error TEXT is deliberately NOT asserted — its wording is
+// net/url's and is hostage to the Go toolchain version.
+//
+// Control rows are labeled in the table. The five non-"//" accept forms are
+// GREEN AT THE PRE-FIX TIP and are REGRESSION CONTROLS, not anchors — a
+// green-on-arrival row proves nothing about a fix. Likewise the
+// RequestURI-stays-the-literal-:path-bytes assertion already holds at the
+// pre-fix tip on every accepted row (buildRequest assigns RequestURI from the
+// raw pseudo-header value, never from the parsed URL); it is carried on every
+// accept row as a control so that no fix to the parse is allowed to start
+// rewriting the literal request-target.
+func TestBuildRequest_PathForms(t *testing.T) {
+	tests := []struct {
+		name string
+		path string // the :path pseudo-header value
+
+		// Accept expectations (used when wantErrMsg == "").
+		wantPath     string
+		wantRawQuery string
+		// wantRawPath is asserted only when non-empty. net/url populates
+		// RawPath ONLY when the escaped form differs from Path, so "" is the
+		// correct value on every row without a percent-escape and asserting
+		// it there would pin an implementation detail rather than a property.
+		wantRawPath string
+
+		// Reject expectations. wantErrMsg != "" selects the reject arm and is
+		// matched by EXACT equality. wantUnderlying records only whether
+		// *Error.Underlying must be non-nil — never its text.
+		wantErrMsg     string
+		wantUnderlying bool
+	}{
+		// --- REGRESSION CONTROLS (green at the pre-fix tip; NOT anchors) ---
+		{name: "root", path: "/", wantPath: "/"},
+		{name: "simple", path: "/foo", wantPath: "/foo"},
+		{name: "query", path: "/foo?a=b", wantPath: "/foo", wantRawQuery: "a=b"},
+		{name: "midpath_double_slash", path: "/a//b", wantPath: "/a//b"},
+		{name: "asterisk_form", path: "*", wantPath: "*"},
+		// Percent-escape semantics: Path is the DECODED form and RawPath the
+		// literal wire bytes, and the two must stay paired. This row is what
+		// entitles the contract to say escape semantics are unchanged by the
+		// primitive swap — without it that claim is asserted nowhere.
+		{name: "percent_escaped_slash", path: "/foo%2Fbar", wantPath: "/foo/bar", wantRawPath: "/foo%2Fbar"},
+
+		// --- RED at the pre-fix tip: the row-87 anchors ---
+		// Each of these peels its first segment into u.Host today, so the
+		// path arrives empty ("//foo", "//") or truncated ("//foo/bar" ->
+		// "/bar", the silent mis-route).
+		{name: "leading_double_slash", path: "//foo", wantPath: "//foo"},
+		{name: "bare_double_slash", path: "//", wantPath: "//"},
+		{name: "leading_double_slash_multi_segment", path: "//foo/bar", wantPath: "//foo/bar"},
+		{name: "leading_double_slash_query", path: "//foo?x=1", wantPath: "//foo", wantRawQuery: "x=1"},
+
+		// --- RED at the pre-fix tip: all four are silently ACCEPTED today ---
+		// The two families are kept apart by Underlying's nil-ness, not by
+		// the wrapped stdlib text.
+		{name: "rootless", path: "foo", wantErrMsg: "bad :path", wantUnderlying: true},
+		{name: "bare_query", path: "?a=b", wantErrMsg: "bad :path", wantUnderlying: true},
+		{name: "fragment", path: "/foo#frag", wantErrMsg: "fragment in :path"},
+		{name: "query_and_fragment", path: "/foo?a=b#frag", wantErrMsg: "fragment in :path"},
+		// ORDERING PIN, and the only row that has this job. Every other reject
+		// row is either fragment-bearing-but-otherwise-valid or
+		// invalid-without-a-fragment, so the two families never intersect and
+		// NO other row can tell "guard before the parse" from "guard after
+		// it". This one is both at once: a rootless target that also carries a
+		// fragment. With the guard before the parse it is "fragment in :path"
+		// with a nil Underlying; move the guard below the parse and it becomes
+		// "bad :path" with a non-nil Underlying, and this row — alone — goes
+		// red. Do not delete it as a near-duplicate of "rootless".
+		{name: "rootless_fragment", path: "foo#frag", wantErrMsg: "fragment in :path"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			headers := minHeaders()
+			for i := range headers {
+				if headers[i].Name == ":path" {
+					headers[i].Value = tc.path
+				}
+			}
+			req, err := buildRequest(headers, strings.NewReader(""))
+
+			if tc.wantErrMsg == "" {
+				if err != nil {
+					t.Fatalf("buildRequest(:path=%q) error = %v, want nil (legal origin-form target)", tc.path, err)
+				}
+				if req == nil {
+					t.Fatalf("buildRequest(:path=%q) req = nil, want a built *http.Request", tc.path)
+				}
+				if req.URL.Path != tc.wantPath {
+					t.Errorf("URL.Path = %q, want %q (:path=%q)", req.URL.Path, tc.wantPath, tc.path)
+				}
+				if req.URL.RawQuery != tc.wantRawQuery {
+					t.Errorf("URL.RawQuery = %q, want %q (:path=%q)", req.URL.RawQuery, tc.wantRawQuery, tc.path)
+				}
+				// Asserted only where the row pins it: net/url leaves RawPath
+				// empty whenever the escaped form equals Path, so "" is correct
+				// on every unescaped row and pinning it there would assert an
+				// implementation detail instead of a property.
+				if tc.wantRawPath != "" && req.URL.RawPath != tc.wantRawPath {
+					t.Errorf("URL.RawPath = %q, want %q (:path=%q)", req.URL.RawPath, tc.wantRawPath, tc.path)
+				}
+				// Control: RequestURI must stay the LITERAL :path bytes.
+				if req.RequestURI != tc.path {
+					t.Errorf("RequestURI = %q, want the literal :path %q", req.RequestURI, tc.path)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatalf("buildRequest(:path=%q) error = nil, want a rejection", tc.path)
+			}
+			if req != nil {
+				t.Errorf("buildRequest(:path=%q) req = %v, want nil on rejection", tc.path, req)
+			}
+			herr, ok := err.(*Error)
+			if !ok {
+				t.Fatalf("buildRequest(:path=%q) error type = %T, want *Error", tc.path, err)
+			}
+			if herr.Code != ErrProtocolError {
+				t.Errorf("Code = %v, want PROTOCOL_ERROR (:path=%q)", herr.Code, tc.path)
+			}
+			if herr.Msg != tc.wantErrMsg {
+				t.Errorf("Msg = %q, want %q (:path=%q)", herr.Msg, tc.wantErrMsg, tc.path)
+			}
+			// Nil-ness ONLY: the wrapped stdlib wording is not asserted.
+			if tc.wantUnderlying && herr.Underlying == nil {
+				t.Errorf("Underlying = nil, want a non-nil wrapped parse error (:path=%q)", tc.path)
+			}
+			if !tc.wantUnderlying && herr.Underlying != nil {
+				t.Errorf("Underlying = %v, want nil (first-party reject wraps nothing) (:path=%q)", herr.Underlying, tc.path)
+			}
+		})
+	}
+}

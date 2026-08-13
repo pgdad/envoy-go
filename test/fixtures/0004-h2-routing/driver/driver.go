@@ -237,8 +237,10 @@ func (d *h2Driver) loadTLSConfig() *tls.Config {
 	}
 }
 
-// drive issues 27 sequential H2 requests against addr (the proxy listener)
-// and returns the concatenated 9 /health response bodies. Per ADR-0028 +
+// drive issues 29 sequential H2 requests against addr (the proxy listener)
+// and returns the concatenated 9 /health response bodies followed by the 2
+// phase-87 leading-`//` arm bodies ("edge-ok" x 2). The first 27 requests and
+// the transcript prefix they produce are unchanged from phase 05.2. Per ADR-0028 +
 // ADR-0056: each request opens a fresh *http2.ClientConn (the helper's
 // fresh-Transport-per-call discipline). The 9 /api response bodies are NOT
 // concatenated into the diff stream (per-side RR offset may differ; routing
@@ -290,6 +292,41 @@ func (d *h2Driver) drive(ctx context.Context, addr string, counts *[3]uint64) ([
 			return nil, fmt.Errorf("/missing/%d: status=%d, want 404", n, status)
 		}
 	}
+
+	// Phase-87 leading-`//` origin-form arms (2 requests; total 29/side).
+	//
+	// A leading `//` in an HTTP/2 `:path` is an ordinary origin-form path, but
+	// under the full RFC-3986 URI grammar it reads as a network-path reference
+	// whose first segment is an authority. A codec that parses `:path` with
+	// url.Parse therefore peels `//edge` into the host component and routes on
+	// the REMAINDER — a silent mis-route. Both arms below target the
+	// `prefix: "//edge"` direct_response route (200 "edge-ok").
+	//
+	// BOTH assertions on BOTH arms are load-bearing; neither arm alone catches
+	// both failure modes. Do not delete either as "redundant":
+	//
+	//   - `//edge`: the STATUS assertion is load-bearing. Under the defect the
+	//     path degrades to "" — a route MISS (an empty path carries no
+	//     `prefix: "/"` either), so the reply is 404 with an EMPTY body, not the
+	//     catch-all's "not found\n". A body-only assertion would compare "" to
+	//     "" and read GREEN on a regression.
+	//   - `//edge/health`: the BODY assertion is load-bearing. Under the defect
+	//     the path degrades to "/health", which MATCHES the first route and
+	//     replies 200 "OK\n" — the silent mis-route. A status-only assertion
+	//     would see 200 and read GREEN on a regression.
+	for _, arm := range []string{"//edge", "//edge/health"} {
+		status, _, body, err := helpers.H2RoundTrip(ctx, addr, tlsConf, "GET", arm, nil, nil)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", arm, err)
+		}
+		if status != 200 {
+			return nil, fmt.Errorf("%s: status=%d, want 200", arm, status)
+		}
+		if string(body) != "edge-ok" {
+			return nil, fmt.Errorf("%s: body=%q, want %q", arm, string(body), "edge-ok")
+		}
+		out.Write(body)
+	}
 	return []byte(out.String()), nil
 }
 
@@ -313,7 +350,7 @@ func parseBackendIdx(body []byte) (int, error) {
 	return idx, nil
 }
 
-// DriveReference runs 27 H2 round-trips against the reference proxy listener
+// DriveReference runs 29 H2 round-trips against the reference proxy listener
 // and records per-backend body counts on d.refBodyCnt for AssertDistribution.
 func (d *h2Driver) DriveReference(ctx context.Context, addr string) ([]byte, error) {
 	var counts [3]uint64
@@ -327,7 +364,7 @@ func (d *h2Driver) DriveReference(ctx context.Context, addr string) ([]byte, err
 	return b, nil
 }
 
-// DriveSubject runs 27 H2 round-trips against the subject proxy listener and
+// DriveSubject runs 29 H2 round-trips against the subject proxy listener and
 // records per-backend body counts on d.subjBodyCnt for AssertDistribution.
 func (d *h2Driver) DriveSubject(ctx context.Context, addr string) ([]byte, error) {
 	var counts [3]uint64

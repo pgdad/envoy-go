@@ -462,7 +462,20 @@ func buildRequest(headers []hpack.HeaderField, body io.Reader) (*http.Request, e
 		return nil, &Error{Code: ErrProtocolError, Msg: "missing :path"}
 	}
 
-	u, err := url.Parse(path)
+	// RFC 9110 §7.1: an origin-form request-target carries no fragment — the
+	// component is never sent on the wire — and ParseRequestURI would keep a
+	// '#' as ordinary path bytes rather than splitting it off. Reject it
+	// explicitly (ADR-0309).
+	if strings.IndexByte(path, '#') >= 0 {
+		return nil, &Error{Code: ErrProtocolError, Msg: "fragment in :path"}
+	}
+	// ParseRequestURI, NOT url.Parse: RFC 9113 §8.3.1 makes :path a
+	// request-target, but url.Parse accepts the whole RFC 3986 §4.2
+	// URI-reference grammar, in which a leading "//" opens a network-path
+	// reference and the next segment is parsed as an AUTHORITY. That peeled
+	// "//foo" down to an empty path and silently mis-routed "//foo/bar" to
+	// "/bar" (ADR-0309).
+	u, err := url.ParseRequestURI(path)
 	if err != nil {
 		return nil, &Error{Code: ErrProtocolError, Msg: "bad :path", Underlying: err}
 	}
