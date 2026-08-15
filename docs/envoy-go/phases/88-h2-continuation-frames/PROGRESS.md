@@ -54,6 +54,19 @@ fixtures **121** (tail `0119-grpc-unary-trailers`, next-free `0120`; **NC observ
 
 **ESTIMATED ~+60-140 net production `.go` over TWO files / ~+300-700 net test.** ⚠️ **THIS IS AN ESTIMATE, NOT A MEASUREMENT, AND THE DISTINCTION IS THE POINT.** The carried "2-4x row 85 (+1046 realized)" figure is superseded because the §6.10 finding removes the largest imagined component. **The SPEC MUST ENUMERATE BY COMPILING PROTOTYPE**: `reference_measured_prototype_is_a_lower_bound` fired **ten consecutive times** before row 87 broke the streak, and ADR-0309 §Consequences (iii) records that row 87's escape rested on **one grep-confirmed call site measured twice by a working prototype**. This row has at least **three decode sites across two files** plus per-connection state; nothing about row 87 licenses treating this estimate as a floor that holds.
 
+## ⚠️ THE ADVERSARIAL WHOLE-BRANCH REVIEW — FOUR REAL DEFECTS, ALL FIXED BEFORE THE SQUASH
+
+The phase-87 IMPL's reviewer found three; this row's found four. **The controller RE-DERIVED each by execution before acting on it**, including re-probing the pinned reference container itself.
+
+1. ⚠️ **A FALSE SENTENCE THIS ROW WAS ABOUT TO MAKE PERMANENT.** The contract bullet and D-88-CODE asserted, as a 5x-measured fact, that the reference rejects an over-large header block *"per STREAM … with NO GOAWAY at all"*. **Re-probed independently by the controller against `contrib-v1.37.2` with a live 200 control: the behavior is BANDED.** Encoded block 60887 / 63931 / 65453 ⇒ `RST_STREAM INTERNAL_ERROR`, no GOAWAY; **66974 / 68496 / 72301 ⇒ `GOAWAY COMPRESSION_ERROR(last=1)`, no RST** — a sharp, monotone flip at **64 KiB of HPACK-ENCODED block**. The reference is stream-scoped only in its LOWER band. The DECISION survives; the stated fact did not. ⚠️ **`BEHAVIOR_CONTRACT.md` is append-only — a wrong sentence there is PERMANENT, and this one was caught with one commit to spare.**
+2. ⚠️ **THIS ROW'S OWN LATE CORRECTION SHIPPED UNTESTED WHILE THE DOCS CLAIMED IT WAS COVERED.** The D-88-WRITE PRIORITY/pad-overhead guard had **ZERO** coverage: deleting the subtraction left all 11 roster rows GREEN. Two rows added; the same break now reddens **exactly those two**. *A guard added in response to a review finding is not thereby tested, and a doc sentence claiming it is tested is worse than silence.*
+3. ⚠️ **THE ENTIRE CLIENT-LEG CONTINUATION REJECT PATH WAS UNPINNED.** Swallowing the accumulator-clear + `emitGoaway` + error return left the unit suite GREEN — so nothing held the pooled-conn teardown this row calls its headline. `TestClientConn_Continuation_FloodExceedsBound` added; the break now reddens it in isolation.
+4. **The cost figure was stale by 34 lines** (see Cost above).
+
+Two notes also actioned: the 16 MiB bound's LOWER side was invisible at the unit layer (a 16384x shrink of the constant left the suite green) — now pinned by `TestServerConn_Continuation_AcceptsPastReferenceLimit`, a 96 KiB block chosen to sit above BOTH reference thresholds and far under 16 MiB, which reddens on that shrink; and a self-falsifying whole-file grep count (`SETTINGS_MAX_HEADER_LIST_SIZE`, which this row's own comments made non-zero) was replaced with a symbol-anchored property.
+
+⚠️ **THE PATTERN WORTH CARRYING: three of the four defects were in TEXT ASSERTING THAT SOMETHING HAD BEEN VERIFIED.** The branch's executable claims held under attack — the isolation proof for the two defense-in-depth guards (attacked via PUSH_PROMISE-without-END_HEADERS and held at the pinned x/net), code-motion faithfulness on both legs, write atomicity of a split block across the conn mutex, the fixture's three-leg discrimination (one break per run), and every break-protocol number. **What did not hold was the prose about them.**
+
 ## NEXT
 
 **SPEC** — dispose the eight BRAINSTORM §7 questions BY EXECUTION: Q1 the reassembly primitive decided by compiling prototype (per-connection accumulator vs `Framer.ReadMetaHeaders`, ⚠️ the latter changes the frame type the entire dispatch switch receives — **price both**); Q2 bounding the accumulator (CONTINUATION-flood class; a new stat name would break the anticipated stat-surface +0); Q3 the client-leg desync question left open above; Q4 the differential proof shape (⚠️ a stock transport reproduces this **without** a raw framer, so the cheap path is an EXTENSION — confirm by execution; `probe88` is the measured fallback, described in BRAINSTORM §2 well enough to rebuild, **not landed**); Q5 the reject-shape divergence post-fix; Q6 the false `dispatchFrame` comment and any contract sentence this row refutes (⚠️ grep for the SENTENCE); Q7 confirm or refute D-88-SEQ; Q8 re-confirm h2spec is **not** a red anchor. Draft **ADR-0310 §Context** STATUS `PROPOSED` (re-arms the strict guard **0 -> 1**). `ROADMAP.md` must be **BYTE-UNTOUCHED** at the SPEC (empty diff), `want` stays **120**, row 88 stays `in-progress`.
@@ -154,3 +167,70 @@ Input **238 lines / 120 data rows**. (1) **`NOT DONE: row 88`** ALONE, denominat
 ## NEXT
 
 **IMPL** — one atomic commit under the frozen D-88-SEQ, TDD held inside (T0 unit RED census -> T1 differential RED census, ONE RUN PER ARM -> T2/T3 production -> T4 GREEN -> T5 docs -> T6 gates LAST). Row 88 flips `done` at `ROADMAP.md:150` (status cell ALONE, summary prose sha256-verified byte-identical); the `:204` gRPC-family window loses *"the CONTINUATION-discard defect"* (11 -> 10 candidates — check (2) **should** stay SIX, but ⚠️ **MEASURE BOTH SIDES, NEVER FORECAST**); `want` stays **120**; the strict `PROPOSED` guard goes **1 -> 0** by completing ADR-0310.
+
+## IMPL — done 2026-08-15 — **PHASE 88 CLOSED, ROW 88 `done`**
+
+## What landed
+
+**ONE atomic row under the frozen D-88-SEQ**, base master `26041b1b`, branch `phase-88-impl`, squashed to one commit and merged. Production **3 files** (`internal/filter/hcm/h2/conn.go`, `client.go`, `framer.go`), tests **2 new files** (`continuation_test.go`, `framer_writeheaderblock_test.go`) + the `0004-h2-routing` extension (**4 files, 0 new**), docs `DECISIONS.md` / `BEHAVIOR_CONTRACT.md` / `ROADMAP.md` / `STATE.md` / this file.
+
+**The codec now reassembles CONTINUATION on read and splits on write, in both directions.** A HEADERS frame without END_HEADERS opens a per-connection `headerBlockAccumulator` and is neither decoded nor dispatched; CONTINUATION fragments append; the block is HPACK-decoded ONCE at END_HEADERS and then takes exactly the path an un-split block took. Both header-write sites emit through `(*framer).writeHeaderBlock`, bounded by the PEER's advertised `SETTINGS_MAX_FRAME_SIZE`. The landed FALSE `dispatchFrame` comment is dead.
+
+## Method — subagent-driven, and the controller re-derived every load-bearing claim
+
+Two probe agents on disjoint detached worktrees (`wt-88-u` unit tests, `wt-88-d` the fixture), disjoint port bands, private scratch each, **neither committing**; a third detached worktree (`wt-88-prod`) carried the production prototype. The controller ran both RED censuses ITSELF at the stage worktree, the break protocol, the sentinel battery, every count axis and every gate. ⚠️ **That re-derivation was not ceremonial: the unit-test agent found a real defect in the write contract the controller had already written and built** (§"the late correction" below), and the controller's own re-runs produced two facts neither agent had.
+
+## TDD — both censuses observed BEFORE the production edit, and the ORDER was load-bearing
+
+**T0 census 1** (arms, roster file ABSENT): 18 `=== RUN` lines, **10/10 top-level FAIL**, and — the part that makes it non-vacuous — **all FOUR non-vacuity controls PASSING** (`C0_control_unsplit`, `self_dependency_rejected`, `legal_split_trailers_control`, client `control_unsplit`), so no arm is red merely because the harness cannot observe headers.
+**T0 census 2** (roster added): the whole package fails to BUILD — `framer_writeheaderblock_test.go:207:16: f.writeHeaderBlock undefined`. ⚠️ **This is why the order was mandated: with the roster present, ZERO behavioural arms run.**
+**T1** on the extended `0004`, **ONE RUN PER ARM** (fail-fast driver): request arm `backend saw "reflect:probe=probe-value,padlen=0", want "…padlen=32000"`; response arm, isolated by demoting the request arm, `marker="emitted" padlen=0, want "emitted"/32000`. `INNER_EXIT=1` both, anchored panic gate 0, **zero `ref drive:` failures in any run**. Demotion reverted, `sha256sum -c` OK, `DEMOTED` residual 0.
+
+## The break protocol is what proves the roster, because the roster's census was only a build failure
+
+Run against the LANDED method, each break reverted with `framer.go` sha256-verified and `BREAK` residual 0:
+
+| break | reddens | vs PLAN §5.1 |
+|---|---|---|
+| hardcode 16384, ignore the peer value | **`peer_max_larger` + `peer_max_max_legal` ONLY (2/11)** | matches — and every SPEC-proposed row stays GREEN, which is why the SPEC's 4-row roster would have been blind |
+| trailing empty CONTINUATION, narrow injection site | **exactly 7 rows**, both `exact_multiple_*` included | matches |
+| same break, broader injection site | **11/11** | ⚠️ `reference_break_arm_injection_site_is_a_claim` — the row count characterises the SITE as much as the roster |
+| END_STREAM arm (SUBSTITUTED) | **ISOLATING, 1/11** | ⚠️ the PLAN's wording does not compile: x/net's `WriteContinuation(streamID, endHeaders, fragment)` has **no flags parameter**, so END_STREAM cannot be leaked onto a CONTINUATION at all |
+
+## ⚠️ THE LATE CORRECTION — A REAL DEFECT IN THIS ROW'S OWN WRITE CONTRACT, CAUGHT BEFORE LANDING
+
+The frame-size limit bounds the frame **PAYLOAD**, not the fragment, and a HEADERS payload also carries the pad-length byte, the padding and the **5-byte PRIORITY block**. The first draft of `writeHeaderBlock` bounded only the fragment, so `HEADERS(fragment = maxFrame, PRIORITY)` would have emitted a `maxFrame + 5` payload — **illegal by exactly the rule the method exists to honor.** Found because the roster asserts the emitted PAYLOAD length rather than the fragment length. No production call site sets `Priority`/`PadLength` today; the guard exists so a future one cannot silently break the bound. *A test roster written against a briefed contract can refute the contract.*
+
+## Findings this stage produced that no prior stage had
+
+1. ⚠️ **THE SURVIVING-FIELD SET IS RUN-TO-RUN NON-DETERMINISTIC.** The PLAN established the loss is PARTIAL and inferred a presence assertion would be vacuous. **Measured: across five subject observations at identical config, the sentinel survived 3 times and was lost 2 — while `padlen=0` was invariant in all five.** The controller reproduced the split independently across its own two census runs. A presence assertion would have been a **FLAKE**, not merely a vacuous green.
+2. ⚠️ **THE PLAN'S ENTROPY MECHANISM IS REFUTED WHILE ITS CONCLUSION STANDS.** HPACK has no LZ stage, so "compressible" is not the axis — **bits-per-symbol is**: `'B'`x32000 encodes at **7.00 bits/char** (28014 B), the rotating alnum pad at **5.95** (23792 B). `'B'` split because it compresses **worse**.
+3. ⚠️ **THE FRAME-SPLIT BOUNDARY, NOT A HEADER-SIZE THRESHOLD — PROVEN BY EXECUTION.** A 21500-byte pad is 5116 bytes PAST the raw 16384 mark, HPACK-encodes to **16037** (one frame), and the fixture **PASSES** (`INNER_EXIT=0`); 22500 encodes to **16781** and FAILS. That negative control is what rules out "envoy-go just caps header size".
+4. ⚠️ **THE DISCARD DEFEATED VALIDATION, NOT ONLY DELIVERY.** PLAN §10 listed split trailers as "entirely unprobed". Probed: **at the tip a pseudo-header carried in a trailer CONTINUATION is accepted and answered 200** — the RFC 9113 §8.1.2.1 trailer rule is never reached, because the bytes were discarded before validation could see them. The sibling unprobed class (**PRIORITY flag + CONTINUATION on one HEADERS**) was also probed and is handled.
+5. ⚠️ **PLAN §1.2's arm-D tip signature does not reproduce at the unit layer.** The PLAN records `GOAWAY LastStreamID=1 COMPRESSION_ERROR(9)`; measured here, **no GOAWAY at all** — request 2 takes `RST_STREAM PROTOCOL_ERROR` on stream 3 and never dispatches. The desync is real either way; **do not cite the PLAN's GOAWAY as this arm's red line.**
+6. **Arm E's second property confirmed:** the tip emitted `HEADERS=1 DATA=1` and `statuses = map[1:200]` AFTER its GOAWAY — it proxied a truncated request. The fixed codec does not.
+
+## ⚠️ Two documented traps that fired ON THE CONTROLLER
+
+- **The `-run` no-match footgun, inside the GREEN run meant to prove the roster passes.** Selector `TestFramerWriteHeaderBlock` matched nothing (the function is `TestFramer_WriteHeaderBlock_Table`); the run reported `ok` with `INNER_EXIT=0` while eleven rows never executed. Caught only by counting `=== RUN` lines. **A green selector-scoped run needs its denominator asserted more than a red one does** — a red run at least announces that something happened.
+- **`\t` in GNU ERE is a literal `t`.** The blank-import gate `grep -c '^\t_ "…'` read **0**; re-run with `-P` it reads **121** on both sides.
+- **misspell locale US fired UNFORCED twice** — `DEFENCE` in the controller's production comments and `labelled`/`honoured` in the agent's test files. A British-spelling sweep over all seven touched `.go` files is now empty.
+
+## Gates — run LAST against the FINAL tree
+
+Full differential **121/121, `INNER_EXIT=0`**, 0 FAIL / 0 SKIP / 0 `no driver registered`, anchored panic gate SILENT, **390.36 s**, clean on the FIRST launch (no flake fired; a sibling `envoy-rust` session was active and was checked rather than blamed) · `go test ./... -count=1` **`INNER_EXIT=0`, 127 ok, 0 FAIL** · `-race` on `internal/filter/hcm/...` clean · `gofmt -l` gated on OUTPUT and empty · `go vet` + `golangci-lint` clean at `INNER_EXIT=0` · `go mod tidy -diff` EMPTY and `go.mod`/`go.sum` vs master EMPTY · **h2spec `95 tests, 94 passed, 1 skipped, 0 failed` from THIS row's own run** (skip invariantly `6.9.2/2`; **§6.10 CONTINUATION 6/6 — identical to the tip that discarded every CONTINUATION frame**, ADR-0310 §Consequences (ii)) · **stat-surface DELTA 0 by the same command both sides** (occurrence **405/405**, line **403/403**; ⚠️ the lineage's carried 406 is NOT corrected and NOT carried — only the delta is asserted; NC fired 405 -> 406 on a fabricated counter and restored) · fixtures **121 +0** · fuzzers **55/48 +0** · BackendKind tail **38 +0** · fixture blank imports **121 +0**.
+
+## Cost — the FLOOR held, and both axes overran
+
+**Production `+397/−113` = net `+284`** against the PLAN's `~+190-240` band — an overrun of **44**. Test-side `+1716/−7` = net **+1709**. ⚠️ **THIS FIGURE WENT STALE TWICE INSIDE ONE ROW, THE SECOND TIME IN THE SENTENCE CORRECTING THE FIRST:** `+244` (measured on the prototype BEFORE the PRIORITY correction, caught by the adversarial review), then `+278` (measured before the review's own mandated edits landed, stale within the hour). **One cause, one remedy: measure a cost at the commit that PUBLISHES it, in the same act as writing it.** **Differential 137 Go insertions** against the PLAN's MEASURED 115. ⚠️ `reference_measured_prototype_is_a_lower_bound` fires again on BOTH axes, one row after row 87 broke its ten-firing streak — and row 87's escape is re-confirmed as specific to its single grep-confirmed call site, not a trend. **The PLAN's code-motion figure reproduced EXACTLY: 86 lines byte-identical after a single de-indent + 8 mechanical substitutions = 94**, so the genuinely new executable code is far smaller than the net suggests.
+
+## Sentinel — MEASURED ON BOTH SIDES OF THE ROADMAP EDITS, NEVER FORECAST
+
+**BEFORE:** 238 lines / 120 data rows · (1) **`NOT DONE: row 88`** ALONE · (2) **SIX** at `:198 :204 :210 :220 :226 :234` · (3) SILENT.
+**AFTER:** 238 / 120 · (1) **SILENT** · (2) **SIX**, same anchors — the PLAN's 11 -> 10 prediction CONFIRMED BY MEASUREMENT · (3) SILENT.
+⇒ **check (2) prints, so the conjunction FAILS and the sentinel does NOT fire. `stop` was NOT created** (verified absent at repo root AND stage worktree).
+**All four NCs fired on BOTH sides.** After the flip the row-62 doctoring prints **`NOT DONE: row 62` ALONE** — the discriminating change from the pre-edit side, where it printed both rows; `want=119` ⇒ `GATE FAIL: examined 120 data rows, expected 119` (the ONLY output now that check (1) is silent, which is what proves the denominator assertion is live); check-(3) doctoring (residual 2 -> 0 confirmed first) ⇒ `NEVER OPENED: gRPC` with WASM correctly silent; check-(2) one-arm **5** / **1**, union **6**. Leak axes INVARIANT both sides: `-family row` **95 occurrences / 67 LINES**, `gRPC-family row` **2**, `Operational-tooling-family row` **3**.
+
+## NEXT
+
+**Phase 88 is CLOSED and every chartered ROADMAP row is `done`.** The sentinel does NOT fire: check (2)'s SIX family windows are the sole remaining blocker, and they name ~42 un-chartered candidates — this row removed one (the CONTINUATION-discard defect) and added four (stream-scoped header-overflow parity via a decode-and-discard drain; `max_request_headers_kb` + the `http2.header_overflow` stat; `SETTINGS_MAX_HEADER_LIST_SIZE` advertisement; decode-side filter mutations never reaching the H2 upstream request — a **pre-existing framework property, not a phase-88 defect**). One class named by the PLAN remains genuinely unprobed: **a split header block on a stream being concurrently reset.**

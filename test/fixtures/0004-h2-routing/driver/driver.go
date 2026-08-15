@@ -16,9 +16,31 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/net/http2/hpack"
+
 	"github.com/pgdad/envoy-go/test/differential/fixture"
 	"github.com/pgdad/envoy-go/test/helpers"
 )
+
+// Phase-88 CONTINUATION-arm constants, MIRRORED from the fixture backend
+// (../backends/main.go). See that file for the MEASURED encoded-size table
+// that proves 32000 B splits and 1024 B / 16000 B do not.
+const (
+	contPadLen     = 32000
+	contProbeValue = "probe-value"
+	contMarker     = "emitted"
+)
+
+// contPad mirrors the backend's pad generator byte-for-byte. Both sides must
+// agree, because the driver asserts the LENGTH the backend reports back.
+func contPad(n int) string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = alphabet[i%len(alphabet)]
+	}
+	return string(b)
+}
 
 const fixtureName = "0004-h2-routing"
 const refContainerListenerPort = 15004
@@ -237,7 +259,7 @@ func (d *h2Driver) loadTLSConfig() *tls.Config {
 	}
 }
 
-// drive issues 29 sequential H2 requests against addr (the proxy listener)
+// drive issues 31 sequential H2 requests against addr (the proxy listener)
 // and returns the concatenated 9 /health response bodies followed by the 2
 // phase-87 leading-`//` arm bodies ("edge-ok" x 2). The first 27 requests and
 // the transcript prefix they produce are unchanged from phase 05.2. Per ADR-0028 +
@@ -327,6 +349,71 @@ func (d *h2Driver) drive(ctx context.Context, addr string, counts *[3]uint64) ([
 		}
 		out.Write(body)
 	}
+
+	// Phase-88 CONTINUATION arms (2 requests; total 31/side).
+	//
+	// contPad(contPadLen) HPACK-encodes to 23792 B — past the 16384 B RFC 9113
+	// §6.5.2 default SETTINGS_MAX_FRAME_SIZE — so the header block MUST travel
+	// as HEADERS + CONTINUATION. Both arms route through `prefix: "/api"` to
+	// c_h2_backend, so each exercises BOTH codec legs (downstream server read /
+	// upstream client write on the request arm; upstream client read /
+	// downstream server write on the response arm).
+	//
+	// ⚠️ ASSERTION CONSTRAINTS — do not "simplify" these:
+	//
+	//   1. Both arms assert the LENGTH of the large field, never the small
+	//      probe/marker header's PRESENCE. The CONTINUATION-discard defect is
+	//      PARTIAL: fields encoded BEFORE the split point survive, so a
+	//      presence-only assertion reads GREEN on a broken tip.
+	//   2. Neither arm asserts WHICH headers survive — that is x/net encoder
+	//      field ordering, not a contract.
+	//   3. 32000 B is MEASURED to split at this fixture's entropy. Changing the
+	//      pad alphabet or size requires RE-MEASURING the encoded block size;
+	//      the byte count does not carry.
+	//
+	// Both arms are appended AFTER the 9 /api/v1/<n> requests so the per-side
+	// [3,3,3] RR distribution over those 9 is untouched, and neither body is
+	// concatenated into the differential byte stream (the transcript prefix
+	// stays byte-identical).
+	{
+		reqHdrs := []hpack.HeaderField{
+			{Name: "x-cont-probe", Value: contProbeValue},
+			{Name: "x-cont-pad", Value: contPad(contPadLen)},
+		}
+		status, _, body, err := helpers.H2RoundTrip(ctx, addr, tlsConf, "GET", "/api/v1/reflect", reqHdrs, nil)
+		if err != nil {
+			return nil, fmt.Errorf("cont-request-arm: %w", err)
+		}
+		if status != 200 {
+			return nil, fmt.Errorf("cont-request-arm: status=%d, want 200", status)
+		}
+		want := fmt.Sprintf("reflect:probe=%s,padlen=%d", contProbeValue, contPadLen)
+		if string(body) != want {
+			return nil, fmt.Errorf("cont-request-arm: backend saw %q, want %q (CONTINUATION-carried request headers lost)", string(body), want)
+		}
+	}
+	{
+		status, respHdrs, _, err := helpers.H2RoundTrip(ctx, addr, tlsConf, "GET", "/api/v1/emit", nil, nil)
+		if err != nil {
+			return nil, fmt.Errorf("cont-response-arm: %w", err)
+		}
+		if status != 200 {
+			return nil, fmt.Errorf("cont-response-arm: status=%d, want 200", status)
+		}
+		var marker string
+		padLen := 0
+		for _, hf := range respHdrs {
+			switch strings.ToLower(hf.Name) {
+			case "x-cont-marker":
+				marker = hf.Value
+			case "x-cont-pad":
+				padLen = len(hf.Value)
+			}
+		}
+		if marker != contMarker || padLen != contPadLen {
+			return nil, fmt.Errorf("cont-response-arm: marker=%q padlen=%d, want %q/%d (CONTINUATION-carried response headers lost)", marker, padLen, contMarker, contPadLen)
+		}
+	}
 	return []byte(out.String()), nil
 }
 
@@ -350,7 +437,7 @@ func parseBackendIdx(body []byte) (int, error) {
 	return idx, nil
 }
 
-// DriveReference runs 29 H2 round-trips against the reference proxy listener
+// DriveReference runs 31 H2 round-trips against the reference proxy listener
 // and records per-backend body counts on d.refBodyCnt for AssertDistribution.
 func (d *h2Driver) DriveReference(ctx context.Context, addr string) ([]byte, error) {
 	var counts [3]uint64
@@ -364,7 +451,7 @@ func (d *h2Driver) DriveReference(ctx context.Context, addr string) ([]byte, err
 	return b, nil
 }
 
-// DriveSubject runs 29 H2 round-trips against the subject proxy listener and
+// DriveSubject runs 31 H2 round-trips against the subject proxy listener and
 // records per-backend body counts on d.subjBodyCnt for AssertDistribution.
 func (d *h2Driver) DriveSubject(ctx context.Context, addr string) ([]byte, error) {
 	var counts [3]uint64

@@ -32,6 +32,106 @@ func safeAddInt32(a, b int32) (int32, bool) {
 	return int32(sum), true
 }
 
+// maxHeaderBlockSize bounds the total number of header-block fragment bytes a
+// single HEADERS + CONTINUATION sequence may accumulate before the connection
+// is torn down. RFC 9113 §6.10 places no limit on the number of CONTINUATION
+// frames in a block, and x/net's Framer.checkFrameOrder caps each individual
+// HOP (SETTINGS_MAX_FRAME_SIZE) but never the running total.
+//
+// ⚠️ The exposure this bounds is CREATED by reassembly, not repaired by it.
+// Before phase 88 the codec DISCARDED every CONTINUATION fragment and
+// therefore retained nothing; accumulating the block is what introduces
+// retention. envoy-go does not inherit x/net's CVE-2023-45288 CONTINUATION-
+// flood mitigation (that lives in readMetaFrame, which this codec never
+// enables) and never advertises SETTINGS_MAX_HEADER_LIST_SIZE, so this
+// constant is the ONLY cap on a CONTINUATION flood.
+//
+// The value diverges from the reference deliberately and in two ways — see
+// ADR-0310 §Decision: Envoy rejects at max_request_headers_kb (60 KiB by
+// default) with a STREAM-scoped RST_STREAM(INTERNAL_ERROR), while this codec
+// rejects at 16 MiB with a CONNECTION-scoped GOAWAY(ENHANCE_YOUR_CALM),
+// because a byte accumulator that abandons a partially-received block leaves
+// the connection-scoped HPACK dynamic table permanently diverged from the
+// peer's encoder — the exact defect phase 88 exists to fix.
+const maxHeaderBlockSize = 16 << 20 // 16 MiB
+
+// headerBlockAccumulator buffers the fragments of one header block that
+// arrived split across a HEADERS frame and one or more CONTINUATION frames
+// (RFC 9113 §6.10). The originating HEADERS frame's flags are carried here
+// because a CONTINUATION frame defines only END_HEADERS: END_STREAM and the
+// PRIORITY fields belong to the HEADERS frame that opened the block.
+//
+// One accumulator per CONNECTION, not per stream: RFC 9113 §6.10 forbids any
+// intervening frame between a HEADERS and its CONTINUATION frames, so at most
+// one block can be open on a connection at a time. Both ServerConn (frame
+// loop) and ClientConn (read loop) touch their accumulator from a single
+// goroutine, so no mutex is taken.
+type headerBlockAccumulator struct {
+	streamID    uint32
+	buf         []byte
+	endStream   bool
+	hasPriority bool
+	priority    http2.PriorityParam
+}
+
+// startHeaderBlock opens an accumulator for a HEADERS frame that did NOT carry
+// END_HEADERS. The fragment is COPIED: http2.Framer reuses its internal read
+// buffer across ReadFrame calls, so the slice does not survive the next read.
+func startHeaderBlock(f *http2.HeadersFrame) *headerBlockAccumulator {
+	frag := f.HeaderBlockFragment()
+	a := &headerBlockAccumulator{
+		streamID:    f.Header().StreamID,
+		buf:         make([]byte, len(frag)),
+		endStream:   f.StreamEnded(),
+		hasPriority: f.HasPriority(),
+		priority:    f.Priority,
+	}
+	copy(a.buf, frag)
+	return a
+}
+
+// appendContinuation appends a CONTINUATION fragment to the open accumulator
+// a, which may be nil when no block is open. Shared by ServerConn and
+// ClientConn so the bound and the three rejects have exactly one definition.
+//
+// All three rejects are CONNECTION-scoped: a header block abandoned partway
+// through leaves the connection-scoped HPACK decoder unable to interpret any
+// later block, which no per-stream reset can repair.
+//
+// ⚠️ The first two rejects are DEFENSE IN DEPTH, not reachable coverage: with
+// frames obtained through Framer.ReadFrame, x/net's checkFrameOrder already
+// rejects a CONTINUATION that no HEADERS opened ("unexpected CONTINUATION")
+// and one naming a different stream, surfacing as a framer connection error
+// before this code sees the frame. The size reject is NOT defense in depth —
+// checkFrameOrder bounds the hop, not the total, and a 19.6 MB flood reaches
+// here (PLAN-88 §4.1).
+//
+// ⚠️ The first two messages below deliberately echo x/net's own checkFrameOrder
+// wording. That is harmless ONLY because translateFramerErr discards x/net's
+// errDetail and reports "framer: connection-error code=%d" instead, so the two
+// sources can never be confused in a log or an assertion. If anyone ever plumbs
+// errDetail through translateFramerErr, a substring assertion on these two
+// messages stops discriminating and must be re-anchored on the h2: prefix.
+//
+// The size reject needs no errors.Is sentinel: ErrEnhanceYourCalm is emitted at
+// exactly one site in internal/ (grep-confirmed at phase 88), so asserting the
+// Code alone already discriminates it.
+func appendContinuation(a *headerBlockAccumulator, f *http2.ContinuationFrame) error {
+	streamID := f.Header().StreamID
+	if a == nil {
+		return connError(ErrProtocolError, fmt.Sprintf("unexpected CONTINUATION for stream %d", streamID))
+	}
+	if a.streamID != streamID {
+		return connError(ErrProtocolError, fmt.Sprintf("got CONTINUATION for stream %d; expected stream %d", streamID, a.streamID))
+	}
+	frag := f.HeaderBlockFragment()
+	if len(a.buf)+len(frag) > maxHeaderBlockSize {
+		return connError(ErrEnhanceYourCalm, "h2 continuation accumulator exceeded maxHeaderBlockSize")
+	}
+	a.buf = append(a.buf, frag...)
+	return nil
+}
+
 // ServerConn is one downstream HTTP/2 server connection. Construct with
 // NewServerConn; call Run to drive the connection lifecycle.
 //
@@ -73,6 +173,10 @@ type ServerConn struct {
 	// counter by the same amount, and reset to 0. Mutated only from the
 	// frame-loop goroutine (in onData), so no separate mutex.
 	recvDebitSinceLastUpdate int32
+	// hdrAccum holds the in-progress header block when a HEADERS frame arrived
+	// without END_HEADERS (RFC 9113 §6.10). nil whenever no block is open.
+	// Mutated only from the frame-loop goroutine (onHeaders / onContinuation).
+	hdrAccum *headerBlockAccumulator
 }
 
 // NewServerConn constructs a ServerConn value. Run owns conn (closes on exit).
@@ -262,10 +366,7 @@ func (s *ServerConn) dispatchFrame(frame http2.Frame) error {
 	case *http2.HeadersFrame:
 		return s.onHeaders(f)
 	case *http2.ContinuationFrame:
-		// Handled by framer as part of ReadMetaHeaders; reaching here means the
-		// framer gave us a raw ContinuationFrame (shouldn't happen in normal usage,
-		// but be safe and ignore).
-		return nil
+		return s.onContinuation(f)
 	case *http2.DataFrame:
 		return s.onData(f)
 	case *http2.SettingsFrame:
@@ -289,9 +390,43 @@ func (s *ServerConn) dispatchFrame(frame http2.Frame) error {
 }
 
 // onHeaders handles an incoming HEADERS frame.
+//
+// A frame WITHOUT END_HEADERS opens a header-block accumulator and is neither
+// decoded nor dispatched here: the rest of the block arrives as CONTINUATION
+// frames (RFC 9113 §6.10) and onContinuation completes it. Before phase 88
+// this method decoded the partial fragment and dispatched the partial field
+// set, leaving the connection-scoped HPACK dynamic table diverged from the
+// peer's encoder for the remaining life of the connection.
 func (s *ServerConn) onHeaders(f *http2.HeadersFrame) error {
-	streamID := f.Header().StreamID
+	if !f.HeadersEnded() {
+		s.hdrAccum = startHeaderBlock(f)
+		return nil
+	}
+	return s.onHeaderBlock(f.Header().StreamID, f.HeaderBlockFragment(), f.StreamEnded(), f.HasPriority(), f.Priority)
+}
 
+// onContinuation accumulates one CONTINUATION fragment (RFC 9113 §6.10),
+// completing the block once END_HEADERS arrives. A rejected fragment clears
+// the accumulator; the reject is connection-scoped, so the connection is going
+// away regardless.
+func (s *ServerConn) onContinuation(f *http2.ContinuationFrame) error {
+	if err := appendContinuation(s.hdrAccum, f); err != nil {
+		s.hdrAccum = nil
+		return err
+	}
+	if !f.HeadersEnded() {
+		return nil
+	}
+	a := s.hdrAccum
+	s.hdrAccum = nil
+	return s.onHeaderBlock(a.streamID, a.buf, a.endStream, a.hasPriority, a.priority)
+}
+
+// onHeaderBlock processes one COMPLETE request header block — the whole of it,
+// whether it arrived in a single HEADERS frame or was reassembled from a
+// HEADERS plus CONTINUATION frames. endStream, hasPriority and priority come
+// from the HEADERS frame that opened the block.
+func (s *ServerConn) onHeaderBlock(streamID uint32, block []byte, endStream, hasPriority bool, priority http2.PriorityParam) error {
 	// Drain any goroutine completions first so that s.streams and s.closedStreams
 	// are up to date before we inspect stream state.  In particular, a stream
 	// that was dispatched and completed before this HEADERS frame arrived will be
@@ -300,8 +435,9 @@ func (s *ServerConn) onHeaders(f *http2.HeadersFrame) error {
 	// correctly.
 	s.drainDone()
 
-	// Validate / decode headers.
-	headers, err := s.hpack.decodeBlock(f.HeaderBlockFragment(), f.HeadersEnded())
+	// Validate / decode headers. The block is complete by construction, so the
+	// decoder is always closed at the block boundary.
+	headers, err := s.hpack.decodeBlock(block, true)
 	if err != nil {
 		return connError(ErrCompressionError, "HPACK decode failed")
 	}
@@ -317,10 +453,10 @@ func (s *ServerConn) onHeaders(f *http2.HeadersFrame) error {
 		// Trailers (HEADERS after DATA in open state) are discarded per SPEC §2.1.
 		// We still validate: trailing HEADERS MUST NOT contain pseudo-headers
 		// (RFC 9113 §8.1.2.1 — pseudo-headers only valid in first HEADERS block).
-		if err := existing.recvTrailingHeaders(headers, f.StreamEnded()); err != nil {
+		if err := existing.recvTrailingHeaders(headers, endStream); err != nil {
 			return err
 		}
-		if f.StreamEnded() {
+		if endStream {
 			// Trailing HEADERS carried END_STREAM: the request is now complete,
 			// so queue the dispatch exactly as the HEADERS/DATA END_STREAM paths
 			// do (the trailer fields themselves were observed-and-discarded
@@ -367,7 +503,7 @@ func (s *ServerConn) onHeaders(f *http2.HeadersFrame) error {
 	}
 
 	// RFC 9113 §5.3.1: a stream cannot depend on itself. Check PRIORITY flag.
-	if f.HasPriority() && f.Priority.StreamDep == streamID {
+	if hasPriority && priority.StreamDep == streamID {
 		return streamError(ErrProtocolError, streamID, "HEADERS self-dependency")
 	}
 
@@ -389,7 +525,7 @@ func (s *ServerConn) onHeaders(f *http2.HeadersFrame) error {
 		peerInitWindow = 65535
 	}
 	ss := newServerStream(streamID, s, peerInitWindow, int32(s.settings.InitialWindowSize))
-	if err := ss.recvHeaders(headers, f.StreamEnded()); err != nil {
+	if err := ss.recvHeaders(headers, endStream); err != nil {
 		return err
 	}
 
@@ -411,7 +547,7 @@ func (s *ServerConn) onHeaders(f *http2.HeadersFrame) error {
 	}
 	s.mu.Unlock()
 
-	if f.StreamEnded() {
+	if endStream {
 		// Queue the dispatch for deferred launch.  The frame loop will launch
 		// all pending dispatches once the current TCP burst is exhausted (no
 		// more frames immediately available), ensuring that RST_STREAM for an
@@ -745,12 +881,16 @@ func (s *ServerConn) encodeAndWriteHeaders(streamID uint32, headers []hpack.Head
 	// Make a copy of the encoded bytes because encBuf is reused.
 	block := make([]byte, len(encoded))
 	copy(block, encoded)
-	return s.fr.WriteHeaders(http2.HeadersFrameParam{
+	// Split into HEADERS + CONTINUATION frames bounded by the peer's advertised
+	// SETTINGS_MAX_FRAME_SIZE (RFC 9113 §6.10). Emitting the whole block as one
+	// frame — what this call site did before phase 88 — is illegal as soon as
+	// the encoded block exceeds the peer's limit, and a conforming peer answers
+	// with a FRAME_SIZE_ERROR instead of the response.
+	return s.fr.writeHeaderBlock(http2.HeadersFrameParam{
 		StreamID:      streamID,
 		BlockFragment: block,
 		EndStream:     endStream,
-		EndHeaders:    true,
-	})
+	}, int32(s.clientS.MaxFrameSize))
 }
 
 // writeData implements streamConn. Called from serverStream.WriteData.
@@ -779,7 +919,7 @@ func (s *ServerConn) writeData(streamID uint32, b []byte, endStream bool) error 
 	// the peer has not yet sent SETTINGS (s.clientS.MaxFrameSize == 0).
 	maxFrame := int32(s.clientS.MaxFrameSize)
 	if maxFrame <= 0 {
-		maxFrame = 16384
+		maxFrame = defaultPeerMaxFrameSize
 	}
 
 	remaining := b

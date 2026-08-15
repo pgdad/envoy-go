@@ -11,12 +11,99 @@ import (
 	"golang.org/x/net/http2"
 )
 
+// defaultPeerMaxFrameSize is the RFC 9113 §6.5.2 default for
+// SETTINGS_MAX_FRAME_SIZE, used whenever the peer has not (yet) announced a
+// value of its own. RFC 9113 §6.5 does not require a SETTINGS frame to carry
+// the parameter at all, so a zero peer value means "unannounced", not "zero".
+//
+// This is the sibling constant already applied by ServerConn.writeData and
+// ClientConn.writeData; phase 88 names it rather than minting a third copy of
+// the literal.
+const defaultPeerMaxFrameSize = 16384
+
 // framer is a thin wrapper over *http2.Framer adding context-aware reads.
-// Write methods are passthrough via embedding. Phase 05.1 does NOT use
-// http2.Framer.WriteRawFrame (per SPEC §4.1).
+// Write methods are passthrough via embedding, except writeHeaderBlock, which
+// wraps WriteHeaders to honor RFC 9113 §6.10 header-block continuation.
+// Phase 05.1 does NOT use http2.Framer.WriteRawFrame (per SPEC §4.1).
 type framer struct {
 	*http2.Framer
 	conn net.Conn
+}
+
+// writeHeaderBlock writes an encoded header block as exactly one HEADERS frame
+// followed by zero or more CONTINUATION frames (RFC 9113 §6.10), each frame's
+// payload bounded by peerMaxFrameSize — the PEER's advertised
+// SETTINGS_MAX_FRAME_SIZE, since the limit governs what we may SEND.
+//
+// x/net's Framer.WriteHeaders does not split: it emits whatever fragment it is
+// handed as a single frame, rejecting only at the 16 MiB wire ceiling. Before
+// phase 88 both header-write sites called it directly with EndHeaders: true,
+// so any block larger than the peer's limit went out as an illegal oversized
+// frame — masked only because the read side discarded CONTINUATION frames
+// before they could be re-emitted (ADR-0310 §Context ¶3).
+//
+// The caller's p.EndHeaders is IGNORED and recomputed: END_HEADERS belongs on
+// the LAST frame of the block and nowhere else. p.EndStream and the PRIORITY
+// fields ride the HEADERS frame only — RFC 9113 §6.10 defines END_HEADERS as
+// the sole flag a CONTINUATION carries.
+//
+// An empty block emits exactly one HEADERS frame with an empty fragment and
+// END_HEADERS set (never zero frames): the header block must still terminate.
+func (f *framer) writeHeaderBlock(p http2.HeadersFrameParam, peerMaxFrameSize int32) error {
+	maxFrame := peerMaxFrameSize
+	if maxFrame <= 0 {
+		maxFrame = defaultPeerMaxFrameSize
+	}
+
+	// SETTINGS_MAX_FRAME_SIZE bounds the frame PAYLOAD, not the fragment, and
+	// the HEADERS frame's payload also carries the pad-length byte, the padding
+	// itself, and the 5-byte PRIORITY block when those are requested. Subtract
+	// that overhead from the FIRST frame's fragment budget, or a HEADERS frame
+	// carrying PRIORITY would emit a payload of maxFrame+5 — illegal by exactly
+	// the rule this method exists to honor. CONTINUATION frames carry no such
+	// overhead, so their budget is the full maxFrame.
+	//
+	// No production call site sets Priority or PadLength today; the guard is
+	// here because the roster asserts the emitted PAYLOAD length rather than the
+	// fragment length, so a future call site that sets either cannot silently
+	// break the bound.
+	headMax := maxFrame
+	if p.PadLength != 0 {
+		headMax -= 1 + int32(p.PadLength)
+	}
+	if !p.Priority.IsZero() {
+		headMax -= 5
+	}
+	if headMax < 0 {
+		headMax = 0
+	}
+
+	block := p.BlockFragment
+	head := block
+	if int32(len(head)) > headMax {
+		head = block[:headMax]
+	}
+	rest := block[len(head):]
+
+	first := p
+	first.BlockFragment = head
+	first.EndHeaders = len(rest) == 0
+	if err := f.WriteHeaders(first); err != nil {
+		return err
+	}
+
+	for len(rest) > 0 {
+		n := int32(len(rest))
+		if n > maxFrame {
+			n = maxFrame
+		}
+		chunk := rest[:n]
+		rest = rest[n:]
+		if err := f.WriteContinuation(p.StreamID, len(rest) == 0, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // newFramer constructs a framer over conn for both reading and writing. The

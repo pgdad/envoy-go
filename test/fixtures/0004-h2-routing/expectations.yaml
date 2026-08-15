@@ -7,7 +7,7 @@
 # helper used is test/helpers.H2RoundTrip per Task 12).
 #
 # Asserted equivalence (per ADR-0044 carry-forward + ADR-0057):
-#   - response status code per request, across all 29 requests/side
+#   - response status code per request, across all 31 requests/side
 #   - decoded response body bytes for /health direct_response (200, "OK\n")
 #     — 9 x "OK\n" concatenated into the Drive byte stream, compared byte-for-byte
 #   - decoded response body bytes for the two leading-`//` arms (200, "edge-ok")
@@ -55,7 +55,7 @@
 #   3. match.prefix: "//edge"  -> direct_response 200 "edge-ok" (phase 87)
 #   4. match.prefix: "/"       -> direct_response 404 "not found\n" (catch-all)
 #
-# Driver request schedule (29 requests/side, deterministic ordering; driver
+# Driver request schedule (31 requests/side, deterministic ordering; driver
 # issues them serially over fresh TLS+H/2 connections per call so RR slots are
 # consumed one-per-request):
 #   9 x GET /health                  -> expect 200, body "OK\n" (concatenated)
@@ -66,6 +66,28 @@
 #   9 x GET /missing/<n> n=0..8      -> expect 404 (body NOT concatenated)
 #   1 x GET //edge                   -> expect 200, body "edge-ok" (concatenated)
 #   1 x GET //edge/health            -> expect 200, body "edge-ok" (concatenated)
+#   1 x GET /api/v1/reflect          -> expect 200, body
+#                                       "reflect:probe=probe-value,padlen=32000"
+#                                       (phase 88; body NOT concatenated, NOT counted
+#                                        into the [3,3,3] distribution)
+#   1 x GET /api/v1/emit             -> expect 200, response headers
+#                                       x-cont-marker: emitted and a 32000-byte
+#                                       x-cont-pad (phase 88; NOT concatenated)
+#
+# CONTINUATION arms (phase 88 — the LENGTH assertion is the load-bearing one):
+#   Both arms carry a 32000-byte header value that HPACK-encodes to 23792 B,
+#   past the 16384 B RFC 9113 §6.5.2 default SETTINGS_MAX_FRAME_SIZE, so the
+#   header block MUST travel as HEADERS + CONTINUATION. MEASURED negative
+#   controls at the same alphabet: 1024 B -> 774 B and 16000 B -> 11902 B both
+#   stay in ONE frame. The flip is therefore at the frame-split boundary, not
+#   at a header-size threshold.
+#   - /api/v1/reflect: the backend reports back the LENGTH of the pad header
+#     it received. Asserting the small x-cont-probe header's PRESENCE instead
+#     would read GREEN on a CONTINUATION-discard defect, because the loss is
+#     PARTIAL — fields encoded before the split point survive.
+#   - /api/v1/emit: same assertion in the response direction.
+#   Neither arm asserts WHICH headers survive (x/net encoder field ordering is
+#   not a contract), and neither body enters the differential byte stream.
 #
 # Leading-`//` origin-form arms (phase 87 — both assertions on both arms are
 # load-bearing; neither arm alone catches both failure modes):

@@ -84,7 +84,12 @@ type ClientConn struct {
 	// was emitted. Mutated only from the readLoop goroutine (in dispatchFrame's
 	// DATA case), so no separate mutex.
 	recvDebitSinceLastUpdate int32
-	goawaySent               bool // true after we've emitted our own GOAWAY
+	// hdrAccum holds the in-progress response header block when a HEADERS frame
+	// arrived without END_HEADERS (RFC 9113 §6.10). nil whenever no block is
+	// open. Mutated only from the readLoop goroutine (dispatchFrame) — the
+	// mirror of ServerConn.hdrAccum.
+	hdrAccum   *headerBlockAccumulator
+	goawaySent bool // true after we've emitted our own GOAWAY
 	// onRxReset / onTxReset are nil-guarded behavioral hooks fired when this conn
 	// RECEIVES (dispatchFrame RSTStreamFrame) / SENDS (RoundTrip ctx.Done CANCEL)
 	// a RST_STREAM. The cluster pool wires them to its http2.rx_reset / tx_reset
@@ -407,100 +412,46 @@ func (cc *ClientConn) dispatchFrame(f http2.Frame) error {
 		return translateFramerErr(err)
 
 	case *http2.HeadersFrame:
-		cs, ok := cc.lookupStream(fr.StreamID)
-		if !ok {
-			if cc.wasReset(fr.StreamID, fr.StreamEnded()) {
-				// Late response HEADERS racing our RST_STREAM(CANCEL) — tolerated
-				// per RFC 9113 §5.1. The block MUST still be HPACK-decoded (the
-				// decoder's dynamic table is connection-scoped state shared with
-				// every other stream's HEADERS); the decoded fields are discarded.
-				if _, err := cc.hp.decodeBlock(fr.HeaderBlockFragment(), fr.HeadersEnded()); err != nil {
-					cc.emitGoaway(ErrCompressionError)
-					return err
-				}
-				return nil
-			}
-			// Server-initiated HEADERS (PUSH_PROMISE-class) — we advertise
-			// ENABLE_PUSH=0 so this is a peer protocol violation.
-			cc.emitGoaway(ErrProtocolError)
-			return connError(ErrProtocolError, "client: server-initiated HEADERS with ENABLE_PUSH=0")
+		// A HEADERS frame without END_HEADERS opens a header-block accumulator and
+		// is neither decoded nor acted on here; the remainder of the block arrives
+		// as CONTINUATION frames (RFC 9113 §6.10). Before phase 88 this arm decoded
+		// the partial fragment, so a split upstream response block silently lost
+		// every field after the split point AND left the connection-scoped HPACK
+		// decoder diverged from the peer's encoder — cumulative damage on a POOLED
+		// upstream connection, where the next request on the same conn hangs and
+		// the one after it takes the GOAWAY (ADR-0310 §Decision).
+		if !fr.HeadersEnded() {
+			cc.hdrAccum = startHeaderBlock(fr)
+			return nil
 		}
-		decoded, err := cc.hp.decodeBlock(fr.HeaderBlockFragment(), fr.HeadersEnded())
-		if err != nil {
-			cc.emitGoaway(ErrCompressionError)
+		return cc.onResponseHeaderBlock(fr.StreamID, fr.HeaderBlockFragment(), fr.StreamEnded())
+
+	case *http2.ContinuationFrame:
+		// Mirror of ServerConn.onContinuation. Before phase 88 the client had no
+		// CONTINUATION arm at all: the frame fell through to the "unknown frame
+		// types are silently ignored" default and its bytes were dropped.
+		if err := appendContinuation(cc.hdrAccum, fr); err != nil {
+			cc.hdrAccum = nil
+			// appendContinuation returns only connError(...) values, so the
+			// errors.As arm always succeeds and the fallback below is
+			// UNREACHABLE BY CONSTRUCTION — kept, and labeled rather than
+			// deleted, so that a future appendContinuation returning a plain
+			// error still tears the connection down instead of silently
+			// leaving a half-read header block on a POOLED conn.
+			var hErr *Error
+			if errors.As(err, &hErr) {
+				cc.emitGoaway(hErr.Code)
+			} else {
+				cc.emitGoaway(ErrProtocolError)
+			}
 			return err
 		}
-		if !cs.respHeadersSeen {
-			cs.respHeadersSeen = true
-			cs.respHeaders = decoded
-			for _, hf := range decoded {
-				if hf.Name == ":status" {
-					cs.respStatus, _ = strconv.Atoi(hf.Value)
-					break
-				}
-			}
-		} else {
-			// Trailing HEADERS (RFC 9113 §8.1 trailer section). VALIDATE BEFORE
-			// RETAINING: the reference books this reject in the upstream codec
-			// (measured: rx_messaging_error / upstream_rq_tx_reset) and the
-			// downstream consequence is a stream reset, never a "cleaned" 200.
-			//
-			// A violation fails THIS STREAM ONLY. cs.finish carries the
-			// stream-scoped *Error out through RoundTrip, and
-			// serverStream.dispatch reads err.Code to emit RST_STREAM with the
-			// carried code downstream. Nothing here touches the CONNECTION: no
-			// GOAWAY, no connection-scoped error return (which would cancel
-			// cc.ctx and tear the pooled conn down) — the reference resets the
-			// stream, not the conn.
-			//
-			// ⚠️ THERE IS DELIBERATELY NO SECOND-TRAILING-BLOCK RULE, and none
-			// may be re-added. The END_STREAM leg inside validateResponseTrailers
-			// makes one unreachable by its PRESENCE (not by being checked first):
-			// a first trailing block that does not terminate the stream is
-			// rejected here whatever else is wrong with it, and after a LEGAL
-			// END_STREAM block cs.finish has already returned RoundTrip — so no
-			// second block can ever reach this branch. Leg ORDER only selects
-			// which message a doubly-malformed block reports. The reference
-			// behaves identically. (PLAN-84.1 §1.8, broken-gate shape 35: a
-			// validation leg no wire sequence can reach still reads as coverage
-			// in a direct table.)
-			//
-			// ⚠️ NAMED NON-GOAL — 1xx INTERIM RESPONSES ARE NOT SUPPORTED BY THIS
-			// CODEC AND NOW FAIL THE STREAM. A leading 1xx HEADERS block sets
-			// respHeadersSeen, so the REAL final HEADERS lands in this branch and
-			// is rejected as a pseudo-header violation (it carries :status). That
-			// is a change from the pre-validation tip, which silently mis-captured
-			// the final block as trailers; the reference FORWARDS 1xx. Failing
-			// loudly is preferred to mis-capturing, but this is a known divergence
-			// — do not read it as accidental.
-			if verr := validateResponseTrailers(fr.StreamID, decoded, fr.StreamEnded()); verr != nil {
-				// Reset the UPSTREAM stream too, copying RoundTrip's ctx-cancel
-				// pattern exactly. markReset FIRST (before the RST write and
-				// before cs.finish releases RoundTrip, whose deferred
-				// cc.streams.Delete removes the map entry) so any further peer
-				// frames on this id — guaranteed when the rejected block did not
-				// carry END_STREAM, since the peer never terminated the stream —
-				// are discarded per RFC 9113 §5.1 instead of falling through to
-				// the "stream gone" arms, which return CONNECTION-level errors
-				// and would tear the pooled conn down. onTxReset is what books
-				// the reference's upstream_rq_tx_reset; it fires OUTSIDE cc.mu so
-				// the codec mutex is never held across a cluster callback.
-				cc.markReset(fr.StreamID)
-				cc.mu.Lock()
-				_ = cc.fr.WriteRSTStream(fr.StreamID, http2.ErrCodeInternal)
-				cc.mu.Unlock()
-				if cc.onTxReset != nil {
-					cc.onTxReset()
-				}
-				cs.finish(verr)
-				return nil
-			}
-			cs.respTrailers = decoded
+		if !fr.HeadersEnded() {
+			return nil
 		}
-		if fr.StreamEnded() {
-			cs.finish(nil)
-		}
-		return nil
+		a := cc.hdrAccum
+		cc.hdrAccum = nil
+		return cc.onResponseHeaderBlock(a.streamID, a.buf, a.endStream)
 
 	case *http2.DataFrame:
 		cs, ok := cc.lookupStream(fr.StreamID)
@@ -642,6 +593,107 @@ func (cc *ClientConn) dispatchFrame(f http2.Frame) error {
 		// Unknown frame types are silently ignored per RFC 9113 §4.1.
 		return nil
 	}
+}
+
+// onResponseHeaderBlock processes one COMPLETE response header block — the
+// whole of it, whether it arrived in a single HEADERS frame or was reassembled
+// from a HEADERS plus CONTINUATION frames. endStream comes from the HEADERS
+// frame that opened the block.
+func (cc *ClientConn) onResponseHeaderBlock(streamID uint32, block []byte, endStream bool) error {
+	cs, ok := cc.lookupStream(streamID)
+	if !ok {
+		if cc.wasReset(streamID, endStream) {
+			// Late response HEADERS racing our RST_STREAM(CANCEL) — tolerated
+			// per RFC 9113 §5.1. The block MUST still be HPACK-decoded (the
+			// decoder's dynamic table is connection-scoped state shared with
+			// every other stream's HEADERS); the decoded fields are discarded.
+			if _, err := cc.hp.decodeBlock(block, true); err != nil {
+				cc.emitGoaway(ErrCompressionError)
+				return err
+			}
+			return nil
+		}
+		// Server-initiated HEADERS (PUSH_PROMISE-class) — we advertise
+		// ENABLE_PUSH=0 so this is a peer protocol violation.
+		cc.emitGoaway(ErrProtocolError)
+		return connError(ErrProtocolError, "client: server-initiated HEADERS with ENABLE_PUSH=0")
+	}
+	decoded, err := cc.hp.decodeBlock(block, true)
+	if err != nil {
+		cc.emitGoaway(ErrCompressionError)
+		return err
+	}
+	if !cs.respHeadersSeen {
+		cs.respHeadersSeen = true
+		cs.respHeaders = decoded
+		for _, hf := range decoded {
+			if hf.Name == ":status" {
+				cs.respStatus, _ = strconv.Atoi(hf.Value)
+				break
+			}
+		}
+	} else {
+		// Trailing HEADERS (RFC 9113 §8.1 trailer section). VALIDATE BEFORE
+		// RETAINING: the reference books this reject in the upstream codec
+		// (measured: rx_messaging_error / upstream_rq_tx_reset) and the
+		// downstream consequence is a stream reset, never a "cleaned" 200.
+		//
+		// A violation fails THIS STREAM ONLY. cs.finish carries the
+		// stream-scoped *Error out through RoundTrip, and
+		// serverStream.dispatch reads err.Code to emit RST_STREAM with the
+		// carried code downstream. Nothing here touches the CONNECTION: no
+		// GOAWAY, no connection-scoped error return (which would cancel
+		// cc.ctx and tear the pooled conn down) — the reference resets the
+		// stream, not the conn.
+		//
+		// ⚠️ THERE IS DELIBERATELY NO SECOND-TRAILING-BLOCK RULE, and none
+		// may be re-added. The END_STREAM leg inside validateResponseTrailers
+		// makes one unreachable by its PRESENCE (not by being checked first):
+		// a first trailing block that does not terminate the stream is
+		// rejected here whatever else is wrong with it, and after a LEGAL
+		// END_STREAM block cs.finish has already returned RoundTrip — so no
+		// second block can ever reach this branch. Leg ORDER only selects
+		// which message a doubly-malformed block reports. The reference
+		// behaves identically. (PLAN-84.1 §1.8, broken-gate shape 35: a
+		// validation leg no wire sequence can reach still reads as coverage
+		// in a direct table.)
+		//
+		// ⚠️ NAMED NON-GOAL — 1xx INTERIM RESPONSES ARE NOT SUPPORTED BY THIS
+		// CODEC AND NOW FAIL THE STREAM. A leading 1xx HEADERS block sets
+		// respHeadersSeen, so the REAL final HEADERS lands in this branch and
+		// is rejected as a pseudo-header violation (it carries :status). That
+		// is a change from the pre-validation tip, which silently mis-captured
+		// the final block as trailers; the reference FORWARDS 1xx. Failing
+		// loudly is preferred to mis-capturing, but this is a known divergence
+		// — do not read it as accidental.
+		if verr := validateResponseTrailers(streamID, decoded, endStream); verr != nil {
+			// Reset the UPSTREAM stream too, copying RoundTrip's ctx-cancel
+			// pattern exactly. markReset FIRST (before the RST write and
+			// before cs.finish releases RoundTrip, whose deferred
+			// cc.streams.Delete removes the map entry) so any further peer
+			// frames on this id — guaranteed when the rejected block did not
+			// carry END_STREAM, since the peer never terminated the stream —
+			// are discarded per RFC 9113 §5.1 instead of falling through to
+			// the "stream gone" arms, which return CONNECTION-level errors
+			// and would tear the pooled conn down. onTxReset is what books
+			// the reference's upstream_rq_tx_reset; it fires OUTSIDE cc.mu so
+			// the codec mutex is never held across a cluster callback.
+			cc.markReset(streamID)
+			cc.mu.Lock()
+			_ = cc.fr.WriteRSTStream(streamID, http2.ErrCodeInternal)
+			cc.mu.Unlock()
+			if cc.onTxReset != nil {
+				cc.onTxReset()
+			}
+			cs.finish(verr)
+			return nil
+		}
+		cs.respTrailers = decoded
+	}
+	if endStream {
+		cs.finish(nil)
+	}
+	return nil
 }
 
 // ErrMalformedTrailers is the sentinel every response-trailer rejection carries
@@ -788,12 +840,17 @@ func (cc *ClientConn) RoundTrip(ctx context.Context, req H2Request) (H2Response,
 	// passing to the framer so a subsequent encode call cannot stomp them.
 	block := make([]byte, len(encoded))
 	copy(block, encoded)
-	werr := cc.fr.WriteHeaders(http2.HeadersFrameParam{
+	// Split into HEADERS + CONTINUATION frames bounded by the peer's advertised
+	// SETTINGS_MAX_FRAME_SIZE (RFC 9113 §6.10). Emitting the whole block as one
+	// frame — what this call site did before phase 88 — is illegal as soon as
+	// the encoded block exceeds the peer's limit; it went unnoticed only because
+	// x/net's Server reads up to 1 MiB regardless of what it advertised, while
+	// its Transport enforces the 16 KiB spec default.
+	werr := cc.fr.writeHeaderBlock(http2.HeadersFrameParam{
 		StreamID:      id,
 		BlockFragment: block,
 		EndStream:     endStream,
-		EndHeaders:    true,
-	})
+	}, int32(cc.serverS.MaxFrameSize))
 	cc.mu.Unlock()
 	if werr != nil {
 		return H2Response{}, translateFramerErr(werr)
@@ -855,7 +912,7 @@ func (cc *ClientConn) writeData(ctx context.Context, cs *clientStream, b []byte,
 	// the peer has not yet sent SETTINGS (cc.serverS.MaxFrameSize == 0).
 	maxFrame := int32(cc.serverS.MaxFrameSize)
 	if maxFrame <= 0 {
-		maxFrame = 16384
+		maxFrame = defaultPeerMaxFrameSize
 	}
 
 	remaining := b
