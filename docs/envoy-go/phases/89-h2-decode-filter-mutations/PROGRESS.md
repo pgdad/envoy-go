@@ -77,3 +77,68 @@ stat-surface DELTA **0** · fuzzers **55 / 48** +0 · BackendKind tail **38** +0
 ## NEXT
 
 **SPEC** — dispose the nine BRAINSTORM §7 questions BY EXECUTION: **Q1** the reconciler shape decided by COMPILING PROTOTYPE (delta-against-snapshot vs full rebuild vs slice-native chain), pricing all three and settling whether `filter_http.ReconcileOrderedHeaders` (`h2dispatch.go:612`) is reusable verbatim · **Q2** where `SetH2Request` moves, re-checking the two `RunAction`-bypassing early exits at `:522` and `:530` · **Q3** pseudo-header safety and whether `:path`/`:authority` mutations must route to the SCALAR fields — **the row's most likely hidden cost** · **Q4** the proof shape, with the corpus facts already measured (fixture `codec_type` census **HTTP1 270 / AUTO 6 / HTTP3 3 / HTTP2 ZERO**; `header_mutation` only in `0012`, which is HTTP1 at both listeners) · **Q5** re-confirm the encode side is already correct so the charter cannot silently widen · **Q6** the contract — **CLOSE the honest "NOT asserted: … H2 differential coverage" carve-out; there is NO false sentence to correct**, and decide in writing whether the reconciler makes the mirror sentence at `BEHAVIOR_CONTRACT.md:829` stale · **Q7** whether decode-side BODY mutation is also dropped (`:552` passes the same frozen `h2req.Body`) · **Q8** keep H3 explicitly OUT of charter · **Q9** h2spec is NOT available as a red anchor (ADR-0307) — cite only from the SPEC's own run.
+
+---
+
+## SPEC — done 2026-08-16
+
+## What landed
+
+`SPEC.md` (new) + this `PROGRESS.md` entry under `docs/envoy-go/phases/89-h2-decode-filter-mutations/`; `DECISIONS.md` gains **ADR-0311 §Context** with the strict `^> **STATUS: PROPOSED` guard **RE-ARMED 0 -> 1** (`numstat 20 0`, 18208 -> 18228, headings 309 -> 310, STATUS census 23 -> 24, `^---$` **STAYS 216** — a new ADR takes no separator); `STATE.md` rolled IN PLACE (lifecycle-state **1 -> 2**); `STATE_HISTORY.md` appended; `next-prompt.txt` rolled. **ZERO production `.go`, ZERO test `.go`.** `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` **BYTE-UNTOUCHED** (verified by EMPTY DIFF against master) — row 89 stays `in-progress` at `:151`, sentinel `want` stays **121**, and the contract edit lands at the IMPL.
+
+## Method
+
+**Subagent-driven per `feedback_execution_style`:** four probe agents on four disjoint detached worktrees, disjoint port bands (47600-47689), private scratch each. **None committed.** The controller ran the sentinel battery, re-derived every load-bearing agent claim by execution, and ran two probes of its own (a real-types aliasing probe through the router's own action closure, in a disposable worktree removed with proof; and a reference header-order probe that FAILED on container networking and is recorded as NOT MEASURED rather than inferred).
+
+**Three claims were corrected or refuted by that re-derivation — one of them the controller's own.**
+
+| # | Claim as received | Verdict |
+|---|---|---|
+| 1 | ADR-0071 forecloses a slice-native decode chain | **REFUTED** — the ADR body has ZERO occurrences of `http.Header`/`OrderedHeaders`/`signature`/`stability`, with `DecodeHeaders` = 1 as the live positive control. It is a CODE COMMENT with eleven citations. |
+| 2 | `SetH2Request` has zero coverage, unlike `SetRequest` | **HALF-REFUTED** — both read 0. The 4 apparent `SetRequest` test files are all `SetRequestCtx`, a different symbol. |
+| 3 | (controller's own) `0004` is the only downstream-H2 fixture | **REFUTED BY THE CONTROLLER'S OWN SECOND PROBE** — three more exist with driver-inline configs and no `envoy-go.yaml`; the first scan was yaml-only and therefore blind. |
+
+## The stage's headline
+
+**THE BRAINSTORM'S TWO-CONTAINER MODEL IS INCOMPLETE, AND THE MISSING PIECE SELECTS THE FIX.** There is a **THIRD writer**: the phase-46.1a tracing seam writes `x-request-id`/`traceparent`/`tracestate`/`X-B3-*` onto the ordered carrier **only**, never onto the decode map (`grep -c 'c\.req'` over that block = **0**). **Any whole-map projection deletes them from the upstream request** — measured three independent ways (an OTLP wire probe across three binaries; a **4-of-4** `TestWriteH2_Tracing*` flip with a green baseline and the `=== RUN` denominator asserted at 4; and the grep). That single fact eliminates two of the three candidate shapes, and it falls on an axis the BRAINSTORM had not flagged at all.
+
+## Decisions frozen
+
+| id | decision |
+|---|---|
+| **D-89-SHAPE** | **DELTA against a pre-decode snapshot.** Verbatim `ReconcileOrderedHeaders` reuse REFUTED (compiles clean, then emits an illegal HEADERS block -> **502 with ZERO backend requests** at a conformant peer). Full rebuild REFUTED (4/4 tracing tests RED). Slice-native REJECTED on **measured** blast radius (33 prod + 38 test files, ~101 mutation sites, a mutation API that does not exist) — **NOT** on ADR-0071. |
+| **D-89-SITE** | Keep the existing Set; **RE-ISSUE after the reconcile, after `RunDecodeData`**, over a **FRESH** slice. Do NOT move it — `RunAction`'s H2 arm has no guard while the H1 arm panics. |
+| **D-89-PSEUDO** | **Skip every `:`-prefixed key.** Do NOT route to the scalar fields. `Host`/`host` left OPEN for the PLAN, deliberately. |
+| **D-89-PROOF** | **Extend `0004-h2-routing` IN PLACE.** Every count axis +0; `0120` stays UNCONSUMED; `0012` is the H1 control at zero cost. Option C (extend `0012`) is **structurally impossible**. |
+| **D-89-DOC** | Close the `, H2 differential coverage.` carve-out **IN PLACE, zero line delta**. The mirror sentence under `### Does not yet apply to` **stays — EXACTLY TRUE**, with the mechanism written down. |
+| **D-89-BODY** | Decode-side body mutation is **OUT of charter — no reachable defect** (no `DecodeBodyOverride` exists; the repo already documents this in `extproc.go`). H1 and H2 do not diverge. |
+| **D-89-STAT** | No new stat. DELTA **0**, measured on the prototype (406 both sides by the same command). |
+
+## Sentinel (measured, ACTUAL output)
+
+⚠️ **A SPEC edits no ROADMAP row — the binding proof is an EMPTY `ROADMAP.md` diff against master**, asserted at stage start (0 bytes) and again at close.
+
+239 lines / 121 data rows. **(1)** `NOT DONE: row 89` ALONE, denominator silent · **(2)** SIX at `:199 :205 :211 :221 :227 :235` · **(3)** SILENT. ⇒ the conjunction FAILS; **the sentinel does NOT fire; `stop` NOT created** (verified absent at the git root).
+
+**ALL FOUR NCs FIRED.** row-62 doctoring — `NC LANDED? [ in-progress ]` inspected FIRST, then `NOT DONE: row 62` **AND** `NOT DONE: row 89` · denominator — `want=120` gave `NOT DONE: row 89` **plus** `GATE FAIL: examined 121 data rows, expected 120` · check-(3) doctoring — residual `gRPC-family row` **2 -> 0** on the doctored copy FIRST, then `NEVER OPENED: gRPC` ALONE with WASM correctly silent · check-(2) one-arm — long **5** / short **1** / union **6**.
+
+**Leak axes:** `-family row` **95 occurrences / 67 LINES** · `gRPC-family row` **2** · `Operational-tooling-family row` **3**. **Row 89 well-formed: `fields=8`, control row 88 also `fields=8`.**
+
+## Cost
+
+**MEASURED +162 / -0 net production `.go`, ONE file, ZERO tests** — controller-re-measured independently. 69 comment lines (42.6%), 5 blank, 24 brace-only, **64 substantive executable lines**. ⚠️ **1.8-3.2x over the BRAINSTORM's ~+50-90**, and **still a FLOOR** with the remainder ENUMERATED (outbound RFC 9113 §8.2.2 re-validation — measured leaking `connection`/`transfer-encoding` and reachable through `header_mutation`; the `Host` decision; duplicate-name collapse; four unit files; the differential arms; the unexercised `RunDecodeHeaders`-error exit). ⚠️ **The validation item is the phase-88 shape: the hazard does not exist at the tip, so THIS ROW'S FIX INTRODUCES IT.** Bands — production **~+165-230**, unit **~+150-350**, differential **~+145-200** (anchored on phase 88's MEASURED `+172/-7` into the same fixture).
+
+## Traps that fired ON THE CONTROLLER at this stage
+
+1. ⚠️ **A `\b`-anchored coverage grep and a bare-substring one disagreed, and BOTH readings were wrong in turn.** The `\b` form read 0 test files for `SetRequest`; the substring form read 4; the 4 are all **`SetRequestCtx`**, a different symbol on a different type. Resolved only by printing the matched forms and adding a live positive control (`SetAction` = 2). `reference_symbol_assertion_needs_qualified_name`.
+2. ⚠️ **The controller's own first Q4 probe had a BLIND AXIS.** Scanning `test/fixtures/*/envoy-go.yaml` for downstream TLS+ALPN found ONE fixture and made `0004` look unique; three more configure themselves from driver-inline Go and have no yaml at all. Corrected by a second probe before it reached the SPEC.
+3. ⚠️ **`--network host` did NOT share the host netns here.** The reference bound its ports inside its own namespace (visible in the container's `/proc/net/tcp`, absent from the host's `ss -ltn`); published ports were unreachable too. The order probe is recorded **NOT MEASURED** rather than inferred. Sibling agents reached the reference fine with `--add-host=host.docker.internal:host-gateway`.
+4. ⚠️ **The Bash cwd reset fired repeatedly and the harness announced it** (`Shell cwd was reset to /home/esa/git/envoy-go`). Every git command used `git -C <abs-path>`.
+
+## Probe hygiene
+
+Five worktrees this stage — `wt-89-spec` (the stage branch), `wt-89-a`/`wt-89-b`/`wt-89-c`/`wt-89-d` (probes), plus prototype worktrees `wt-89-a-proto`, `wt-89-a-verbatim`, `wt-89-d2` and a disposable controller worktree `wt-89-ctl`. **No agent committed; the controller squashes.** Ports banded **47600-47689** for agents, **47700-47719** for the controller — clear of the static fixture ports (10000-19172), the subject block (20000-31007), the backend band (11000-14999) and the receiver-race ports 35097/35323/42039. Containers created BY NAME with `--rm` and torn down BY NAME; `docker ps` empty before and after. ⚠️ **A sibling container appeared mid-run and was RECORDED, NOT TORN DOWN.** No tracked file was patched by any probe; the controller's own probe file was deleted and its worktree proven clean by EMPTY `status --porcelain` and `diff --stat`.
+
+## NEXT
+
+**PLAN** — the nine deliverables of SPEC §17: TDD task decomposition with the tracing pin in the RED set · the **slice-only-writer inventory** as a named deliverable · the outbound RFC 9113 §8.2.2 validation decision (⚠️ the fix INTRODUCES this hazard) · the `Host`/`host` decision · the `0004` arm roster with a break protocol per arm and the injection site named · the unit roster including the currently-zero `SetH2Request` coverage · a duplicate-name-collapse reference measurement or an explicit written deferral · the contract edit's exact substring and its zero line delta · **cost re-measured at the PUBLISHING commit** (`reference_cost_figure_measured_at_publishing_commit` went stale TWICE inside the phase-88 IMPL, the second time in the sentence correcting the first).
