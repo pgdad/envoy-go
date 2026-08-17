@@ -376,6 +376,26 @@ func isConnectionSpecificField(name string) bool {
 	}
 }
 
+// IsIllegalH2RequestHeader reports whether a (name, value) pair may NOT appear
+// on an HTTP/2 request message per RFC 9113 §8.2.2. name MUST already be
+// lowercase (H/2 wire form).
+//
+// Exported so the OUTBOUND path — package hcm's decode-filter reconciler,
+// which re-emits filter-written header names onto the upstream HEADERS block
+// — can consult the SAME list buildRequest enforces on the inbound path,
+// without duplicating it.
+//
+// Phase 89 / ADR-0311. This is an EXPORT of the existing predicate pair, not a
+// second copy: isConnectionSpecificField above is documented as "the ONE source
+// of truth for the RFC list ... so a member can never be dropped from one copy
+// and survive in the other", and a duplicate would break that invariant.
+func IsIllegalH2RequestHeader(name, value string) bool {
+	if isConnectionSpecificField(name) {
+		return true
+	}
+	return name == "te" && value != teTrailersValue
+}
+
 // buildRequest constructs an *http.Request from decoded pseudo-headers,
 // regular headers, and the body pipe reader. Per SPEC §10 #3: reuse stdlib
 // *http.Request so the route-table machinery stays single-shape.

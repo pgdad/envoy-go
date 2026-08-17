@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
@@ -259,9 +260,10 @@ func (d *h2Driver) loadTLSConfig() *tls.Config {
 	}
 }
 
-// drive issues 31 sequential H2 requests against addr (the proxy listener)
-// and returns the concatenated 9 /health response bodies followed by the 2
-// phase-87 leading-`//` arm bodies ("edge-ok" x 2). The first 27 requests and
+// drive issues 39 sequential H2 requests against addr (the proxy listener)
+// and returns the concatenated 9 /health response bodies, followed by the 2
+// phase-87 leading-`//` arm bodies ("edge-ok" x 2), followed by the 8 phase-89
+// normalized arm markers ("p89-a1:ok" … "p89-a8:ok"). The first 27 requests and
 // the transcript prefix they produce are unchanged from phase 05.2. Per ADR-0028 +
 // ADR-0056: each request opens a fresh *http2.ClientConn (the helper's
 // fresh-Transport-per-call discipline). The 9 /api response bodies are NOT
@@ -414,7 +416,242 @@ func (d *h2Driver) drive(ctx context.Context, addr string, counts *[3]uint64) ([
 			return nil, fmt.Errorf("cont-response-arm: marker=%q padlen=%d, want %q/%d (CONTINUATION-carried response headers lost)", marker, padLen, contMarker, contPadLen)
 		}
 	}
+	// Phase-89 decode-side filter-mutation arms (8 requests; total 39/side).
+	//
+	// Each arm targets an exact-path route that carries its own
+	// header_mutation `typed_per_filter_config` (A5 excepted — see hmArms),
+	// so the decode chain mutates the request header map and the proxy must
+	// reconcile that delta onto the ordered upstream H/2 carrier.
+	//
+	// ⚠️ THE REFLECTED BODY NEVER ENTERS THE DIFFERENTIAL TRANSCRIPT. It
+	// carries `x-request-id` (a random UUID) plus reference-only
+	// `x-forwarded-proto` / `x-envoy-expected-rq-timeout-ms`, so the two sides
+	// can never compare equal byte-for-byte. Each arm parses the block and
+	// asserts named headers IN-BAND; only a normalized `p89-<arm>:ok` marker
+	// is appended to the cross-side byte stream.
+	//
+	// ⚠️ NO ARM ASSERTS HEADER ORDER. helpers.H2RoundTrip sets client headers
+	// with req.Header.Add onto a Go map, so the relative order of DIFFERENT
+	// client-sent names is randomized per request by map iteration; and the
+	// backend is net/http + http2.ConfigureServer, whose H/2 server folds the
+	// HEADERS block into an http.Header MAP before any handler runs, so wire
+	// order is destroyed before it can be observed. Recovering it would need a
+	// raw-framer backend (a new BackendKind for one assertion). Wire ORDER is
+	// pinned at the UNIT layer instead (internal/filter/hcm reconcile tests);
+	// this fixture pins presence / absence / value / count / status.
+	//
+	// All 8 arms are appended AFTER the pre-existing 31 round-trips, so the
+	// transcript prefix and the [3,3,3] RR distribution over the 9 counted
+	// /api/v1/<n> requests are both untouched.
+	for _, arm := range hmArms() {
+		status, _, body, err := helpers.H2RoundTrip(ctx, addr, tlsConf, arm.method, arm.path, arm.send, arm.body)
+		if err != nil {
+			return nil, fmt.Errorf("p89-%s: %w", arm.name, err)
+		}
+		if status != 200 {
+			return nil, fmt.Errorf("p89-%s: status=%d, want 200 (body=%q)", arm.name, status, string(body))
+		}
+		got := parseReflectedHeaders(body)
+		if err := arm.check(got); err != nil {
+			return nil, fmt.Errorf("p89-%s: %w (reflected names=%v)", arm.name, err, sortedNames(got))
+		}
+		fmt.Fprintf(&out, "p89-%s:ok", arm.name)
+	}
 	return []byte(out.String()), nil
+}
+
+// hmArm is one phase-89 decode-mutation arm: a request to send and an
+// assertion over the header block the BACKEND reports having received.
+type hmArm struct {
+	name   string              // marker written to the cross-side transcript
+	path   string              // exact route path (route config keys off it)
+	method string              // "GET" except the body-carrying arm
+	body   []byte              // request body (nil except the body-carrying arm)
+	send   []hpack.HeaderField // client-sent seed headers
+	check  func(got map[string][]string) error
+}
+
+// hmReflectBase is the backend's reflect-headers subtree. Every arm path is
+// this prefix plus the arm's id.
+const hmReflectBase = "/api/v1/reflect-headers/"
+
+// hmArms returns the phase-89 arm table. See ../README.md for the honest
+// scope statement on each arm.
+func hmArms() []hmArm {
+	return []hmArm{
+		// A1 — net-new append (APPEND_IF_EXISTS_OR_ADD, no client seed). The
+		// COUNT is asserted, not just presence: a reconcile that appended the
+		// added value once per pass would read GREEN on a presence-only check.
+		{
+			name: "a1", path: hmReflectBase + "a1", method: "GET",
+			check: func(got map[string][]string) error {
+				return hmWantValues(got, "x-p89-added", "a1")
+			},
+		},
+		// A2 — per-route `remove` of a header the CLIENT sent. Under the
+		// pre-phase-89 defect the removal was ignored and the seed reached the
+		// upstream, so this arm is the removal half of the two-container bug.
+		{
+			name: "a2", path: hmReflectBase + "a2", method: "GET",
+			send:  []hpack.HeaderField{{Name: "x-p89-removed", Value: "seed"}},
+			check: func(got map[string][]string) error { return hmWantAbsent(got, "x-p89-removed") },
+		},
+		// A3 — OVERWRITE_IF_EXISTS_OR_ADD over a client-sent value. Asserting
+		// EXACTLY ONE value is what discriminates overwrite from append: a
+		// reconcile that appended instead of replacing would deliver
+		// ["old","new"] and a Get-style check would still see "new".
+		{
+			name: "a3", path: hmReflectBase + "a3", method: "GET",
+			send: []hpack.HeaderField{{Name: "x-p89-changed", Value: "old"}},
+			check: func(got map[string][]string) error {
+				return hmWantValues(got, "x-p89-changed", "new")
+			},
+		},
+		// A4 — the cross-side pin for the APPEND rule. Reference Envoy's
+		// APPEND_IF_EXISTS_OR_ADD leaves the existing field where it is and
+		// appends only the new value; envoy-go's reconcile classifies this as
+		// `extra` for the same reason. BOTH values must survive, in wire order
+		// [c0 v1] — duplicates of one name are always adjacent (the client
+		// sets them through a single http.Header slot), so this ordering is a
+		// pin and not a flake.
+		{
+			name: "a4", path: hmReflectBase + "a4", method: "GET",
+			send: []hpack.HeaderField{{Name: "x-p89-dup", Value: "c0"}},
+			check: func(got map[string][]string) error {
+				return hmWantValues(got, "x-p89-dup", "c0", "v1")
+			},
+		},
+		// A5 — NO per-route config. `/api/v1/reflect-headers/a5` has no exact
+		// route, so it falls through to the `prefix: "/api"` route: the
+		// no-mutation path. The arm's real content is the status-200 +
+		// round-trip-completes assertion, i.e. that the reconcile is a no-op
+		// when the delta is empty.
+		//
+		// ⚠️ THE PSEUDO-HEADER CHECK BELOW IS A FREE VACUOUS INVARIANT, NOT
+		// COVERAGE. A `:`-prefixed name in the regular-header region is an RFC
+		// 9113 §8.3 protocol error that the backend's codec rejects before any
+		// handler runs, so this loop can never fire on a reachable input. It is
+		// kept because it costs nothing and documents the intent; it must NOT
+		// be counted as pinning h2ReconcileSkipKey's pseudo-header clause
+		// (that clause is pinned at the unit layer).
+		{
+			name: "a5", path: hmReflectBase + "a5", method: "GET",
+			check: func(got map[string][]string) error {
+				for n := range got {
+					if strings.HasPrefix(n, ":") {
+						return fmt.Errorf("regular-header block carries pseudo-header %q", n)
+					}
+				}
+				return nil
+			},
+		},
+		// A6 — the config key is written in canonical-MIME form
+		// (`X-P89-Case`), which both proxies canonicalize on ingest.
+		//
+		// ⚠️ HONEST SCOPE: this arm does NOT prove the wire name was
+		// lowercased. The backend is net/http, which canonicalizes every
+		// received name into `X-P89-Case` regardless of the bytes on the wire,
+		// so the reflected block reads the same either way. The REAL
+		// discriminator is that an uppercase name on an H/2 request is a
+		// protocol error — a proxy emitting `X-P89-Case` verbatim would fail
+		// the round-trip outright and this arm would go red on the STATUS
+		// check, not on the header check.
+		{
+			name: "a6", path: hmReflectBase + "a6", method: "GET",
+			check: func(got map[string][]string) error {
+				return hmWantValues(got, "x-p89-case", "c1")
+			},
+		},
+		// A7a — a benign custom append alongside `te: trailers`, the ONE
+		// conditionally-legal RFC 9113 §8.2.2 value that must SURVIVE the
+		// reconcile's IsIllegalH2RequestHeader guard.
+		//
+		// ⚠️ `te` is appended AT MOST ONCE. Reference Envoy comma-coalesces
+		// repeated `te` into a single field, and the conformant x/net backend
+		// rejects anything but exactly "trailers".
+		//
+		// ⚠️ THE A7b COUNTERPART IS DELIBERATELY ABSENT — see ../README.md
+		// "Phase-89 INTENTIONAL DEPARTURE".
+		{
+			name: "a7", path: hmReflectBase + "a7", method: "GET",
+			check: func(got map[string][]string) error {
+				if err := hmWantValues(got, "x-p89-benign", "kept"); err != nil {
+					return err
+				}
+				return hmWantValues(got, "te", "trailers")
+			},
+		},
+		// A8 — the A1 mutation replayed on a POST with a NON-EMPTY body, so
+		// the request takes WriteH2's `hasBody` branch and RunDecodeData runs
+		// before the reconcile.
+		//
+		// ⚠️ HONEST SCOPE: this arm exercises that branch but does NOT
+		// discriminate the reconcile's PLACEMENT relative to RunDecodeData.
+		// Every mutation here originates in DecodeHeaders, so moving the
+		// reconcile above the hasBody block would leave this arm green. That
+		// placement is pinned at the unit layer by
+		// TestWriteH2_Reconcile_DecodeDataMutationIsApplied.
+		{
+			name: "a8", path: hmReflectBase + "a8", method: "POST",
+			body: []byte("p89-a8-body"),
+			check: func(got map[string][]string) error {
+				return hmWantValues(got, "x-p89-added", "a1")
+			},
+		},
+	}
+}
+
+// parseReflectedHeaders parses the backend's sorted `name: value` block into a
+// lowercase-keyed multimap. Values are taken verbatim after the FIRST ": "
+// separator, so a value containing ": " survives intact.
+func parseReflectedHeaders(body []byte) map[string][]string {
+	out := make(map[string][]string)
+	for _, line := range strings.Split(strings.TrimRight(string(body), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		i := strings.Index(line, ": ")
+		if i < 0 {
+			continue
+		}
+		out[strings.ToLower(line[:i])] = append(out[strings.ToLower(line[:i])], line[i+2:])
+	}
+	return out
+}
+
+// sortedNames returns the reflected block's names in sorted order, for error
+// messages. Never used in an assertion.
+func sortedNames(got map[string][]string) []string {
+	names := make([]string, 0, len(got))
+	for n := range got {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// hmWantValues asserts that name is present with EXACTLY the given value list,
+// in order. The length check is the load-bearing half: a duplicate-emitting
+// reconcile is invisible to a presence-only or first-value-only check.
+func hmWantValues(got map[string][]string, name string, want ...string) error {
+	have := got[name]
+	if len(have) != len(want) {
+		return fmt.Errorf("header %q: got %d value(s) %v, want %d %v", name, len(have), have, len(want), want)
+	}
+	for i := range want {
+		if have[i] != want[i] {
+			return fmt.Errorf("header %q: got %v, want %v", name, have, want)
+		}
+	}
+	return nil
+}
+
+// hmWantAbsent asserts that name does not appear in the reflected block at all.
+func hmWantAbsent(got map[string][]string, name string) error {
+	if v, ok := got[name]; ok {
+		return fmt.Errorf("header %q: present with %v, want ABSENT (per-route `remove` did not reach the upstream H/2 carrier)", name, v)
+	}
+	return nil
 }
 
 // parseBackendIdx extracts the numeric idx from a body that starts with
@@ -437,7 +674,7 @@ func parseBackendIdx(body []byte) (int, error) {
 	return idx, nil
 }
 
-// DriveReference runs 31 H2 round-trips against the reference proxy listener
+// DriveReference runs 39 H2 round-trips against the reference proxy listener
 // and records per-backend body counts on d.refBodyCnt for AssertDistribution.
 func (d *h2Driver) DriveReference(ctx context.Context, addr string) ([]byte, error) {
 	var counts [3]uint64
@@ -451,7 +688,7 @@ func (d *h2Driver) DriveReference(ctx context.Context, addr string) ([]byte, err
 	return b, nil
 }
 
-// DriveSubject runs 31 H2 round-trips against the subject proxy listener and
+// DriveSubject runs 39 H2 round-trips against the subject proxy listener and
 // records per-backend body counts on d.subjBodyCnt for AssertDistribution.
 func (d *h2Driver) DriveSubject(ctx context.Context, addr string) ([]byte, error) {
 	var counts [3]uint64

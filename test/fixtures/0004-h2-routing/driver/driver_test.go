@@ -6,9 +6,21 @@
 package driver
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
+
+// residualPortPlaceholder matches a `port_value: 0` that renderBootstrap did
+// NOT substitute. Phase 89: the previous form was `strings.Contains(out,
+// "port_value: 0\n")`, which is STRUCTURALLY VACUOUS — every `port_value: 0`
+// in both YAMLs sits inside a flow mapping and is followed by ` }`, never by a
+// newline, so `grep -c 'port_value: 0$'` reads 0 while the unanchored form
+// reads 3 (envoy.yaml) and 5 (envoy-go.yaml). The old check could not fire on
+// any input, including a deliberately injected extra placeholder. The trailing
+// non-digit class is what keeps this from matching a substituted `port_value:
+// 30000`; no port the driver assigns begins with `0`.
+var residualPortPlaceholder = regexp.MustCompile(`port_value: 0(?:[^0-9]|$)`)
 
 // TestH2Driver_AssertDistribution covers the AssertDistribution branches:
 // happy [3,3,3] (both sides), subject skew, reference skew, length mismatch.
@@ -61,8 +73,8 @@ func TestRenderBootstrap_Subject(t *testing.T) {
 	if strings.Contains(out, "{{") {
 		t.Fatalf("subject contains leftover placeholder:\n%s", out)
 	}
-	if strings.Contains(out, "port_value: 0\n") {
-		t.Errorf("subject still has port_value: 0:\n%s", out)
+	if residualPortPlaceholder.MatchString(out) {
+		t.Errorf("subject still has an unsubstituted port_value: 0:\n%s", out)
 	}
 	for _, want := range []string{
 		"port_value: 19999",
@@ -87,8 +99,8 @@ func TestRenderBootstrap_Reference(t *testing.T) {
 	if strings.Contains(out, "{{") {
 		t.Fatalf("reference contains leftover placeholder:\n%s", out)
 	}
-	if strings.Contains(out, "port_value: 0\n") {
-		t.Errorf("reference still has port_value: 0:\n%s", out)
+	if residualPortPlaceholder.MatchString(out) {
+		t.Errorf("reference still has an unsubstituted port_value: 0:\n%s", out)
 	}
 	for _, want := range []string{
 		"port_value: 9901",  // fixed admin

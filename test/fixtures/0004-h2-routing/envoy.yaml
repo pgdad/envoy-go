@@ -9,8 +9,13 @@
 #   - 1 listener l_h2 on 0.0.0.0:15004 with:
 #       * downstream TLS termination (alpn_protocols: ["h2","http/1.1"])
 #       * HCM with codec_type=AUTO (ALPN drives the per-conn codec choice)
-#       * 4 routes (/health direct_response, /api prefix → cluster, //edge
+#       * http_filters: an EMPTY header_mutation (phase 89 — zero listener-scope
+#         mutations; it only makes the filter name live for per-route configs)
+#         followed by the router
+#       * 4 base routes (/health direct_response, /api prefix → cluster, //edge
 #         direct_response (phase 87 leading-`//` origin form), /missing 404)
+#         plus 7 phase-89 exact-path arm routes ABOVE the /api prefix route,
+#         each with its own header_mutation typed_per_filter_config
 #   - Cluster c_h2_backend: STRICT_DNS (ADR-0010 V4_ONLY); 3 endpoints reaching
 #     backends via host.docker.internal:{{BACKEND_PORT_N}}; upstream TLS with
 #     ALPN h2; trusted_ca: the fixture-local CA (driver-rendered inline_string).
@@ -58,6 +63,97 @@ static_resources:
                           direct_response:
                             status: 200
                             body: { inline_string: "OK\n" }
+                        # ── Phase 89 (ADR-0311) decode-side H/2 filter-mutation arms ──
+                        #
+                        # Each arm is an EXACT-path route carrying its OWN
+                        # header_mutation `typed_per_filter_config`, declared ABOVE
+                        # the `prefix: "/api"` route so first-match-wins picks it.
+                        # All of them route to c_h2_backend, whose backend serves
+                        # `/api/v1/reflect-headers/` by reflecting the request
+                        # headers it ACTUALLY received (sorted, one `name: value`
+                        # line per (name, value) pair).
+                        #
+                        # ⚠️ Arm A5 ("no per-route config") deliberately has NO route
+                        # entry here — `/api/v1/reflect-headers/a5` falls through to
+                        # the `prefix: "/api"` route below, which IS the
+                        # no-per-route-mutation case. An explicit route with an empty
+                        # config would be indistinguishable and is not added.
+                        #
+                        # ⚠️ `te` is appended AT MOST ONCE (arm A7a only): reference
+                        # Envoy comma-coalesces repeated `te` into a single field, and
+                        # a coalesced `te: trailers,trailers` is rejected by the
+                        # conformant x/net backend (`TE may only be "trailers"`).
+                        - match: { path: "/api/v1/reflect-headers/a1" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - append:
+                                      header: { key: "x-p89-added", value: "a1" }
+                                      append_action: APPEND_IF_EXISTS_OR_ADD
+                        - match: { path: "/api/v1/reflect-headers/a2" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - remove: "x-p89-removed"
+                        - match: { path: "/api/v1/reflect-headers/a3" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - append:
+                                      header: { key: "x-p89-changed", value: "new" }
+                                      append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                        - match: { path: "/api/v1/reflect-headers/a4" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - append:
+                                      header: { key: "x-p89-dup", value: "v1" }
+                                      append_action: APPEND_IF_EXISTS_OR_ADD
+                        - match: { path: "/api/v1/reflect-headers/a6" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - append:
+                                      header: { key: "X-P89-Case", value: "c1" }
+                                      append_action: APPEND_IF_EXISTS_OR_ADD
+                        - match: { path: "/api/v1/reflect-headers/a7" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - append:
+                                      header: { key: "x-p89-benign", value: "kept" }
+                                      append_action: APPEND_IF_EXISTS_OR_ADD
+                                  - append:
+                                      header: { key: "te", value: "trailers" }
+                                      append_action: APPEND_IF_EXISTS_OR_ADD
+                        - match: { path: "/api/v1/reflect-headers/a8" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - append:
+                                      header: { key: "x-p89-added", value: "a1" }
+                                      append_action: APPEND_IF_EXISTS_OR_ADD
                         - match: { prefix: "/api" }
                           route: { cluster: c_h2_backend }
                         - match: { prefix: "//edge" }
@@ -69,6 +165,16 @@ static_resources:
                             status: 404
                             body: { inline_string: "not found\n" }
                 http_filters:
+                  # Phase 89: an EMPTY listener-level HeaderMutation. It declares
+                  # ZERO listener-scope mutations, so the pre-existing 31
+                  # round-trips are byte-untouched; its only job is to make
+                  # `envoy.filters.http.header_mutation` a live filter name so the
+                  # per-route `typed_per_filter_config` entries above attach.
+                  # MEASURED: reference Envoy contrib-v1.37.2 boots this shape
+                  # (`--mode validate` => `configuration OK`, rc=0).
+                  - name: envoy.filters.http.header_mutation
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

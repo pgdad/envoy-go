@@ -210,3 +210,94 @@ Six worktrees this stage — `wt-89-plan` (the stage branch) plus `wt-89-a`..`wt
 ## NEXT
 
 **IMPL** — ONE atomic commit delivering PLAN §4's T1-T8: the RED census observed FIRST with denominators (the fifth tracing row in **BOTH** files inside it) · the reconciler with the **tail-append** rule, the `host` skip, explicit lowercasing and the exported value-aware §8.2.2 guard · the 13-row table plus the three early-exit arms (⚠️ the `RunDecodeData` arm is **silently vacuous unless `hasBody` is true**) and the `SetH2Request` arm in `hcm` · the `0004` extension with eight arms and **seven break arms at seven DISTINCT injection sites** · **the scoped contract edit whose gate is a residual count of 2, not 0** · the two added contract sentences · ADR-0311 completed with the strict guard **1 -> 0** · **row 89 flipped `done`** with `want` **121 -> 121** · the slice-only-writer gate re-read at **6** and stated · **cost re-measured at the IMPL's OWN publishing commit** · the sentinel and all four NCs run on **BOTH sides** of the row flip.
+
+---
+
+## IMPL — done 2026-08-17
+
+## What landed
+ONE atomic squashed commit delivering PLAN §4's T1-T8. Production `internal/filter/hcm/h2dispatch.go` (**+284**) and `internal/filter/hcm/h2/stream.go` (**+20**); unit **+1028** across four files (one new: `h2dispatch_reconcile_test.go`, 770 lines); differential `test/fixtures/0004-h2-routing/` **+688 / -24** over seven files. Docs: **ADR-0311 COMPLETED IN PLACE** (strict `PROPOSED` guard **1 -> 0**, `^---$` stays 216, headings stay 310, next-free stays ADR-0312), `BEHAVIOR_CONTRACT.md` **5960 -> 5962**, `ROADMAP.md` **row 89 `in-progress` -> `done`** with `want` **121 -> 121** and the file staying 239 lines.
+
+## Method
+SUBAGENT-DRIVEN per `feedback_execution_style`. Six agents: core (T1-T4), `0004` recon (read-only), reference-Envoy probe, unit break protocol (own detached worktree), differential implementation, gate battery. The controller re-derived every load-bearing claim by execution and ran the sentinel battery, the count battery and five of the twelve break arms itself — which produced findings no agent made.
+
+## ⚠️ THE HEADLINE: THE IMPL REFUTED THE PLAN'S FROZEN D-89-DUP, AND THE REFUTATION CHANGED THE ALGORITHM
+
+Reference Envoy has **TWO write rules, not one.** Measured against `envoyproxy/envoy:contrib-v1.37.2`, downstream H2 -> upstream H2, raw-framer recorder holding **one `hpack.Decoder` per connection** (`hpack_errors=0`, `n=12`, a no-mutation positive control captured FIRST so "dropped" is distinguishable from "the probe is broken"):
+
+| reference verb | rule | measured |
+|---|---|---|
+| `OVERWRITE_IF_EXISTS_OR_ADD` / `remove` | remove EVERY occurrence, append one copy at the TAIL | `x-p89-changed: old` at `[7]` removed; `new` reappears at the tail |
+| `APPEND_IF_EXISTS_OR_ADD` | **the existing field STAYS AT ITS POSITION**; only the added value goes to the tail | `x-client-dup: c0` STAYS at `[9]`; `v1` lands at the tail |
+
+The PLAN froze only the first and applied it to both. **The single undifferentiated rule RELOCATES AN OTHERWISE-UNTOUCHED ORIGINAL TO THE TAIL.** The reconciler now classifies by testing whether the pre-decode value list is a PREFIX of the post-decode one. Pinned by unit row `7b_append_to_existing_keeps_original_in_place`; **negative-controlled TWICE** — once by disabling the prefix classification (reddens that row ALONE out of 641), and once by accident when an uncommitted `git checkout --` wiped the fix mid-session and reddened exactly the same row.
+
+## Three further PLAN claims refuted by execution
+
+1. ⚠️ **The `order=` line is NOT EXPRESSIBLE.** `0004`'s backend is `net/http` + `http2.ConfigureServer`; x/net's H2 server folds the HEADERS block into an `http.Header` **map** (`server.go:2270`) before any handler runs, and no hook exposes `MetaHeadersFrame.Fields`. Independently, `helpers.H2RoundTrip` sets headers via `req.Header.Add` on a Go map (`h2.go:68`), so duplicates of one name are ALWAYS ADJACENT and inter-name order is RANDOMIZED per request — any client-order assertion is a flake, not a pin. Recovering order needs a raw-framer backend, moving the BackendKind tail 38 -> 39 for one assertion. ⇒ **wire ORDER moved to the UNIT layer and the reduction is WRITTEN INTO THE CONTRACT, not absorbed.**
+2. ⚠️ **The PLAN's "free guard" `TestRenderBootstrap_Subject`/`_Reference` was STRUCTURALLY VACUOUS.** Every `port_value: 0` in both YAMLs sits inside a flow mapping followed by ` }` — `grep -c 'port_value: 0$'` reads **0** while the unanchored form reads **3** / **5** — so `strings.Contains(out, "port_value: 0\n")` could not match ANY input, including a deliberately injected extra placeholder. REPAIRED with a regexp form and proven live by execution on a render carrying one genuinely unsubstituted placeholder: **old form `false`, new form `true`.**
+3. ⚠️ **Arm A7b cannot be a parity arm.** The reference does NOT sanitize: it FORWARDS `connection: close`, `transfer-encoding: chunked` and `te: gzip` verbatim, and a conformant upstream answers **400 with ZERO backend delivery** (attributed by the reference's own `cluster.c_strict.upstream_rq_400: 1`, backend handler never logging a hit) while envoy-go DROPS and delivers 200. **D-89-VALIDATE creates a DEPARTURE, which the PLAN did not record.** Pinned at UNIT level; named in the contract.
+
+## ⚠️ BREAK PROTOCOL — TWELVE RUNS ACROSS TWO LAYERS, one break per run, `-count=1`, each restored and sha256-verified
+
+| break | site | layer | reddens | verdict |
+|---|---|---|---|---|
+| B1 | re-issued `SetH2Request` deleted | unit + differential | 14 unit rows incl. both new tracing rows; differential `p89-a1: got 0 value(s) []` | FIRED |
+| B2 | fresh slice -> `fields[:0]` | unit | **NOTHING** | **DID NOT FIRE — see below** |
+| B3 | `:`-prefix skip deleted | unit row 8 ALONE | differential GREEN | **wrong-layer, see below** |
+| B4 | lowercasing removed | unit (9 rows) + differential | differential fails on **STATUS 502**, exactly as A6's honest-scope note predicts | FIRED |
+| B5 | §8.2.2 guard deleted | unit row 11 ALONE | fires on the illegal headers APPEARING, **not** on `te: trailers` being dropped | FIRED, over-firing control HELD |
+| B6 | first-occurrence rewrite | unit rows 4/6/13 | rows 2 and 7b correctly STAY GREEN | FIRED |
+| B7 | reconcile moved above `RunDecodeData` | the DecodeData arm ALONE | — | FIRED |
+| B8 | the PLAN's collapsed single rule | unit row 7b ALONE | — | FIRED |
+
+⚠️ **TWO BREAKS DID NOT REDDEN, AND THEY ARE DIFFERENT FROM EACH OTHER — both recorded rather than quietly dropped.**
+
+- **B2 is a NON-DEFECT, not a passenger guard.** Swapping the fresh output slice for `fields[:0]` left the ENTIRE 640-row unit census GREEN. A randomized differential of the two initialisers over the exact loop (**200,000 cases**) found **ZERO** divergence: the write index never outruns the read index of the copy loop, so the in-place variant only overwrites slots already consumed. Observing the clobber needs a SECOND LIVE ALIAS of the pre-reconcile backing array read after the call, and `WriteH2` has none. ⇒ **the code comment's aliasing justification was FALSE and was CORRECTED**; the slice is kept as defensive, not load-bearing.
+- **B3's guard IS LIVE — the differential simply cannot reach its input.** Two executed reasons: the pseudo-injections at `h2dispatch.go:472-499` run BEFORE the snapshot at `:538`, so `:method`/`:authority`/`:path` are in both `before` and `after` and contribute no delta; and `header_mutation` — the only filter `0004` can configure — has `:`-prefixed keys REJECTED AT CONFIG-COMPILE TIME on BOTH sides (the reference measured answering `:-prefixed or host headers may not be modified`, rc=1). **Discriminated by a stacked probe, not asserted:** B3 + a `delete(preDecodeHeaders, ":method")` making the key net-new turns the fixture RED (`status=502, want 200`), while the `delete` ALONE with the clause intact stays GREEN. The reachable input class is the PROGRAMMATIC filters — controller-executed: `textproto.CanonicalMIMEHeaderKey(":path")` returns `":path"` unchanged, `h.Set(":path", …)` lands a raw colon key, and `internal/filter/http/lua/bridge.go:905`/`:915`/`:926` write caller-supplied names straight through `Add`/`Del`/`Set` with no protected-header consultation. ⇒ pinned at the UNIT layer, by row 8's double writing `:method` and `:custom` raw into the map exactly as lua does.
+
+## Sentinel (measured, BOTH sides of the row flip, ACTUAL output)
+
+Input 239 lines / 121 data rows, unchanged on both sides.
+
+| | BEFORE the flip | AFTER the flip |
+|---|---|---|
+| (1) `want=121` | **`NOT DONE: row 89`** ALONE | **SILENT** (board all-done) |
+| (2) union | **SIX** at `:199 :205 :211 :221 :227 :235` | **SIX**, same anchors |
+| (3) | **SILENT** | **SILENT** |
+
+⇒ **THE SENTINEL DOES NOT FIRE — check (2) still prints SIX. `stop` was NOT created.**
+**ALL FOUR NCs FIRED ON THE POST-FLIP FILE**, which matters more than usual because check (1) is now silent and the row-62 NC is the ONLY thing distinguishing a green board from a broken check: row-62 doctoring with `NC LANDED? [ in-progress ]` INSPECTED FIRST ⇒ `NOT DONE: row 62` **ALONE** (row 89 correctly absent) · denominator `want=120` ⇒ `GATE FAIL: examined 121 data rows, expected 120` · check-(3) doctoring, residual **2 -> 0** confirmed first ⇒ `NEVER OPENED: gRPC` with WASM correctly silent · check-(2) one-arm **5** long / **1** short, union **6**.
+Leak axes unmoved: `-family row` **95 / 67** · `gRPC-family row` **2** · `Operational-tooling-family row` **3**. Row 89 `fields=8`.
+
+## ⚠️ COST — ALL THREE BANDS OVERRUN, AND THE PLAN'S FIGURE WENT STALE INSIDE THIS ROW
+
+| axis | measured at the publishing commit | PLAN band | verdict |
+|---|---|---|---|
+| production | **+304 / -0** (`h2dispatch.go` +284, `h2/stream.go` +20) | `~+185-250` | **+22% above top of band** |
+| unit | **+1028** | `~+250-450` | **2.3x** |
+| differential | **+688 / -24** over 7 files | `~+145-200` | **3.4x** |
+
+The production excess is entirely the two-rule refinement and its provenance comments. ⚠️ **The +241 figure measured mid-row went stale WITHIN the row** when the reference measurement forced the algorithm change — the third consecutive row in which `reference_cost_figure_measured_at_publishing_commit` has fired.
+
+## ⚠️ Traps that fired ON THE CONTROLLER at this stage
+
+1. ⚠️ **`git checkout --` WIPED AN UNCOMMITTED FIX.** The controller restored a break patch with `git checkout -- <path>` while the two-rule refinement was still uncommitted, and lost it. `reference_break_protocol_commit_first`, fired in the very session that quotes it. **Commit before you break anything.** (The loss was detected immediately because `sha256sum -c` reported FAILED and the census reddened; it doubled as a clean negative control.)
+2. ⚠️ **A GATE THE CONTROLLER ITSELF WROTE WAS VACUOUS — the same defect class it had just repaired.** The differential denominator gate was specified as `grep -c '^--- PASS: TestDifferential/0004-h2-routing$'`; measured against a GREEN log it reads **0**. `cat -A` shows the real line is `    --- PASS: TestDifferential/0004-h2-routing (9.14s)$` — indented four spaces (so `^---` cannot match) AND carrying a duration suffix (so `routing$` cannot match). **Either defect alone makes it unable to fire, and a gate reading 0 on success reads exactly like "the selector matched nothing".** Corrected form: `grep -cE '^ +--- PASS: TestDifferential/0004-h2-routing \([0-9.]+s\)$'` ⇒ 1, negative-controlled against a nonexistent fixture name ⇒ 0. **THREE vacuous matchers were found in this one row, all sharing the shape of anchoring on a line ending the tool never emits.**
+3. ⚠️ **A bare symbol grep for the newly-exported RFC-9113 request-header predicate is DOCS-CONTAMINATED, AND THIS BULLET IS WHY NO NUMBER AND NO SPELLED-OUT MATCHER APPEAR IN IT.** The PLAN quotes that function's signature verbatim, so an unscoped `git grep -l` already matched a doc file alongside the source. The first draft of this bullet stated a count — and the gate run then measured a HIGHER one, **because the bullet itself had become another matching file.** Every restatement that spells both the symbol and a total mints its own counter-example, which is why this one does neither. **Pathspec-scope every symbol assertion (`-- 'internal/filter/hcm/h2/*.go'`) and carry NO whole-repo count.** `reference_a_drift_correction_is_itself_a_claim`.
+4. ⚠️ **The ARM-A `{119, 131}` figure is LINE NUMBERS, not row ids** — the malformed rows are ids **57** (fields=9) and **69** (fields=10). An ad-hoc field-count form printing ids reads `{57, 69}` and looks like drift; it is not.
+5. The PLAN's T1c recipe to clone `localReplyFilter` from `internal/filter/http/chain_test.go:317-337` is **not literally executable** — it lives in package `filter_http` and embeds an unexported test type. The same seam was reproduced in-package instead.
+6. A probe agent's first reference-config render substituted PEM bodies into a doc-comment line and BOTH arms failed identically; only the positive control distinguished "the reference rejects this" from "my renderer is broken". **A config-validation probe without a positive control produces a confident false NO-GO.**
+
+## ⚠️ A STANDING GATE VALUE THAT DOES NOT EXIST — `INNER_EXIT`
+
+The six-gate posture has demanded, for many phases, that every differential launch capture **`INNER_EXIT`**, on the ground that *"the wrapper exits 0 even when the binary aborts mid-suite"*. **Measured at this tip: THERE IS NO WRAPPER.** `git grep -n 'INNER_EXIT' -- ':!docs'` returns **exactly one** hit — `next-prompt.txt`'s own instruction text — and `git ls-files | grep -icE '\.(sh|mk|bash)$|Makefile'` returns **0**. The suite is launched as a direct `go test ./test/differential/`, so **the outer process IS the inner process** and `PIPESTATUS[0]` is the only exit code that exists. ⚠️ **`DECISIONS.md` nonetheless records `INNER_EXIT=0` as a measured gate reading at phase 87** — a value nothing in the tree emits. **The HAZARD the note describes is real** (a mid-suite abort must not read as green); **the MECHANISM it names is not.** The substituted evidence, which actually discriminates an abort: `PIPESTATUS[0]=0` · the terminal `ok  …/test/differential  389.667s` line present · and a **121/121 SET RECONCILIATION** (`comm` of the `=== RUN` set against the resolved-result set, EMPTY IN BOTH DIRECTIONS), which is exactly what a mid-suite abort destroys. ⚠️ **AND THE NAIVE FIXTURE COUNT IS ITSELF A TRAP:** a `^ *--- PASS: TestDifferential/[0-9]{4}-[a-z0-9-]+ \(…\)$` form reads **119**, not 121, because `0007a-cors` and `0007b-iteration-probe` carry LETTER suffixes that `[0-9]{4}-` does not admit — a spurious two-fixture shortfall that reads exactly like an abort.
+
+## Two pre-existing subject bugs re-confirmed, still NOT chartered
+Inbound `:authority` AND `host` ⇒ envoy-go projects BOTH upstream while the reference DROPS the regular `host`; inbound `host` ONLY ⇒ envoy-go emits `:authority = ""` (EMPTY) while the reference PROMOTES it. Independent of phase 89, reachable at the tip with no filter at all. NAMED, NOT FIXED.
+
+## Probe hygiene
+Six agents, disjoint port bands 47900-47999, private scratch each. Two detached worktrees (`wt-89-break`, `wt-89-bk2`) created and REMOVED, each proved clean by `git status --porcelain` empty and `git diff --stat` empty before removal. Every patched tracked file restored and `sha256sum -c` verified. All `p89c-*`/`p89e-*` containers torn down BY NAME; foreign containers belonging to other sessions (`er110probe` and others) were observed and DELIBERATELY LEFT UNTOUCHED.
+
+## NEXT
+Phase 89 is CLOSED. The sentinel does NOT fire — check (2) still prints SIX — so the next session SELF-PICKS phase 90 per the 2026-07-12 standing directive.

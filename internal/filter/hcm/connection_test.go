@@ -702,6 +702,20 @@ func mkTracingFilter(t *testing.T, tt *routeTable, rng tracing.RandSource) (*Fil
 	return f, reg
 }
 
+// mkTracingFilterChain is mkTracingFilter with a caller-supplied chainConfig.
+// mkTracingFilter (via mkFilterForTable) installs a ROUTER-ONLY chain, so none
+// of the pre-phase-89 TestWriteH2_Tracing* rows runs a decode filter at all.
+// Phase 89 (ADR-0311) needs the tracing seam exercised alongside a mutating
+// decode filter, to prove the H/2 decode-delta reconciler does not clobber the
+// tracing writes the seam makes on the SAME carrier. Additive: existing callers
+// of mkTracingFilter are untouched.
+func mkTracingFilterChain(t *testing.T, tt *routeTable, rng tracing.RandSource, chainConfig []chainEntry) (*Filter, *stats.Registry) {
+	t.Helper()
+	f, reg := mkTracingFilter(t, tt, rng)
+	f.chainConfig = chainConfig
+	return f, reg
+}
+
 func tracingCounterValue(t *testing.T, reg *stats.Registry, name string) uint64 {
 	t.Helper()
 	var v uint64
@@ -913,6 +927,66 @@ func TestWriteH2_Tracing_Continued(t *testing.T) {
 	}
 	if got := tracingCounterValue(t, reg, "not_traceable"); got != 1 {
 		t.Errorf("not_traceable = %d, want 1", got)
+	}
+}
+
+// TestWriteH2_Tracing_DecodeFilterMutationSurvives — phase 89 (ADR-0311),
+// row 12 of the reconciler roster (the tracing survival row).
+//
+// The four pre-phase-89 TestWriteH2_Tracing* rows all run a ROUTER-ONLY chain,
+// so no decode filter runs in any of them. This row installs a TWO-ENTRY chain
+// [headerMutatingFilter, router] over the SAME OTel tracing setup and asserts
+// BOTH directions of the interaction on the shared carrier:
+//
+//   - the tracing seam's writes (x-request-id, traceparent), made at
+//     h2dispatch.go :438-455 BEFORE RunDecodeHeaders, SURVIVE the reconcile;
+//   - the decode filter's own mutation LANDS.
+//
+// A whole-map projection (rebuild the carrier from c.req.Header) would drop the
+// tracing writes, because they are made on the CARRIER and never mirrored into
+// the decode map.
+func TestWriteH2_Tracing_DecodeFilterMutationSurvives(t *testing.T) {
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	chainCfg := mutatingChain(t, func() *headerMutatingFilter {
+		return &headerMutatingFilter{onHeaders: func(h http.Header) { h.Set("X-Filter-Added", "yes") }}
+	})
+	f, reg := mkTracingFilterChain(t, tt, fakeTraceRand{f: 0, b: 0x55}, chainCfg)
+
+	var captured h2.H2Request
+	hreq, _ := http.NewRequest("GET", "/health", nil)
+	hreq.Proto = "HTTP/2.0"
+	hreq.Header.Add("x-seed", "s")
+	c := &chainDispatchAction{f: f, action: captureH2Action(&captured), req: hreq, routeIdx: 0}
+
+	h2req := h2.H2Request{
+		Method:    "GET",
+		Path:      "/health",
+		Scheme:    "https",
+		Authority: "localhost",
+		Headers:   []hpack.HeaderField{{Name: "x-seed", Value: "s"}},
+	}
+	if err := c.WriteH2(context.Background(), h2req, &captureH2Writer{}); err != nil {
+		t.Fatalf("WriteH2: %v", err)
+	}
+
+	rid := h2HeaderValues(captured, "x-request-id")
+	if len(rid) != 1 || len(rid[0]) != 36 {
+		t.Errorf("forwarded x-request-id = %v, want exactly one 36-char id (tracing write survives the reconcile)", rid)
+	}
+	tp := h2HeaderValues(captured, "traceparent")
+	if len(tp) != 1 || !traceparentMatches(tp[0], true) {
+		t.Errorf("forwarded traceparent = %v, want exactly one 00-<32hex>-<16hex>-01", tp)
+	}
+	if got := h2HeaderValues(captured, "x-filter-added"); len(got) != 1 || got[0] != "yes" {
+		t.Errorf("forwarded x-filter-added = %v, want [yes] (the decode filter's mutation must land)", got)
+	}
+	if got := h2HeaderValues(captured, "x-seed"); len(got) != 1 || got[0] != "s" {
+		t.Errorf("forwarded x-seed = %v, want [s] (untouched header unchanged)", got)
+	}
+	if got := tracingCounterValue(t, reg, "random_sampling"); got != 1 {
+		t.Errorf("random_sampling = %d, want 1", got)
 	}
 }
 

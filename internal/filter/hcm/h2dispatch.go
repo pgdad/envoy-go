@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -515,6 +516,27 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 	hasBody := len(h2req.Body) > 0
 	endStreamOnHeaders := !hasBody
 
+	// Phase 89 Task 3 (ADR-0311): snapshot the decode header map IMMEDIATELY
+	// before the decode chain runs, so the post-chain map can be diffed against
+	// it and the delta re-emitted onto the ordered upstream carrier.
+	//
+	// Why a snapshot and not a projection: c.req.Header (an http.Header map,
+	// built by h2/stream.go's buildRequest) and h2req.Headers (an ordered
+	// []hpack.HeaderField, built by buildH2Request) are TWO INDEPENDENT
+	// CONTAINERS with no write-back. A whole-map REBUILD of the carrier would
+	// destroy everything written to the carrier ALONE — the phase-46.1a/46.2
+	// tracing seam above writes x-request-id / traceparent / tracestate /
+	// x-b3-* onto h2req.Headers and never mirrors them into the map. Only a
+	// DELTA (what the decode chain actually changed) is safe.
+	//
+	// The :method / :authority / :path injections at :471-499 above already
+	// happened, so they are IN the snapshot and contribute no delta. The
+	// ':'-skip inside the reconciler is still mandatory and structural: a
+	// filter is free to write any pseudo key, and a pseudo-header on the
+	// regular-header carrier is an RFC 9113 §8.3 protocol error (h2/client.go
+	// re-prepends the four request pseudo-headers itself).
+	preDecodeHeaders := snapshotDecodeHeaders(c.req.Header)
+
 	if _, err := chain.RunDecodeHeaders(ctx, c.req.Header, endStreamOnHeaders); err != nil {
 		// ctx-cancel or unknown filter status. status==0 → emitAccessLogH2
 		// skips submission per SPEC §2.1 sentinel. Surface the err to
@@ -553,6 +575,27 @@ func (c *chainDispatchAction) WriteH2(ctx context.Context, h2req h2.H2Request, s
 			return err
 		}
 	}
+
+	// Phase 89 Task 3 (ADR-0311): apply the decode-side header delta onto the
+	// upstream-forwarded ordered carrier, then RE-ISSUE SetH2Request.
+	//
+	// Placement is load-bearing on both sides:
+	//   - AFTER the hasBody/RunDecodeData block, so a mutation made from a
+	//     filter's DecodeData callback lands too (the decode map is the same
+	//     map across both callbacks).
+	//   - BEFORE rf.RunAction, which is where the router filter reads the value
+	//     it dispatches upstream. RunAction is idempotent (router.go:306), so
+	//     the re-issue MUST precede the single RunAction call below.
+	//
+	// The re-issue is mandatory, not defensive: router.Filter stores the
+	// H2Request BY VALUE, so the SetH2Request at :457 above captured a copy
+	// made before the decode chain ran. The :457 call is deliberately NOT
+	// moved down here — RunAction's H2 arm has no guard against a zero-value
+	// request, so the early-exit paths above (RunDecodeHeaders error,
+	// LocalReplyDone, RunDecodeData error) must still leave a populated value
+	// behind them.
+	h2req.Headers = reconcileH2DecodeDelta(h2req.Headers, preDecodeHeaders, c.req.Header)
+	rf.SetH2Request(h2req)
 
 	// Terminal-action invocation. Idempotent — if a non-terminal filter
 	// triggered SendLocalReply earlier, the chain transitioned to encode
@@ -680,6 +723,247 @@ func upsertH2Header(fields []hpack.HeaderField, name, value string) []hpack.Head
 		}
 	}
 	return append(out, hpack.HeaderField{Name: strings.ToLower(name), Value: value})
+}
+
+// snapshotDecodeHeaders returns a DEEP copy of h: the map, and every value
+// slice in it. Phase 89 Task 3 (ADR-0311).
+//
+// A shallow map copy is not enough. http.Header values are []string, and a
+// filter that mutates a value in place (h["X"][0] = "…") or appends to an
+// existing slice would be invisible to a diff taken against shared backing
+// arrays — the "before" would silently become the "after" and the delta would
+// read as empty.
+func snapshotDecodeHeaders(h http.Header) http.Header {
+	snap := make(http.Header, len(h))
+	for k, v := range h {
+		cp := make([]string, len(v))
+		copy(cp, v)
+		snap[k] = cp
+	}
+	return snap
+}
+
+// h2ReconcileSkipKey reports whether a decode-map key is EXCLUDED from the
+// phase-89 delta. Two structural exclusions, both ADR-0311:
+//
+//   - Pseudo-headers, detected by a BYTE TEST on the leading ':' rather than a
+//     three-name enumeration. WriteH2 injects :method / :authority / :path onto
+//     the decode map for filter consumption, and a filter may write any other
+//     ':'-prefixed key; none of them may reach the regular-header carrier,
+//     because h2/client.go re-prepends the four request pseudo-headers itself
+//     and a duplicate on the wire is an RFC 9113 §8.3 protocol error. An
+//     enumeration would let a novel pseudo key through.
+//
+//   - `host`, case-insensitively (D-89-HOST: SKIP). Reference Envoy was
+//     measured NORMALIZING `host` into `:authority` in 15 of 15 readings, so a
+//     regular `host` field forwarded alongside :authority diverges from the
+//     reference and is a conformance hazard. A filter's Host mutation is
+//     therefore observed by the chain but not re-emitted.
+func h2ReconcileSkipKey(k string) bool {
+	if len(k) > 0 && k[0] == ':' {
+		return true
+	}
+	return strings.EqualFold(k, "host")
+}
+
+// h2LowerHeaderView folds an http.Header into lowercase-keyed value lists,
+// dropping the keys h2ReconcileSkipKey excludes. Phase 89 Task 3 (ADR-0311).
+//
+// Lowercase keying is what makes the diff correct across Go's canonical-MIME
+// canonicalization: http.Header.Set/Add route through
+// textproto.CanonicalMIMEHeaderKey, but raw map writes (h["x-foo"] = …) do not,
+// so the same header can appear under two spellings. Source keys that fold to
+// the same lowercase name are merged in sorted key order so the fold is
+// deterministic under Go's nondeterministic map iteration.
+func h2LowerHeaderView(h http.Header) map[string][]string {
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		if h2ReconcileSkipKey(k) {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(map[string][]string, len(keys))
+	for _, k := range keys {
+		lk := strings.ToLower(k)
+		out[lk] = append(out[lk], h[k]...)
+	}
+	return out
+}
+
+// reconcileH2DecodeDelta re-emits the decode chain's header mutations onto the
+// ordered upstream-forwarded H/2 carrier. Phase 89 Task 3 (ADR-0311).
+//
+// before/after are the decode header map snapshotted immediately BEFORE
+// RunDecodeHeaders and its state after the decode side finished; fields is the
+// carrier (h2req.Headers). Returns the carrier to forward.
+//
+// ALGORITHM — TAIL-APPEND, measured against reference Envoy contrib-v1.37.2
+// over a downstream-H2 -> upstream-H2 leg. The reference's request header map
+// is an ORDERED MULTIMAP with TWO distinct write rules, and conflating them is
+// observable on the wire:
+//
+//   - REPLACED or REMOVED (reference OVERWRITE_IF_EXISTS_OR_ADD / remove):
+//     drop EVERY occurrence from the carrier, then append ONE FIELD PER
+//     SURVIVING VALUE AT THE TAIL. It never collapses to the first
+//     occurrence's position and never comma-joins a multi-value name.
+//   - APPENDED-TO (reference APPEND_IF_EXISTS_OR_ADD): the existing fields
+//     STAY AT THEIR POSITIONS and only the ADDED values go to the tail.
+//   - UNTOUCHED names keep their EXACT original positions — including untouched
+//     duplicates of the same name at non-adjacent positions.
+//
+// ⚠️ ONE INLINE-HEADER DIVERGENCE IS KNOWN AND DELIBERATELY NOT REPRODUCED:
+// the reference comma-coalesces repeated `te` into a single field
+// (`te: gzip,trailers`, measured), while custom names are NOT coalesced
+// (`x-p89-dup` arrives as two fields, measured). envoy-go emits one field per
+// value for every name. The case is unreachable here in practice because the
+// RFC 9113 §8.2.2 guard below drops every `te` value except `trailers`.
+//
+// The repo's own upsertH2Header above already implements drop-everywhere-then-
+// append-at-tail for the tracing seam; this differs only in building a FRESH
+// output slice instead of reusing the input's backing array via fields[:0].
+//
+// ⚠️ THE FRESH SLICE IS DEFENSIVE, NOT LOAD-BEARING, AND THE HONEST STATEMENT
+// IS THAT NO TEST CAN PIN IT. The phase-89 break protocol swapped it for
+// `out := fields[:0]` and the whole 640-row unit census stayed GREEN. That is
+// not a coverage gap: a randomized differential of the two initialisers over
+// this exact loop (200,000 cases) found ZERO divergence, because the write
+// index never outruns the read index of the copy loop, so the in-place variant
+// only ever overwrites slots already consumed. Observing the clobber needs a
+// SECOND LIVE ALIAS of the pre-reconcile backing array read after this call,
+// and WriteH2 has none — the only holder is the router via SetH2Request, which
+// the re-issue below overwrites, and every later emitAccessLogH2 reads the
+// post-assignment value. The fresh slice is kept because it is unconditionally
+// safe and costs one allocation on a path that already allocates two header
+// maps; it is NOT kept because a live hazard was demonstrated.
+//
+// The ADDED/CHANGED set is sorted BY NAME before appending. Go map iteration is
+// nondeterministic, so without the sort the wire bytes of a multi-name mutation
+// would vary run to run and no cross-side byte assertion could hold. Whether
+// the reference's own multi-add ordering matches a lexical sort is NOT MEASURED
+// — the sort is chosen here for determinism and cross-side stability, and this
+// comment makes no fidelity claim about it.
+//
+// Emitted names are LOWERCASE. This is load-bearing rather than cosmetic:
+// header_mutation canonicalizes its config keys through http.CanonicalHeaderKey,
+// and nothing below this point lowercases (h2/client.go appends req.Headers
+// verbatim). An uppercase name on the H/2 wire is a protocol error.
+//
+// Each emitted (name, value) pair is checked with h2.IsIllegalH2RequestHeader
+// (RFC 9113 §8.2.2) and DROPPED — not rejected — when illegal. Dropping is what
+// the tip already effectively does with these mutations (they never reach the
+// upstream at all today), whereas rejecting would turn a config-legal filter
+// mutation into a client-facing 5xx. The check is VALUE-AWARE because `te` is
+// conditionally legal: `te: trailers` must survive, `te: gzip` must not. This
+// hazard is INTRODUCED by the fix, not inherited by it — measured against a
+// conformant peer, a leaked `connection: close` yields 400 with body
+// `request header "Connection" is not valid in HTTP/2` and ZERO backend
+// delivery (D-89-VALIDATE).
+//
+// When the delta is empty the input slice is returned UNCHANGED, so the
+// no-filter and no-op-filter paths stay byte-stable.
+func reconcileH2DecodeDelta(fields []hpack.HeaderField, before, after http.Header) []hpack.HeaderField {
+	beforeView := h2LowerHeaderView(before)
+	afterView := h2LowerHeaderView(after)
+
+	// Two disjoint dispositions, because reference Envoy has TWO rules and the
+	// difference is observable on the wire:
+	//
+	//   replaced[name] — the chain REPLACED or REMOVED this name's value list.
+	//                    Every occurrence is dropped from the carrier and the
+	//                    surviving values (if any) are appended at the TAIL.
+	//                    Reference OVERWRITE_IF_EXISTS_OR_ADD, measured: a
+	//                    client-sent `x-p89-changed: old` at index [7] is
+	//                    removed and one copy of `new` reappears at the tail.
+	//
+	//   extra[name]    — the chain only APPENDED to this name's existing value
+	//                    list (the pre-decode values are a PREFIX of the
+	//                    post-decode ones). The carrier's existing fields for
+	//                    that name STAY WHERE THEY ARE and only the added
+	//                    values go to the tail. Reference
+	//                    APPEND_IF_EXISTS_OR_ADD, measured: a client-sent
+	//                    `x-client-dup: c0` STAYS at index [9] while the
+	//                    appended `v1` lands at the tail.
+	//
+	// ⚠️ Collapsing these two into a single remove-everywhere-then-tail-append
+	// rule is what the phase-89 PLAN froze, and it is WRONG FOR THE APPEND
+	// CASE: it relocates an otherwise-untouched original to the tail. Pinned by
+	// table row 7b, which reads [x-mid x-keep x-keep] under the unrefined rule.
+	//
+	// A net-new name has an empty "before", which is trivially a prefix, so it
+	// classifies as extra and lands at the tail with nothing kept in place —
+	// the same wire result either disposition would give.
+	replaced := make(map[string]bool)
+	extra := make(map[string][]string)
+	for name, av := range afterView {
+		bv := beforeView[name]
+		if equalStringSlices(bv, av) {
+			continue
+		}
+		if len(bv) < len(av) && equalStringSlices(bv, av[:len(bv)]) {
+			extra[name] = av[len(bv):]
+			continue
+		}
+		replaced[name] = true
+	}
+	for name := range beforeView {
+		if _, ok := afterView[name]; !ok {
+			replaced[name] = true
+		}
+	}
+	if len(replaced) == 0 && len(extra) == 0 {
+		return fields
+	}
+
+	// Sorted so the wire bytes of a multi-name mutation are deterministic under
+	// Go's nondeterministic map iteration. Fidelity of the sort ORDER against
+	// the reference's own multi-add order is NOT MEASURED.
+	appended := make([]string, 0, len(replaced)+len(extra))
+	for name := range replaced {
+		if len(afterView[name]) > 0 {
+			appended = append(appended, name)
+		}
+	}
+	for name := range extra {
+		appended = append(appended, name)
+	}
+	sort.Strings(appended)
+
+	out := make([]hpack.HeaderField, 0, len(fields)+len(appended))
+	for _, f := range fields {
+		if replaced[strings.ToLower(f.Name)] {
+			continue
+		}
+		out = append(out, f)
+	}
+	for _, name := range appended {
+		vals := extra[name]
+		if replaced[name] {
+			vals = afterView[name]
+		}
+		for _, v := range vals {
+			if h2.IsIllegalH2RequestHeader(name, v) {
+				continue
+			}
+			out = append(out, hpack.HeaderField{Name: name, Value: v})
+		}
+	}
+	return out
+}
+
+// equalStringSlices reports element-wise equality, treating nil and empty as
+// equal. Phase 89 Task 3 (ADR-0311) — the delta predicate.
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // writeH2Reply emits an HTTP/2 response on sw from a pre-built ordered header

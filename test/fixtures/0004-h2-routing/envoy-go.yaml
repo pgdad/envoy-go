@@ -11,6 +11,10 @@
 #   - Admin address: 127.0.0.1:{{ADMIN_PORT}} (randomly-allocated per run).
 #   - No listener_filters needed: envoy-go's HCM reads ALPN natively via crypto/tls.
 #
+# Route table and http_filters are IDENTICAL to envoy.yaml, including the phase-89
+# empty listener-level header_mutation and the 7 exact-path arm routes carrying
+# per-route HeaderMutationPerRoute configs.
+#
 # See also: ADR-0010 (V4_ONLY), ADR-0027 (STATIC vs STRICT_DNS), ADR-0028
 # (--concurrency 1 reference pin), ADR-0056 (Cluster.UseH2 from
 # typed_extension_protocol_options.HttpProtocolOptions), ADR-0057 (the closure
@@ -57,6 +61,97 @@ static_resources:
                           direct_response:
                             status: 200
                             body: { inline_string: "OK\n" }
+                        # ── Phase 89 (ADR-0311) decode-side H/2 filter-mutation arms ──
+                        #
+                        # Each arm is an EXACT-path route carrying its OWN
+                        # header_mutation `typed_per_filter_config`, declared ABOVE
+                        # the `prefix: "/api"` route so first-match-wins picks it.
+                        # All of them route to c_h2_backend, whose backend serves
+                        # `/api/v1/reflect-headers/` by reflecting the request
+                        # headers it ACTUALLY received (sorted, one `name: value`
+                        # line per (name, value) pair).
+                        #
+                        # ⚠️ Arm A5 ("no per-route config") deliberately has NO route
+                        # entry here — `/api/v1/reflect-headers/a5` falls through to
+                        # the `prefix: "/api"` route below, which IS the
+                        # no-per-route-mutation case. An explicit route with an empty
+                        # config would be indistinguishable and is not added.
+                        #
+                        # ⚠️ `te` is appended AT MOST ONCE (arm A7a only): reference
+                        # Envoy comma-coalesces repeated `te` into a single field, and
+                        # a coalesced `te: trailers,trailers` is rejected by the
+                        # conformant x/net backend (`TE may only be "trailers"`).
+                        - match: { path: "/api/v1/reflect-headers/a1" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - append:
+                                      header: { key: "x-p89-added", value: "a1" }
+                                      append_action: APPEND_IF_EXISTS_OR_ADD
+                        - match: { path: "/api/v1/reflect-headers/a2" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - remove: "x-p89-removed"
+                        - match: { path: "/api/v1/reflect-headers/a3" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - append:
+                                      header: { key: "x-p89-changed", value: "new" }
+                                      append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                        - match: { path: "/api/v1/reflect-headers/a4" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - append:
+                                      header: { key: "x-p89-dup", value: "v1" }
+                                      append_action: APPEND_IF_EXISTS_OR_ADD
+                        - match: { path: "/api/v1/reflect-headers/a6" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - append:
+                                      header: { key: "X-P89-Case", value: "c1" }
+                                      append_action: APPEND_IF_EXISTS_OR_ADD
+                        - match: { path: "/api/v1/reflect-headers/a7" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - append:
+                                      header: { key: "x-p89-benign", value: "kept" }
+                                      append_action: APPEND_IF_EXISTS_OR_ADD
+                                  - append:
+                                      header: { key: "te", value: "trailers" }
+                                      append_action: APPEND_IF_EXISTS_OR_ADD
+                        - match: { path: "/api/v1/reflect-headers/a8" }
+                          route: { cluster: c_h2_backend }
+                          typed_per_filter_config:
+                            envoy.filters.http.header_mutation:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                              mutations:
+                                request_mutations:
+                                  - append:
+                                      header: { key: "x-p89-added", value: "a1" }
+                                      append_action: APPEND_IF_EXISTS_OR_ADD
                         - match: { prefix: "/api" }
                           route: { cluster: c_h2_backend }
                         - match: { prefix: "//edge" }
@@ -68,6 +163,16 @@ static_resources:
                             status: 404
                             body: { inline_string: "not found\n" }
                 http_filters:
+                  # Phase 89: an EMPTY listener-level HeaderMutation. It declares
+                  # ZERO listener-scope mutations, so the pre-existing 31
+                  # round-trips are byte-untouched; its only job is to make
+                  # `envoy.filters.http.header_mutation` a live filter name so the
+                  # per-route `typed_per_filter_config` entries above attach.
+                  # MEASURED: reference Envoy contrib-v1.37.2 boots this shape
+                  # (`--mode validate` => `configuration OK`, rc=0).
+                  - name: envoy.filters.http.header_mutation
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

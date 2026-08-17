@@ -774,3 +774,116 @@ func TestBuildRequest_PathForms(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildH2Request_PseudoHeaderExclusion — phase 89 (ADR-0311)
+// CHARACTERIZATION PIN. It PASSES at the unmodified tip; it is not part of the
+// phase-89 RED census.
+//
+// buildH2Request had ZERO test coverage before phase 89 (`git grep -l -w
+// buildH2Request -- '*_test.go'` => 0 files), yet its pseudo-header EXCLUSION
+// contract is what makes the phase-89 decode-delta reconciler's ':'-skip
+// necessary AND sufficient: the ordered carrier the reconciler edits must never
+// contain a ':'-prefixed field, because h2/client.go re-prepends the four
+// request pseudo-headers itself and a second copy on the wire is a
+// PROTOCOL_ERROR. Pin it so a future refactor cannot quietly start leaking
+// pseudo-headers onto .Headers.
+func TestBuildH2Request_PseudoHeaderExclusion(t *testing.T) {
+	tests := []struct {
+		name        string
+		headers     []hpack.HeaderField
+		wantMethod  string
+		wantPath    string
+		wantScheme  string
+		wantAuth    string
+		wantHeaders []hpack.HeaderField
+	}{
+		{
+			name:        "minimal_pseudo_only_yields_empty_regular_set",
+			headers:     minHeaders(),
+			wantMethod:  "GET",
+			wantPath:    "/",
+			wantScheme:  "https",
+			wantAuth:    "example.com",
+			wantHeaders: nil,
+		},
+		{
+			name: "regular_headers_kept_in_wire_order",
+			headers: append(minHeaders(),
+				hpack.HeaderField{Name: "x-b", Value: "2"},
+				hpack.HeaderField{Name: "x-a", Value: "1"},
+			),
+			wantMethod: "GET",
+			wantPath:   "/",
+			wantScheme: "https",
+			wantAuth:   "example.com",
+			wantHeaders: []hpack.HeaderField{
+				{Name: "x-b", Value: "2"},
+				{Name: "x-a", Value: "1"},
+			},
+		},
+		{
+			name: "duplicate_regular_names_kept_non_adjacent",
+			headers: append(minHeaders(),
+				hpack.HeaderField{Name: "x-dup", Value: "one"},
+				hpack.HeaderField{Name: "x-mid", Value: "mid"},
+				hpack.HeaderField{Name: "x-dup", Value: "three"},
+			),
+			wantMethod: "GET",
+			wantPath:   "/",
+			wantScheme: "https",
+			wantAuth:   "example.com",
+			wantHeaders: []hpack.HeaderField{
+				{Name: "x-dup", Value: "one"},
+				{Name: "x-mid", Value: "mid"},
+				{Name: "x-dup", Value: "three"},
+			},
+		},
+		{
+			name: "unknown_pseudo_header_is_excluded_not_forwarded",
+			headers: append(minHeaders(),
+				hpack.HeaderField{Name: ":protocol", Value: "connect-udp"},
+				hpack.HeaderField{Name: "x-a", Value: "1"},
+			),
+			wantMethod:  "GET",
+			wantPath:    "/",
+			wantScheme:  "https",
+			wantAuth:    "example.com",
+			wantHeaders: []hpack.HeaderField{{Name: "x-a", Value: "1"}},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildH2Request(tc.headers, []byte("body"))
+			if got.Method != tc.wantMethod {
+				t.Errorf("Method = %q, want %q", got.Method, tc.wantMethod)
+			}
+			if got.Path != tc.wantPath {
+				t.Errorf("Path = %q, want %q", got.Path, tc.wantPath)
+			}
+			if got.Scheme != tc.wantScheme {
+				t.Errorf("Scheme = %q, want %q", got.Scheme, tc.wantScheme)
+			}
+			if got.Authority != tc.wantAuth {
+				t.Errorf("Authority = %q, want %q", got.Authority, tc.wantAuth)
+			}
+			if string(got.Body) != "body" {
+				t.Errorf("Body = %q, want %q", got.Body, "body")
+			}
+			for _, h := range got.Headers {
+				if len(h.Name) > 0 && h.Name[0] == ':' {
+					t.Errorf("Headers carries pseudo-header %q; buildH2Request must exclude every ':'-prefixed field", h.Name)
+				}
+			}
+			if len(got.Headers) != len(tc.wantHeaders) {
+				t.Fatalf("Headers = %v, want %v", got.Headers, tc.wantHeaders)
+			}
+			for i := range tc.wantHeaders {
+				if got.Headers[i] != tc.wantHeaders[i] {
+					t.Errorf("Headers[%d] = %v, want %v", i, got.Headers[i], tc.wantHeaders[i])
+				}
+			}
+		})
+	}
+}

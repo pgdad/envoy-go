@@ -1,13 +1,26 @@
 # Phase 05.2 fixture 0004-h2-routing — expectations
 #
-# This file is prose, not machine-evaluated (per ADR-0019). The runner enforces
-# the assertions described below via test/differential/runner_test.go's byte
-# comparison + DistributionAsserter + HTTPExpectations passes (the H2 variant
-# of the phase-04 carry-forward — same shape, different RoundTrip path; the
-# helper used is test/helpers.H2RoundTrip per Task 12).
+# This file is prose, not machine-evaluated (per ADR-0019).
 #
-# Asserted equivalence (per ADR-0044 carry-forward + ADR-0057):
-#   - response status code per request, across all 31 requests/side
+# ⚠️ CORRECTED IN PHASE 89 — the previous wording claimed the assertions below
+# are enforced via "byte comparison + DistributionAsserter + HTTPExpectations
+# passes". THE HTTPExpectations HALF WAS FALSE: this driver deliberately does
+# NOT implement fixture.HTTPExpectations (driver.go, "HTTPExpectations is
+# intentionally NOT implemented"), and the runner's HTTPExpectations branch uses
+# helpers.HTTPRoundTrip (HTTP/1.1), which cannot speak to an h2-only listener at
+# all. The enforcement is therefore exactly TWO runner passes plus in-band
+# driver assertions:
+#
+#   1. the runner's cross-side BYTE COMPARISON of the Drive transcripts;
+#   2. the runner's DistributionAsserter pass (driver-implemented from response
+#      bodies — subprocess HTTPSH2 backends never touch the in-process accept
+#      counter);
+#   3. IN-BAND assertions inside DriveReference / DriveSubject, which report by
+#      `return nil, fmt.Errorf(...)` — so the FIRST failing arm ABORTS the Drive
+#      and later arms do not run. The helper is test/helpers.H2RoundTrip.
+#
+# Asserted equivalence (per ADR-0044 carry-forward + ADR-0057 + ADR-0311):
+#   - response status code per request, across all 39 requests/side
 #   - decoded response body bytes for /health direct_response (200, "OK\n")
 #     — 9 x "OK\n" concatenated into the Drive byte stream, compared byte-for-byte
 #   - decoded response body bytes for the two leading-`//` arms (200, "edge-ok")
@@ -53,9 +66,13 @@
 #   1. match.path: "/health"   -> direct_response 200 "OK\n"
 #   2. match.prefix: "/api"    -> router -> cluster c_h2_backend (3 endpoints, RR)
 #   3. match.prefix: "//edge"  -> direct_response 200 "edge-ok" (phase 87)
+#   1b. (phase 89) seven match.path: "/api/v1/reflect-headers/<a1|a2|a3|a4|a6|
+#       a7|a8>" exact routes -> router -> c_h2_backend, each with its own
+#       typed_per_filter_config HeaderMutationPerRoute. Declared ABOVE the
+#       "/api" prefix route. Arm a5 has NO route on purpose.
 #   4. match.prefix: "/"       -> direct_response 404 "not found\n" (catch-all)
 #
-# Driver request schedule (31 requests/side, deterministic ordering; driver
+# Driver request schedule (39 requests/side, deterministic ordering; driver
 # issues them serially over fresh TLS+H/2 connections per call so RR slots are
 # consumed one-per-request):
 #   9 x GET /health                  -> expect 200, body "OK\n" (concatenated)
@@ -73,6 +90,103 @@
 #   1 x GET /api/v1/emit             -> expect 200, response headers
 #                                       x-cont-marker: emitted and a 32000-byte
 #                                       x-cont-pad (phase 88; NOT concatenated)
+#   8 x the phase-89 decode-mutation arms A1..A8 against
+#     /api/v1/reflect-headers/<arm>  -> expect 200; the reflected header block is
+#                                       asserted IN-BAND and NOT concatenated;
+#                                       only a normalized "p89-<arm>:ok" marker
+#                                       is appended to the byte stream
+#
+# Decode-side filter-mutation arms (phase 89 / ADR-0311):
+#   The proxy's http_filters are an EMPTY listener-level header_mutation (zero
+#   listener-scope mutations — it only makes the filter name live so the
+#   per-route typed_per_filter_config entries attach; MEASURED to boot on
+#   reference Envoy contrib-v1.37.2, --mode validate => configuration OK, rc=0)
+#   followed by the router. The pre-existing 31 round-trips are byte-untouched.
+#
+#   A1  append x-p89-added: a1 (APPEND_IF_EXISTS_OR_ADD), no client seed
+#       -> present EXACTLY ONCE with value a1; 200
+#   A2  remove: "x-p89-removed"; client sends x-p89-removed: seed
+#       -> name ABSENT; 200
+#   A3  x-p89-changed: new (OVERWRITE_IF_EXISTS_OR_ADD); client sends
+#       x-p89-changed: old -> EXACTLY ONE value and it is "new"; 200
+#   A4  append x-p89-dup: v1 (APPEND_IF_EXISTS_OR_ADD); client sends
+#       x-p89-dup: c0 -> BOTH values [c0 v1]. THIS IS THE CROSS-SIDE PIN FOR
+#       THE APPEND RULE: reference Envoy leaves the existing field AT ITS
+#       POSITION and appends only the new value at the tail, whereas
+#       OVERWRITE_IF_EXISTS_OR_ADD removes every occurrence and re-appends one
+#       copy at the tail. Collapsing the two rules relocates an untouched
+#       original.
+#   A5  NO per-route config (/api/v1/reflect-headers/a5 has no exact route and
+#       falls through to the prefix "/api" route) -> 200; the reconcile is a
+#       no-op on an empty delta.
+#   A6  append with a canonical-MIME config key X-P89-Case: c1 -> 200 and
+#       x-p89-case: c1 present.
+#   A7a append x-p89-benign: kept AND te: trailers (te appended AT MOST ONCE)
+#       -> both present; 200.
+#   A8  the A1 mutation on a POST with a NON-EMPTY body -> mutation lands; 200.
+#
+# NOT ASSERTED by any phase-89 arm — HEADER ORDER. Two independent reasons:
+#   (a) helpers.H2RoundTrip sets client headers via req.Header.Add onto a Go
+#       map, so the relative order of DIFFERENT client-sent names is randomized
+#       per request by map iteration — an order assertion would be a FLAKE, not
+#       a pin. (Duplicates of a SINGLE name stay adjacent and in order, which is
+#       what makes A4's [c0 v1] a legitimate pin.)
+#   (b) this fixture's backend is net/http + http2.ConfigureServer, and x/net's
+#       H/2 server folds the HEADERS block into an http.Header MAP before any
+#       handler runs — wire order is destroyed before it can be observed, and no
+#       hook exposes MetaHeadersFrame.Fields. Recovering it needs a raw-framer
+#       backend, i.e. a new BackendKind for one assertion.
+#   Wire ORDER is pinned at the UNIT layer instead (internal/filter/hcm
+#   reconcile tests). This fixture pins presence / absence / value / COUNT /
+#   status.
+#
+# HONEST SCOPE on three arms — do not read them as more than they are:
+#   - A5's "no ':'-prefixed name in the block" check is a FREE VACUOUS
+#     INVARIANT. A ':'-prefixed name in the regular-header region is an RFC 9113
+#     Sec 8.3 protocol error the backend's codec rejects before any handler
+#     runs, so the check can never fire on a reachable input. Kept because it is
+#     free and documents intent; it does NOT pin h2ReconcileSkipKey's
+#     pseudo-header clause (unit layer does).
+#   - A6 does NOT prove the wire name was lowercased: the backend canonicalizes
+#     every received name, so the block reads X-P89-Case either way. The real
+#     discriminator is that an uppercase name on an H/2 request is a protocol
+#     error — a proxy emitting it verbatim fails the round-trip and A6 goes red
+#     on the STATUS check, not the header check.
+#   - A8 exercises the hasBody / RunDecodeData branch but does NOT discriminate
+#     the reconcile's PLACEMENT relative to RunDecodeData: every mutation here
+#     originates in DecodeHeaders, so moving the reconcile above the hasBody
+#     block leaves A8 green. That placement is pinned at the unit layer by
+#     TestWriteH2_Reconcile_DecodeDataMutationIsApplied.
+#
+# The reflected block is NEVER written into the differential transcript: it
+# carries x-request-id (random UUID) plus reference-only x-forwarded-proto and
+# x-envoy-expected-rq-timeout-ms, so the sides can never compare equal
+# byte-for-byte. For the same reason no arm may assert its mutated header is the
+# LAST field on the wire — the reference adds x-forwarded-proto / x-request-id
+# BEFORE the filter chain and x-envoy-expected-rq-timeout-ms from the ROUTER,
+# i.e. AFTER header_mutation.
+#
+# ⚠️ PHASE-89 INTENTIONAL DEPARTURE — arm A7b is DELIBERATELY OMITTED:
+#   `connection`, `transfer-encoding` and `te: gzip` CANNOT be cross-side arms.
+#   Reference Envoy accepts all three as header_mutation config (its protected
+#   set is exactly ':'-prefixed + host, the same set as envoy-go's
+#   isProtectedHeader) and then FORWARDS THEM VERBATIM onto the H/2 upstream
+#   wire. Against this fixture's conformant backend (x/net's
+#   checkValidHTTP2RequestHeaders rejects the connection-specific set and any
+#   `te` other than "trailers") each yields 400 WITH ZERO BACKEND DELIVERY,
+#   attributed by Envoy's own cluster.*.upstream_rq_400: 1. envoy-go DROPS them
+#   (h2.IsIllegalH2RequestHeader, value-aware so `te: trailers` survives) and
+#   answers 200 WITH delivery — decision D-89-VALIDATE, frozen. That is a real,
+#   MEASURED, INTENTIONAL divergence, not parity, and it is pinned at the UNIT
+#   layer (.../11_rfc9113_illegal_pairs_dropped_te_trailers_kept). Do NOT try to
+#   make it green cross-side.
+#
+#   A related reference behavior is also NOT reproduced: the reference
+#   comma-coalesces repeated `te` into ONE field (te: gzip,trailers — measured)
+#   while custom names are NOT coalesced (x-p89-dup arrives as two fields —
+#   measured); envoy-go emits one field per value for every name. `te` is
+#   therefore appended AT MOST ONCE (A7a only) — a coalesced
+#   `te: trailers,trailers` would be rejected by the backend.
 #
 # CONTINUATION arms (phase 88 — the LENGTH assertion is the load-bearing one):
 #   Both arms carry a 32000-byte header value that HPACK-encodes to 23792 B,

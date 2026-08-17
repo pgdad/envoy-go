@@ -243,3 +243,74 @@ func TestWriteH2_TracingZipkin_Continued(t *testing.T) {
 		t.Errorf("span TraceID = %q, want continued %s", got, fixedTrace)
 	}
 }
+
+// mkZipkinTracingFilterChain is mkZipkinTracingFilter with a caller-supplied
+// chainConfig. Phase 89 (ADR-0311) — the Zipkin analog of mkTracingFilterChain
+// in connection_test.go; mkFilterForTable installs a ROUTER-ONLY chain, which
+// cannot exercise the tracing seam alongside a decode filter. Additive.
+func mkZipkinTracingFilterChain(t *testing.T, tt *routeTable, rng tracing.RandSource, exp tracing.Exporter, id128, shared bool, chainConfig []chainEntry) (*Filter, *stats.Registry) {
+	t.Helper()
+	f, reg := mkZipkinTracingFilter(t, tt, rng, exp, id128, shared)
+	f.chainConfig = chainConfig
+	return f, reg
+}
+
+// TestWriteH2_TracingZipkin_DecodeFilterMutationSurvives — phase 89 (ADR-0311),
+// the Zipkin half of the tracing survival row. Same shape as
+// TestWriteH2_Tracing_DecodeFilterMutationSurvives in connection_test.go, but
+// the seam writes the B3 multi-header set (x-b3-traceid / x-b3-spanid /
+// x-b3-sampled) instead of traceparent. All of them are written onto the
+// CARRIER only — never mirrored into the decode header map — so a whole-map
+// projection would silently drop the whole B3 set.
+func TestWriteH2_TracingZipkin_DecodeFilterMutationSurvives(t *testing.T) {
+	tt := &routeTable{routes: []routeEntry{
+		{match: matchPath("/health"), action: &directResponseAction{status: 200, bodyText: "OK\n"}},
+	}}
+	fe := &fakeExporter{}
+	chainCfg := mutatingChain(t, func() *headerMutatingFilter {
+		return &headerMutatingFilter{onHeaders: func(h http.Header) { h.Set("X-Filter-Added", "yes") }}
+	})
+	f, reg := mkZipkinTracingFilterChain(t, tt, fakeTraceRand{f: 0, b: 0x66}, fe, true, true, chainCfg)
+
+	var captured h2.H2Request
+	hreq, _ := http.NewRequest("GET", "/health", nil)
+	hreq.Proto = "HTTP/2.0"
+	hreq.Header.Add("x-seed", "s")
+	c := &chainDispatchAction{f: f, action: captureH2Action(&captured), req: hreq, routeIdx: 0}
+
+	h2req := h2.H2Request{
+		Method:    "GET",
+		Path:      "/health",
+		Scheme:    "https",
+		Authority: "zipkin.h2.example.com",
+		Headers:   []hpack.HeaderField{{Name: "x-seed", Value: "s"}},
+	}
+	if err := c.WriteH2(context.Background(), h2req, &captureH2Writer{}); err != nil {
+		t.Fatalf("WriteH2: %v", err)
+	}
+
+	if got := h2HeaderValues(captured, "x-b3-traceid"); len(got) != 1 || len(got[0]) != 32 {
+		t.Errorf("forwarded x-b3-traceid = %v, want exactly one 32-hex id (survives the reconcile)", got)
+	}
+	if got := h2HeaderValues(captured, "x-b3-spanid"); len(got) != 1 || len(got[0]) != 16 {
+		t.Errorf("forwarded x-b3-spanid = %v, want exactly one 16-hex id", got)
+	}
+	if got := h2HeaderValues(captured, "x-b3-sampled"); len(got) != 1 || got[0] != "1" {
+		t.Errorf("forwarded x-b3-sampled = %v, want [1]", got)
+	}
+	if got := h2HeaderValues(captured, "x-request-id"); len(got) != 1 || len(got[0]) != 36 {
+		t.Errorf("forwarded x-request-id = %v, want exactly one 36-char id", got)
+	}
+	if got := h2HeaderValues(captured, "x-filter-added"); len(got) != 1 || got[0] != "yes" {
+		t.Errorf("forwarded x-filter-added = %v, want [yes] (the decode filter's mutation must land)", got)
+	}
+	if got := h2HeaderValues(captured, "x-seed"); len(got) != 1 || got[0] != "s" {
+		t.Errorf("forwarded x-seed = %v, want [s] (untouched header unchanged)", got)
+	}
+	if spans := fe.captured(); len(spans) != 1 {
+		t.Errorf("expected 1 span, got %d", len(spans))
+	}
+	if got := tracingCounterValue(t, reg, "random_sampling"); got != 1 {
+		t.Errorf("random_sampling = %d, want 1", got)
+	}
+}
