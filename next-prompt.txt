@@ -60,6 +60,8 @@ Also NC the DENOMINATOR (`want=121` on the real file must print `GATE FAIL: exam
 **SENTINEL RUN MECHANICALLY AT THE PHASE-90 BRAINSTORM (2026-08-19), ON BOTH SIDES OF THE ROW ADD. IT DOES NOT FIRE; `stop` was NOT created** (verified absent at the git root AND in the stage worktree). ACTUAL output, recorded not predicted: **BEFORE:** 239 lines / 121 data rows — (1) **SILENT** at `want=121`, (2) SIX at `:199 :205 :211 :221 :227 :235`, (3) SILENT · **AFTER:** 240 lines / 122 data rows — (1) **`NOT DONE: row 90`**, (2) **SIX** at `:200 :206 :212 :222 :228 :236`, (3) SILENT.
 - **ALL FOUR NCs FIRED ON THE POST-ADD FILE.** NC-A `NC LANDED? [ in-progress ]` inspected FIRST => `NOT DONE: row 62` **AND** `NOT DONE: row 90` (see the shape warning above) · NC-B `want=121` => `GATE FAIL: examined 122 data rows, expected 121` · NC-C residual **2 -> 0** confirmed first => `NEVER OPENED: gRPC`, WASM correctly silent · NC-D long **5** / short **1**, union **6** (a one-arm strip is NOT an NC for the union).
 - ⚠️ **A DRAFT OF THE BRAINSTORM PREDICTED "(1) SILENT" AFTER THE ADD AND WAS WRONG.** An `in-progress` row MUST be named by check (1). The error was caught ONLY by running the gate. **RECORD, DO NOT FORECAST.**
+**RE-VERIFIED AT THE PUSHED TIP `059c13c9` (2026-08-19), AFTER the merge and push — the sentinel and ALL FOUR NCs re-run mechanically, and EVERY count figure in this file re-derived.** (1) **`NOT DONE: row 90`** with the denominator asserted at 122 · (2) **SIX** at `:200 :206 :212 :222 :228 :236` · (3) **SILENT**. NC-A => `NOT DONE: row 62` **AND** `NOT DONE: row 90` · NC-B `want=121` => `GATE FAIL: examined 122 data rows, expected 121` · NC-C residual 2 -> 0 => `NEVER OPENED: gRPC`, WASM silent · NC-D long **5** / short **1** / union **6**. ⇒ **THE SENTINEL DOES NOT FIRE — TWO checks block it (row 90 in-progress AND six windows). `stop` WAS NOT CREATED** (verified absent at the git root). `master` and `origin/master` both `059c13c9`, `0 0`.
+
 - Every leak axis at this tip: `-family row` **95 / 67** · `gRPC-family row` **2** · `Operational-tooling-family row` **3**. Row 90 `fields=8` (escape-aware, verified BEFORE installing).
 - ⚠️ do NOT "fix" the six and do NOT forecast a decrease — history `0 -> 1 -> 3 -> 4 -> 5 -> 6` across ~40 phases; the candidate sentences are a WINDOW onto a larger deferred backlog, not an inventory of it. ⚠️ **THE INVENTORY IS ~59, NOT ~42** — the long-carried "~42" is the SENTENCE-VISIBLE subset only. **Cite ~42 only as "sentence-visible", never as the inventory.** ⚠️ **AND TWO WINDOW CANDIDATES ARE STALE — RE-VERIFIED BY EXECUTION AT THE PHASE-90 BRAINSTORM:** window `:222` (was `:221`) still lists the H2 `//`-path routing bug that **ROW 87 CLOSED** — `internal/filter/hcm/h2/stream.go` now uses `url.ParseRequestURI`, confirmed — and the `/stats/prometheus` projection gap that **ROWS 79 AND 80 CONSUMED** (both `done`, confirmed). **A candidate's presence in a window is NOT evidence it is still open.**
 
@@ -71,6 +73,21 @@ command grep -rl 'STANDING DIRECTIVE (human, 2026-07-12)' . | sed 's|^\./||' | s
 grep -c 'STANDING DIRECTIVE (human, 2026-07-12)' next-prompt.txt                      # direct access WORKS
 ```
 ⚠️ **THE METHOD BINDS; carry no standing discrepancy figure and no standing absolute.** ⚠️ **NORMALIZE THE PATH FORM BEFORE COMPARING ARMS; print FILE NAMES, never a count.** ⚠️ **THE HARNESS `grep` STRIPS A LEADING `./` FROM PATHS** — measured at the phase-90 BRAINSTORM, where a `grep -v '^\./internal/'` filter matched NOTHING and silently read as "no files outside internal/". ⚠️ **`git check-ignore` REASSURES YOU WRONGLY** (git exempts TRACKED files; use `-v --no-index`, and `git status` is the discriminating check). ⚠️ **`command grep` DOES NOT SURVIVE `xargs`** — inside `xargs` use `git grep` or `/usr/bin/grep`. ⚠️ **`grep -c` ON ZERO MATCHES IS TOOL-SPECIFIC** (only `git grep -c` prints nothing; all exit 1 — capture the value, never chain on the exit code). ⚠️ **`grep -c` COUNTS *LINES*, NOT *OCCURRENCES*.** ⚠️ **`\t` IN GNU ERE IS A LITERAL `t` — use `-P`.** ⚠️ **A `git grep` PATHSPEC ENDING IN `/` READS A FAIL-UNSAFE ZERO** — use the shell-glob form. ⚠️ **AN UNANCHORED PANIC-GREP FALSE-FIRES 14 TIMES ON A FULLY-GREEN DIFFERENTIAL LOG** — **the canonical gate is ANCHORED: `^panic:|DATA RACE|SIGSEGV`.** ⚠️ **AND `STATE.md` QUOTES ITS OWN MATCHERS:** an unanchored `grep -c 'next-skill:'` reads more than 1 on the unmodified file; the anchored `^- \*\*next-skill:\*\*` reads 1.
+
+## ⚠️ A BARE `^func <name>` GREP IS A PREFIX MATCH — MEASURED ON THIS ROW'S OWN PICKED SYMBOL
+
+The SPEC must prototype at `buildRequest`. **A bare prefix grep mis-scopes it across TWO packages:**
+```sh
+git grep -c '^func buildRequest'  -- 'internal/**/*.go' ':!*_test.go'   # reads 3  <-- TRAP
+#   internal/filter/hcm/h2/stream.go:409   func buildRequest(...)              <-- the real one
+#   internal/filter/http/extproc/attributes.go:141  buildRequestHeadersProcessingRequest(
+#   internal/filter/http/extproc/attributes.go:308  buildRequestBodyProcessingRequest(
+git grep -c '^func buildRequest(' -- 'internal/**/*.go' ':!*_test.go'   # reads 1  <-- CORRECT
+```
+**ANCHOR THE OPEN PAREN.** `^func buildH2Request(` likewise reads **1**. Negative-controlled: a fabricated
+`^func buildRequestZZZ(` reads **0**, so the discriminating form is live and not vacuously matching.
+⚠️ **This is the same species as `reference_symbol_assertion_needs_qualified_name`, but the contaminant here is a
+LONGER SYMBOL IN A DIFFERENT PACKAGE, not a doc quote — a `':!docs'` pathspec would NOT have caught it.**
 
 ## ⚠️ A DRIFT CORRECTION IS ITSELF A CLAIM — ONE FIRED AND WAS REFUTED AT THE PHASE-90 BRAINSTORM
 
