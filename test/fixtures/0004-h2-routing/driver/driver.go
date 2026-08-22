@@ -6,17 +6,23 @@
 package driver
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/pgdad/envoy-go/test/differential/fixture"
@@ -260,10 +266,11 @@ func (d *h2Driver) loadTLSConfig() *tls.Config {
 	}
 }
 
-// drive issues 39 sequential H2 requests against addr (the proxy listener)
+// drive issues 42 sequential H2 requests against addr (the proxy listener)
 // and returns the concatenated 9 /health response bodies, followed by the 2
 // phase-87 leading-`//` arm bodies ("edge-ok" x 2), followed by the 8 phase-89
-// normalized arm markers ("p89-a1:ok" … "p89-a8:ok"). The first 27 requests and
+// normalized arm markers ("p89-a1:ok" … "p89-a8:ok"), followed by the 4
+// phase-90 authority-normalization lines ("p90-P:…" … "p90-B:…"). The first 27 requests and
 // the transcript prefix they produce are unchanged from phase 05.2. Per ADR-0028 +
 // ADR-0056: each request opens a fresh *http2.ClientConn (the helper's
 // fresh-Transport-per-call discipline). The 9 /api response bodies are NOT
@@ -456,6 +463,64 @@ func (d *h2Driver) drive(ctx context.Context, addr string, counts *[3]uint64) ([
 			return nil, fmt.Errorf("p89-%s: %w (reflected names=%v)", arm.name, err, sortedNames(got))
 		}
 		fmt.Fprintf(&out, "p89-%s:ok", arm.name)
+	}
+
+	// Phase-90 H/2 `host` vs `:authority` normalization arms (3 requests;
+	// total 42/side). Each arm is a HAND-BUILT HPACK field list driven by a raw
+	// http2.Framer over its OWN fresh TLS(ALPN h2) connection — the 0119
+	// instrument shape (../../0119-grpc-unary-trailers/driver/driver.go).
+	//
+	// ⚠️ helpers.H2RoundTrip CANNOT express any of these arms, on three
+	// independent mechanisms:
+	//
+	//   1. No req.Host surface — the signature carries no host parameter and
+	//      the URL is hard-built as "https://"+addr+path (helpers/h2.go).
+	//   2. A client-supplied `host` entry is SILENTLY DROPPED —
+	//      x/net/http2/transport.go `continue`s on asciiEqualFold(k, "host"),
+	//      so passing {Name:"host"} through the helper is a VACUOUS arm.
+	//   3. `:authority` cannot be set, emptied or injected — the transport
+	//      derives it from req.Host/req.URL.Host, emits it unconditionally,
+	//      and validateHeaders rejects a literal ":authority" header name.
+	//
+	// ⚠️ ONE FRESH CONNECTION PER ARM, EACH WITH ITS OWN HPACK DECODER. The
+	// HPACK dynamic table is CONNECTION-scoped; a shared or per-request decoder
+	// decodes only the first request on a pooled connection and then yields
+	// "invalid indexed representation index NN" with a truncated field list —
+	// which reads exactly like "headers were lost"
+	// (reference_hpack_decoder_must_be_per_connection).
+	//
+	// ⚠️ THIS BLOCK IS DELIBERATELY NOT FAIL-FAST. The arms above assert
+	// in-band with `return nil, fmt.Errorf(...)`, so the first failing arm
+	// aborts the whole Drive and every later arm is unreachable
+	// (reference_failfast_driver_masks_later_red_arms). These arms follow 0119's
+	// discipline instead: every failure is recorded IN the transcript, all
+	// arms ALWAYS run, and the runner's cross-side byte compare IS the
+	// assertion. Exactly ONE `p90-<arm>:auth=… host=…` line is emitted per arm,
+	// always, plus an ERR line when the arm did not complete cleanly.
+	//
+	// ⚠️ Every arm sends a FIXED LITERAL authority, never the dial address:
+	// the reference dials a mapped container port and the subject a local one,
+	// so an address-derived authority would break cross-side byte equality by
+	// construction.
+	//
+	// ⚠️ NO YAML EDIT. Routes 2-8 are EXACT matches for a1-a4/a6-a8, so a
+	// `/api/v1/reflect-headers/p90*` path falls through to
+	// `- match: { prefix: "/api" }` -> c_h2_backend -> the backend's
+	// `/api/v1/reflect-headers/` SUBTREE handler, exactly as a5 already does by
+	// design. And the per-backend counter increment lives ONLY inside the
+	// `/api/v1/<n>` loop above (deliberately not spelled here as a literal, so
+	// the audit grep for it keeps reading exactly ONE hit), so
+	// AssertDistribution's [3,3,3] over those 9 requests is untouched by these
+	// three.
+	for _, arm := range p90Arms() {
+		got, status, failure := p90DriveArm(ctx, addr, tlsConf, arm)
+		switch {
+		case failure != "":
+			fmt.Fprintf(&out, "p90-%s:ERR %s\n", arm.name, failure)
+		case status != 200:
+			fmt.Fprintf(&out, "p90-%s:ERR status=%d, want 200\n", arm.name, status)
+		}
+		fmt.Fprintf(&out, "p90-%s:auth=%q host=%v\n", arm.name, p90ObservedValue(got), p90HostPresent(got))
 	}
 	return []byte(out.String()), nil
 }
@@ -654,6 +719,287 @@ func hmWantAbsent(got map[string][]string, name string) error {
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// Phase-90 authority-normalization arms (raw framer, ONE FRESH CONNECTION EACH)
+// ---------------------------------------------------------------------------
+
+const (
+	// p90ArmDeadline bounds each phase-90 arm's dial + write + read loop.
+	p90ArmDeadline = 10 * time.Second
+
+	// p90StreamID is the single client-initiated stream each arm uses. One
+	// FRESH connection per arm, so it is always stream 1.
+	p90StreamID = 1
+
+	// p90HpackTableSize is the RESPONSE decoder's dynamic-table size. The
+	// decoder itself is created per connection, never shared across arms.
+	p90HpackTableSize = 4096
+
+	// The wire literals. FIXED, never derived from the dial address — see the
+	// block comment in drive().
+	p90Authority = "p90.example"
+	p90HostValue = "p90host.example"
+
+	// p90ObservedAuthority is the header the fixture backend emits AFTER its
+	// sorted reflected block, carrying r.Host — i.e. the authority the proxy
+	// actually forwarded (../backends/main.go).
+	p90ObservedAuthority = "x-observed-authority"
+
+	// p90AbsentAuthority is what the transcript records when the reflected
+	// block carries NO p90ObservedAuthority key at all.
+	//
+	// ⚠️ ABSENT and PRESENT-AND-EMPTY are DIFFERENT observations and this
+	// fixture must not conflate them. parseReflectedHeaders splits on the FIRST
+	// ": ", so an EMPTY r.Host emits `x-observed-authority: ` — separator
+	// intact — and parses as the key PRESENT with value "" (rendered `""`).
+	// A key missing entirely means the request never reached the reflect
+	// handler at all, which is a different finding and renders as this literal.
+	// No arm sends a header whose value could collide with it.
+	p90AbsentAuthority = "<absent>"
+)
+
+// p90Arm is one phase-90 arm: a hand-built HPACK field list in WIRE ORDER, and
+// the path it targets. `fields` is hpack-encoded verbatim, duplicates and all,
+// which is precisely what helpers.H2RoundTrip cannot express.
+type p90Arm struct {
+	name   string
+	fields []hpack.HeaderField
+}
+
+// p90Fields builds a request field list: the three mandatory pseudo-headers
+// followed by rest, in order. Any `:authority` belongs in rest's FIRST slot so
+// the pseudo-header block stays contiguous, as RFC 9113 §8.3 requires.
+func p90Fields(path string, rest ...hpack.HeaderField) []hpack.HeaderField {
+	fields := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":scheme", Value: "https"},
+		{Name: ":path", Value: hmReflectBase + path},
+	}
+	return append(fields, rest...)
+}
+
+// p90Arms returns the phase-90 arm roster.
+//
+// ⚠️ ARM C (`:authority` PRESENT-AND-EMPTY) IS DELIBERATELY NOT HERE. It is a
+// deferred follow-on: `:authority` absent and `:authority` present-and-empty
+// both satisfy `rp.authority == ""` in x/net's H/2 server and both take the
+// fallback to the Host header, landing byte-identical in r.Host AND r.Header —
+// so NO backend edit can recover the distinction, and recovering it needs a
+// raw-framer BACKEND (a new BackendKind) that this row does not buy.
+//
+// ⚠️ ARM E (FIRST-OCCURRENCE-WINS: two regular `host` fields, no `:authority`)
+// WAS HERE AND WAS REMOVED. It is NOT DIFFERENTIABLE IN PRINCIPLE — do not
+// re-add it:
+//
+//  1. THE REFERENCE REFUSES THE SHAPE. MEASURED against the pinned image
+//     (envoyproxy/envoy:contrib-v1.37.2, docs/envoy-go/ENVOY_TARGET.md): a
+//     SECOND regular `host` field on the H/2 downstream leg is rejected at the
+//     codec layer — "Invalid HTTP header field was received: frame type: 1,
+//     stream: 1, name: [host]", response details `http2.invalid.header.field`,
+//     reset reason "connection termination". The client is sent NO GOAWAY and
+//     NO RST_STREAM; the connection is closed and the arm reads a bare EOF, so
+//     the reference transcript line is `p90-E:ERR read-frame: …` while a
+//     correct subject serves a 200. The rejection is by ARITY, not by value —
+//     two IDENTICAL `host` values are refused the same way — and holds with
+//     `:authority` also present. Stats move `http2.rx_messaging_error`,
+//     `downstream_cx_protocol_error` and `downstream_rq_rx_reset`.
+//     Testing first-occurrence-wins REQUIRES two `host` fields, so no
+//     subject-side change can ever make the two sides' bytes agree.
+//  2. THE AXIS IS ALREADY PINNED, AT THE UNIT LAYER.
+//     TestAuthorityNormalization/E_dup_host_first_wins
+//     (internal/filter/hcm/h2/authority_norm_test.go) is the SOLE first-wins
+//     discriminator in the tree: inverting both latches to last-wins reddens
+//     that arm and only that arm. Do not delete it.
+//  3. MATCHING THE REFERENCE HERE IS OUT OF CHARTER. Row 90 is
+//     promote/suppress. A duplicate-`host` REJECT is reference-side admission
+//     control — the same family as the deferred arm-C validity reject and the
+//     same class as D-90-DUP (the duplicate-`:authority` reject this row
+//     deliberately declined to add). Implementing it would be an unpriced
+//     behavior change.
+func p90Arms() []p90Arm {
+	return []p90Arm{
+		// P90-P — POSITIVE CONTROL: `:authority` only, no `host` field.
+		// Asserts x-observed-authority == p90.example AND `host` ABSENT.
+		// ⚠️ This arm must PASS on BOTH sides even PRE-fix; if it ever
+		// diverges the roster is vacuously red and the rest proves nothing.
+		{"P", p90Fields("p90p",
+			hpack.HeaderField{Name: ":authority", Value: p90Authority},
+		)},
+		// P90-A — BOTH authorities. `:authority` wins and the regular `host`
+		// field must not survive onto the upstream carrier. Pre-fix the
+		// SUBJECT emits `host: p90host.example` and the reference does not.
+		{"A", p90Fields("p90a",
+			hpack.HeaderField{Name: ":authority", Value: p90Authority},
+			hpack.HeaderField{Name: "host", Value: p90HostValue},
+		)},
+		// P90-B — `host` ONLY, no `:authority`. The `host` field must be
+		// PROMOTED to the authority and then suppressed as a regular field.
+		// Pre-fix the subject reads an EMPTY authority — which is why
+		// p90AbsentAuthority exists as a distinct rendering (see above).
+		{"B", p90Fields("p90b",
+			hpack.HeaderField{Name: "host", Value: p90HostValue},
+		)},
+	}
+}
+
+// p90EncodeHeaderBlock hpack-encodes fields into a single header block
+// fragment, in the given order. DUPLICATE NAMES ARE PRESERVED (arm E sends two
+// `host` fields) and pseudo-headers are written verbatim; neither is
+// expressible through helpers.H2RoundTrip.
+func p90EncodeHeaderBlock(fields []hpack.HeaderField) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := hpack.NewEncoder(&buf)
+	for _, hf := range fields {
+		if err := enc.WriteField(hf); err != nil {
+			return nil, fmt.Errorf("hpack encode %s: %w", hf.Name, err)
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+// p90ScrubAddr replaces the side-specific dial address with a fixed
+// placeholder so failure lines stay cross-side comparable (the reference dials
+// a mapped container port, the subject a local one).
+func p90ScrubAddr(msg, addr string) string {
+	return strings.ReplaceAll(msg, addr, "<addr>")
+}
+
+// p90DriveArm opens a FRESH TLS(ALPN h2) connection, writes the arm's
+// hand-built header block with a raw framer, and reads the response stream to
+// END_STREAM. It returns the parsed reflected block, the observed :status, and
+// a NON-EMPTY failure string when the arm did not complete — it NEVER returns
+// an error, so no arm can make a later arm unreachable.
+func p90DriveArm(ctx context.Context, addr string, tlsConf *tls.Config, a p90Arm) (map[string][]string, int, string) {
+	fail := func(stage string, err error) (map[string][]string, int, string) {
+		return nil, 0, stage + ": " + p90ScrubAddr(err.Error(), addr)
+	}
+
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: p90ArmDeadline},
+		Config:    tlsConf,
+	}
+	raw, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fail("dial", err)
+	}
+	conn, ok := raw.(*tls.Conn)
+	if !ok {
+		_ = raw.Close()
+		return nil, 0, "dial: not a TLS connection"
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(p90ArmDeadline))
+
+	// ⚠️ 0004 is TLS+ALPN-h2, NOT h2c: the negotiated protocol is asserted
+	// BEFORE the preface is written, exactly as 0119's driveArm does.
+	if proto := conn.ConnectionState().NegotiatedProtocol; proto != "h2" {
+		return nil, 0, fmt.Sprintf("alpn: negotiated %q, want h2", proto)
+	}
+
+	// h2 client preface + SETTINGS.
+	if _, err := io.WriteString(conn, http2.ClientPreface); err != nil {
+		return fail("preface", err)
+	}
+	fr := http2.NewFramer(conn, conn)
+	// ⚠️ PER-CONNECTION decoder. See drive()'s block comment.
+	fr.ReadMetaHeaders = hpack.NewDecoder(p90HpackTableSize, nil)
+	if err := fr.WriteSettings(); err != nil {
+		return fail("settings", err)
+	}
+
+	block, err := p90EncodeHeaderBlock(a.fields)
+	if err != nil {
+		return fail("hpack-encode", err)
+	}
+	if err := fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      p90StreamID,
+		BlockFragment: block,
+		EndHeaders:    true,
+		EndStream:     true,
+	}); err != nil {
+		return fail("write-headers", err)
+	}
+
+	// Read loop: accumulate the response body until END_STREAM (or a terminal
+	// condition, returned as a failure string).
+	status := 0
+	var body []byte
+	for {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			return nil, status, "read-frame: " + p90ScrubAddr(err.Error(), addr)
+		}
+		switch f := f.(type) {
+		case *http2.SettingsFrame:
+			if !f.IsAck() {
+				if err := fr.WriteSettingsAck(); err != nil {
+					return fail("settings-ack", err)
+				}
+			}
+		case *http2.PingFrame:
+			if !f.IsAck() {
+				_ = fr.WritePing(true, f.Data)
+			}
+		case *http2.MetaHeadersFrame:
+			if f.StreamID != p90StreamID {
+				continue
+			}
+			for _, hf := range f.Fields {
+				if hf.Name == ":status" {
+					if n, convErr := strconv.Atoi(hf.Value); convErr == nil {
+						status = n
+					}
+				}
+			}
+			if f.StreamEnded() {
+				return parseReflectedHeaders(body), status, ""
+			}
+		case *http2.DataFrame:
+			if f.StreamID != p90StreamID {
+				continue
+			}
+			body = append(body, f.Data()...)
+			if f.StreamEnded() {
+				return parseReflectedHeaders(body), status, ""
+			}
+		case *http2.RSTStreamFrame:
+			if f.StreamID != p90StreamID {
+				continue
+			}
+			return nil, status, fmt.Sprintf("rst-stream code=%v", f.ErrCode)
+		case *http2.GoAwayFrame:
+			return nil, status, fmt.Sprintf("goaway code=%v", f.ErrCode)
+		default:
+			// WINDOW_UPDATE / PRIORITY / unknown: not recorded.
+		}
+	}
+}
+
+// p90ObservedValue renders the reflected p90ObservedAuthority for the
+// transcript, keeping ABSENT distinguishable from PRESENT-AND-EMPTY (see
+// p90AbsentAuthority).
+func p90ObservedValue(got map[string][]string) string {
+	v, ok := got[p90ObservedAuthority]
+	switch {
+	case !ok:
+		return p90AbsentAuthority
+	case len(v) == 1:
+		return v[0]
+	default:
+		// The backend emits the header exactly once, so any other count is
+		// itself a finding: record it verbatim rather than taking v[0].
+		return strings.Join(v, "|")
+	}
+}
+
+// p90HostPresent reports whether a regular `host` field survived onto the
+// upstream H/2 carrier. PRESENCE, not value, is the contract here: the fix
+// suppresses the field outright, so there is no surviving value to compare.
+func p90HostPresent(got map[string][]string) bool {
+	_, ok := got["host"]
+	return ok
+}
+
 // parseBackendIdx extracts the numeric idx from a body that starts with
 // "backend-<idx>:..." (per fixture-0004 backend's /api/v1 handler).
 func parseBackendIdx(body []byte) (int, error) {
@@ -674,7 +1020,7 @@ func parseBackendIdx(body []byte) (int, error) {
 	return idx, nil
 }
 
-// DriveReference runs 39 H2 round-trips against the reference proxy listener
+// DriveReference runs 42 H2 round-trips against the reference proxy listener
 // and records per-backend body counts on d.refBodyCnt for AssertDistribution.
 func (d *h2Driver) DriveReference(ctx context.Context, addr string) ([]byte, error) {
 	var counts [3]uint64
@@ -688,7 +1034,7 @@ func (d *h2Driver) DriveReference(ctx context.Context, addr string) ([]byte, err
 	return b, nil
 }
 
-// DriveSubject runs 39 H2 round-trips against the subject proxy listener and
+// DriveSubject runs 42 H2 round-trips against the subject proxy listener and
 // records per-backend body counts on d.subjBodyCnt for AssertDistribution.
 func (d *h2Driver) DriveSubject(ctx context.Context, addr string) ([]byte, error) {
 	var counts [3]uint64

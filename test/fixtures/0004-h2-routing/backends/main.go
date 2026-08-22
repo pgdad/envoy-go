@@ -129,6 +129,13 @@ func main() {
 				fmt.Fprintf(&b, "%s: %s\n", n, v)
 			}
 		}
+		// Phase 90: the AUTHORITY the proxy forwarded. x/net's H/2 server puts
+		// :authority into r.Host (server.go:2373) and leaves a regular `host`
+		// field in r.Header as "Host" (only "Trailer" is deleted, :2341), so the
+		// sorted block above already shows arm A while r.Host shows arm B.
+		// Emitted AFTER the sort, deliberately: folding it into `names` would let
+		// a lexical sort move it and re-baseline every existing arm.
+		fmt.Fprintf(&b, "x-observed-authority: %s\n", r.Host)
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte(b.String()))
 	})

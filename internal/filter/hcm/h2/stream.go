@@ -330,6 +330,13 @@ func (s *serverStream) dispatch(ctx context.Context, dispatcher Dispatcher) {
 // up-stack in buildRequest).
 func buildH2Request(headers []hpack.HeaderField, body []byte) H2Request {
 	out := H2Request{Body: body}
+	// D-90-SCOPE. authoritySeen tracks PRESENCE ONLY, because a bare
+	// out.Authority != "" cannot tell an ABSENT :authority from a
+	// PRESENT-AND-EMPTY one, and only the former promotes. hostSeen plays the
+	// same role for the regular host: it latches the FIRST occurrence as the
+	// promotion source even when that first value is itself empty.
+	var hostField string
+	var hostSeen, authoritySeen bool
 	for _, h := range headers {
 		switch h.Name {
 		case ":method":
@@ -340,11 +347,26 @@ func buildH2Request(headers []hpack.HeaderField, body []byte) H2Request {
 			out.Scheme = h.Value
 		case ":authority":
 			out.Authority = h.Value
+			authoritySeen = true
+		case "host":
+			// The regular host never reaches the upstream carrier: EVERY
+			// occurrence is suppressed here, and the FIRST is latched.
+			// Field names are lowercase-only on this leg — buildRequest has
+			// already rejected an uppercase name with PROTOCOL_ERROR before
+			// this function runs — so the test is an exact match, not a fold.
+			if !hostSeen {
+				hostField, hostSeen = h.Value, true
+			}
 		default:
 			if len(h.Name) > 0 && h.Name[0] != ':' {
 				out.Headers = append(out.Headers, h)
 			}
 		}
+	}
+	// Promote on ABSENT, never on EMPTY: a present-and-empty :authority wins
+	// and stays empty.
+	if !authoritySeen && hostSeen {
+		out.Authority = hostField
 	}
 	return out
 }
@@ -409,6 +431,12 @@ func IsIllegalH2RequestHeader(name, value string) bool {
 func buildRequest(headers []hpack.HeaderField, body io.Reader) (*http.Request, error) {
 	var method, path, scheme, authority string
 	var methodSeen, pathSeen, schemeSeen bool
+	// D-90-SCOPE. authoritySeen records PRESENCE ONLY — deliberately NOT a
+	// duplicate guard like its three siblings above: duplicate :authority
+	// keeps its existing silent last-wins behavior, and the reject belongs
+	// to the deferred authority-validation row (D-90-DUP).
+	var hostField string
+	var hostSeen, authoritySeen bool
 	seenRegular := false
 	regular := http.Header{}
 
@@ -445,6 +473,7 @@ func buildRequest(headers []hpack.HeaderField, body io.Reader) (*http.Request, e
 				schemeSeen = true
 			case ":authority":
 				authority = h.Value
+				authoritySeen = true
 			default:
 				// Unknown or response pseudo-header in request → PROTOCOL_ERROR.
 				return nil, &Error{Code: ErrProtocolError, Msg: "unknown/invalid pseudo-header: " + name}
@@ -469,7 +498,26 @@ func buildRequest(headers []hpack.HeaderField, body io.Reader) (*http.Request, e
 			return nil, &Error{Code: ErrProtocolError, Msg: "TE header field value not 'trailers'"}
 		}
 
+		// D-90-SCOPE: the regular host is suppressed from the decode map in
+		// every shape. It must be dropped BEFORE the Add — http.Header.Add
+		// routes through textproto and canonicalizes the key to "Host", so a
+		// later delete of "host" would miss it. The FIRST occurrence is
+		// latched as the promotion source; hostSeen (not hostField != "")
+		// carries that latch so an empty first value still wins.
+		if name == "host" {
+			if !hostSeen {
+				hostField, hostSeen = h.Value, true
+			}
+			continue
+		}
+
 		regular.Add(name, h.Value)
+	}
+
+	// Promote on ABSENT, never on EMPTY — resolved here so both u.Host and
+	// http.Request.Host below carry the effective authority.
+	if !authoritySeen && hostSeen {
+		authority = hostField
 	}
 
 	if method == "" {

@@ -1,6 +1,6 @@
 # Fixture 0004 — HTTP/2 routing (HCM AUTO + ALPN h2 + upstream H/2 + TLS termination + TLS origination)
 
-**Purpose:** end-to-end exercise the phase-05.2 dataplane (HCM(AUTO) + route match + router → upstream-H/2 client codec + upstream-TLS validation) and prove byte-equivalent decoded response bodies + per-side RR distribution + status-code equivalence between upstream Envoy and envoy-go on a 39-request workload, all over TLS-terminated downstream H/2 + TLS-originated upstream H/2. Since phase 89 the workload also covers **decode-side HTTP-filter header mutations reaching the upstream H/2 request** (ADR-0311).
+**Purpose:** end-to-end exercise the phase-05.2 dataplane (HCM(AUTO) + route match + router → upstream-H/2 client codec + upstream-TLS validation) and prove byte-equivalent decoded response bodies + per-side RR distribution + status-code equivalence between upstream Envoy and envoy-go on a 42-request workload, all over TLS-terminated downstream H/2 + TLS-originated upstream H/2. Since phase 89 the workload also covers **decode-side HTTP-filter header mutations reaching the upstream H/2 request** (ADR-0311). Since phase 90 it also covers **H/2 `host` vs `:authority` normalization on the downstream leg** (ADR-0312).
 
 **Differential surface:** concatenated decoded response bodies for the 9 `/health` direct_response requests (`"OK\n"` x 9) followed by the two phase-87 leading-`//` arms (`"edge-ok"` x 2) are byte-equivalent. The `/api/v1/<n>` router-action bodies are NOT concatenated into the diff stream (RR-pick ordering may diverge between STATIC and STRICT_DNS); routing correctness is covered by per-side `[3,3,3]` distribution + status-200. The 404 catch-all bodies are NOT compared (envoy-go: `not found\n`; Envoy: HTML/JSON local reply per its default config).
 
@@ -26,7 +26,7 @@ The 3 backends are subprocesses spawned from `test/fixtures/0004-h2-routing/back
 
 **HTTP filters (both sides, identical):** an **empty** `envoy.filters.http.header_mutation` (zero listener-scope mutations — its only job is to make the filter name live so the per-route configs attach; MEASURED: reference Envoy `contrib-v1.37.2` boots this shape, `--mode validate` ⇒ `configuration OK`, rc=0) followed by `envoy.filters.http.router`. Because the listener-level filter declares no mutations, the pre-existing 31 round-trips are byte-untouched.
 
-**Driver request schedule (39 requests per side):**
+**Driver request schedule (42 requests per side):**
 
 - 9 × `GET /health` → expect 200, body `"OK\n"` (concatenated into the byte stream)
 - 9 × `GET /api/v1/<n>` for n=0..8 → expect 200, body `"backend-<idx>:v1/<n>"` (not concatenated; distribution counted)
@@ -36,6 +36,7 @@ The 3 backends are subprocesses spawned from `test/fixtures/0004-h2-routing/back
 - 1 × `GET /api/v1/reflect` → expect 200, body `"reflect:probe=probe-value,padlen=32000"` (phase 88; not concatenated, not counted into the distribution)
 - 1 × `GET /api/v1/emit` → expect 200, response header `x-cont-marker: emitted` plus a 32000-byte `x-cont-pad` (phase 88; not concatenated)
 - 8 × the phase-89 decode-mutation arms `A1..A8` against `/api/v1/reflect-headers/<arm>` → expect 200; the reflected header block is asserted in-band, and only a normalized `p89-<arm>:ok` marker is appended to the byte stream
+- 3 × the phase-90 authority-normalization arms `P90-P` / `P90-A` / `P90-B` against `/api/v1/reflect-headers/p90{p,a,b}` → expect 200; each is a **hand-built HPACK field list over its own raw `http2.Framer` connection**, and each appends exactly one `p90-<arm>:auth=… host=…` line to the byte stream
 
 The first 27 requests are unchanged from phase 05.2, and the two new arms are appended after them, so the pre-existing transcript prefix stays byte-identical.
 
@@ -97,6 +98,29 @@ Wire **order** is therefore pinned at the **unit** layer (`internal/filter/hcm` 
 That is a real, measured, **intentional divergence**, not parity, so it is pinned at the **unit** layer instead (`…/11_rfc9113_illegal_pairs_dropped_te_trailers_kept`). Dropping rather than rejecting is the deliberate choice: rejecting would turn a config-legal filter mutation into a client-facing 5xx, whereas dropping matches what the pre-fix tip effectively did (these mutations never reached the upstream at all).
 
 A related reference behavior is also **not** reproduced: reference Envoy comma-coalesces repeated `te` into one field (`te: gzip,trailers`, measured) while custom names are not coalesced (`x-p89-dup` arrives as two fields, measured); envoy-go emits one field per value for every name. `te` is therefore appended **at most once** (A7a only) — a coalesced `te: trailers,trailers` would be rejected by the backend.
+
+## H/2 `host` vs `:authority` normalization arms (phase 90, ADR-0312)
+
+Before phase 90 the upstream H/2 request could carry **two** authorities or **none that is usable**, where reference Envoy always forwards exactly one. `buildH2Request` (`internal/filter/hcm/h2/stream.go`) filled `H2Request.Authority` from `:authority` alone and its `default:` arm appended every non-pseudo field — **including a regular `host`** — onto the ordered upstream carrier. The rule is now **promote on ABSENT** (`host` becomes the authority only when `:authority` was absent from the field list — never when it was present-and-empty), **suppress always** (a regular `host` never reaches the upstream carrier, nor the decode map), **first occurrence wins** as the promotion source.
+
+The three arms are driven by a **raw `http2.Framer`** — the `0119-grpc-unary-trailers` instrument shape — over **one fresh TLS(ALPN h2) connection per arm, each with its own per-connection `hpack.Decoder`**. `helpers.H2RoundTrip` **cannot** express any of them, on three independent mechanisms: it has no `req.Host` surface, x/net's H/2 transport **silently drops** a client-supplied `host` entry, and `:authority` can neither be set nor emptied nor injected through it. Every arm sends a **fixed literal** authority (`p90.example` / `p90host.example`), never the dial address, so the two sides' bytes can agree by construction.
+
+| arm | client sends (wire order) | asserted |
+|---|---|---|
+| P90-P | `:authority: p90.example`, no `host` | **positive control** — `x-observed-authority: p90.example`, `host` absent; must pass on both sides even PRE-fix |
+| P90-A | `:authority: p90.example` **and** `host: p90host.example` | `:authority` wins; the regular `host` must **not** survive onto the upstream carrier |
+| P90-B | `host: p90host.example` only, no `:authority` | `host` is **promoted** to the authority and then **suppressed** as a regular field |
+
+The backend emits `x-observed-authority: <r.Host>` **after** its sorted reflected block (never folded into the sorted names — a lexical sort would relocate it and re-baseline every phase-89 arm). The driver renders `ABSENT` as `<absent>`, distinct from present-and-empty (`""`); that distinction is **load-bearing for P90-B**, where the pre-fix subject emits a present-and-**empty** `:authority`.
+
+**⚠️ This block is deliberately NOT fail-fast.** The phase-87/88/89 arms assert in-band with `return nil, fmt.Errorf(...)`, so the first failing arm aborts the whole Drive and every later arm is unreachable. These arms follow 0119's discipline instead: every failure is recorded **in** the transcript (`p90-<arm>:ERR …`), all arms **always** run, and the runner's cross-side byte compare **is** the assertion. Exactly one `p90-<arm>:auth=… host=…` line is emitted per arm, always.
+
+**⚠️ NO YAML EDIT.** Routes 2-8 are *exact* matches for `a1`-`a4`/`a6`-`a8`, so `/api/v1/reflect-headers/p90{p,a,b}` falls through to the `/api` prefix route into the backend's `reflect-headers/` subtree handler — exactly as `a5` already does by design. Both `*.yaml` files are **byte-untouched** by phase 90, and the per-backend counter increment lives only inside the `/api/v1/<n>` loop, so the per-side `[3,3,3]` RR distribution is unchanged.
+
+### ⚠️ Phase-90 INTENTIONAL SCOPE LIMITS — two arms are deliberately absent
+
+- **Arm C (`:authority` PRESENT-AND-EMPTY) is a deferred follow-on.** `:authority` absent and `:authority` present-and-empty **both** satisfy `rp.authority == ""` in x/net's H/2 server and both take the fallback to the `Host` header, landing byte-identical in `r.Host` **and** `r.Header`. No backend edit can recover the distinction; a raw-framer **backend** (a new `BackendKind`) would be required, and this row does not buy it.
+- **Arm E (first-occurrence-wins: two regular `host` fields, no `:authority`) was built, run, and REMOVED. It is not differentiable in principle — do not re-add it.** MEASURED against the pinned image (`envoyproxy/envoy:contrib-v1.37.2`): a **second** regular `host` field on the H/2 downstream leg is rejected at the codec layer (`Invalid HTTP header field was received: frame type: 1, stream: 1, name: [host]`, details `http2.invalid.header.field`). The client is sent **no GOAWAY and no RST_STREAM** — the connection is simply closed and the arm reads a bare EOF, so the reference line is `p90-E:ERR read-frame: …` while a correct subject serves 200. **The rejection is by ARITY, not by value** (two *identical* `host` values are refused the same way) and holds with `:authority` also present. Testing first-occurrence-wins **requires** two `host` fields, so no subject-side change can ever make the two sides' bytes agree. The axis is pinned at the **unit** layer instead — `TestAuthorityNormalization/E_dup_host_first_wins` (`internal/filter/hcm/h2/authority_norm_test.go`) is the sole first-wins discriminator in the tree; do not delete it. Matching the reference's reject here is out of charter: it is reference-side admission control, the same family as the deferred arm-C validity reject and the same class as **D-90-DUP**.
 
 **STATIC vs STRICT_DNS divergence (ADR-0027 inherited):** subject is host-side STATIC; reference is container-side STRICT_DNS with `dns_lookup_family: V4_ONLY` per ADR-0010.
 

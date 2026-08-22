@@ -292,3 +292,234 @@ tracked file restored with `sha256sum -c` verified; the probe test file deleted;
 untouched throughout (`?? .claude/` only, pre-existing). **No commits by any agent. No Docker container
 started and no differential run launched at this stage** — the §7 recipe is designed from read code, and
 the PLAN says so in §12. No `pgrep -f` used. No port bound.
+
+---
+
+## IMPL — done 2026-08-22
+
+**Stage:** lifecycle-state **3 -> DONE**. Base master `1f147262`, branch `phase-90-impl`, FOUR task commits
+squashed at the close. Execution style: subagent-driven per `feedback_execution_style`, one agent per task
+group, all work in the worktree `wt-phase-90-impl` per `feedback_git_worktrees`; no agent pushed.
+
+### What landed
+
+Code: `internal/filter/hcm/h2/stream.go` **+48/−0** · `internal/filter/hcm/h2/authority_norm_test.go`
+(**NEW**) **+122/−0** · `test/fixtures/0004-h2-routing/driver/driver.go` **+354/−4** ·
+`test/fixtures/0004-h2-routing/backends/main.go` **+7/−0**. Docs: `DECISIONS.md` (ADR-0312 §Decision +
+§Consequences appended **IN PLACE**, guard **1 -> 0**), `ROADMAP.md` (row 90 -> `done` + the false
+*"ROUTE-MATCHING input"* sentence corrected), `BEHAVIOR_CONTRACT.md:2034` rider,
+`test/fixtures/0004-h2-routing/README.md`, this file, `STATE.md`, `STATE_HISTORY.md`, `next-prompt.txt`.
+**+0 on every count axis** — fixtures **121**, blank imports **121**, BackendKind tail **38**, new ports
+none, `go.mod`/`go.sum` byte-untouched, fuzzers **55 / 48 files**, stat surface **406**, `0120` unconsumed,
+**both `0004` YAMLs BYTE-UNTOUCHED**, `^---$` in `DECISIONS.md` still **216**, next-free still **ADR-0313**.
+
+### T1 — RED census (commit `a25cabd8`)
+
+`internal/filter/hcm/h2/authority_norm_test.go` NEW, tests only, **ZERO production bytes**. `package h2`,
+in-package (both symbols unexported). Helper names `hf` / `carrierValues` landed **without rename** — the
+seven `hf` hits in the package are all function-scoped `for _, hf := range …` loop variables.
+**T1b reachability control:** `panic("NC-REACH-buildRequest")` as `buildRequest`'s first statement ⇒
+`rc=1`, `panic: NC-REACH-buildRequest [recovered, repanicked]`, package FAIL. **Run TWICE** — with the new
+file present (panic trips at `authority_norm_test.go:78`, proving THIS roster reaches the symbol) and with
+it moved aside (same panic, proving the PRE-EXISTING suite reaches it too — the PLAN's §5.1 claim
+re-derived, not inherited). Reverted; `sha256sum -c` ⇒ `stream.go: OK`.
+**T1c census** (`-count=1 -v`): **`rc=1`, `=== RUN` 204, `--- PASS` 199, anchored FAIL 8** (5 test lines +
+3 summary), and **199 + 5 = 204 reconciles the FULL denominator** — every non-roster test in the package is
+green, so the RED is exclusively this roster's. PASS: `P_authority_only` (positive control — the roster is
+**not** vacuously red) and `TestAuthorityNormalization_DuplicateAuthorityUnchanged` (the D-90-DUP pin).
+FAIL: `A_both` (2 properties), `B_host_only` (5), `C_empty_authority` (2), `E_dup_host_first_wins` (5).
+
+⚠️ **THREE PLAN §5.5 DISCREPANCIES, REPORTED RATHER THAN SMOOTHED.** (1) `E_dup_host_first_wins` was
+**undescribed at the PLAN**; it fails on FIVE properties, identically shaped to `B_host_only` — no promotion
+happens at all, so *"first wins"* is never even reached, and both host values survive on the carrier AND in
+the decode map (`[first.example second.example]`). (2) **§5.5's transcript does not match the §5.3 code it
+claims produced it** (`host on carrier = true, want false` vs the table's `carrier carries host %v, want
+none`); the §5.3 code is authoritative and is what landed. (3) §5.5 under-reports `C_empty_authority` at
+**one** failing property; it actually fails on **two** (carrier AND decode map) — §5.5 omits its
+`req.Header` line.
+
+### T2 + T3 — production, both symbols (commit `c00d0420`)
+
+**T2 `buildH2Request`:** ADDS a `case "host":` arm — the pre-image grep read **exactly `:503` and `:507`,
+both writes of `authority`**, so there was no `host` branch and no `host` identifier in the file to modify.
+The arm latches the FIRST occurrence and suppresses EVERY occurrence from the carrier; `authoritySeen`
+records `:authority` **presence**; the promotion runs after the loop under `!authoritySeen` only.
+**T3 `buildRequest`:** `continue` before `regular.Add` for `host`, latching the first value. ⚠️ **The drop
+MUST precede the `Add`** — `http.Header.Add` routes through `textproto` and canonicalizes the key to
+`"Host"`, so a later `delete("host")` would miss it. `authoritySeen` is set at the `:authority` case and the
+effective authority is resolved after the loop, so **both** P4 fields (`u.Host` `:551`, `Host:` `:555`)
+carry it.
+**D-90-DUP HELD:** `authoritySeen` records **presence only**; no duplicate reject was added alongside its
+three sibling `…Seen` booleans, and the stability pin still passes.
+
+⚠️ **`hostSeen`'s NECESSITY IS NARROWER THAN PLAN §9.1 STATES.** Measured here: it is required for
+**first-occurrence-wins** — `hostField != ""` cannot distinguish *"not yet latched"* from *"latched to an
+empty first value"*, so `host: ""` then `host: x` would wrongly promote `x` — but it is **NOT** required for
+the promote condition, where `!authoritySeen` alone suffices (an absent `host` leaves `hostField == ""` and
+the authority is already `""`).
+
+### T4 — GREEN census (folded into `c00d0420`)
+
+h2 package **`rc=0`, `=== RUN` 204, `--- PASS` 204, anchored FAIL 0** — T1's 199 + 5 = 204 = 204, so no arm
+was added, removed or silently skipped. `./internal/...` `rc=0`, **ok=70**, anchored FAIL 0. `gofmt -l`
+**output** empty. Symbol assertions, qualified and pathspec-scoped: `authoritySeen` **8**, `hostField`
+**7**, `hostSeen` **10**. ⚠️ **`golangci-lint` first flagged TWO `behaviour` misspellings under locale US**
+— one in this change and one **pre-existing in T1's committed `authority_norm_test.go:101`**, i.e. T1 ran a
+lint gate that did not gate on OUTPUT. Both corrected here.
+
+⚠️ **PLAN §10.3's STATED MECHANISM IS REFUTED.** §10.3 said the slice-only-writer gate would still read 6
+because *"this row MODIFIES writer #1"*. In the landed diff **writer #1 is byte-for-byte unmodified** — the
+new `case "host":` diverts before `default:` ever runs. **The gate reads 6 for a different reason than
+predicted**, and a reviewer diffing that line would find nothing and could wrongly conclude the carrier
+suppression was never implemented.
+
+### T5 + T6 — the `0004` fixture arms (commit `3076010c`)
+
+**T5 `backends/main.go` (+7):** emit `x-observed-authority: <r.Host>` **AFTER** the sorted reflected block,
+never folded into `names` — a lexical sort would relocate it and re-baseline every phase-89 arm.
+`git grep 'r\.Host'` read `rc=1` before the edit.
+**T6 `driver/driver.go`:** four phase-90 arms (P/A/B/E) driven by a raw `http2.Framer`, the `0119`
+instrument shape. **ONE FRESH TLS(ALPN h2) CONNECTION PER ARM, each with its OWN per-connection
+`hpack.Decoder`** (`reference_hpack_decoder_must_be_per_connection`); ALPN asserted BEFORE the preface.
+**NOT fail-fast** — every failure is recorded IN the transcript, all arms ALWAYS run, and the runner's
+cross-side byte compare IS the assertion (`reference_failfast_driver_masks_later_red_arms`). Every arm sends
+a **fixed literal** authority, never the dial address. `p90ObservedValue` keeps ABSENT (`<absent>`)
+distinguishable from PRESENT-AND-EMPTY (`""`), which is load-bearing for arm B.
+**NO YAML EDIT:** `/api/v1/reflect-headers/p90*` falls through to `- match: { prefix: "/api" }` exactly as
+`a5` does; `counts[idx]++` stays the sole occurrence inside the `/api/v1/<n>` loop, so `AssertDistribution`'s
+`[3,3,3]` is untouched.
+
+⚠️ **AN OFFLINE MEASUREMENT REFUTED ARM E's STATED DISCRIMINATOR BEFORE THE DIFFERENTIAL EVER RAN.** Raw
+framer straight at the fixture backend's handler over TLS+h2, no proxy: x/net's H/2 server leaves a regular
+`host` field in `r.Header` (PLAN §4 / refutation 6 **CONFIRMED**), and given TWO `host` fields and no
+`:authority` it sets `r.Host` to the **FIRST** one. ⇒ `x-observed-authority: first.example` is by itself
+**NON-DISCRIMINATING** for the proxy's first-occurrence latch — the backend latches first-wins on its own.
+
+### T7 — break protocol, and the REMOVAL of arm P90-E (commit `94fa0ccd`)
+
+**FOUR break arms at FOUR DISTINCT injection sites, and HALF OF THEM ARE DIFFERENTIALLY SILENT.** B1 (delete
+the `case "host":` suppression) reddened **P90-A at byte offset 179** on the `host=` boolean. B2 (drop the
+`!authoritySeen` guard) reddened **P90-A at offset 164** on the `auth=` **value** — a different property,
+different bytes, fully discriminated from B1. **B3** (delete the decode-map host-drop) and **B4**
+(first-wins → last-wins) are **BOTH differentially SILENT** and reddened the **unit** roster only — B3 on
+property P3, B4 on exactly one arm. ⚠️ Recorded as an **OBSERVED RESULT, not a prediction**: a break that
+reddens nothing anywhere is indistinguishable from one that was never applied, so each was asserted to have
+landed by **grepping the patched file**, not by observing a build.
+
+⚠️ **PLAN §7.5's B2 PREDICTION IS REFUTED, AND THE INSTRUCTED BREAK DOES NOT COMPILE.** §7.5 predicted B2
+would redden **P90-P**. It cannot: P90-P sends `:authority` only and **no** `host`, so `hostSeen` is false
+and removing `!authoritySeen` cannot change its outcome **under any input**; B2 reddens P90-A on the
+authority-**value** axis instead. And deleting `!authoritySeen` as literally instructed leaves
+`declared and not used: authoritySeen` at two sites — a `reference_plan_break_instructions_dont_compile`
+firing, and a **dangerous** one: the build failure reddens BOTH the unit and the differential run with
+`RUN=0`, **which reads exactly like a successful break**. A compiling equivalent was substituted.
+
+⚠️ **B1's DIFFERENTIAL EVIDENCE IS HALF-OBSERVABLE.** The cross-side comparator reports the **first**
+divergence and stops, so B1 could only be shown to redden P90-A; **P90-B's divergence under B1 is MASKED.**
+The unit roster (`B_host_only` red) is what carries that half. A first-divergence-only comparator cannot
+enumerate the arms a break reddens.
+
+⚠️ **AND THE ROW DISCOVERED A NEW REFERENCE DIVERGENCE THAT KILLED ONE OF ITS OWN ARMS.** P90-E was **RED at
+the UNBROKEN tip**, deterministically, first divergence at transcript offset **231** — the first byte after
+the literal `p90-E:` — with everything before it cross-side identical, so P90-P/A/B and the whole
+pre-existing `0004` transcript already passed post-fix and **E alone diverged, on the REFERENCE side**.
+MEASURED with a standalone raw-framer probe against `envoyproxy/envoy:contrib-v1.37.2`: a **SECOND** regular
+`host` field is rejected at the codec layer — `Invalid HTTP header field was received: frame type: 1,
+stream: 1, name: [host]`, details `http2.invalid.header.field`, reset reason *connection termination*.
+**NO GOAWAY and NO RST_STREAM reach the client** (confirmed on a second pass that completed the SETTINGS
+handshake first so a GOAWAY could not be missed); the connection is closed and the arm reads a bare EOF.
+**The refusal is by ARITY, NOT VALUE** — two *identical* `host` values are refused identically — and holds
+with `:authority` also present. Stats moved: `http2.rx_messaging_error`, `downstream_cx_protocol_error`,
+`downstream_rq_rx_reset`. ⇒ **this is the MIRROR of H1-D: on H/1 the SUBJECT is the stricter side, on H/2
+the REFERENCE is.** Testing first-occurrence-wins REQUIRES two `host` fields, so **the axis is NOT
+DIFFERENTIABLE IN PRINCIPLE** — arm P90-E was **removed**, first-wins stays pinned at the **unit** layer by
+`TestAuthorityNormalization/E_dup_host_first_wins` (shown by counterfactual to be the **sole** first-wins
+discriminator in the tree, deliberately untouched), and the reject is banked as deferred follow-on **(vii)**
+rather than implemented — it is reference-side admission control, out of a promote/suppress charter.
+Removed with it: the now-unused `p90FirstHost` / `p90SecondHost` literals — ⚠️ **Go does NOT flag unused
+constants, so their removal was verified by grep, not by the compiler.** The differential roster is **three**
+arms and the `0004` workload is **42** requests/side, **re-derived not guessed**: 27 + 2 (phase-87) +
+2 (phase-88) + 8 (phase-89) + 3 (phase-90), updated on `drive()`, `DriveReference()` and `DriveSubject()`.
+
+### T8 — docs
+
+ADR-0312 completed **in place**: §Decision (D-90-SCOPE, D-90-DUP, D-90-SKIP, D-90-TARGET, D-90-YAML) +
+§Consequences (i)–(xix), no renumber, no new `---`. Strict guard `^> **STATUS: PROPOSED` **1 -> 0**;
+`^---$` still **216**; `^## ADR-` **311**; bare `^## ` **319**; next-free still **ADR-0313**.
+
+⚠️ **THE ADR'S OWN APPEND POINT DID NOT EXIST.** ADR-0312's STATUS line **and** PLAN §8.3 both directed the
+IMPL to append *"after the RETAINED italic footer"*. **ADR-0312 had no such footer** — its block ended at
+§Context ¶7 — while **four sibling ADRs** carry the exact form `*§Decision and §Consequences follow at the
+phase-NN IMPL.*`; the phase-90 SPEC omitted it. **The IMPL added the missing footer and then appended after
+it**, so the ADR is now structurally identical to its predecessors and the STATUS line's instruction is true.
+
+⚠️ **A GATE THAT READS THE RIGHT NUMBER CAN BE POINTED AT THE WRONG LINE.** Two plausible strict `PROPOSED`
+guard forms **both read exactly `1`** on the pre-IMPL tree: the canonical `^> **STATUS: PROPOSED`
+(ADR-0312, `:18281`) and `^**Status:** PROPOSED` (a historical **ADR-0231** line, `:14866`). ⇒ **the 1 -> 0
+disarm must be verified by LINE AND ADR, never by the count alone** — the decoy would have read a successful
+disarm as a failure, and a change to that historical line would read as a successful disarm that never
+happened.
+
+⚠️ **PLAN §8.3 SAID "FIVE DEFERRED FOLLOW-ONS"; §11/§13 SAY SIX; THE IMPL REGISTERED SEVEN** — the seventh
+being the duplicate regular-`host` reject discovered by this row's own T7.
+
+`README.md` drift **this row introduced** was fixed: the workload figure **39 -> 42** in both the purpose
+line and the request-schedule heading (`driver.go` already carried 42 in three doc comments), the three
+phase-90 arms documented, and both scope limits (arm C deferred, arm E not-differentiable-in-principle)
+written out. ⚠️ **`:27`'s *"pre-existing 31 round-trips are byte-untouched"* is still TRUE and was left
+alone.**
+
+### T9 — gates against the FINAL tree
+
+**(a)/(b)** `go test ./...` **`rc=0`**, set reconciliation **exact at 236 packages** (127 ok + 109
+no-test-files), zero difference in both directions. Full differential suite **`rc=0`, 121 `=== RUN` /
+121 `--- PASS` / 0 SKIP**, fixture set reconciled against `ls -d test/fixtures/*/` with zero difference both
+directions, and **`--- PASS: TestDifferential/0004-h2-routing` asserted EXPLICITLY** — `runner_test.go:200`
+`t.Skipf`s an unregistered fixture and **no fixture-count gate exists anywhere in the tree**.
+**(c)** h2spec is **STRUCTURALLY INCAPABLE of anchoring this row** — its harness configures
+`envoy.filters.http.router` ALONE with `direct_response` routes and never goes upstream, so no authority is
+ever forwarded; **no h2spec figure is cited**. grpc-conformance deferred in writing; proxy-wasm 10/16.
+**(d)** fuzzers **55 / 48 files**, **+0**. **(e)** the **ANCHORED** panic gate `^panic:|DATA RACE|SIGSEGV`
+read **0** on every differential launch. **(f)** no `REVIEW.md` — the standing departure, **NAMED**.
+
+⚠️ **TWO GATE COMMANDS WERE THEMSELVES BROKEN DURING THIS ROW, AND BOTH FAILED SILENT-CLEAN.**
+`git grep -o -- -e 'NewCounter('` made git read `-e` as a revision and die outright; and `rc=$?` taken after
+`… | cat` returned **cat's** status `0` where the real status was `1`.
+`reference_gate_command_negative_control` applies to the gates a stage writes **for itself**.
+
+⚠️ **PLAN §10.2's FLAKE-CAUSATION EXCLUSION WAS UNEARNED FOR HALF ITS SCOPE.** The PLAN excluded both named
+SDS flakes with *"that test binary does not link the patched package at all"*. Re-run here:
+`go list -deps -test ./internal/xds/ | grep -c 'filter/hcm/h2'` ⇒ **0**, but **`./internal/boot/` ⇒ 1 — the
+`boot` flake's binary DOES link the patched package.** The claim was true of `xds` **only**. It was replaced
+with a direct exclusion: `panic(...)` injected as the first statement of **both** patched functions leaves
+`go test ./internal/boot/` at `rc=0` with **zero panic hits**, so neither function is executed by that
+binary, with a positive control proving the injection was live. **An exclusion that covers only half its
+named scope is worse than none, because it is quoted as though it covered both.**
+
+⚠️ **A STANDING FINDING, NOT A FLAKE: `TestServerConn_TinyWindowDelivery` RECURRED.** Phase-80
+`PLAN.md:636` records it **FIXED** at `f46ba419`/`f2dd994a` and states that *"a recurrence is now a FINDING,
+not a re-run"*. It already recurred once at phase 85 (`STATE_HISTORY.md:486`). **This is the SECOND post-fix
+recurrence.** It cleared 5/5 scoped-isolated and 3/3 full-package, and is causally excluded from row 90
+(`go list -deps -test ./internal/filter/hcm/h2/ | grep -c 'fixtures/0004'` ⇒ 0, and `stream.go`
+byte-identical to the pre-break snapshot) — but it is **flagged as a finding, not absorbed as a flake**.
+
+### Cost, re-measured at THIS IMPL's own publishing commit
+
+Production **+48 / −0**, ONE file, ONE package. Unit **+122 / −0** · differential driver **+354 / −4** ·
+fixture backend **+7 / −0**. The BRAINSTORM floor was `+15/−1`, the SPEC prototype `+34/−0`, the PLAN
+prototype `+36/−0`. ⚠️ **`reference_measured_prototype_is_a_lower_bound` FIRES A FOURTH CONSECUTIVE TIME,
+and the cause is again UNDER-ENUMERATION, not estimation error.**
+
+### Sentinel — ACTUAL output, AFTER the row-90 flip
+
+(1) **SILENT** (row 90 now `done`) · (2) **SIX** at `:200 :206 :212 :222 :228 :236` · (3) **SILENT**.
+⇒ **ONE check blocks it; `stop` was NOT created.** NCs: **NC-A** returned to the ONE-line
+`NOT DONE: row 62` form (row 90's line is gone, exactly as the flip predicts) · **NC-B** `want=121` ⇒
+`GATE FAIL: examined 122 data rows, expected 121`.
+
+### Probe hygiene
+
+All work in the dedicated worktree `wt-phase-90-impl`; the canonical root was never written to. Every break
+arm reverted with `sha256sum -c` before the next task started, and every probe file deleted. Reference
+containers were torn down **BY NAME** per `reference_parallel_agents_shared_machine_namespaces`. No agent
+pushed; the controller squashes.
