@@ -185,3 +185,110 @@ Foreign containers `infallible_booth`, `crazy_kare`, `golink-ai`, `quizzical_gol
 untouched. No `pgrep -f` collision this stage; the controller killed only a PID whose cmdline carried its
 own scratch path. **No flake observed in any run at this stage** — `TestAcquireH2Stream_PromoteSkipsDrainingConn`
 did not recur.
+
+---
+
+## PLAN — done 2026-08-22
+
+**Stage:** lifecycle-state **2 -> 3**. Base master `c7fef29b`, branch `phase-90-plan`, ONE squashed commit.
+Lifecycle position re-derived **from the phase DIRECTORY**, not from prose: `BRAINSTORM.md` + `SPEC.md` +
+`PROGRESS.md` and **no `PLAN.md`** ⇒ BOOTSTRAP §5 state **2** ⇒ output `PLAN.md`. `STATE.md` agreed
+independently (`lifecycle-state: 2`, `next-skill: the phase-90 PLAN`).
+
+### What landed
+
+`PLAN.md` created (**1039 lines**). Docs-only: **ZERO production `.go`, ZERO test `.go`** — gated by
+`git diff --stat c7fef29b -- '*.go'` ⇒ **EMPTY**. `ROADMAP.md`, `BEHAVIOR_CONTRACT.md` and `DECISIONS.md`
+all **BYTE-UNTOUCHED** (verified by EMPTY DIFF against master, each individually). Row 90 stays
+`in-progress`, `want` stays **122**, next-free stays **`ADR-0313`**, strict `PROPOSED` guard **STAYS
+ARMED at 1**. Phase dirs stay **131** — a PLAN adds no directory.
+
+### ⚠️ FIVE SPEC CLAIMS REFUTED BY EXECUTION, AND ONE MEASUREMENT AGENT
+
+1. ⚠️ **THERE IS NO `host` BRANCH IN `stream.go`.** ADR-0312 §Context ¶1 reads as though `buildRequest`
+   has a `host`-specific `regular.Add` site. `grep -in 'host' internal/filter/hcm/h2/stream.go` returns
+   **exactly two lines, `:503` and `:507`, both the WRITE of `authority`**. A regular `host` reaches the
+   **generic** `regular.Add` at `:472` with zero special-casing. ⇒ **the IMPL ADDS a branch, it does not
+   modify one** — which is why the measured prototype is `−0`.
+2. ⚠️ **THE GUARD ASYMMETRY IS BY PROPERTY, NOT BY SYMBOL.** SPEC §9.3 says `buildH2Request` has
+   demonstrated sensitivity and `buildRequest` zero. Executed: `if h.Name == "host" { continue }`
+   **unconditionally inside `buildH2Request`** — the exact production behaviour arm A introduces — leaves
+   **`rc=0`, both packages `ok`. VACUOUS.** Only `H2Request.Authority`'s **VALUE** is pinned anywhere.
+   ⇒ the roster is rebuilt around **four PROPERTIES**, not two symbols.
+3. ⚠️ **COST +36/−0, NOT +34/−0**; `hostField` **6**, not 7; and a **THIRD** symbol the SPEC never names,
+   `hostSeen` (**8**), is *required* — a bare `hostField != ""` cannot distinguish ABSENT from
+   PRESENT-AND-EMPTY, nor express first-occurrence-wins. `reference_measured_prototype_is_a_lower_bound`
+   fires a **third** time; the cause is again under-enumeration.
+4. ⚠️ **THE FIXTURE CONSTRAINT IS OVER-BROAD.** SPEC §8.2's *"must not hit `/api`"* is false —
+   `counts[idx]++` occurs at **exactly one line, `driver.go:308`**, inside the `/api/v1/<n>` loop, and the
+   eight phase-89 arms already hit `/api/v1/reflect-headers/` through a different loop. ⇒ a `p90*` path
+   takes the documented `a5` fall-through to `prefix: "/api"` and **BOTH `0004` YAMLs stay BYTE-UNTOUCHED**,
+   removing the route edit and the `TestRenderBootstrap_*` updates entirely.
+5. ⚠️ **"THE 69 WAS A MEASUREMENT ARTIFACT" IS PARTIALLY REFUTED.** A 69 reading was reproduced **at this
+   stage** and it came with **`rc=1` and a real `--- FAIL`** (`TestSDSEndToEnd_FetchFailure_BootFailsClosed`,
+   `internal/boot`). A **second** flake, `TestProvider_FetchInitialCertificate_Timeout` (`internal/xds`),
+   fired on **3 of 8** full-suite runs. Both pass **5/5 in isolation**; both are the standing SDS
+   dial-budget class. ⚠️ **Causation excluded MECHANICALLY, not by re-running:**
+   `go list -deps -test ./internal/xds/ | grep -c 'filter/hcm/h2'` ⇒ **0** — that test binary does not
+   link the patched package at all.
+6. ⚠️ **AND A MEASUREMENT AGENT WAS REFUTED BY THE CONTROLLER.** An agent reported that `net/http` lifts
+   the authority out of `r.Header`, so `0004`'s reflected block *"can never contain it"*. At the pinned
+   source, `x/net@v0.34.0/http2/server.go` deletes **only `Trailer`** (`:2341`) and has **no `Del("Host")`**
+   — a regular `host` survives into `req.Header` as `Host`. **SPEC §8.4's table is correct.**
+   `feedback_brief_citations_not_evidence` applies to **subagent reports** exactly as to stage briefs.
+
+### What the PLAN froze
+
+**D-90-DUP** (NEW — the SPEC did not reach it): `:authority` has **no duplicate guard** while
+`:method`/`:path`/`:scheme` all do, so an implementer following the local idiom would add a reject that is
+an **unpriced behaviour change**. `authoritySeen` tracks **PRESENCE ONLY**; duplicate `:authority` keeps
+silent last-wins, and a **stability-pin test** asserts the non-change so it is a measurement, not a claim.
+**D-90-TARGET**: the differential axis is `host`-presence + `r.Host`. A route assertion is **forbidden**
+(SPEC §4); the access-log/Zipkin axis is **rejected on a new measurement** — **not one of the four
+H2-capable fixtures carries an access-log or tracing surface** — and is registered as follow-on **(vi)**.
+**D-90-YAML**: both `0004` YAMLs byte-untouched (refutation 4).
+**Arm block is NOT fail-fast** — it follows `0119`'s never-return-an-error discipline, because `0004`'s
+in-band `return nil, fmt.Errorf(...)` would let the first red arm mask the rest.
+
+### Sentinel — ACTUAL output, ONE side (`ROADMAP.md` byte-untouched)
+
+(1) **`NOT DONE: row 90`**, denominator asserted **122** · (2) **SIX** at `:200 :206 :212 :222 :228 :236` ·
+(3) **SILENT**. ⇒ **TWO checks block it; `stop` was NOT created** (verified absent at the git root and in
+the stage worktree). **ALL FOUR NCs FIRED:** NC-A (`NC LANDED? [ in-progress ]` inspected FIRST) ⇒
+`NOT DONE: row 62` **AND** `NOT DONE: row 90` — **both required** · NC-B `want=121` ⇒
+`GATE FAIL: examined 122 data rows, expected 121` · NC-C residual **2 -> 0** confirmed first ⇒
+`NEVER OPENED: gRPC`, WASM correctly silent · NC-D long **5** / short **1** / union **6**.
+The **discriminating** provenance grep reads **0 across all six windows**, positive control **22** on row
+90's own line, fabricated-token NC **0** six times.
+
+### Counts and gate hazards found at this stage
+
+⚠️ **`DECISIONS.md` 311 is `^## ADR-`-SCOPED** — bare `^## ` reads **319** (8 `## Amendment` headings).
+Both are right; they measure different things. **State the scope whenever the number is restated.**
+⚠️ **`0004` has SEVEN `H2RoundTrip` CALL SITES, not nine** — `grep -c` counts LINES and `:433`/`:739` are
+prose. ⚠️ **`discoverFixtures` ends at `:1499`, not `:1497`.** ⚠️ **The brief's phantom gate
+`git grep -c 'h2.parseHeadersForRequest'` reads 1, not 0** — it counts a comment citation; the
+*definition* selector `^func.*parseHeadersForRequest` is the one reading 0.
+⚠️ **THE `*H2Request` COMPANION COUNTER IS VACUOUS AS A CONTROL** — it reads 0, exactly like a fabricated
+selector, so it cannot discriminate; use `git grep -c 'H2Request'` (**20** files).
+⚠️ **NEW GATE HAZARD: on `-v` output, unanchored `grep -c 'FAIL'` reads 11 on a FULLY GREEN tree** (nine
+`INFO wasm: FAIL_CLOSED/FAIL_OPEN` lines + two lines of a test *name* containing `boot-FAILS`). Use
+`grep -cE '^(FAIL|--- FAIL)|^ *--- FAIL'`, which reads 0 green.
+⚠️ **AND THE `\|` TRAP FIRED ON THE CONTROLLER'S OWN SELF-REVIEW** — `grep -ciE 'a\|b'` matches a LITERAL
+pipe, so three real hits read **0** and briefly looked like coverage gaps.
+
+### Split gate — EVALUATED, not assumed
+
+**NINE tasks** (≤ ~25) and **~+322 to ~+581 LoC** (≤ ~1500, the upper bound **2.6× under**).
+⇒ **NOT TRIPPED. NO SPLIT**; `want` stays **122**, no sub-phase row minted. ⚠️ The bound holds **because**
+arm C, H1-B′, H1-D and the H3 leg are deferred — an IMPL that absorbs any of them re-opens the gate.
+
+### Probe hygiene
+
+Three measurement agents; **two read-only in the canonical root, one on its own throwaway worktree**
+(`wt-probe-90-red`, created off `c7fef29b`, used, and **removed** with its branch deleted). Every patched
+tracked file restored with `sha256sum -c` verified; the probe test file deleted; the probe worktree's
+`git status --porcelain` and `git diff --stat c7fef29b` both EMPTY before teardown. Canonical root
+untouched throughout (`?? .claude/` only, pre-existing). **No commits by any agent. No Docker container
+started and no differential run launched at this stage** — the §7 recipe is designed from read code, and
+the PLAN says so in §12. No `pgrep -f` used. No port bound.
