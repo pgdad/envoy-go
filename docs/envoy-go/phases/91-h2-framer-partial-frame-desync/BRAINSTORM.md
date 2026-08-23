@@ -195,13 +195,13 @@ stale for a different reason — they were wrong when written.**
 
 - ⚠️ **THE SHAPE DECISION HAS THREE OPTIONS, NOT TWO.** Beyond (a) stream-scoped `RST_STREAM` via
   `buildRequest` and (b) connection-scoped GOAWAY-and-close, there is **(c) connection-scoped BARE CLOSE** —
-  suppressing the GOAWAY through `emitGoaway`'s existing `goawaySent` guard (`conn.go:864`) and relying on
+  suppressing the GOAWAY through `emitGoaway`'s existing `goawaySent` guard (`conn.go:865`) and relying on
   `Run`'s deferred `s.conn.Close()` (`conn.go:207`). **(c) is the only shape matching the reference's
   no-GOAWAY/no-RST teardown, and it is the shape candidate (2) requires.** The ADR enumerates only (a) and
   (b), and prices (b) against `(*serverStream).recvHeaders` — a site that **cannot express (c)** at all,
   because `serverStream` holds only the three-method `streamConn` interface.
 - ⚠️ **NO SHAPE CAN REACH BYTE-PARITY.** `Run` **Step 2 writes the server's initial SETTINGS at
-  `conn.go:217`, before the frame loop reads any HEADERS.** The reference's teardown emits *"not even the
+  `conn.go:218` — the `writeServerInitialSettings` call, NOT the `:217` comment — before the frame loop reads any HEADERS.** The reference's teardown emits *"not even the
   server's own SETTINGS."* The subject has already put bytes on the wire before any authority reject can
   fire.
 - ⚠️ **NO VALIDATION PREDICATE EXISTS TO REUSE.** `isValidAuthority` appears in **docs only** — zero `.go`
@@ -283,7 +283,7 @@ DECISION"* and describes at least two different behaviours (scalar write-back vs
 ⇒ the row's opening question is not *"is (b) defensible"* but *"what is (b)?"*.
 
 Two further corrections: **D-89-HOST's grounds are not in ADR-0311** — `D-89-HOST` is not one of ADR-0311's
-five labelled decisions; the enumerated grounds live at `phases/89-…/PLAN.md:78-88`. And **the retirement is
+five labelled decisions; the enumerated grounds live at `phases/89-…/PLAN.md:72` (*"DECISION: SKIP. Three grounds, all measured:"*, grounds 1/2/3 follow). And **the retirement is
 over-broad**: ground 2 has three clauses and row 90 retires only the middle one, and only for the
 client-sent arity. ⚠️ **New finding:** `BEHAVIOR_CONTRACT.md:2040` still carries that rationale verbatim
 (*"projecting it would put a mutated `host` beside an unmutated `:authority`"*), so the contract asserts
@@ -550,7 +550,7 @@ escape-aware field count catches it at `NF=9`. Row 91 was field-counted to **NF=
 
 6. Arm C's shape decision has **THREE** options; the third (bare close via the `goawaySent` guard) is the
    only reference-shaped one, and **no** shape reaches byte-parity because `Run` writes SETTINGS at
-   `conn.go:217` first.
+   `conn.go:218` first (the `writeServerInitialSettings` call; `:217` is its comment).
 7. **`isValidAuthority` does not exist in any `.go` file** — docs only.
 8. **H1-B′'s reference 400 is scoped to ABSENCE**; empty and whitespace-only `Host` are **200**. A
    `req.Host == ""` guard turns one divergence into two. The fix site is `serveOneRequest`, not
