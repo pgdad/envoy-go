@@ -3,7 +3,7 @@ This file is a SELF-ADVANCING router for driving the project forward one stage a
 
 **STANDING DIRECTIVE (human, 2026-07-12): the loop runs AUTONOMOUSLY until the termination sentinel fires.** When a phase completes and the sentinel does NOT fire, the roller SELF-PICKS the next subject — smallest defensible candidate first (record the pick + the rejected alternatives in the BRAINSTORM) — and does NOT pause for a human pick. When there is banked, already-PLAN'd work mid-lifecycle, advancing THAT is more defensible than opening a brand-new subject. When the sentinel DOES fire, create the `stop` file per the rule below and exit.
 
-⚠️ **PHASE 91 (`h2-framer-partial-frame-desync`) IS OPEN AT LIFECYCLE-STATE 1. ROW 91 READS `in-progress` AT `ROADMAP.md:153` AND `want` IS 123.** ⇒ **THERE IS BANKED MID-LIFECYCLE WORK. THIS SESSION RUNS THE PHASE-91 SPEC. DO NOT SELF-PICK A NEW SUBJECT.** ⚠️ **THE SENTINEL DOES NOT FIRE — check (1) prints `NOT DONE: row 91`, check (2) prints SIX, check (3) is SILENT. TWO checks block it. DO NOT create `stop`.** ⚠️ **MEASURE ALL THREE YOURSELF BEFORE DOING ANYTHING ELSE; do not take this file's word for it.**
+⚠️ **PHASE 91 (`h2-framer-partial-frame-desync`) IS OPEN AT LIFECYCLE-STATE 2. ROW 91 READS `in-progress` AT `ROADMAP.md:153` AND `want` IS 123.** ⇒ **THERE IS BANKED MID-LIFECYCLE WORK. THIS SESSION RUNS THE PHASE-91 PLAN. DO NOT SELF-PICK A NEW SUBJECT.** ⚠️ **THE SENTINEL DOES NOT FIRE — check (1) prints `NOT DONE: row 91`, check (2) prints SIX, check (3) is SILENT. TWO checks block it. DO NOT create `stop`.** ⚠️ **MEASURE ALL THREE YOURSELF BEFORE DOING ANYTHING ELSE; do not take this file's word for it.**
 
 TERMINATION SENTINEL: if — and ONLY if — ALL work is complete (every chartered ROADMAP row/phase is `done`, EVERY family's deferred-candidate list is ALSO empty, and STATE.md's NEXT shows there is NO next stage left to perform), create an empty file named `stop` at the git root with `: > /home/esa/git/envoy-go/stop` and EXIT without further action.
 
@@ -56,17 +56,44 @@ Also NC the DENOMINATOR (`want=122` on the real file must print `NOT DONE: row 9
 
 ⚠️ **AND A ROW WITH AN UNESCAPED `|` PASSES CHECK (1) SILENTLY — REPRODUCED AGAIN AT THIS TIP.** A doctored one-row file carrying an unescaped pipe printed NOTHING from check (1) while the escape-aware field count caught it at `NF=9`. **FIELD-COUNT ANY NEW ROW BEFORE INSTALLING IT.**
 
-**SENTINEL RUN MECHANICALLY AT THE PHASE-91 BRAINSTORM (2026-08-22), at stage start AND after the row-91 insertion. `ROADMAP.md` CHANGED this stage, so there are TWO sides.** ACTUAL output, recorded not predicted:
-- **BEFORE the insertion (`want=122`):** (1) **SILENT** · (2) **SIX** at `:200 :206 :212 :222 :228 :236` · (3) **SILENT**. NC-A gave the ONE-line `NOT DONE: row 62`; NC-B `want=121` => `GATE FAIL: examined 122 data rows, expected 121`; NC-C residual 2 -> 0 => `NEVER OPENED: gRPC`; NC-D long 5 / short 1 / union 6.
-- **AFTER the insertion (`want=123`):** (1) **`NOT DONE: row 91`** · (2) **SIX**, ⚠️ **AT SHIFTED ANCHORS `:201 :207 :213 :223 :229 :237`** (+1 from the pure insertion; the COUNT is invariant) · (3) **SILENT**. NC-A returned to the TWO-line `row 62` + `row 91` form with `NC LANDED? [ in-progress ]` inspected FIRST · NC-B `want=122` => `NOT DONE: row 91` AND `GATE FAIL: examined 123 data rows, expected 122` · NC-C residual **2 -> 0** confirmed first => `NEVER OPENED: gRPC`, WASM correctly silent · NC-D long **5** / short **1** / union **6**.
+**SENTINEL RUN MECHANICALLY AT THE PHASE-91 SPEC (2026-08-23), at stage start AND at close. `ROADMAP.md` was BYTE-UNTOUCHED this stage, so BOTH runs are identical.** ACTUAL output, recorded not predicted:
+- **(1)** `want=123` => **`NOT DONE: row 91`** · **(2)** **SIX** at `:201 :207 :213 :223 :229 :237` · **(3)** **SILENT**.
+- **All four NCs fired:** NC-A the **TWO-line** form (`NOT DONE: row 62` AND `NOT DONE: row 91`) with `NC LANDED? [ in-progress ]` **inspected FIRST** · NC-B `want=122` => `NOT DONE: row 91` AND `GATE FAIL: examined 123 data rows, expected 122` · NC-C residual **2 -> 0** confirmed first => `NEVER OPENED: gRPC`, WASM correctly silent · NC-D long **5** / short **1** / union **6**.
 ⇒ **THE SENTINEL DOES NOT FIRE — TWO checks block it. `stop` WAS EVALUATED AND DELIBERATELY NOT CREATED** (verified absent at the git root AND in the stage worktree).
 - ⚠️ do NOT "fix" the six and do NOT forecast a decrease — history `0 -> 1 -> 3 -> 4 -> 5 -> 6` across ~40 phases; the candidate sentences are a WINDOW onto a larger deferred backlog, not an inventory of it. ⚠️ **THE INVENTORY IS ~59, NOT ~42** — the long-carried "~42" is the SENTENCE-VISIBLE subset only. **Cite ~42 only as "sentence-visible", never as the inventory.**
 
 ==============================================
 
-## STATUS AS OF 2026-08-22: PHASE 91 (`h2-framer-partial-frame-desync`) **OPEN AT STATE 1** — row 91 `in-progress` at `ROADMAP.md:153`, `want` **123**. **THIS SESSION RUNS THE PHASE-91 SPEC.**
+## STATUS AS OF 2026-08-23: PHASE 91 (`h2-framer-partial-frame-desync`) **OPEN AT STATE 2** — row 91 `in-progress` at `ROADMAP.md:153`, `want` **123**. **THIS SESSION RUNS THE PHASE-91 PLAN.**
 
-**What the 91 BRAINSTORM landed (2026-08-22, base master `f71cc7e2`, branch `phase-91-brainstorm`, ONE squashed commit).** `BRAINSTORM.md` (607 lines) in a NEW phase dir (**131 -> 132**); row 91 registered `in-progress` (`ROADMAP.md` **240 -> 241 / 122 -> 123 rows**, `git diff --numstat` = `1 0`, a PURE INSERTION); `STATE.md` rolled IN PLACE (`9 9`, still 63 lines) with the oldest §Recent entry evicted by DIRECT DATE READ and archived to `STATE_HISTORY.md` as ONE INLINE LINE (`2 0`, **514 -> 516**, strict guard **163 DELTA 0**, loose **207 -> 208**). **ZERO production `.go` bytes changed. `DECISIONS.md` BYTE-UNTOUCHED** (18367, tail ADR-0312, next-free **ADR-0313**, strict `PROPOSED` guard **0**, `^---$` **216**). `BEHAVIOR_CONTRACT.md` BYTE-UNTOUCHED (5962).
+**What the 91 SPEC landed (2026-08-23, base master `870fc90b`, branch `phase-91-spec`, ONE squashed commit).** `SPEC.md` (**623 lines**) in the existing phase dir (dirs STAY **132**); **ADR-0313 §Context DRAFTED** (`DECISIONS.md` **18367 -> 18387**, `20 0` a PURE APPEND; tail **ADR-0313**, next-free **ADR-0314**; `^---$` **216 DELTA 0**; `^## ADR-` **312**, bare `^## ` **320**) with the strict `^> **STATUS: PROPOSED` guard **RE-ARMED 0 -> 1** and **VERIFIED BY LINE AND ADR** (`:18371`, nearest preceding heading `## ADR-0313` at `:18369` — NOT the ADR-0231 decoy at `:14866`, which still reads 1 and is byte-untouched) and the **RETAINED ITALIC FOOTER INCLUDED**; `STATE.md` rolled IN PLACE (`9 9`, still **63** lines) with the oldest §Recent entry evicted by **DIRECT DATE READ** (phase 89 IMPL, 2026-08-17 — the **UNIQUE** oldest, NO tie) and archived to `STATE_HISTORY.md` as **ONE INLINE LINE** (`2 0`, **516 -> 518**, strict guard **163 DELTA 0**, loose **208 -> 209**). **ZERO production `.go` bytes changed. `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` BOTH BYTE-UNTOUCHED** (verified by EMPTY DIFF); `go.mod`/`go.sum` untouched.
+
+### ⚠️ WHAT THE SPEC DECIDED — the PLAN inherits these, it does not re-open them
+
+- **D-91-SHAPE** — reader goroutine, `ReadFrame` with **NO deadline**, **UNBUFFERED** channel + **release handshake at the START of each consumer read call**. Widening the deadlines is **NOT the fix** and the PLAN is forbidden to ship it.
+- **D-91-ALIAS** — settled by quoting the pinned source; see the REFUTATION below.
+- **D-91-LAZY** — the reader **MUST start lazily**; `newFramer` cannot start it. FOUR blockers.
+- **D-91-GAP1** — **h2spec 5.1.2/1 IS the gate**, and its **REDDENING NEGATIVE CONTROL IS MANDATORY**.
+- **D-91-DIFF** — **NO differential fixture.** Fixtures stay **121**, `0120` stays UNCONSUMED. Recorded as a NAMED departure on **CORRECTED grounds** (see below).
+- **D-91-PROOF** — the gate is at the UNIT layer; the contended arm must run **n >= 30**, not 12.
+
+### ⚠️ SEVEN INHERITED CLAIMS THE SPEC REFUTED BY EXECUTION — do NOT re-inherit the old wording
+
+1. ⚠️ **"A deep copy is impossible from outside `x/net`" is FALSE.** Every aliasing type exposes an **EXPORTED accessor** (`Data()`, `DebugData()`, `HeaderBlockFragment()`, `Payload()`, `ForeachSetting()`), and an executed probe showed the copy SURVIVES a clobber that destroys the aliased slice. **The conclusion (unbuffered + handshake) survives only on REBUILT grounds:** `frame.go` exports exactly **TWO** producing functions (`ReadFrameHeader` `:230`, `NewFramer` `:430`) and ZERO setters, so a copied payload **cannot be re-minted as an `http2.Frame`**.
+2. ⚠️ **The retaining-type inventory is SEVEN, not five** — `DataFrame.data` (`frame.go:584`/`:630`, **5 production call sites**) and `UnknownFrame.p` (`:931`/`:945`) were both omitted; `typeFrameParser` routes **every unrecognised type** to `parseUnknownFrame`.
+3. ⚠️ **The hazard is an UNCATCHABLE PANIC, and it is PURELY a panic.** `checkValid()` (`frame.go:211-215`) panics on **8** accessors; production calls three at **14 live sites**; there is **NO `recover()`** in `internal/filter/hcm/h2` OR `internal/filter/hcm`. But **every consumer already COPIES** (`startHeaderBlock` explicitly, `recvData` -> `bytes.Buffer` at `stream.go:190`, client -> `cs.respBody` at `client.go:475`) and the three `pendingDispatch` closures capture **NO frame** — so an invalidated frame can never yield WRONG DATA here, only a crash.
+4. ⚠️ **`closeReader` needs SEVEN wiring sites, not four — and the FOURTH DOES NOT EXIST.** `(*ClientConn).readLoop` (`client.go:305-317`) has **ZERO defers**; the wiring is an ADDITION, not an amendment. The three MISSED sites are all client-side: `NewClientConn`'s pre-spawn error returns (`:250 :255 :260`), its SETTINGS-ACK `ctx.Done()` branch (`:271-274`, where the caller gets `nil` and can **NEVER** call `Close()`), and `Close` itself (`:1009-1010`, no join).
+5. ⚠️ **The differential departure's stated grounds are WRONG.** *"No reference-side counterpart"* conflates two claims: the reference genuinely cannot EXHIBIT the defect, but its **OBSERVABLE IS reference-comparable** (deadlock vs response — exactly what `CompareBytes` catches). **The real blocker is that the TRIGGER is not harness-controllable** — the subject subprocess is spawned with **NO `cmd.Env`** and no cpuset/`GOMAXPROCS` hook (⚠️ **the one `cmd.Env` in the tree, `runner_test.go:1829`, sets `BACKEND_IDX` on a BACKEND**). **Recording it on the wrong grounds would generalize badly.**
+6. ⚠️ **`ROADMAP.md` cites `esalaine` 4 LINES / 7 OCCURRENCES** — the long-carried *"FIVE times"* is wrong on BOTH axes. **State the axis.**
+7. ⚠️ **A CONTROLLER-CAUGHT NEAR-MISS, recorded because the near-miss IS the lesson.** An agent reported that `git grep -c` under-matches a `find`-based count by one on `.ReadFrame(`; **it DOES NOT REPRODUCE** (both read **71**, per-file `diff` EMPTY — the agent's figures were differently-filtered subsets). **It had ALREADY been written into the SPEC before being verified.** `feedback_brief_citations_not_evidence` applies to a subagent's INCIDENTAL figures.
+
+### ⚠️ GAP 1 IS PRICED AND GATEABLE — the BRAINSTORM's "largest unpriced risk" is now the CHEAPEST to retire
+
+**"Pinned by ZERO tests" was proven by GUTTING the drain, not by a grep.** With `tryReadFrame` degenerated to `return nil, nil` the package runs **204/204 green 4/4**, and both ordering-adjacent tests pass **5/5**. ⚠️ **THE OPPOSITE CONCLUSION WAS NEARLY FILED AT n=1** — the first run reddened on an unrelated test whose i/o-timeout signature matches THIS ROW'S OWN DEFECT; only widening the denominator showed it a load-dependent one-off. The one plausible candidate, `TestServerConn_MaxConcurrentStreamsEnforcement`, is **structurally incapable** (blocking dispatcher ⇒ ordering imposed BY THE FIXTURE; assertion is a **COUNT, never an ORDER**). The differential suite is blind too — `0079`/`0080` are UPSTREAM and both deliberately size caps so REFUSED_STREAM **never** fires.
+
+⇒ **h2spec 5.1.2/1 is the ONLY existing gate, and it is realistic:** `"http2/5.1.2": 1` is a **PINNED** suite (`h2spec.go:51`) reached by the `"http2/5"` selector (`:26`) under `-S` strict; `imageRef()` (`:15`) resolves to a **LOCAL** image whose RepoDigest matches the pin **byte for byte** (no pull); already a per-push CI gate (`ci.yml:71`) at **~9 s warm**. Baseline **`95 tests, 94 passed, 1 skipped, 0 failed`** (`CONFORMANCE_PINS.md:142`, commit `83ebf029`, 2026-08-10; skip invariantly 6.9.2/2).
+
+⚠️ **THE NEGATIVE CONTROL IS THE LOAD-BEARING HALF AND IS MANDATORY.** A green h2spec proves NOTHING on its own — the package suite is measurably blind here. **The IMPL MUST show 5.1.2/1 actually REDDENS under a degenerate `tryReadFrame`** (arm A is the ready-made injection, `--numstat 2 16`). Without it `reference_review_mandated_guard_is_untested` fires. **Residual risk, NAMED:** 5.1.2/1 exercises exactly ONE shape and covers neither trailer-driven (`conn.go:467`) nor DATA-END_STREAM (`conn.go:649`) dispatch.
 
 ### ⚠️ THE CHARTER
 
@@ -144,9 +171,12 @@ sed -n "${L}p" docs/envoy-go/ROADMAP.md | command grep -oE '(remaining deferred 
 ### ⚠️ COUNTS AT THIS TIP — RE-DERIVE MECHANICALLY, NEVER COPY
 
 - **`ROADMAP.md` 241 lines / 123 data rows**; row 91 `in-progress` at `:153`; check-(2) anchors `:201 :207 :213 :223 :229 :237`; `-family row` **95 / 67**; `gRPC-family row` **2**; `Operational-tooling-family row` **3**; ARM-A malformed ids **57**/**69** at lines **119**/**131** (ESCAPE-AWARE; naive reads **17**).
-- **`DECISIONS.md` 18367** (BYTE-UNTOUCHED this stage) · tail **ADR-0312** · next-free **ADR-0313** (`grep -c '^## ADR-0313'` ⇒ **0**) · strict `PROPOSED` guard **0** · `^---$` **216**. ⚠️ **THE HEADING FIGURE IS SCOPED: `^## ADR-` reads 311 while bare `^## ` reads 319** — the extra **8** are `## Amendment` headings. **STATE THE SCOPE.** ⚠️ **The strict guard is NOT self-locating** — a historical `^**Status:** PROPOSED` at **ADR-0231** (`:14866`) also reads **1**, so the SPEC's 0 -> 1 re-arm must be verified **BY LINE AND ADR**.
-- **`BEHAVIOR_CONTRACT.md` 5962** (BYTE-UNTOUCHED). **CITE BY STRING OR SYMBOL, never by line.**
-- **`STATE.md` 63** (rolled in place, `9 9`) · **`STATE_HISTORY.md` 516** (`2 0`; strict guard **163 DELTA 0**, loose **208**) · **`BOOTSTRAP_PROMPT.md` 522** · phase dirs **132** · ⚠️ **`REVIEW.md` 37 is a FILE COUNT** — the standing REVIEW departure, NAMED not claimed.
+- **`DECISIONS.md` 18387 LINES** (⚠️ **LINES, not bytes — `wc -c` reads ~4.17M**) · tail **ADR-0313** · next-free **ADR-0314** (`grep -c '^## ADR-0314'` ⇒ **0**) · strict `PROPOSED` guard **1** (at `:18371`, ADR-0313 — the ADR-0231 decoy at `:14866` also reads 1) · `^---$` **216**. ⚠️ **THE HEADING FIGURE IS SCOPED: `^## ADR-` reads 312 while bare `^## ` reads 320** — and ⚠️ **312 headings vs tail id 0313 means the id space is SPARSE; headings+1 COLLIDES** — the extra **8** are `## Amendment` headings. **STATE THE SCOPE.** ⚠️ **The strict guard is NOT self-locating** — a historical `^**Status:** PROPOSED` at **ADR-0231** (`:14866`) also reads **1**, so the SPEC's 0 -> 1 re-arm must be verified **BY LINE AND ADR**.
+- **`BEHAVIOR_CONTRACT.md` 5962 LINES** (BYTE-UNTOUCHED). **CITE BY STRING OR SYMBOL, never by line.**
+- ⚠️ **`ROADMAP.md` cites `esalaine` 4 LINES / 7 OCCURRENCES — the carried "FIVE" is WRONG on BOTH axes.**
+- ⚠️ **The ARM-A escape-aware malformed-row guard reads 2 (rows 57/69), NOT 0** — a gate asserting `== 0` FAILS on pre-existing content. Row 91 is NF=8 under BOTH forms.
+- **differential fixtures 121 DIRS but only 120 DISTINCT INDICES** — `0007a-cors` and `0007b-iteration-probe` share `0007`; next-free is max+1, NOT the directory count.
+- **`STATE.md` 63** (rolled in place, `9 9`) · **`STATE_HISTORY.md` 518** (`2 0`; strict guard **163 DELTA 0**, loose **209**) · **`BOOTSTRAP_PROMPT.md` 522** ⚠️ **at the REPO ROOT, and `git ls-files` shows exactly ONE tracked path — the standing "2 copies" means two copies WITHIN the single file** · phase dirs **132** · ⚠️ **`REVIEW.md` 37 is a FILE COUNT** — the standing REVIEW departure, NAMED not claimed.
 - **differential fixtures 121** at **`test/fixtures/`** (⚠️ **NOT `test/differential/fixtures/`, a plausible wrong path returning a SILENT `0`**); numeric tail `0119-grpc-unary-trailers`, next-free **`0120` STAYS UNCONSUMED**. · **fuzzers 55 / 48 files** (`*.go`-scoped under `internal/`). · **BackendKind tail 38** — ⚠️ **a TAIL VALUE, not a count**.
 - **`internal/filter/hcm/h2` package: 204 `=== RUN` / 204 `--- PASS` / rc=0.** Parent `internal/filter/hcm`: **322 / 322**.
 - ⚠️ **`git grep -c 'H2Request'` reads 78 repo-wide vs 21 pathspec-scoped. STATE THE SCOPE.**
@@ -207,7 +237,7 @@ grep -c 'STANDING DIRECTIVE (human, 2026-07-12)' next-prompt.txt                
 
 Fresh worktree off **the CURRENT master tip** per `feedback_git_worktrees` — from `git rev-parse master`, **NOT a SHA quoted in this file**. ⚠️ **USE THE SLUG-ANCHORED SUBJECT-LOCATE FORM** (the bare grep is contaminated by this file's own prose):
 ```sh
-git log --grep '^phase 91 (h2-framer-partial-frame-desync)' --format='%h %s'   # 1 at this tip: BRAINSTORM
+git log --grep '^phase 91 (h2-framer-partial-frame-desync)' --format='%h %s'   # 2 at this tip: SPEC, BRAINSTORM
 git log --grep '^phase 90 (h2-host-authority-normalization)' --format='%h %s'  # 4 — a CLOSED phase, use as a FIRING CONTROL
 ```
 ⚠️ **The count comments are LIVE FIGURES — VERIFY before relying.** Take the NEWEST line (`| head -1`). A fabricated slug must read **0**.
@@ -221,20 +251,26 @@ Execution style: **subagent-driven per `feedback_execution_style`**. Subagents c
 ⚠️ **IF YOU WRITE A PROBE INTO A WORKTREE, DELETE IT AND PROVE THE TREE IS CLEAN** — `git status --porcelain` AND `git diff --stat master` must show ONLY your intended edits. For a patched TRACKED file: `sha256sum` BEFORE patching, `git checkout -- <path>` after, `sha256sum -c` the capture — ⚠️ **and COMMIT FIRST, because `git checkout --` restores from HEAD and will wipe uncommitted work.**
 
 ## Read first (in order)
-1. `docs/envoy-go/STATE.md` — **§Current pointer ONLY**. ⚠️ **`next-skill:` reads the phase-91 SPEC.** ⚠️ **§Project counts SELF-CONTRADICT §Current and carry NO label saying so — do not anchor on them.**
-2. `docs/envoy-go/phases/91-h2-framer-partial-frame-desync/BRAINSTORM.md` — **all 607 lines**, especially **§2** (the reproduction, its controls and the counterfactual), **§3** (the mechanism), **§6.3** (the TWO design constraints), **§6.4** (the gap list) and **§7** (what the SPEC owes).
-3. `docs/envoy-go/DECISIONS.md` **ADR-0312 §Consequences (xii)** (the standing finding this row consumes) and **(xviii)** (the seven follow-ons — five now refuted or re-priced; read the corrections above BEFORE the ADR text).
-4. `docs/envoy-go/ROADMAP.md` — row 91 at `:153`, and the six sentinel windows at `:201 :207 :213 :223 :229 :237`.
-5. `BOOTSTRAP_PROMPT.md` §4-§7 (repo ROOT) — the lifecycle contract and the six-gate posture. **SPEC.md absent + row open ⇒ state 1 ⇒ SPEC.**
+1. `docs/envoy-go/STATE.md` — **§Current pointer ONLY**. ⚠️ **`next-skill:` reads the phase-91 PLAN.** ⚠️ **§Project counts SELF-CONTRADICT §Current and carry NO label saying so — do not anchor on them.**
+2. `docs/envoy-go/phases/91-h2-framer-partial-frame-desync/SPEC.md` — **all 623 lines**, especially **§3** (D-91-SHAPE), **§4** (D-91-ALIAS, and the REFUTED reason), **§5.3-§5.6** (the SEVEN wiring sites, the THREE parked states, the release-placement caveats), **§6** (D-91-GAP1 and the mandatory NC), **§7** (D-91-DIFF on corrected grounds), **§8** (the proof shape) and **§12** (what the PLAN owes).
+3. `docs/envoy-go/phases/91-h2-framer-partial-frame-desync/BRAINSTORM.md` — **§2** (the reproduction and its counterfactual) and **§6.1** (the cost floor). ⚠️ **Read it AFTER the SPEC and treat its §6.3 reasoning as SUPERSEDED** — the SPEC refuted its aliasing justification.
+4. `docs/envoy-go/DECISIONS.md` **ADR-0313 §Context** (drafted this stage, `STATUS: PROPOSED`) and **ADR-0312 §Consequences (xii)** (the standing finding this row consumes).
+5. `docs/envoy-go/ROADMAP.md` — row 91 at `:153`, and the six sentinel windows at `:201 :207 :213 :223 :229 :237`.
+6. `BOOTSTRAP_PROMPT.md` §4-§7 (repo ROOT) — the lifecycle contract and the six-gate posture. **SPEC.md present + PLAN.md absent ⇒ state 2 ⇒ PLAN.** ⚠️ **§6.1 SPLIT GATE: if the PLAN exceeds ~25 tasks OR ~1500 LoC, SPLIT and STOP.**
 
 ## What the next session owes
-**RUN THE PHASE-91 SPEC** (state 1 -> 2), producing `SPEC.md` in the existing phase directory ·
-**DRAFT ADR-0313 §Context** and re-arm the strict `^> **STATUS: PROPOSED` guard **0 -> 1** — ⚠️ **verify BY LINE AND ADR, never by the count alone** (the ADR-0231 decoy also reads 1) — and ⚠️ **INCLUDE THE RETAINED ITALIC FOOTER** ·
-**SETTLE THE TWO DESIGN CONSTRAINTS BY QUOTING THE PINNED `x/net` SOURCE**, not by assuming ·
-**PRICE THE GAP LIST**, above all gap 1 (the burst-drain ordering guarantee pinned by ZERO tests) ·
-**DECIDE THE DIFFERENTIAL POSTURE** and, if no arm can discriminate this row, record that as a NAMED departure rather than leaving it implied ·
-**WIDEN THE CONTENDED DENOMINATOR** — 0/12 against a 3-6/12 background is a signal, not proof ·
-`ROADMAP.md` row 91 **STAYS `in-progress`** and `want` **STAYS 123** (a SPEC changes neither; verify by EMPTY DIFF) ·
+**RUN THE PHASE-91 PLAN** (state 2 -> 3), producing `PLAN.md` in the existing phase directory ·
+**CARRY THE SPEC'S SIX DECISIONS FORWARD WITHOUT RE-OPENING THEM** (D-91-SHAPE / ALIAS / LAZY / GAP1 / DIFF / PROOF) ·
+**WRITE OUT ALL SEVEN `closeReader` WIRING SITES** with the **LIFO ordering stated correctly** — ⚠️ `conn.go:207` is the FIRST body statement, so the new defer must sit **textually AFTER** it — and `closeReader` as a **SIGNAL-AND-JOIN over THREE parked states**, positioned **BETWEEN the release and the drain** ·
+**WRITE OUT THE TWO RELEASE-PLACEMENT CAVEATS** (release AFTER `readFrameCtx`'s ctx-err early return; ONE release per consumer call, **NEVER per retry**) ·
+**GIVE `tryReadFrame` A CONCRETE BOUNDED WAIT** — well under 50 ms, and ⚠️ **NOT a bare `default:`** ·
+**SPECIFY THE h2spec GATE *AND* ITS MANDATORY REDDENING NEGATIVE CONTROL** ·
+**SPECIFY THE CONTENDED MEASUREMENT AT n >= 30 PER ARM** with the bimodality reported (⚠️ **0/12 is NOT proof — the SAME unmodified tree read 3/12 and 6/12**) ·
+**SPECIFY THE LEAK GUARD** mirroring an existing `pollUntil` (⚠️ **`goleak` is NOT a dep**; the three in-tree copies have THREE DIFFERENT SIGNATURES — mirror one, do NOT import one, do NOT mint a fourth) that **POLLS, never samples once**, because dispatch goroutines **OUTLIVE `Run`** ·
+**ADDRESS `readErr` STICKINESS** — new behaviour the old code did not have ·
+**DECIDE WHETHER `-race` RUNS UNDER THE FULL DIFFERENTIAL SUITE** — ⚠️ UNRUN at every stage so far ·
+`ROADMAP.md` row 91 **STAYS `in-progress`** and `want` **STAYS 123** (a PLAN changes neither; verify by EMPTY DIFF) ·
+`DECISIONS.md` **STAYS BYTE-UNTOUCHED** — ⚠️ **a PLAN adds no ADR**; next-free STAYS **ADR-0314** and the strict `PROPOSED` guard **STAYS ARMED at 1**, disarmed by the IMPL ·
 run the sentinel and all four NCs and record ACTUAL output (⚠️ **check (1) will print `NOT DONE: row 91` — that is the HEALTHY reading, and NC-A stays in its TWO-line form**) ·
-`STATE.md` rolled IN PLACE with the oldest §Recent entry evicted by a **DIRECT DATE READ** (⚠️ **the tie shape does NOT carry — the phase-91 BRAINSTORM had a UNIQUE oldest and NO tie; the phase-90 IMPL broke a TWO-way tie by LAST LIST POSITION. Read the dates yourself every time.**) and archived to `STATE_HISTORY.md` as **ONE INLINE LINE** so the strict guard stays at **163, DELTA 0** ·
+`STATE.md` rolled IN PLACE with the oldest §Recent entry evicted by a **DIRECT DATE READ** (⚠️ **the tie shape does NOT carry — the phase-91 SPEC had a UNIQUE oldest and NO tie; the phase-90 IMPL broke a TWO-way tie by LAST LIST POSITION. Read the dates yourself every time.**) and archived to `STATE_HISTORY.md` as **ONE INLINE LINE** so the strict guard stays at **163, DELTA 0** ·
 `next-prompt.txt` rolled (`git add -f`) · ONE squashed commit, merged and pushed.
