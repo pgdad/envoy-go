@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
-	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -21,13 +23,92 @@ import (
 // the literal.
 const defaultPeerMaxFrameSize = 16384
 
+// tryReadFrameWait bounds how long the burst-drain waits for the reader
+// goroutine to produce the next frame before declaring the burst exhausted. It
+// replaces the 1 ms SOCKET read deadline the pre-phase-91 tryReadFrame armed.
+//
+// The value is bounded on both sides, and neither bound is arbitrary:
+//
+//   - it must be > 1 ms, because the phase-91 shape interposes a goroutine
+//     handoff the old inline read did not have. 1 ms was sufficient when the
+//     drain performed the read itself; it is not obviously sufficient when a
+//     scheduler wake-up must precede it.
+//   - it must be < 5 ms, because conn_test.go's tiny-window workload drips
+//     WINDOW_UPDATE(1,16) every 5 ms. A wait at or above that interval lets
+//     consecutive grants COALESCE into one larger frame, which reddens
+//     TestServerConn_WriteData_RespectsPerStreamSendWindow on a legitimate
+//     frame rather than on a defect.
+//
+// Raising it to at most 4 ms is permitted, but only after re-running both the
+// h2spec 5.1.2/1 gate and the contended TinyWindowDelivery measurement. Any
+// value >= 5 ms is a reversal of ADR-0313, not a constant edit.
+const tryReadFrameWait = 2 * time.Millisecond
+
+// aLongTimeAgo is a non-zero time far in the past. Stamping it as a read
+// deadline unblocks a reader goroutine parked in a blocking read(2) — the one
+// reader state no channel close can reach. Mirrors the x/net/http2 idiom.
+var aLongTimeAgo = time.Unix(1, 0)
+
+// errReaderNotStarted is returned by readFrameCtx and tryReadFrame when they
+// are called on a framer whose reader plumbing was never allocated — i.e. a
+// framer built as a composite literal rather than by newFramer. Returning an
+// error converts what would otherwise be a permanent block on a nil channel
+// (or, before phase 91, a nil-pointer panic on f.conn) into a diagnosable
+// failure.
+var errReaderNotStarted = errors.New("h2: framer: reader not started")
+
 // framer is a thin wrapper over *http2.Framer adding context-aware reads.
 // Write methods are passthrough via embedding, except writeHeaderBlock, which
 // wraps WriteHeaders to honor RFC 9113 §6.10 header-block continuation.
 // Phase 05.1 does NOT use http2.Framer.WriteRawFrame (per SPEC §4.1).
+//
+// Phase 91 (ADR-0313) moved the read side onto a dedicated goroutine. The
+// pre-phase-91 shape armed a short read deadline around http2.Framer.ReadFrame
+// and retried on timeout, but ReadFrame reads its payload with io.ReadFull, so
+// a deadline expiring MID-FRAME discarded bytes already drained off the socket
+// and the retry resumed at the wrong byte offset — desynchronizing the frame
+// stream permanently. The reader goroutine reads with NO deadline, ever, and
+// context awareness is provided by selecting on a channel instead.
+//
+// ⚠️ PRECONDITION, LOAD-BEARING AND UNENFORCED BY THE TYPE SYSTEM: a framer's
+// READ side has exactly ONE consumer goroutine. Server-side that is
+// (*ServerConn).Run — processFrameAndMaybeDrain runs on the same goroutine.
+// Client-side it is (*ClientConn).readLoop. The `held` field below is
+// deliberately unsynchronized and would become a data race under a second
+// read-side caller; the package's -race gates are what enforce this.
 type framer struct {
 	*http2.Framer
 	conn net.Conn
+
+	// Reader-goroutine plumbing. All four channels are allocated by newFramer;
+	// only the GOROUTINE is lazy, spawned by startReader. A framer built as a
+	// composite literal therefore has nil channels, which the read methods
+	// detect and reject with errReaderNotStarted rather than blocking forever.
+	//
+	// frameCh is UNBUFFERED, and that is a correctness requirement rather than
+	// a tuning choice: x/net's Framer invalidates the previously returned frame
+	// at the ENTRY of the next ReadFrame, so the reader must not re-enter
+	// ReadFrame while the consumer still holds frame N. Capacity would let it,
+	// and every frame accessor then panics with no recover() in this subtree.
+	// framer_reader_test.go pins cap(frameCh) == 0 for exactly this reason.
+	frameCh   chan http2.Frame
+	releaseCh chan struct{} // capacity 1; carries a TOKEN, never a frame
+	stopCh    chan struct{} // closed by closeReader
+	doneCh    chan struct{} // closed by the reader goroutine on exit
+
+	startOnce sync.Once
+	stopOnce  sync.Once
+	started   atomic.Bool
+
+	// readErr is written by the reader goroutine BEFORE it closes frameCh, and
+	// read by the consumer ONLY after a receive on frameCh has reported the
+	// channel closed. That close/receive pair is the happens-before edge.
+	readErr error
+
+	// held is touched ONLY by the single consumer goroutine and is deliberately
+	// unsynchronized. It is true exactly while the consumer owns a frame the
+	// reader has not yet been released from.
+	held bool
 }
 
 // writeHeaderBlock writes an encoded header block as exactly one HEADERS frame
@@ -111,12 +192,142 @@ func (f *framer) writeHeaderBlock(p http2.HeadersFrameParam, peerMaxFrameSize in
 // WriteHeaders, WriteData, WriteRSTStream, WriteWindowUpdate, WritePing,
 // WriteGoAway, and ReadFrame directly. maxReadFrameSize sets the read-side
 // limit: frames larger than this trigger a FRAME_SIZE_ERROR.
+//
+// The reader plumbing is ALLOCATED here but the reader goroutine is NOT
+// spawned: several call sites read the socket directly before any framer read
+// may happen, so the spawn is an explicit startReader() seam. A framer built
+// as a composite literal instead of by newFramer therefore has nil channels,
+// which the read methods reject with errReaderNotStarted.
 func newFramer(conn net.Conn, maxReadFrameSize uint32) *framer {
 	fr := http2.NewFramer(conn, conn)
 	fr.SetMaxReadFrameSize(maxReadFrameSize)
 	return &framer{
 		Framer: fr,
 		conn:   conn,
+		// frameCh is UNBUFFERED and must stay that way — see the field comment.
+		// Capacity would break the frame-ownership invariant, not merely change
+		// throughput.
+		frameCh:   make(chan http2.Frame),
+		releaseCh: make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
+	}
+}
+
+// startReader spawns the frame-reader goroutine. It MUST be called exactly
+// once per framer, from the connection's own setup goroutine, AFTER every
+// direct socket read (the client preface, the peer's initial SETTINGS) and
+// BEFORE the first readFrameCtx or tryReadFrame.
+//
+// The seam is explicit rather than folded into newFramer because four things
+// read the socket directly before any framer read: readClientPreface,
+// readClientSettings (which calls the EMBEDDED fr.ReadFrame on both sides),
+// the two post-GOAWAY io.Copy drains, and the package's own tests, eleven of
+// which hold a *framer and call the embedded ReadFrame directly.
+//
+// Idempotent. A framer whose reader was never started is still safe to
+// closeReader.
+func (f *framer) startReader() {
+	f.startOnce.Do(func() {
+		f.started.Store(true)
+		go f.readerLoop()
+	})
+}
+
+// readerLoop is the single reader goroutine. The name is readerLoop, not
+// readLoop: (*ClientConn).readLoop already exists in this package and two
+// identically named loops is how a reviewer misreads a defer.
+func (f *framer) readerLoop() {
+	defer close(f.doneCh)
+	for {
+		// NO deadline. This is the whole of ADR-0313: a frame read is never
+		// abandoned part-way, so io.ReadFull can never discard bytes it has
+		// already drained off the socket.
+		frame, err := f.Framer.ReadFrame()
+		if err != nil {
+			// Store BEFORE the close: the close/receive pair is what publishes
+			// readErr to the consumer.
+			f.readErr = err
+			close(f.frameCh)
+			return
+		}
+		select {
+		case f.frameCh <- frame:
+		case <-f.stopCh:
+			return
+		}
+		// The consumer now OWNS frame. Do not re-enter ReadFrame until it is
+		// released: x/net invalidates the previous frame at the entry of the
+		// next ReadFrame.
+		select {
+		case <-f.releaseCh:
+		case <-f.stopCh:
+			return
+		}
+	}
+}
+
+// release signals the reader that the frame it last handed over is finished
+// with. It is called at the START of each consumer read call, which is exact
+// parity with x/net's invalidate-at-entry-of-the-next-ReadFrame: the frame
+// stays valid for precisely as long as it did before phase 91.
+//
+// release is a no-op unless a frame is held, which bounds outstanding tokens
+// to exactly one — which is in turn why releaseCh can have capacity 1 and why
+// this send can never block.
+func (f *framer) release() {
+	if !f.held {
+		return
+	}
+	f.held = false
+	f.releaseCh <- struct{}{}
+}
+
+// exitErr reports why the reader stopped. It substitutes io.EOF for a nil
+// readErr so a consumer can never receive (nil, nil) from a CLOSED frameCh and
+// then dereference a nil Frame. The reader never closes frameCh with a nil
+// readErr, so this is a fail-closed guard rather than a live path.
+func (f *framer) exitErr() error {
+	if f.readErr == nil {
+		return io.EOF
+	}
+	return f.readErr
+}
+
+// closeReader stops the reader goroutine and JOINS it. Idempotent, and safe on
+// a framer whose reader was never started or whose channels were never
+// allocated.
+//
+// AFTER closeReader RETURNS, THE READER GOROUTINE IS GONE. That is the
+// property the two post-GOAWAY drains and framer_leak_test.go both depend on.
+//
+// It is signal + stamp + join, over the three states the reader can be parked
+// in, because no single mechanism reaches all three:
+//
+//	(i)   blocked in ReadFrame on the socket — reachable ONLY by the deadline
+//	      stamp; no channel close can interrupt a blocking read(2).
+//	(ii)  blocked SENDING on frameCh       — released by close(stopCh).
+//	(iii) blocked WAITING FOR RELEASE      — released by close(stopCh).
+//
+// The stamp is safe here only because phase 91 deleted every reader-side
+// deadline clear from this file; the read deadline now has exactly three
+// writers tree-wide — this one, and the two post-GOAWAY drains with their
+// paired clears. It is deliberately NOT cleared: both drain sites overwrite it
+// with their own bound immediately afterwards, and after the join there is no
+// reader left for it to affect. Clearing it would re-open the unbounded
+// blocking read this row exists to remove.
+func (f *framer) closeReader() {
+	if f.stopCh == nil {
+		return // composite-literal framer; there is no reader
+	}
+	f.stopOnce.Do(func() {
+		close(f.stopCh)
+		if f.conn != nil {
+			_ = f.conn.SetReadDeadline(aLongTimeAgo)
+		}
+	})
+	if f.started.Load() {
+		<-f.doneCh
 	}
 }
 
@@ -152,67 +363,70 @@ func translateFramerErr(err error) error {
 	return err
 }
 
-// readFrameCtx reads one frame, honoring ctx cancellation by setting a
-// short (50ms) read deadline on the underlying conn and re-checking ctx.Err()
-// after each timeout. http2.Framer.ReadFrame is otherwise blocking and not
-// ctx-aware; this method bridges the two via polling.
+// readFrameCtx reads one frame, honoring ctx cancellation. Since phase 91 the
+// socket read happens on the reader goroutine with NO deadline; this method
+// waits for that goroutine to hand a frame over, or for ctx to be done.
 //
-// Always uses 50ms slices so that context cancellation (including cancellation
-// of a context that also has a deadline) is observed within bounded latency.
-// If the context deadline has already passed, ctx.Err() is non-nil on the
-// first timeout check and the method returns immediately with ctx.Err().
+// On a CLOSED frameCh the reader has already stored its error and returned, so
+// the stored error is reported directly without touching the socket. That
+// stickiness is new behavior and is deliberate (ADR-0313): it is strictly more
+// deterministic than re-entering a failed socket read, and it is what makes
+// the reader provably gone by the time any consumer observes an error.
+//
+// translateFramerErr is applied on EVERY read rather than once at store time:
+// connError and streamError allocate a fresh *Error per call, so each caller
+// keeps the per-call allocation shape it had before phase 91.
 func (f *framer) readFrameCtx(ctx context.Context) (http2.Frame, error) {
-	for {
-		// Check ctx before arming a new read deadline.
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	if f.frameCh == nil {
+		return nil, errReaderNotStarted
+	}
+	// The ctx-error early return comes BEFORE the release, and the order is
+	// load-bearing. The pre-phase-91 body returned on ctx.Err() without ever
+	// reaching ReadFrame, so a ctx-canceled read did NOT invalidate the
+	// previously returned frame. Releasing first would invalidate where the old
+	// code did not — a behavior change smuggled in as a refactor. It is also
+	// what keeps ctx precedence ahead of a stored read error.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.release()
+	select {
+	case frame, ok := <-f.frameCh:
+		if !ok {
+			return nil, translateFramerErr(f.exitErr())
 		}
-		_ = f.conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-		frame, err := f.ReadFrame()
-		if err == nil {
-			_ = f.conn.SetReadDeadline(time.Time{})
-			return frame, nil
-		}
-		// On any timeout (os.ErrDeadlineExceeded or net.Error.Timeout), re-check
-		// ctx and re-arm. Genuine network errors fall through to the return below.
-		var nerr net.Error
-		isTimeout := errors.As(err, &nerr) && nerr.Timeout()
-		if !isTimeout {
-			isTimeout = errors.Is(err, os.ErrDeadlineExceeded)
-		}
-		if isTimeout {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				_ = f.conn.SetReadDeadline(time.Time{})
-				return nil, ctxErr
-			}
-			// ctx still alive — re-loop and re-arm.
-			continue
-		}
-		_ = f.conn.SetReadDeadline(time.Time{})
-		return nil, translateFramerErr(err)
+		f.held = true
+		return frame, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
-// tryReadFrame attempts to read one frame without blocking.  It sets a 1ms
-// read deadline; if no frame is available it returns (nil, nil).  This is
-// used by the frame loop to detect whether more frames are immediately
-// available after processing a batch, so that pending dispatch goroutines
-// can be deferred until the batch is exhausted (see ServerConn.Run).
+// tryReadFrame attempts to read one frame with a short bounded wait, returning
+// (nil, nil) when the burst is exhausted. It is used by the frame loop to
+// detect whether more frames arrived in the same TCP burst, so that pending
+// dispatch goroutines can be deferred until the batch is drained (see
+// ServerConn.Run).
+//
+// The wait is a TIMER, never a bare default:. A non-blocking select would
+// return before the reader goroutine could be scheduled, silently gutting the
+// burst drain that the RST_STREAM-before-DATA ordering guarantee — and h2spec
+// 5.1.2/1 with it — depends on.
 func (f *framer) tryReadFrame() (http2.Frame, error) {
-	_ = f.conn.SetReadDeadline(time.Now().Add(time.Millisecond))
-	frame, err := f.ReadFrame()
-	_ = f.conn.SetReadDeadline(time.Time{})
-	if err == nil {
+	if f.frameCh == nil {
+		return nil, errReaderNotStarted
+	}
+	f.release()
+	t := time.NewTimer(tryReadFrameWait)
+	defer t.Stop()
+	select {
+	case frame, ok := <-f.frameCh:
+		if !ok {
+			return nil, translateFramerErr(f.exitErr())
+		}
+		f.held = true
 		return frame, nil
+	case <-t.C:
+		return nil, nil // burst exhausted — the ONLY (nil, nil) return
 	}
-	// Any timeout means "no data yet" — return (nil, nil).
-	var nerr net.Error
-	isTimeout := errors.As(err, &nerr) && nerr.Timeout()
-	if !isTimeout {
-		isTimeout = errors.Is(err, os.ErrDeadlineExceeded)
-	}
-	if isTimeout {
-		return nil, nil
-	}
-	return nil, translateFramerErr(err)
 }

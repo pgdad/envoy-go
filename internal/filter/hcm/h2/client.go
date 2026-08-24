@@ -263,6 +263,9 @@ func NewClientConn(ctx context.Context, upstream net.Conn, opts ...ClientConnOpt
 	// Step 4: spawn the frame-read goroutine BEFORE waiting for SETTINGS_ACK
 	// (the ACK arrives as a SETTINGS frame with the ACK flag set; the goroutine
 	// closes settingsAckCh when it sees that frame).
+	// Starts here: Step 3 above read the peer's SETTINGS off the socket
+	// DIRECTLY, so the reader must not exist until that has completed.
+	cc.fr.startReader()
 	go cc.readLoop()
 	// Step 5: wait synchronously for the peer's SETTINGS_ACK for our SETTINGS.
 	select {
@@ -270,6 +273,9 @@ func NewClientConn(ctx context.Context, upstream net.Conn, opts ...ClientConnOpt
 		return cc, nil
 	case <-ctx.Done():
 		cc.cancel()
+		// The caller receives nil here and therefore can never call Close(),
+		// so this is the only place the reader can be reclaimed on this path.
+		cc.fr.closeReader()
 		return nil, fmt.Errorf("h2: client: SETTINGS_ACK wait: %w", ctx.Err())
 	}
 }
@@ -303,6 +309,7 @@ func (cc *ClientConn) readPeerSettingsAndAck() error {
 // any pending RoundTrip via ctx.Done()) but does NOT close the underlying
 // conn — the caller (or Close) owns the TCP FIN.
 func (cc *ClientConn) readLoop() {
+	defer cc.fr.closeReader()
 	for {
 		f, err := cc.fr.readFrameCtx(cc.ctx)
 		if err != nil {
@@ -1007,6 +1014,11 @@ func (cc *ClientConn) Close() error {
 		}
 		cc.mu.Unlock()
 		cc.cancel()
+		// Join the reader BEFORE closing the conn, so Close carries a
+		// deterministic contract: Close returned => the reader is gone.
+		// cancel() above runs first so a readLoop re-entering readFrameCtx
+		// takes its ctx path rather than waiting on a channel nobody closes.
+		cc.fr.closeReader()
 		closeErr = cc.conn.Close()
 	})
 	return closeErr

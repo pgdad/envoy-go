@@ -205,6 +205,10 @@ func NewServerConn(ctx context.Context, conn net.Conn, dispatcher Dispatcher, se
 // *Error on protocol violation, ctx.Err() on cancellation.
 func (s *ServerConn) Run() error {
 	defer func() { _ = s.conn.Close() }()
+	// Written AFTER the Close defer above ON PURPOSE: Go defers run LIFO, so a
+	// defer written later RUNS EARLIER. The reader must be joined while the
+	// conn is still open, never after it has been closed underneath it.
+	defer s.fr.closeReader()
 
 	// Step 1: read client preface.
 	// RFC 9113 §3.4: mismatch → connection error PROTOCOL_ERROR. We must send
@@ -236,6 +240,12 @@ func (s *ServerConn) Run() error {
 	if err := s.fr.WriteSettingsAck(); err != nil {
 		return err
 	}
+
+	// The reader goroutine starts HERE and can start no earlier: Step 1's
+	// readClientPreface and Step 3's readClientSettings both read the socket
+	// DIRECTLY. It can start no later either -- the dispatch loop below is the
+	// first readFrameCtx caller.
+	s.fr.startReader()
 
 	// Frame dispatch loop.
 	//
@@ -275,6 +285,9 @@ func (s *ServerConn) Run() error {
 			}
 			if hErr != nil && hErr.Stream == 0 {
 				s.emitGoaway(hErr.Code)
+				// See the note at the sibling drain below: joined before the drain
+				// arms its deadline. A measured no-op at this tip, kept structural.
+				s.fr.closeReader()
 				_ = s.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 				_, _ = io.Copy(io.Discard, s.conn)
 				_ = s.conn.SetReadDeadline(time.Time{})
@@ -311,6 +324,12 @@ func (s *ServerConn) processFrameAndMaybeDrain(first http2.Frame) error {
 			if hErr != nil && hErr.Stream == 0 {
 				s.flushPendingDispatch()
 				s.emitGoaway(hErr.Code)
+				// Join the reader before the drain arms its own deadline: the drain
+				// needs the socket exclusively, and its 500 ms bound is only a bound
+				// if no other goroutine can clear it. See ADR-0313 -- at this tip the
+				// reader is already gone on every path that reaches here, so this is a
+				// MEASURED no-op retained as a structural invariant, not a live guard.
+				s.fr.closeReader()
 				_ = s.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 				_, _ = io.Copy(io.Discard, s.conn)
 				_ = s.conn.SetReadDeadline(time.Time{})
