@@ -64,7 +64,9 @@ Also NC the DENOMINATOR (`want=123` on the real file must print `GATE FAIL: exam
 
 ## STATUS AS OF 2026-08-25: PHASE 92 (`h2-response-header-validation`) **OPEN AT lifecycle-state 1**. **THIS SESSION RUNS THE PHASE-92 SPEC.**
 
-**What the 92 BRAINSTORM landed (2026-08-25, base master `47e44004`, branch `phase-92-brainstorm`, ONE squashed commit).** **DOCS ONLY — ZERO production `.go`, ZERO test `.go`** (gated by `git diff --stat master -- '*.go'` => EMPTY). `BRAINSTORM.md` created (**572 lines**); phase dirs **132 -> 133**. `ROADMAP.md` **241 -> 242 lines / 123 -> 124 data rows**, `git diff --numstat` = **`1 0`** (a PURE INSERTION, matching the phase-91 BRAINSTORM's own numstat), `want` **123 -> 124**. `STATE.md` rolled IN PLACE (`9 9`, 63 lines, unchanged); `STATE_HISTORY.md` **522 -> 524** (`2 0`), **strict guard `^- \*\*prior active-phase:\*\*` STAYS 163, DELTA 0**. **`DECISIONS.md` and `BEHAVIOR_CONTRACT.md` BYTE-UNTOUCHED** — a BRAINSTORM adds no ADR; tail STAYS **ADR-0313**, next-free STAYS **ADR-0314**, `^---$` STAYS **216**, the strict `PROPOSED` guard reads **0** and the ADR-0231 decoy still reads 1.
+**What the 92 BRAINSTORM landed (2026-08-25, base master `47e44004`, ⚠️ TWO commits — `fbd4211b` the stage commit and `97d7c519` a CORRECTION; see the correction note below).** **DOCS ONLY — ZERO production `.go`, ZERO test `.go`** (gated across BOTH commits by `git diff --stat 47e44004..HEAD -- '*.go'` => EMPTY). `BRAINSTORM.md` created (**627 lines**); phase dirs **132 -> 133**. `ROADMAP.md` **241 -> 242 lines / 123 -> 124 data rows**, `git diff --numstat` = **`1 0`** (a PURE INSERTION, matching the phase-91 BRAINSTORM's own numstat), `want` **123 -> 124**. `STATE.md` rolled IN PLACE (`9 9`, 63 lines, unchanged); `STATE_HISTORY.md` **522 -> 524** (`2 0`), **strict guard `^- \*\*prior active-phase:\*\*` STAYS 163, DELTA 0**. **`DECISIONS.md` and `BEHAVIOR_CONTRACT.md` BYTE-UNTOUCHED** — a BRAINSTORM adds no ADR; tail STAYS **ADR-0313**, next-free STAYS **ADR-0314**, `^---$` STAYS **216**, the strict `PROPOSED` guard reads **0** and the ADR-0231 decoy still reads 1.
+
+⚠️ **THE STAGE LANDED TWO COMMITS, AND THAT IS ITSELF A CARRIED LESSON.** `fbd4211b` is the stage commit; `97d7c519` corrects it. A measurement probe returned **after** the stage commit was pushed, with the banked pooled-upstream-lifetime candidate **reproduced end to end and materially enlarged** — the stage commit had banked it saying its reachability *"was NOT executed"*, which had become FALSE. It was corrected in place rather than left standing. **CUMULATIVELY vs `47e44004` the stage is still `ROADMAP.md` `1 0` (a PURE INSERTION) and `STATE.md` `9 9`** — the correction rewrote the same lines the stage commit added — **but `BRAINSTORM.md` is `627 0`, not the 572 the first commit reported.** ⚠️ **`reference_cost_figure_measured_at_publishing_commit` FIRED AGAIN, INSIDE THIS ROW, ON THIS FILE'S OWN FIGURES.** Two consequences that bind you: **(a) the subject-locate grep returns 2, not 1 — take the NEWEST with `| head -1`**; **(b) re-derive every figure in this file at YOUR tip before quoting it.**
 
 ### ⚠️ THE CHARTER
 
@@ -171,7 +173,7 @@ Baseline `./internal/filter/hcm/... ./internal/filter/http/router/...` => **655 
 
 ## ⚠️ A RECURSIVE `grep` IN THIS HARNESS IS BLIND TO `next-prompt.txt`
 
-`grep` is a shell **function**, not GNU grep: it execs `claude -G --ignore-files …` (ugrep under the hood). **`--ignore-files` honours `.gitignore`**, `.gitignore:2` lists `next-prompt.txt`, and the file is **TRACKED anyway**. Reproduced at THIRTY-EIGHT separate tips.
+`grep` is a shell **function**, not GNU grep: it execs `claude -G --ignore-files …` (ugrep under the hood). **`--ignore-files` honours `.gitignore`**, `.gitignore:2` lists `next-prompt.txt`, and the file is **TRACKED anyway**. Reproduced at THIRTY-NINE separate tips — most recently at `97d7c519`, where `command grep -rl` returned **10** paths including `next-prompt.txt` and the harness function returned the **same 9 minus that file**, with direct access reading 3.
 ```sh
 command grep -rl 'STANDING DIRECTIVE (human, 2026-07-12)' . | sed 's|^\./||' | sort   # GNU: PRESENT
 grep -c 'STANDING DIRECTIVE (human, 2026-07-12)' next-prompt.txt                      # direct access WORKS
@@ -182,7 +184,7 @@ grep -c 'STANDING DIRECTIVE (human, 2026-07-12)' next-prompt.txt                
 
 Fresh worktree off **the CURRENT master tip** per `feedback_git_worktrees` — from `git rev-parse master`, **NOT a SHA quoted in this file**. ⚠️ **USE THE SLUG-ANCHORED SUBJECT-LOCATE FORM** (the bare grep is contaminated by this file's own prose):
 ```sh
-git log --grep '^phase 92 (h2-response-header-validation)' --format='%h %s'   # 1 at this tip — the BRAINSTORM
+git log --grep '^phase 92 (h2-response-header-validation)' --format='%h %s'   # 2 at this tip — the BRAINSTORM + its CORRECTION
 git log --grep '^phase 91 (h2-framer-partial-frame-desync)' --format='%h %s'  # 4 — a CLOSED phase, use as a FIRING CONTROL
 ```
 ⚠️ **The count comments are LIVE FIGURES — VERIFY before relying.** Take the NEWEST line (`| head -1`). A fabricated slug must read **0**.
@@ -211,4 +213,4 @@ Execution style: **subagent-driven per `feedback_execution_style`**. Subagents c
 **ROW 92 STAYS `in-progress`** — `ROADMAP.md` should be BYTE-UNTOUCHED at the SPEC (the phase-91 SPEC's own numstat was empty); `want` STAYS **124** ·
 **REFUTE YOUR PREDECESSOR BY EXECUTION** — this BRAINSTORM refuted its own inherited pick, its own routing instruction, the inventory total, a documentary defect that does not exist, and one of its own claims pre-commit ·
 `STATE.md` rolled IN PLACE with the oldest §Recent entry evicted by a **DIRECT DATE READ** (⚠️ **read the dates yourself every time — this stage found a THREE-WAY tie at 2026-08-22 broken by LAST LIST POSITION, the THIRD distinct tie shape in three stages; the shape does NOT carry**) and archived to `STATE_HISTORY.md` as **ONE INLINE LINE** whose label does NOT match `^- \*\*prior active-phase:\*\*`, so the strict guard stays at **163, DELTA 0** ·
-`next-prompt.txt` rolled (`git add -f`) · ONE squashed commit, merged and pushed.
+`next-prompt.txt` rolled (`git add -f`) · ONE squashed commit, merged and pushed — ⚠️ **and if a late measurement invalidates something you already pushed, land a CLEARLY-LABELLED correction commit rather than force-pushing or leaving it standing; the phase-92 BRAINSTORM did exactly that.**
