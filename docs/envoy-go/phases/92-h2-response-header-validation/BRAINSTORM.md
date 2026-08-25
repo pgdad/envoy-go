@@ -171,21 +171,65 @@ See §9.1. ADR-0313 §Consequences (viii) records a leak at *"the three `NewClie
 grep it rests on is true; **the conclusion is false**, and the count is wrong. Refuted by execution with a
 load-bearing leak arm. **A row chartered on it would have had nothing to fix.**
 
-### 4.2 The `*ClientConn` lifetime-ctx defect — **REAL, BANKED, and BIGGER than this row**
+### 4.2 The pooled-upstream-lifetime defect — **REAL, THREE-SITED, BANKED, and BIGGER than this row**
 
-Surfaced while refuting 4.1. `NewClientConn` derives the pooled connection's **lifetime** ctx from the
-**dialing caller's** ctx, and `(*ClientConn).Closed()` is literally `cc.ctx.Err() != nil`. Cancelling one
-request's ctx therefore tears down a connection other requests are multiplexed on, and the pool never
-reaps it. Measured: `cc2.Closed() == true` while request 2 still holds a stream (control: `false`); orphan
-FD delta **+100 over N=50** against **+2** in the uncancelled control. The production cancel sites were
-controller-verified: `hedge.go` (`hedgeCtx` + `defer cancelAll()` -> `doH2ClusterAction`) and `retry.go`
-(`attemptCtx` from `per_try_timeout` -> `doH2ClusterAction`). `context.WithoutCancel` is available
-(`go.mod` `go 1.23.0`, toolchain go1.26.7) and has **zero** uses in the tree today.
+Surfaced while refuting 4.1, then **reproduced END TO END through the real filter chain** after this
+document's first draft had banked it as un-executed. **It is THREE independent defects at three sites
+sharing one root confusion — who owns a pooled upstream H/2 connection's lifetime — and one user-visible
+symptom.**
 
-**DEFERRED, not dismissed**, on three stated grounds: the fix probably spans **two packages**
-(`h2/client.go` plus a pool reaper at `h2pool.go`) where this row spans one; its reference-comparability is
-undetermined; and its cost is not yet bounded by a prototype. **It is the strongest banked candidate in
-this document and the next self-pick should look at it first.** §9.2 carries its full state.
+- **D1 — ctx ownership** (`h2.NewClientConn`): the pooled conn's **lifetime** ctx is the **dialing
+  caller's** ctx, and `(*ClientConn).Closed()` is literally `cc.ctx.Err() != nil`.
+- **D2 — evict-on-own-cancel** (`router_h2.go`): `EvictH2ConnOnError` fires on **any** RoundTrip error
+  *before* the ctx-cancel discrimination below it, and `evictH2ConnLocked` hard-`Close()`s a **shared
+  multiplexed** conn. Its own comment calls eviction *"safe with our stream still in-flight"* — true for
+  the accounting, **false for every sibling stream**.
+- **D3 — a reaper arm that does nothing** (`h2pool.go` `watchDrain`, ADR-0254): its `case <-cc.Done():`
+  arm is empty, on a documented assumption (*"evicted/closed by another path"*) that `readLoop`'s
+  transport-error `cc.cancel()` violates.
+
+**MEASURED end-to-end against the real binary** — h2c listener, STATIC H2 cluster, a byte-controlled
+backend; REQ2 fired 400 ms after REQ1 on a plain route with **no** retry and **no** hedging:
+
+| arm | REQ1 | **sibling REQ2** | shared conn? |
+|---|---|---|---|
+| control (nothing cancels) | 200 | **200** | `BACKEND_ACCEPTED_TCP_CONNS=1`, `upstream_cx_total: 1` |
+| `per_try_timeout` route | 504 | **502 "bad gateway"** | same, **1** |
+| `hedge_on_per_try_timeout` | **200 — it SUCCEEDS** | **502 "bad gateway"** | same, **1** |
+
+⚠️ **Worse than predicted in two ways:** the hedge arm's REQ1 **succeeds with 200** and still poisons its
+sibling, and the trigger needs nothing exotic. Non-vacuity is carried by the conn count — both requests
+provably rode **ONE** pooled upstream conn — and REQ2's failure instant coincides exactly with REQ1's.
+
+⚠️ **AND D3 NEEDS NO RETRY POLICY, NO HEDGING, AND NO UNUSUAL CONFIG AT ALL.** With D1 and D2 already
+fixed, against a backend that RSTs without a GOAWAY — an LB idle reap, a rolling restart, a conntrack
+timeout — the cluster **WEDGES PERMANENTLY** against its `max_connections` cap: `upstream_cx_active`
+pinned at the cap forever, `upstream_cx_total` frozen, the backend never sees another connection, and
+requests **HANG** (`upstream_rq_pending_overflow: 0` — they pend for a permit that is never released)
+rather than failing fast with a 503. envoy-go's `max_connections` is a **HARD** cap (recorded departure,
+ADR-0252), so an orphaned permit is unrecoverable. A GOAWAY control (`watchDrain`'s other arm) is 6/6
+green, and the same arm re-run with D3 fixed is 6/6 green.
+
+**Cost: `24 added / 12 removed` across three files** (`h2pool.go` `11 1`, `client.go` `5 2`,
+`router_h2.go` `8 9`), `gofmt` clean, `golangci-lint` **RC=0 zero findings**; `context.WithoutCancel`
+would be its first use in the tree. **UNPINNED IN BOTH DIRECTIONS AT ALL THREE SITES** — inverting each
+reddens nothing across 791 named tests in the three closest packages, all 73 `./internal/...` packages,
+and `-race` — while a `panic()` reachability control reddens at every one, so all three are executed.
+
+**DEFERRED — on grounds that are stronger, not weaker, for being measured.** ⚠️ **The reference side is a
+reasoned PREDICTION from its pool architecture, NOT a measurement** — the probe ran no docker, and this
+project does not charter a parity row on an unmeasured reference side. It also spans **three packages**
+where this row spans one, it is **three defects** and therefore a probable SPLIT-phase, and its H1
+sibling (`retry.go` / `hedge.go` `doH1ClusterAction` over the phase-43.1 pool) carries the identical ctx
+shape and is **entirely unmeasured**, so the true blast radius may be double.
+
+⚠️ **It is nevertheless MORE SEVERE than the row this document picked, and that is stated plainly rather
+than smoothed away.** The next self-pick should take it, and its first two jobs are to **measure the
+reference side** and to **decide the split**. ⚠️ **Unlike phase 91's axis, its trigger IS
+harness-controllable and deterministic** (static config plus backend behaviour the harness already owns —
+`BlockingHoldResponder`, the `0076`/`0077` route shapes, the existing release-barrier pattern; 100%
+reproduction at a 400 ms gap), so a differential fixture SHOULD be built on the sibling-502 arm, with the
+wedge arms kept subject-side only because the hard-cap departure makes a cross-side wedge infeasible.
 
 ### 4.3 HTTP/1.1 with no `Host` (the phase-91 banked candidate) — **BANKED; its rejection is PARTLY REFUTED**
 
@@ -435,17 +479,22 @@ carries the extra `closeReader()`. It was measured clean on both axes — gorout
 call graph one layer UP.** A row chartered on (viii) would have had nothing to fix, and would have
 discovered that only after opening.
 
-### 9.2 The defect the refutation surfaced instead — BANKED with everything a taker needs
+### 9.2 The defect the refutation surfaced instead — and a correction to this document's own first draft
 
-See §4.2. `NewClientConn` derives the pooled connection's lifetime ctx from the dialing caller's ctx.
-Measured: `cc2.Closed() == true` while request 2 still holds a stream on the same pooled conn (control:
-`false`); orphan FD **+100 over N=50** versus **+2** uncancelled. Mechanism: `makeRelease` evicts and
-Closes a `Closed()` conn only on the **last** in-flight release, so a cancel landing after `inFlight`
-reached 0 is never followed by any release, and `findStreamHitLocked` merely **skips** the dead conn —
-nothing ever calls `cc.Close()`. Production cancel sites controller-verified in `hedge.go` and `retry.go`.
-⚠️ **Its end-to-end reachability through the filter chain was NOT executed at this stage** — that is the
-first thing a taker owes, and a measured *"the blast radius is fd/permit exhaustion only, not request
-failure"* would legitimately shrink the charter.
+See §4.2. ⚠️ **This section's first draft said the defect's end-to-end reachability *"was NOT executed at
+this stage"*. That became FALSE before the stage closed** — the probe returned with it reproduced through
+the real filter chain, and with the finding materially enlarged: **three defects at three sites**, a
+sibling request 502'd on a provably shared pooled connection in both the per-try-timeout and the hedge
+arms (the latter with REQ1 **succeeding**), and a **permanent cluster wedge** with requests **hanging**
+that needs no retry policy, no hedging and no unusual config at all. **The section was corrected in a
+follow-up commit rather than left standing**, because a landed document that understates a defect is worse
+than one that never mentioned it.
+
+⚠️ **The correction does NOT change the pick.** The reference side of that defect is a **PREDICTION, not a
+measurement**, and this project does not charter a parity row on an unmeasured reference side; it also
+spans three packages and is a probable split-phase. **But it IS the more severe defect, it is recorded as
+such, and the next self-pick should take it** — first measuring the reference side, then deciding the
+split.
 
 ### 9.3 On the phase-91 banked H1 candidate — its rejection is PARTLY REFUTED
 
@@ -567,6 +616,12 @@ than headline claims:
 - ⚠️ **Two transient files were dropped into the MAIN repo root** by a mis-parsed `cd … && … &` in one
   probe. They were removed and the main repo verified back to its pre-existing `?? .claude/` alone. Recorded
   because a silent cleanup is indistinguishable from never having noticed.
+- ⚠️ **A CONTROLLER ERROR, RECORDED RATHER THAN QUIETLY ABSORBED: one probe's worktree was removed while
+  that probe was still running.** The stage-close teardown ran `git worktree remove --force` across all
+  five trees on the assumption that every agent had reported; one had not. The agent had already completed
+  its measurements and its own clean-tree proof, so no result was lost and no tracked file was left dirty
+  — **but that is luck, not method.** The rule this stage adds: **enumerate live agents before tearing
+  down any worktree they were given.**
 - ⚠️ **The Bash-tool cwd reset fired again** (`Shell cwd was reset to /home/esa/git/envoy-go` after a
   `cd` + `go test`), confirming `reference_bash_cwd_reset_commits_to_main` for the fifth consecutive phase.
   Every git command in this stage used `git -C <abs-worktree-path>`.
