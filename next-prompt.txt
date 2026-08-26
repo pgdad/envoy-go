@@ -64,7 +64,7 @@ Also NC the DENOMINATOR (`want=123` on the real file must print `GATE FAIL: exam
 
 ## STATUS AS OF 2026-08-26: PHASE 92 (`h2-response-header-validation`) **OPEN AT lifecycle-state 3**. **THIS SESSION RUNS THE PHASE-92 IMPL.**
 
-**What the 92 PLAN landed (2026-08-26, base master `8c18100c`, ONE squashed commit).** **DOCS ONLY — ZERO production `.go`, ZERO test `.go`** (`git diff --name-only master -- '*.go'` => **0 files**). `PLAN.md` created (**1479 lines**); phase dirs STAY **133**. `ROADMAP.md`, `DECISIONS.md`, `BEHAVIOR_CONTRACT.md`, `go.mod`, `go.sum` **BYTE-UNTOUCHED** (EMPTY DIFF); `want` STAYS **124**; row 92 STAYS `in-progress`. **NO ADR ADDED** — tail STAYS **ADR-0314**, next-free **ADR-0315**, strict guard STAYS **ARMED at 1**, `^---$` STAYS **216**. `STATE.md` rolled IN PLACE (**`9 9`**, 63 lines); `STATE_HISTORY.md` **526 -> 528** (`2 0`), **strict guard STAYS 163, DELTA 0**, loose **213 -> 214**.
+**What the 92 PLAN landed (2026-08-26, base master `8c18100c`, ONE squashed commit).** **DOCS ONLY — ZERO production `.go`, ZERO test `.go`** (`git diff --name-only master -- '*.go'` => **0 files**). `PLAN.md` created (**1482 lines**); phase dirs STAY **133**. `ROADMAP.md`, `DECISIONS.md`, `BEHAVIOR_CONTRACT.md`, `go.mod`, `go.sum` **BYTE-UNTOUCHED** (EMPTY DIFF); `want` STAYS **124**; row 92 STAYS `in-progress`. **NO ADR ADDED** — tail STAYS **ADR-0314**, next-free **ADR-0315**, strict guard STAYS **ARMED at 1**, `^---$` STAYS **216**. `STATE.md` rolled IN PLACE (**`9 9`**, 63 lines); `STATE_HISTORY.md` **526 -> 528** (`2 0`), **strict guard STAYS 163, DELTA 0**, loose **213 -> 214**.
 
 ### ⚠️ THE CHARTER (unchanged in substance)
 
@@ -180,7 +180,7 @@ Execution style: **subagent-driven per `feedback_execution_style`**. Subagents c
 
 ## Read first (in order)
 1. `docs/envoy-go/STATE.md` — **§Current pointer ONLY**. ⚠️ **`next-skill:` reads the phase-92 IMPL.** ⚠️ **§Project counts is STALE (phase-76 era: fixtures 119, ADR tail 0298, stat surface 1205) and SELF-CONTRADICTS §Current with NO label saying so — do not anchor on it.**
-2. `docs/envoy-go/phases/92-h2-response-header-validation/PLAN.md` (**1479 lines**) — **§4 (the FROZEN DESIGN), §6 (the test roster), §7 (the NC campaign), §10 (cost + the split gate), §14 (the 23 ordered tasks)**.
+2. `docs/envoy-go/phases/92-h2-response-header-validation/PLAN.md` (**1482 lines**) — **§4 (the FROZEN DESIGN), §6 (the test roster), §7 (the NC campaign), §10 (cost + the split gate), §14 (the 23 ordered tasks)**.
 3. `docs/envoy-go/phases/92-h2-response-header-validation/SPEC.md` — §4, §7, §10, §13. ⚠️ **THREE of its figures are SUPERSEDED by the PLAN (`+74`/`+77`, `406`, `http2_tx_reset`) and one of its legs (`te`) shipped unmeasured. The PLAN is authoritative where they disagree.**
 4. `docs/envoy-go/DECISIONS.md` **ADR-0314** (PROPOSED, §Context only) — ¶4-¶7 carry the load-bearing findings. Also **ADR-0312 §Consequences (xix)** and **ADR-0313 §Consequences (ix-bis)**.
 5. `BOOTSTRAP_PROMPT.md` §4-§7 (repo ROOT). **Phase-92 dir has `BRAINSTORM.md` + `SPEC.md` + `PLAN.md` and no `PROGRESS.md` ⇒ state 3 ⇒ the IMPL.**
