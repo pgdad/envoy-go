@@ -52,10 +52,11 @@ Also NC the DENOMINATOR (`want=123` on the real file must print `GATE FAIL: exam
 
 ⚠️ **AND DO NOT SUBSTITUTE A "REASONABLE EQUIVALENT" FOR CHECK (1)'s AWK.** A measurement agent once tried `NF>=8 && $2 ~ /^ *[0-9]+ *$/`: it printed **92**, not the true denominator, because the naive split of escaped-pipe rows moves `NF` and the numeric `$2` anchor then rejects rows the canonical form accepts. **Use the form above verbatim.**
 
-**SENTINEL RUN MECHANICALLY AT THE PHASE-92 SPEC (2026-08-25) at `221eedf4`.** ACTUAL output, recorded not predicted:
+**SENTINEL RUN MECHANICALLY AT THE PHASE-92 SPEC (2026-08-25), FIRST at the pre-commit base `221eedf4` AND AGAIN AT THE PUBLISHING TIP `13ad0aa0` AFTER THE COMMIT LANDED.** ACTUAL output, recorded not predicted, **IDENTICAL AT BOTH TIPS**:
 - **(1)** `want=124` -> **`NOT DONE: row 92`**, ONE line · **(2) SIX** at `:202 :208 :214 :224 :230 :238` · **(3) SILENT.**
 - **All four NCs fired:** NC-A **TWO** lines (`NOT DONE: row 62` + `NOT DONE: row 92`) with `NC LANDED? [ in-progress ]` **inspected FIRST** · NC-B `NOT DONE: row 92` **AND** `GATE FAIL: examined 124 data rows, expected 123` · NC-C residual **2 -> 0** => `NEVER OPENED: gRPC`, WASM correctly silent · NC-D long **5** / short **1** / union **6**.
 ⇒ **THE SENTINEL DOES NOT FIRE — TWO checks block it. `stop` WAS EVALUATED AND DELIBERATELY NOT CREATED** (verified absent at the git root AND in the stage worktree).
+- ⚠️ **AND EVERY LIVE FIGURE IN THIS FILE WAS RE-DERIVED AT THE PUBLISHING TIP `13ad0aa0`, NOT ONLY AT THE PRE-COMMIT BASE — and this time NONE had gone stale.** Verified post-commit: `DECISIONS.md` **18467** · `^---$` **216** · `^## ADR-` **313** · bare `^## ` **321** · tail **ADR-0314** · `^## ADR-0315` **0** · strict `PROPOSED` guard **1** · ADR-0231 decoy **1** · `STATE.md` **63** · `STATE_HISTORY.md` **526** with strict **163** / loose **213** · phase dirs **133** · `SPEC.md` **586** · `BEHAVIOR_CONTRACT.md` **5962** · fixtures **121** · fuzzers **55 / 48** · `-family row` **95 occurrences / 67 lines** · subject-locate **3** for phase 92 and **4** for phase 91, fabricated slug **0**. ⚠️ **Recorded because the PRECEDING row's figures DID go stale inside their own row** (`reference_cost_figure_measured_at_publishing_commit` fired there); a clean re-derivation is a RESULT, not a reason to stop re-deriving.
 - ⚠️ do NOT "fix" the six and do NOT forecast a decrease — history `0 -> 1 -> 3 -> 4 -> 5 -> 6` across ~40 phases; the candidate sentences are a WINDOW onto a larger deferred backlog, not an inventory of it. ⚠️ **Cite ~40 only as "sentence-visible", never as the inventory** — and see METHOD NOTE 3d: **no gate may rest on a ` + ` split.**
 
 ==============================================
@@ -161,7 +162,7 @@ Also NC the DENOMINATOR (`want=123` on the real file must print `GATE FAIL: exam
 
 ## ⚠️ A RECURSIVE `grep` IN THIS HARNESS IS BLIND TO `next-prompt.txt`
 
-`grep` is a shell **function**, not GNU grep: it execs `claude -G --ignore-files …` (**ugrep 7.8.4** under the hood). **`--ignore-files` honours `.gitignore`**, `.gitignore:2` lists `next-prompt.txt`, and the file is **TRACKED anyway**. Reproduced at FORTY separate tips.
+`grep` is a shell **function**, not GNU grep: it execs `claude -G --ignore-files …` (**ugrep 7.8.4** under the hood). **`--ignore-files` honours `.gitignore`**, `.gitignore:2` lists `next-prompt.txt`, and the file is **TRACKED anyway**. Reproduced at **FORTY-ONE** separate tips — most recently at **`13ad0aa0`**, where GNU `command grep -rl` returned **10** paths including `next-prompt.txt` and the harness function returned the **same 9 minus that file**, with direct access reading **3** and `git ls-files --error-unmatch` confirming **TRACKED: yes**.
 ```sh
 command grep -rl 'STANDING DIRECTIVE (human, 2026-07-12)' . | sed 's|^\./||' | sort   # GNU: PRESENT
 grep -c 'STANDING DIRECTIVE (human, 2026-07-12)' next-prompt.txt                      # direct access WORKS
