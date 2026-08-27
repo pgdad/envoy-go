@@ -204,6 +204,12 @@ func (c *Cluster) h2RxResetInc() { incCounter(c.http2RxReset) }
 // the codec's downstream-cancel CANCEL). nil-guarded. (phase 43.2b)
 func (c *Cluster) h2TxResetInc() { incCounter(c.http2TxReset) }
 
+// h2RxMessagingErrorInc Inc's the cluster's http2.rx_messaging_error counter (an
+// inbound message the codec rejected as malformed). nil-guarded VIA incCounter —
+// the handle is useH2-gated and therefore nil on every non-H2 cluster, and
+// stats.Counter.Inc has no nil guard of its own. (phase 92, ADR-0313)
+func (c *Cluster) h2RxMessagingErrorInc() { incCounter(c.http2RxMessagingError) }
+
 // ---------------------------------------------------------------------------
 // The acquire / release lifecycle (phase 43.2a, Task 5, ADR-0253)
 //

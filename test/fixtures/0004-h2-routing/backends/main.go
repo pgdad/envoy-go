@@ -11,6 +11,8 @@
 //   - /api/v1/emit    -> 200 "emit-ok" + a split response header block (phase-88)
 //   - /api/v1/reflect-headers/<arm> -> 200, a SORTED `name: value` block of the
 //     request headers actually received (phase-89 decode-mutation arms)
+//   - /api/v1/p92-<shape> -> 200 "p92-ok" + ONE illegal connection-specific
+//     RESPONSE header (phase-92 response-header-validation arms)
 //   - any other path -> 404 "not found\n"
 //
 // BACKEND_IDX env var supplies the per-instance numeric idx that flows into the
@@ -94,6 +96,58 @@ func main() {
 		w.Header().Set("X-Cont-Marker", "emitted")
 		w.Header().Set("X-Cont-Pad", contPad(contPadLen))
 		_, _ = fmt.Fprint(w, "emit-ok")
+	})
+	// Phase-92 illegal-response-header emitters (ONE ILLEGAL SHAPE PER PATH).
+	//
+	// x/net's H/2 server deletes ONLY `Connection` from a handler's response
+	// header map -- server.go carries a live
+	// `TODO: remove more Connection-specific header fields here` right beside
+	// that delete -- so every other connection-specific field a handler sets
+	// travels verbatim onto the upstream wire. These handlers are the
+	// fixture's source of the illegal RESPONSE shapes phase 92 must make the
+	// proxy reject.
+	//
+	// ⚠️ ONE ILLEGAL FIELD PER PATH, deliberately. A single path emitting all
+	// three at once would be BLIND to a fix that catches one shape and
+	// launders another: one arm would keep showing a non-empty illegal set and
+	// no per-shape verdict could be read out of it.
+	//
+	// ⚠️ Registered as EXACT patterns, so Go's ServeMux prefers them over the
+	// `/api/v1/` subtree handler above and no existing response body moves.
+	// They sit UNDER /api so the fixture route table needs NO edit: both
+	// sides' `- match: { prefix: "/api" }` -> c_h2_backend already covers
+	// them. A TOP-LEVEL `/p92-*` path would NOT match that prefix -- it falls
+	// through to `- match: { prefix: "/" }` and is answered by a 404
+	// direct_response that never reaches a backend at all.
+	//
+	// ⚠️ FOUR ILLEGAL SHAPES ARE STRUCTURALLY UNREACHABLE from a net/http
+	// backend and are deliberately absent here: `connection` (the H/2 server
+	// deletes it), `transfer-encoding` (the H/2 server frames the body itself
+	// and never emits it), an UPPERCASE wire name (the HPACK encoder
+	// lowercases every field name), and a DUPLICATE `content-length` (the
+	// server synthesizes exactly one). Those are pinned at the unit layer.
+	mux.HandleFunc("/api/v1/p92-keepalive", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Keep-Alive", "timeout=5, max=100")
+		_, _ = fmt.Fprint(w, "p92-ok")
+	})
+	mux.HandleFunc("/api/v1/p92-upgrade", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Upgrade", "websocket")
+		_, _ = fmt.Fprint(w, "p92-ok")
+	})
+	mux.HandleFunc("/api/v1/p92-proxyconn", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Proxy-Connection", "keep-alive")
+		_, _ = fmt.Fprint(w, "p92-ok")
+	})
+	// PROBE PATHS (phase-92 T2 measurement obligation): whether a `te` field
+	// set by a net/http handler survives onto the upstream H/2 wire at all was
+	// UNMEASURED. Driven and read on the wire; kept only if they leak.
+	mux.HandleFunc("/api/v1/p92-te-gzip", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Te", "gzip")
+		_, _ = fmt.Fprint(w, "p92-ok")
+	})
+	mux.HandleFunc("/api/v1/p92-te-empty", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Te", "")
+		_, _ = fmt.Fprint(w, "p92-ok")
 	})
 	// Phase-89 decode-side filter-mutation reporter. Reflects the request
 	// headers this backend ACTUALLY received, one `name: value` line per

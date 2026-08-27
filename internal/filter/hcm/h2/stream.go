@@ -383,12 +383,15 @@ const teTrailersValue = "trailers"
 // `te` is deliberately NOT in this set: it is CONDITIONALLY legal (permitted
 // with the single value teTrailersValue), so it cannot be answered by a
 // name-only predicate. Callers must test `te`'s VALUE separately — see
-// buildRequest below and validateResponseTrailers in client.go.
+// buildRequest below, and validateResponseHeaders / validateResponseTrailers
+// in client.go.
 //
-// This is the ONE source of truth for the RFC list. It is shared by the
-// request-decode path (buildRequest, server side) and the response-trailer
-// validation path (validateResponseTrailers, client side) so a member can
-// never be dropped from one copy and survive in the other.
+// This is the ONE source of truth for the RFC list. It is shared by THREE
+// paths: the request-decode path (buildRequest, server side), the
+// response-HEADER validation path (validateResponseHeaders, client side —
+// phase 92) and the response-TRAILER validation path
+// (validateResponseTrailers, client side), so a member can never be dropped
+// from one copy and survive in the others.
 func isConnectionSpecificField(name string) bool {
 	switch name {
 	case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":

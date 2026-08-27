@@ -199,6 +199,13 @@ func registerClusterMetrics(r *stats.Registry, c *Cluster) {
 		// stream_refused_errors (AMEND-H2B-3).
 		c.http2RxReset = r.NewCounter(prefix + "http2.rx_reset")
 		c.http2TxReset = r.NewCounter(prefix + "http2.tx_reset")
+		// Phase 92 (ADR-0313): the codec-detected malformed-message counter,
+		// wired from the codec via h2.WithRxMessagingErrorHook at dial.
+		// REGISTERED HERE AT BOOT, NEVER LAZILY: Registry.Walk holds r.mu.RLock
+		// across the whole iteration while register takes r.mu.Lock, and Go's
+		// sync.RWMutex is not reentrant — registering from a scrape/Walk
+		// callback DEADLOCKS (confirmed by execution; the probe never returned).
+		c.http2RxMessagingError = r.NewCounter(prefix + "http2.rx_messaging_error")
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -73,6 +74,13 @@ type h2Driver struct {
 	mu          sync.Mutex
 	refBodyCnt  [3]uint64
 	subjBodyCnt [3]uint64
+
+	// Per-side phase-92 `content-length` field arity, one entry per p92Arms()
+	// arm, recorded during DriveReference / DriveSubject and asserted in
+	// AssertDistribution — which the runner calls AFTER the cross-side byte
+	// compare. See p92AssertCLFields for why the pin must sit BELOW that gate.
+	refP92CL  []int
+	subjP92CL []int
 
 	rootCAs *x509.CertPool
 }
@@ -266,11 +274,13 @@ func (d *h2Driver) loadTLSConfig() *tls.Config {
 	}
 }
 
-// drive issues 42 sequential H2 requests against addr (the proxy listener)
+// drive issues 47 sequential H2 requests against addr (the proxy listener)
 // and returns the concatenated 9 /health response bodies, followed by the 2
 // phase-87 leading-`//` arm bodies ("edge-ok" x 2), followed by the 8 phase-89
 // normalized arm markers ("p89-a1:ok" … "p89-a8:ok"), followed by the 4
-// phase-90 authority-normalization lines ("p90-P:…" … "p90-B:…"). The first 27 requests and
+// phase-90 authority-normalization lines ("p90-P:…" … "p90-B:…"), followed by the
+// 5 phase-92 illegal-response-header lines ("p92-keepalive:…" …
+// "p92-te-empty:…"). The first 27 requests and
 // the transcript prefix they produce are unchanged from phase 05.2. Per ADR-0028 +
 // ADR-0056: each request opens a fresh *http2.ClientConn (the helper's
 // fresh-Transport-per-call discipline). The 9 /api response bodies are NOT
@@ -283,7 +293,14 @@ func (d *h2Driver) loadTLSConfig() *tls.Config {
 // (where idx is parsed from the "backend-<idx>:" prefix) so the driver can
 // surface per-side distribution to AssertDistribution (subprocess backends
 // don't increment the runner's accept counter).
-func (d *h2Driver) drive(ctx context.Context, addr string, counts *[3]uint64) ([]byte, error) {
+//
+// Side-effect: *p92CL is appended one entry per phase-92 arm, in p92Arms()
+// order, carrying that arm's downstream `content-length` field ARITY. That
+// observable is deliberately NOT in the cross-side byte stream (see the p92
+// block below and p92AssertCLFields); the caller stashes it per side and
+// AssertDistribution asserts each side against its OWN measured pin, AFTER
+// the runner's cross-side byte compare.
+func (d *h2Driver) drive(ctx context.Context, addr string, counts *[3]uint64, p92CL *[]int) ([]byte, error) {
 	tlsConf := d.loadTLSConfig()
 
 	var out strings.Builder
@@ -521,6 +538,49 @@ func (d *h2Driver) drive(ctx context.Context, addr string, counts *[3]uint64) ([
 			fmt.Fprintf(&out, "p90-%s:ERR status=%d, want 200\n", arm.name, status)
 		}
 		fmt.Fprintf(&out, "p90-%s:auth=%q host=%v\n", arm.name, p90ObservedValue(got), p90HostPresent(got))
+	}
+
+	// Phase-92 illegal RESPONSE header arms (5 requests; total 47/side).
+	//
+	// Each arm targets a backend path whose handler emits exactly ONE illegal
+	// connection-specific RESPONSE header (see ../backends/main.go), and reads
+	// the DOWNSTREAM header block back off the wire with a raw framer. The
+	// proxy sits between the two: what the transcript records is what the
+	// proxy chose to forward.
+	//
+	// ⚠️ NO YAML EDIT. Every p92 path sits under /api, so both sides'
+	// `- match: { prefix: "/api" }` -> c_h2_backend already routes it. See
+	// p92PathBase for why a top-level `/p92-*` path would NOT.
+	//
+	// ⚠️ THE [3,3,3] DISTRIBUTION IS UNTOUCHED. counts[] is incremented ONLY
+	// inside the `/api/v1/<n>` loop far above, which has already completed;
+	// these five requests are appended after it exactly as the phase-88/89/90
+	// arms are, so AssertDistribution still sees 9 counted requests per side.
+	//
+	// ⚠️ NOT FAIL-FAST, and NO STATUS ASSERTION. Exactly ONE
+	// `p92-<arm>:status=… illegal=…` line is emitted per arm, ALWAYS, plus an
+	// ERR line when the arm did not complete — so a red arm cannot make a
+	// later arm unreachable. The STATUS IS IN THE LINE rather than asserted
+	// in-band on purpose: the two sides are EXPECTED to disagree on it
+	// pre-fix, and the cross-side byte compare IS the assertion.
+	//
+	// ⚠️ `content-length` ARITY IS DELIBERATELY NOT IN THIS LINE — it is
+	// carried out through p92CL and pinned PER SIDE instead. It measures a
+	// pre-existing H/2 LOCAL-REPLY composition departure that is not this
+	// row's charter, and local-reply composition is ALREADY an excluded
+	// cross-side axis in this fixture (the 404 catch-all bodies are not
+	// compared for the same reason). See p92AssertCLFields for the pins and
+	// the README's phase-92 departure note for the root cause.
+	for _, arm := range p92Arms() {
+		fields, status, failure := p92DriveArm(ctx, addr, tlsConf, arm)
+		if failure != "" {
+			fmt.Fprintf(&out, "p92-%s:ERR %s\n", arm.name, failure)
+		}
+		fmt.Fprintf(&out, "p92-%s:status=%d illegal=%s\n",
+			arm.name, status, p92IllegalRendering(fields))
+		if p92CL != nil {
+			*p92CL = append(*p92CL, p92ContentLengthFields(fields))
+		}
 	}
 	return []byte(out.String()), nil
 }
@@ -1000,6 +1060,361 @@ func p90HostPresent(got map[string][]string) bool {
 	return ok
 }
 
+// ---------------------------------------------------------------------------
+// Phase-92 illegal RESPONSE header arms (raw framer, ONE FRESH CONNECTION EACH)
+// ---------------------------------------------------------------------------
+
+const (
+	// p92ArmDeadline bounds each phase-92 arm's dial + write + read loop.
+	p92ArmDeadline = 10 * time.Second
+
+	// p92StreamID is the single client-initiated stream each arm uses. ONE
+	// FRESH connection per arm, so it is always stream 1.
+	p92StreamID = 1
+
+	// p92HpackTableSize is the RESPONSE decoder's dynamic-table size. The
+	// decoder is created PER CONNECTION, never shared across arms: the HPACK
+	// dynamic table is connection-scoped, and a shared decoder yields
+	// "invalid indexed representation index NN" plus a truncated field list on
+	// every arm after the first — which reads exactly like "headers were lost".
+	p92HpackTableSize = 4096
+
+	// p92Authority is the FIXED literal authority every p92 arm sends. Never
+	// the dial address: the reference dials a mapped container port and the
+	// subject a local one, so an address-derived value would break cross-side
+	// byte equality by construction.
+	p92Authority = "p92.example"
+
+	// p92PathBase is the backend prefix the phase-92 emitters live under.
+	//
+	// ⚠️ IT IS UNDER /api DELIBERATELY. Both sides' route tables end with
+	// `- match: { prefix: "/api" }` -> c_h2_backend, so these paths need NO
+	// YAML edit. A TOP-LEVEL `/p92-*` path does NOT match that prefix — it
+	// falls through to `- match: { prefix: "/" }` and is answered by a 404
+	// direct_response that never reaches a backend at all, which would make
+	// every arm below vacuous on BOTH sides.
+	p92PathBase = "/api/v1/p92-"
+
+	// p92NoIllegal is what the transcript records when the SET of illegal
+	// response-header names is EMPTY. A literal, so an empty set stays visibly
+	// distinct from a truncated or absent field.
+	p92NoIllegal = "<none>"
+
+	// p92TETrailers is the ONE `te` value RFC 9113 section 8.2.2 permits on an
+	// H/2 message. EVERY other value is illegal, INCLUDING the empty string —
+	// which is why the te-empty arm exists as its own shape.
+	p92TETrailers = "trailers"
+)
+
+// p92ConnectionSpecific is the roster of response-header names that are
+// illegal on an H/2 message by NAME ALONE (RFC 9113 section 8.2.2). `te` is
+// deliberately NOT in it: `te` is illegal by VALUE, and p92IllegalSet handles
+// that separately.
+//
+// ⚠️ EVERY ARM SCANS THE WHOLE ROSTER, not just the one shape its own backend
+// path emits. A shared code path defeats per-arm counts: a fix that suppresses
+// one field while laundering another must show up as a CHANGE IN THE SET, so
+// the transcript records the SET of illegal names present, NEVER a single name.
+var p92ConnectionSpecific = []string{
+	"connection",
+	"keep-alive",
+	"proxy-connection",
+	"transfer-encoding",
+	"upgrade",
+}
+
+// p92Arm is one phase-92 arm: the transcript marker and the backend path whose
+// handler emits exactly ONE illegal response header.
+type p92Arm struct {
+	name string
+	path string
+}
+
+// p92Arms returns the phase-92 arm roster. ONE ILLEGAL SHAPE PER ARM.
+//
+// A single path emitting all shapes at once would be BLIND to a fix that
+// catches one and launders another: that arm's illegal set would stay
+// non-empty either way and no per-shape verdict could be read out of it.
+//
+// ⚠️ WHY THESE FIVE AND NOT NINE. The fixture backend is net/http +
+// http2.ConfigureServer. x/net's H/2 server deletes ONLY `Connection` from a
+// handler's response header map (the delete carries a live
+// `TODO: remove more Connection-specific header fields here` right beside it),
+// so `keep-alive`, `upgrade` and `proxy-connection` reach the upstream wire
+// verbatim. FOUR further illegal shapes are STRUCTURALLY UNREACHABLE from such
+// a backend and are pinned at the unit layer instead: `connection` (deleted),
+// `transfer-encoding` (the H/2 server frames the body itself), an UPPERCASE
+// wire name (the HPACK encoder lowercases every name), and a DUPLICATE
+// `content-length` (the server synthesizes exactly one).
+//
+// ⚠️ THE TWO `te` ARMS ARE HERE BECAUSE THEY WERE MEASURED, NOT ASSUMED.
+// Whether a `te` field set by a net/http handler survives onto the H/2 wire
+// was an open question; a raw-framer probe against the fixture backend alone
+// (no proxy in the path) read BOTH `te: gzip` and `te: ""` back off the wire
+// verbatim, so both are permanent wire arms rather than unit-only shapes.
+func p92Arms() []p92Arm {
+	return []p92Arm{
+		{"keepalive", p92PathBase + "keepalive"},
+		{"upgrade", p92PathBase + "upgrade"},
+		{"proxyconn", p92PathBase + "proxyconn"},
+		{"te-gzip", p92PathBase + "te-gzip"},
+		{"te-empty", p92PathBase + "te-empty"},
+	}
+}
+
+// p92Fields builds an arm's request field list: the four pseudo-headers in one
+// contiguous block and nothing else. The REQUEST is deliberately boring — this
+// row's subject is the RESPONSE direction.
+func p92Fields(path string) []hpack.HeaderField {
+	return []hpack.HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":scheme", Value: "https"},
+		{Name: ":path", Value: path},
+		{Name: ":authority", Value: p92Authority},
+	}
+}
+
+// p92DriveArm opens a FRESH TLS(ALPN h2) connection, sends the arm's request
+// with a raw framer, and returns the RESPONSE header fields EXACTLY AS THEY
+// ARRIVED ON THE WIRE, the observed :status, and a NON-EMPTY failure string
+// when the arm did not complete. It NEVER returns an error, so no arm can make
+// a later arm unreachable.
+//
+// ⚠️ A RAW FRAMER IS REQUIRED, not helpers.H2RoundTrip. That helper hands the
+// response to net/http and then rebuilds the field list from `resp.Header` — a
+// MAP. That canonicalizes every name (`keep-alive` -> `Keep-Alive`), collapses
+// arity, and iterates in randomized order, so the field list it returns is
+// neither the wire truth nor byte-stable across runs. The illegal shapes this
+// row exists to observe are precisely the ones a header map destroys.
+//
+// ⚠️ Failure strings are scrubbed with p90ScrubAddr — the SAME helper the
+// phase-90 arms use, deliberately reused rather than duplicated so both
+// families scrub byte-identically. Reference and subject dial different
+// addresses, so an unscrubbed error text can never compare equal.
+func p92DriveArm(ctx context.Context, addr string, tlsConf *tls.Config, a p92Arm) ([]hpack.HeaderField, int, string) {
+	fail := func(stage string, err error) ([]hpack.HeaderField, int, string) {
+		return nil, 0, stage + ": " + p90ScrubAddr(err.Error(), addr)
+	}
+
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: p92ArmDeadline},
+		Config:    tlsConf,
+	}
+	raw, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fail("dial", err)
+	}
+	conn, ok := raw.(*tls.Conn)
+	if !ok {
+		_ = raw.Close()
+		return nil, 0, "dial: not a TLS connection"
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(p92ArmDeadline))
+
+	// 0004 is TLS+ALPN-h2, NOT h2c: assert the negotiated protocol BEFORE the
+	// preface is written.
+	if proto := conn.ConnectionState().NegotiatedProtocol; proto != "h2" {
+		return nil, 0, fmt.Sprintf("alpn: negotiated %q, want h2", proto)
+	}
+
+	if _, err := io.WriteString(conn, http2.ClientPreface); err != nil {
+		return fail("preface", err)
+	}
+	fr := http2.NewFramer(conn, conn)
+	fr.ReadMetaHeaders = hpack.NewDecoder(p92HpackTableSize, nil)
+	if err := fr.WriteSettings(); err != nil {
+		return fail("settings", err)
+	}
+
+	block, err := p90EncodeHeaderBlock(p92Fields(a.path))
+	if err != nil {
+		return fail("hpack-encode", err)
+	}
+	if err := fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      p92StreamID,
+		BlockFragment: block,
+		EndHeaders:    true,
+		EndStream:     true,
+	}); err != nil {
+		return fail("write-headers", err)
+	}
+
+	status := 0
+	var fields []hpack.HeaderField
+	for {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			return fields, status, "read-frame: " + p90ScrubAddr(err.Error(), addr)
+		}
+		switch f := f.(type) {
+		case *http2.SettingsFrame:
+			if !f.IsAck() {
+				if err := fr.WriteSettingsAck(); err != nil {
+					return fail("settings-ack", err)
+				}
+			}
+		case *http2.PingFrame:
+			if !f.IsAck() {
+				_ = fr.WritePing(true, f.Data)
+			}
+		case *http2.MetaHeadersFrame:
+			if f.StreamID != p92StreamID {
+				continue
+			}
+			// ⚠️ FIRST header block ONLY. A TRAILING block would otherwise
+			// overwrite the response header fields this arm exists to observe.
+			if fields == nil {
+				fields = f.Fields
+				for _, hf := range f.Fields {
+					if hf.Name == ":status" {
+						if n, convErr := strconv.Atoi(hf.Value); convErr == nil {
+							status = n
+						}
+					}
+				}
+			}
+			if f.StreamEnded() {
+				return fields, status, ""
+			}
+		case *http2.DataFrame:
+			if f.StreamID != p92StreamID {
+				continue
+			}
+			// The body is NOT recorded: a forwarded 200 "p92-ok" and a locally
+			// generated 502 carry different, side-specific text.
+			if f.StreamEnded() {
+				return fields, status, ""
+			}
+		case *http2.RSTStreamFrame:
+			if f.StreamID != p92StreamID {
+				continue
+			}
+			return fields, status, fmt.Sprintf("rst-stream code=%v", f.ErrCode)
+		case *http2.GoAwayFrame:
+			return fields, status, fmt.Sprintf("goaway code=%v", f.ErrCode)
+		default:
+			// WINDOW_UPDATE / PRIORITY / unknown: not recorded.
+		}
+	}
+}
+
+// p92IllegalSet returns the SORTED SET of illegal header names present in a
+// response field list: every p92ConnectionSpecific name, plus `te` whenever its
+// value is anything other than p92TETrailers (the empty value included).
+//
+// ⚠️ A SET, NEVER A SINGLE NAME. See p92ConnectionSpecific.
+func p92IllegalSet(fields []hpack.HeaderField) []string {
+	seen := make(map[string]bool, len(p92ConnectionSpecific)+1)
+	for _, hf := range fields {
+		n := strings.ToLower(hf.Name)
+		for _, bad := range p92ConnectionSpecific {
+			if n == bad {
+				seen[n] = true
+			}
+		}
+		if n == "te" && hf.Value != p92TETrailers {
+			seen[n] = true
+		}
+	}
+	names := make([]string, 0, len(seen))
+	for n := range seen {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// p92IllegalRendering renders p92IllegalSet for the transcript. SORTED and
+// comma-joined, so the rendering is stable regardless of wire order, and
+// p92NoIllegal when the set is empty.
+func p92IllegalRendering(fields []hpack.HeaderField) string {
+	names := p92IllegalSet(fields)
+	if len(names) == 0 {
+		return p92NoIllegal
+	}
+	return strings.Join(names, ",")
+}
+
+// p92ContentLengthFields counts the `content-length` FIELDS in a response.
+//
+// ⚠️ COUNT, NEVER VALUE. The two sides' bodies differ by construction — a
+// forwarded 200 "p92-ok" against a locally generated 502 — so the VALUE is not
+// cross-side comparable and only the ARITY is a contract. Arity is also the
+// only observable that a duplicate-`content-length` regression would move.
+func p92ContentLengthFields(fields []hpack.HeaderField) int {
+	n := 0
+	for _, hf := range fields {
+		if strings.ToLower(hf.Name) == "content-length" {
+			n++
+		}
+	}
+	return n
+}
+
+// Phase-92 PER-SIDE `content-length` arity pins.
+//
+// ⚠️ THESE ARE A DOCUMENTED DEPARTURE, PINNED IN BOTH DIRECTIONS — not an
+// exemption. On every phase-92 arm both sides now answer 502 from a LOCAL
+// REPLY, and the two local replies are composed differently:
+//
+//   - the REFERENCE emits a `content-length` on its 502  -> arity 1
+//   - the SUBJECT emits NONE                             -> arity 0
+//
+// The subject side is `h2LocalReplyHeaders()`
+// (internal/filter/http/router/router_h2.go), which returns Content-Type /
+// Date / Server and NO Content-Length. Its H/1 sibling
+// `localReplyHeaders(bodyLen int)` (router.go) DOES emit one and even takes
+// the bodyLen the H/2 version lacks. The gap dates from phase 07.1 and feeds
+// SEVEN local-reply sites across the 502/503/504 H/2 paths, so closing it is
+// its own behavior-contract row: it is BANKED, not fixed here.
+//
+// Pinning it per side rather than cross-side keeps the departure VISIBLE: if
+// envoy-go later gains a Content-Length on H/2 local replies, or the reference
+// stops emitting one, THESE PINS REDDEN and a human must consciously re-derive
+// them. Deleting the observable instead would have hidden it.
+//
+// ⚠️ ARITY, NEVER VALUE. The two 502 bodies differ by construction (the
+// reference's own local-reply body against envoy-go's `bad gateway\n`), so the
+// content-length VALUE is not a contract on either side and pinning it would
+// be a false gate.
+const (
+	p92WantRefCLFields  = 1
+	p92WantSubjCLFields = 0
+)
+
+// p92AssertCLFields checks one side's per-arm `content-length` field arity
+// against that side's measured pin. side is "ref" or "subj" and appears in the
+// error so a red run names the side without the caller re-wrapping.
+//
+// The observation count is asserted against the LIVE p92Arms() roster first:
+// an empty or short observation slice would otherwise satisfy the per-arm loop
+// vacuously, and this pin has to fail when the arms did not run at all.
+//
+// ⚠️ NOT FAIL-FAST ACROSS ARMS. Every mismatching arm is named in the returned
+// error, not just the first. Returning on the first would let one arm MASK its
+// four siblings, exactly as the runner's first-divergence byte comparator does
+// — and a break that reddens only the first arm is not evidence the other four
+// are pinned at all.
+func p92AssertCLFields(side string, want int, got []int) error {
+	arms := p92Arms()
+	if len(got) != len(arms) {
+		return fmt.Errorf("p92 %s content-length arity: got %d observations, want %d (one per arm)",
+			side, len(got), len(arms))
+	}
+	var bad []string
+	for i, n := range got {
+		if n != want {
+			bad = append(bad, fmt.Sprintf("%s=%d", arms[i].name, n))
+		}
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("p92 %s content-length fields: want %d on every arm, got %s (%d of %d arms)",
+			side, want, strings.Join(bad, ","), len(bad), len(arms))
+	}
+	return nil
+}
+
 // parseBackendIdx extracts the numeric idx from a body that starts with
 // "backend-<idx>:..." (per fixture-0004 backend's /api/v1 handler).
 func parseBackendIdx(body []byte) (int, error) {
@@ -1020,42 +1435,61 @@ func parseBackendIdx(body []byte) (int, error) {
 	return idx, nil
 }
 
-// DriveReference runs 42 H2 round-trips against the reference proxy listener
+// DriveReference runs 47 H2 round-trips against the reference proxy listener
 // and records per-backend body counts on d.refBodyCnt for AssertDistribution.
 func (d *h2Driver) DriveReference(ctx context.Context, addr string) ([]byte, error) {
 	var counts [3]uint64
-	b, err := d.drive(ctx, addr, &counts)
+	var p92CL []int
+	b, err := d.drive(ctx, addr, &counts, &p92CL)
 	if err != nil {
 		return nil, fmt.Errorf("ref drive: %w", err)
 	}
 	d.mu.Lock()
 	d.refBodyCnt = counts
+	d.refP92CL = p92CL
 	d.mu.Unlock()
 	return b, nil
 }
 
-// DriveSubject runs 42 H2 round-trips against the subject proxy listener and
+// DriveSubject runs 47 H2 round-trips against the subject proxy listener and
 // records per-backend body counts on d.subjBodyCnt for AssertDistribution.
 func (d *h2Driver) DriveSubject(ctx context.Context, addr string) ([]byte, error) {
 	var counts [3]uint64
-	b, err := d.drive(ctx, addr, &counts)
+	var p92CL []int
+	b, err := d.drive(ctx, addr, &counts, &p92CL)
 	if err != nil {
 		return nil, fmt.Errorf("subj drive: %w", err)
 	}
 	d.mu.Lock()
 	d.subjBodyCnt = counts
+	d.subjP92CL = p92CL
 	d.mu.Unlock()
 	return b, nil
 }
 
 // AssertDistribution asserts both ref and subj per-cluster RR distributions
-// are exactly [3,3,3] over the 9 router-action /api requests.
+// are exactly [3,3,3] over the 9 router-action /api requests, AND the per-side
+// phase-92 `content-length` arity pins.
 //
 // The runner-supplied refCounts / subjCounts are zero for HTTPSH2 backends
 // (subprocess backends don't increment the in-process counter). The driver
 // therefore consults the body-derived counts it recorded during DriveReference
 // / DriveSubject. The incoming counters are accepted but only used for a
 // length sanity check; their values are deliberately ignored.
+//
+// ⚠️ THIS IS THE FIXTURE'S POST-DIFF IN-BAND ASSERTION HOOK, and that is WHY
+// the phase-92 arity pins live here rather than in DriveReference /
+// DriveSubject. The runner calls AssertDistribution at step 8 — AFTER the
+// cross-side CompareBytes at step 7 — and surfaces its error with t.Errorf,
+// not t.Fatalf. A Drive-level return would have been t.Fatalf'd BEFORE the byte
+// compare ever ran. MEASURED: with the production guard reverted, a Drive-level
+// arity pin reported ONLY "p92 subj content-length fields: …" and the row's own
+// status/illegal divergence was never reached — the out-of-charter pin MASKED
+// the charter regression. Here both are reported by the same run.
+//
+// ⚠️ EVERY failing property is reported, never just the first: the distribution
+// rule and the two arity pins are independent, and returning on the first would
+// let either mask the others.
 func (d *h2Driver) AssertDistribution(refCounts, subjCounts []uint64) error {
 	if len(refCounts) != 3 {
 		return fmt.Errorf("ref backend count: got %d, want 3", len(refCounts))
@@ -1066,16 +1500,25 @@ func (d *h2Driver) AssertDistribution(refCounts, subjCounts []uint64) error {
 	d.mu.Lock()
 	ref := d.refBodyCnt
 	subj := d.subjBodyCnt
+	refCL := d.refP92CL
+	subjCL := d.subjP92CL
 	d.mu.Unlock()
 
+	var errs []error
 	want := [3]uint64{3, 3, 3}
 	if subj != want {
-		return fmt.Errorf("subj distribution %v != %v (RR [3,3,3] expected)", subj, want)
+		errs = append(errs, fmt.Errorf("subj distribution %v != %v (RR [3,3,3] expected)", subj, want))
 	}
 	if ref != want {
-		return fmt.Errorf("ref distribution %v != %v (RR [3,3,3] expected)", ref, want)
+		errs = append(errs, fmt.Errorf("ref distribution %v != %v (RR [3,3,3] expected)", ref, want))
 	}
-	return nil
+	if err := p92AssertCLFields("ref", p92WantRefCLFields, refCL); err != nil {
+		errs = append(errs, err)
+	}
+	if err := p92AssertCLFields("subj", p92WantSubjCLFields, subjCL); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // HTTPExpectations is intentionally NOT implemented: fixture 0004 asserts

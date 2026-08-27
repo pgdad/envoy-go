@@ -1742,6 +1742,20 @@ func TestRegisterClusterMetrics_H2Stats(t *testing.T) {
 		if !hasMetric(reg, "cluster.c_h2s.http2.tx_reset") {
 			t.Error("cluster.c_h2s.http2.tx_reset not registered (H2 cluster)")
 		}
+
+		// Phase 92 (ADR-0313): http2.rx_messaging_error is useH2-gated the same
+		// way and wired from the codec via h2.WithRxMessagingErrorHook at dial.
+		// ⚠️ The handle assertion is NOT redundant with the name assertion:
+		// h2RxMessagingErrorInc routes through incCounter, which SWALLOWS a nil
+		// handle, so a registration that allocated the counter without binding
+		// it to the field would leave every increment a silent no-op while the
+		// name still appeared in the registry.
+		if cl.http2RxMessagingError == nil {
+			t.Error("http2RxMessagingError is nil; want non-nil after registerClusterMetrics (H2 cluster)")
+		}
+		if !hasMetric(reg, "cluster.c_h2s.http2.rx_messaging_error") {
+			t.Error("cluster.c_h2s.http2.rx_messaging_error not registered (H2 cluster)")
+		}
 	})
 
 	t.Run("non_h2_cluster_has_no_h2_stats", func(t *testing.T) {
@@ -1761,6 +1775,12 @@ func TestRegisterClusterMetrics_H2Stats(t *testing.T) {
 			// Phase 43.2b (ADR-0254): the reset counters are useH2-gated too.
 			"cluster.c_h1s.http2.rx_reset",
 			"cluster.c_h1s.http2.tx_reset",
+			// Phase 92 (ADR-0313): useH2-gated too. ⚠️ THIS LEG IS WHAT PROVES
+			// THE GATE GATES — and it is what makes routing the increment
+			// through incCounter load-bearing rather than decorative, since a
+			// registration hoisted out of the `if c.useH2 {` block would give
+			// every non-H2 cluster a live handle and nothing else would notice.
+			"cluster.c_h1s.http2.rx_messaging_error",
 		} {
 			if hasMetric(reg, name) {
 				t.Errorf("non-H2 cluster must NOT register %q (byte-stability)", name)
@@ -1776,6 +1796,9 @@ func TestRegisterClusterMetrics_H2Stats(t *testing.T) {
 		}
 		if cl.http2TxReset != nil {
 			t.Error("http2TxReset must be nil on a non-H2 cluster (byte-stability)")
+		}
+		if cl.http2RxMessagingError != nil {
+			t.Error("http2RxMessagingError must be nil on a non-H2 cluster (byte-stability)")
 		}
 	})
 }

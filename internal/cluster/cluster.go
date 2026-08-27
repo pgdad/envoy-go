@@ -257,6 +257,19 @@ type Cluster struct {
 	http2RxReset *stats.Counter
 	http2TxReset *stats.Counter
 
+	// http2RxMessagingError is the cluster.<name>.http2.rx_messaging_error
+	// counter — ++ per inbound message the upstream codec REJECTS as malformed
+	// (phase 92: a LEADING response header block failing the codec's
+	// validateResponseHeaders). It exists because http2.tx_reset moves on BOTH
+	// the trailer-reject and the header-reject path and therefore cannot
+	// discriminate them. The pool injects the increment via
+	// h2.WithRxMessagingErrorHook at dial. Registered useH2-gated, so it is NIL
+	// on every non-H2 cluster — the h2pool helper MUST route through incCounter
+	// (stats.Counter.Inc has no nil guard; a bare .Inc() is a process crash).
+	// Flattens to cluster_http2_rx_messaging_error, the reference's name.
+	// (phase 92, ADR-0313)
+	http2RxMessagingError *stats.Counter
+
 	// health is the per-cluster active-HC registry (ADR-0243). nil for a cluster
 	// with no health_checks. Built + threaded into the LB constructs in
 	// buildCluster; consumed in registerClusterMetrics (stat injection) +

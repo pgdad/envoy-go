@@ -22,8 +22,22 @@ import (
 // 30000`; no port the driver assigns begins with `0`.
 var residualPortPlaceholder = regexp.MustCompile(`port_value: 0(?:[^0-9]|$)`)
 
+// p92CLObs builds a VALID per-arm content-length arity observation slice for
+// the unit table: one entry per p92 arm, every entry equal to v. It is derived
+// from p92Arms() rather than written as a literal, so adding a p92 arm cannot
+// silently make these rows vacuous again — which is exactly what happened once
+// already (see the note on wantErrSubstr below).
+func p92CLObs(v int) []int {
+	obs := make([]int, len(p92Arms()))
+	for i := range obs {
+		obs[i] = v
+	}
+	return obs
+}
+
 // TestH2Driver_AssertDistribution covers the AssertDistribution branches:
-// happy [3,3,3] (both sides), subject skew, reference skew, length mismatch.
+// happy [3,3,3] (both sides), subject skew, reference skew, length mismatch,
+// and the phase-92 per-side content-length arity pins.
 //
 // Per the driver's design note: AssertDistribution consults the BODY-derived
 // counts the driver populated during Drive (because subprocess HTTPSH2
@@ -31,21 +45,44 @@ var residualPortPlaceholder = regexp.MustCompile(`port_value: 0(?:[^0-9]|$)`)
 // refCounts/subjCounts arguments are length-checked but their values are
 // ignored — the test seeds d.refBodyCnt / d.subjBodyCnt directly to exercise
 // the assertion branches.
+//
+// ⚠️ EVERY ROW ASSERTS *WHICH* PROPERTY FAILED, VIA wantErrSubstr, AND THAT IS
+// NOT DECORATION. When phase 92 added the two arity pins to AssertDistribution
+// it did NOT seed the new d.refP92CL / d.subjP92CL fields here, so the bare
+// &h2Driver{} carried zero observations against five arms. The non-vacuity
+// guard inside p92AssertCLFields then fired on EVERY row: the happy row went
+// RED, and — worse — the five wantErr:true rows kept PASSING for the WRONG
+// REASON, reporting the arity guard instead of the distribution branch each
+// one exists to exercise. A bare `err != nil` check could not tell the two
+// apart. Asserting the message is what makes each row a guard rather than a
+// test that merely passes.
 func TestH2Driver_AssertDistribution(t *testing.T) {
 	cases := []struct {
-		name       string
-		refBody    [3]uint64
-		subjBody   [3]uint64
-		refCounts  []uint64
-		subjCounts []uint64
-		wantErr    bool
+		name          string
+		refBody       [3]uint64
+		subjBody      [3]uint64
+		refCounts     []uint64
+		subjCounts    []uint64
+		refCL         []int
+		subjCL        []int
+		wantErr       bool
+		wantErrSubstr string
 	}{
-		{"both [3,3,3]", [3]uint64{3, 3, 3}, [3]uint64{3, 3, 3}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, false},
-		{"subj [4,3,2]", [3]uint64{3, 3, 3}, [3]uint64{4, 3, 2}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, true},
-		{"ref [4,3,2]", [3]uint64{4, 3, 2}, [3]uint64{3, 3, 3}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, true},
-		{"subj count length mismatch", [3]uint64{3, 3, 3}, [3]uint64{3, 3, 3}, []uint64{0, 0, 0}, []uint64{3, 3}, true},
-		{"ref count length mismatch", [3]uint64{3, 3, 3}, [3]uint64{3, 3, 3}, []uint64{3, 3, 3, 3}, []uint64{0, 0, 0}, true},
-		{"both [9,0,0] (full skew)", [3]uint64{9, 0, 0}, [3]uint64{9, 0, 0}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, true},
+		// --- the distribution branches. All carry VALID arity observations, so
+		// a failure here can only come from the distribution rule itself.
+		{"both [3,3,3]", [3]uint64{3, 3, 3}, [3]uint64{3, 3, 3}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, p92CLObs(1), p92CLObs(0), false, ""},
+		{"subj [4,3,2]", [3]uint64{3, 3, 3}, [3]uint64{4, 3, 2}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, p92CLObs(1), p92CLObs(0), true, "subj distribution"},
+		{"ref [4,3,2]", [3]uint64{4, 3, 2}, [3]uint64{3, 3, 3}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, p92CLObs(1), p92CLObs(0), true, "ref distribution"},
+		{"subj count length mismatch", [3]uint64{3, 3, 3}, [3]uint64{3, 3, 3}, []uint64{0, 0, 0}, []uint64{3, 3}, p92CLObs(1), p92CLObs(0), true, "subj backend count"},
+		{"ref count length mismatch", [3]uint64{3, 3, 3}, [3]uint64{3, 3, 3}, []uint64{3, 3, 3, 3}, []uint64{0, 0, 0}, p92CLObs(1), p92CLObs(0), true, "ref backend count"},
+		{"both [9,0,0] (full skew)", [3]uint64{9, 0, 0}, [3]uint64{9, 0, 0}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, p92CLObs(1), p92CLObs(0), true, "distribution"},
+
+		// --- the phase-92 arity pins. The distribution is [3,3,3] on both sides
+		// in every row below, so a failure can only come from an arity pin.
+		{"p92 ref arity: no observations", [3]uint64{3, 3, 3}, [3]uint64{3, 3, 3}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, nil, p92CLObs(0), true, "p92 ref content-length arity"},
+		{"p92 subj arity: no observations", [3]uint64{3, 3, 3}, [3]uint64{3, 3, 3}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, p92CLObs(1), nil, true, "p92 subj content-length arity"},
+		{"p92 ref value: 0 where 1 expected", [3]uint64{3, 3, 3}, [3]uint64{3, 3, 3}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, p92CLObs(0), p92CLObs(0), true, "p92 ref content-length fields"},
+		{"p92 subj value: 1 where 0 expected", [3]uint64{3, 3, 3}, [3]uint64{3, 3, 3}, []uint64{0, 0, 0}, []uint64{0, 0, 0}, p92CLObs(1), p92CLObs(1), true, "p92 subj content-length fields"},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -53,9 +90,14 @@ func TestH2Driver_AssertDistribution(t *testing.T) {
 			d := &h2Driver{}
 			d.refBodyCnt = tc.refBody
 			d.subjBodyCnt = tc.subjBody
+			d.refP92CL = tc.refCL
+			d.subjP92CL = tc.subjCL
 			err := d.AssertDistribution(tc.refCounts, tc.subjCounts)
 			if (err != nil) != tc.wantErr {
 				t.Errorf("AssertDistribution: err=%v, wantErr=%v", err, tc.wantErr)
+			}
+			if tc.wantErrSubstr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErrSubstr)) {
+				t.Errorf("AssertDistribution: err=%v, want it to mention %q", err, tc.wantErrSubstr)
 			}
 		})
 	}

@@ -1,6 +1,6 @@
 # Fixture 0004 — HTTP/2 routing (HCM AUTO + ALPN h2 + upstream H/2 + TLS termination + TLS origination)
 
-**Purpose:** end-to-end exercise the phase-05.2 dataplane (HCM(AUTO) + route match + router → upstream-H/2 client codec + upstream-TLS validation) and prove byte-equivalent decoded response bodies + per-side RR distribution + status-code equivalence between upstream Envoy and envoy-go on a 42-request workload, all over TLS-terminated downstream H/2 + TLS-originated upstream H/2. Since phase 89 the workload also covers **decode-side HTTP-filter header mutations reaching the upstream H/2 request** (ADR-0311). Since phase 90 it also covers **H/2 `host` vs `:authority` normalization on the downstream leg** (ADR-0312).
+**Purpose:** end-to-end exercise the phase-05.2 dataplane (HCM(AUTO) + route match + router → upstream-H/2 client codec + upstream-TLS validation) and prove byte-equivalent decoded response bodies + per-side RR distribution + status-code equivalence between upstream Envoy and envoy-go on a 47-request workload, all over TLS-terminated downstream H/2 + TLS-originated upstream H/2. Since phase 89 the workload also covers **decode-side HTTP-filter header mutations reaching the upstream H/2 request** (ADR-0311). Since phase 90 it also covers **H/2 `host` vs `:authority` normalization on the downstream leg** (ADR-0312). Since phase 92 it also covers **rejection of a malformed upstream LEADING response header block** on the encode direction (ADR-0314).
 
 **Differential surface:** concatenated decoded response bodies for the 9 `/health` direct_response requests (`"OK\n"` x 9) followed by the two phase-87 leading-`//` arms (`"edge-ok"` x 2) are byte-equivalent. The `/api/v1/<n>` router-action bodies are NOT concatenated into the diff stream (RR-pick ordering may diverge between STATIC and STRICT_DNS); routing correctness is covered by per-side `[3,3,3]` distribution + status-200. The 404 catch-all bodies are NOT compared (envoy-go: `not found\n`; Envoy: HTML/JSON local reply per its default config).
 
@@ -26,7 +26,7 @@ The 3 backends are subprocesses spawned from `test/fixtures/0004-h2-routing/back
 
 **HTTP filters (both sides, identical):** an **empty** `envoy.filters.http.header_mutation` (zero listener-scope mutations — its only job is to make the filter name live so the per-route configs attach; MEASURED: reference Envoy `contrib-v1.37.2` boots this shape, `--mode validate` ⇒ `configuration OK`, rc=0) followed by `envoy.filters.http.router`. Because the listener-level filter declares no mutations, the pre-existing 31 round-trips are byte-untouched.
 
-**Driver request schedule (42 requests per side):**
+**Driver request schedule (47 requests per side):**
 
 - 9 × `GET /health` → expect 200, body `"OK\n"` (concatenated into the byte stream)
 - 9 × `GET /api/v1/<n>` for n=0..8 → expect 200, body `"backend-<idx>:v1/<n>"` (not concatenated; distribution counted)
@@ -37,6 +37,7 @@ The 3 backends are subprocesses spawned from `test/fixtures/0004-h2-routing/back
 - 1 × `GET /api/v1/emit` → expect 200, response header `x-cont-marker: emitted` plus a 32000-byte `x-cont-pad` (phase 88; not concatenated)
 - 8 × the phase-89 decode-mutation arms `A1..A8` against `/api/v1/reflect-headers/<arm>` → expect 200; the reflected header block is asserted in-band, and only a normalized `p89-<arm>:ok` marker is appended to the byte stream
 - 3 × the phase-90 authority-normalization arms `P90-P` / `P90-A` / `P90-B` against `/api/v1/reflect-headers/p90{p,a,b}` → expect 200; each is a **hand-built HPACK field list over its own raw `http2.Framer` connection**, and each appends exactly one `p90-<arm>:auth=… host=…` line to the byte stream
+- 5 × the phase-92 illegal-RESPONSE-header arms against `/api/v1/p92-{keepalive,upgrade,proxyconn,te-gzip,te-empty}` → each backend path emits exactly **ONE** illegal connection-specific response header, and the driver reads the **downstream** header block back with a raw framer. Each appends one `p92-<arm>:status=… illegal=…` line to the byte stream. ⚠️ **ONE SHAPE PER PATH is load-bearing** — a single path emitting all of them is blind to a fix that catches one and launders another. ⚠️ The transcript records the **SET** of illegal names present, never a single name. ⚠️ `content-length` **arity** is deliberately **NOT** in the cross-side line — it is pinned **per side** instead; see the phase-92 departure section below.
 
 The first 27 requests are unchanged from phase 05.2, and the two new arms are appended after them, so the pre-existing transcript prefix stays byte-identical.
 
@@ -121,6 +122,35 @@ The backend emits `x-observed-authority: <r.Host>` **after** its sorted reflecte
 
 - **Arm C (`:authority` PRESENT-AND-EMPTY) is a deferred follow-on.** `:authority` absent and `:authority` present-and-empty **both** satisfy `rp.authority == ""` in x/net's H/2 server and both take the fallback to the `Host` header, landing byte-identical in `r.Host` **and** `r.Header`. No backend edit can recover the distinction; a raw-framer **backend** (a new `BackendKind`) would be required, and this row does not buy it.
 - **Arm E (first-occurrence-wins: two regular `host` fields, no `:authority`) was built, run, and REMOVED. It is not differentiable in principle — do not re-add it.** MEASURED against the pinned image (`envoyproxy/envoy:contrib-v1.37.2`): a **second** regular `host` field on the H/2 downstream leg is rejected at the codec layer (`Invalid HTTP header field was received: frame type: 1, stream: 1, name: [host]`, details `http2.invalid.header.field`). The client is sent **no GOAWAY and no RST_STREAM** — the connection is simply closed and the arm reads a bare EOF, so the reference line is `p90-E:ERR read-frame: …` while a correct subject serves 200. **The rejection is by ARITY, not by value** (two *identical* `host` values are refused the same way) and holds with `:authority` also present. Testing first-occurrence-wins **requires** two `host` fields, so no subject-side change can ever make the two sides' bytes agree. The axis is pinned at the **unit** layer instead — `TestAuthorityNormalization/E_dup_host_first_wins` (`internal/filter/hcm/h2/authority_norm_test.go`) is the sole first-wins discriminator in the tree; do not delete it. Matching the reference's reject here is out of charter: it is reference-side admission control, the same family as the deferred arm-C validity reject and the same class as **D-90-DUP**.
+
+## Illegal-RESPONSE-header rejection arms (phase 92, ADR-0314)
+
+The five arms drive a backend path that emits exactly one illegal connection-specific **response** header, and read the **downstream** header block back off the wire with a raw `http2.Framer`. What the transcript records is what the proxy chose to forward. The row's contract is that the malformed upstream leading block is **rejected** and the illegal header is **not laundered downstream**.
+
+**What CONVERGES cross-side (the row's contract, byte-compared on all five arms):**
+
+| observable | reference | subject |
+|---|---|---|
+| `status` | 502 | 502 |
+| `illegal` (sorted SET of illegal names in the downstream block) | `<none>` | `<none>` |
+
+**What does NOT converge, and is pinned PER SIDE instead:** the `content-length` field **arity** of the 502 local reply — **reference 1, subject 0**, on all five arms. These values are pinned in `p92AssertCLFields` (`driver/driver.go`), which reports **every** mismatching arm rather than the first.
+
+⚠️ **The arity pin is asserted in `AssertDistribution`, deliberately BELOW the cross-side byte compare — not in `DriveReference` / `DriveSubject`.** The runner `t.Fatalf`s a Drive error at step 5/6 but only `t.Errorf`s `AssertDistribution` at step 8, *after* `CompareBytes` at step 7. **MEASURED:** with the production guard reverted, a Drive-level arity pin reported **only** `p92 subj content-length fields: …` and the row's own `status` / `illegal` divergence was **never reached** — the out-of-charter pin **masked** the charter regression it was supposed to sit beside. Below the gate, one run reports both. ⚠️ Do not move this assertion back into the Drive path.
+
+### ⚠️ Phase-92 DOCUMENTED DEPARTURE — H/2 local replies carry no `content-length`
+
+**Root cause.** `h2LocalReplyHeaders()` (`internal/filter/http/router/router_h2.go`) returns `Content-Type` / `Date` / `Server` and **no** `Content-Length`. Its H/1 sibling `localReplyHeaders(bodyLen int)` (`internal/filter/http/router/router.go`) **does** emit one, and even takes a `bodyLen` the H/2 version does not have. The asymmetry dates from **phase 07.1** and is **not** a phase-92 regression: phase 92 merely reuses the existing helper.
+
+**Why phase 92 is the row that exposed it.** It is a **compensating-defect unmasking**. *Pre*-fix the subject forwarded the backend's 200 carrying `content-length: 6` (arity 1) while the reference already answered 502 with a `content-length` (arity 1) — **1 vs 1, the two defects cancelled** and the field was a cross-side invariant. The fix replaces the forwarded 200 with a **locally generated** 502, and envoy-go's H/2 local reply carries no `content-length`, so the arity becomes **0 vs 1**. The observable only became a discriminator once the row's own defect was fixed.
+
+**Why it is BANKED, not fixed here.** `h2LocalReplyHeaders()` has **seven** call sites across the 502/503/504 H/2 paths (`retry.go` 504; `router_h2.go` 503 x3 and 502 x3). Giving it a body length and emitting `Content-Length` changes every one of them and needs its own behavior-contract treatment with its own arms; it is unchartered and unpriced for this row.
+
+**Why the axis is EXCLUDED from the cross-side stream rather than left red.** Local-reply **composition** is already an established excluded cross-side axis in this fixture — the 404 catch-all bodies are not compared for exactly the same reason (envoy-go: `not found\n`; Envoy: HTML/JSON local reply per its default config). Leaving the byte stream red would have conflated a **pre-existing, out-of-charter** departure with the row's own contract, so a later real regression on `status` / `illegal` would have landed on an already-failing gate.
+
+**Why the per-side pin is mandatory.** Dropping the observable outright would have hidden the departure. Pinning it per side at its **measured** values keeps it visible in **both** directions: if envoy-go later gains a `Content-Length` on H/2 local replies (subject 0 → 1), or the reference stops emitting one (reference 1 → 0), the pin **reddens** and a human must consciously re-derive it.
+
+⚠️ **ARITY, NEVER VALUE.** The two 502 bodies differ by construction (the reference's own local-reply body against envoy-go's `bad gateway\n`), so the `content-length` **value** is not a contract on either side; pinning it would be a false gate. Arity is also the only observable a duplicate-`content-length` regression would move.
 
 **STATIC vs STRICT_DNS divergence (ADR-0027 inherited):** subject is host-side STATIC; reference is container-side STRICT_DNS with `dns_lookup_family: V4_ONLY` per ADR-0010.
 

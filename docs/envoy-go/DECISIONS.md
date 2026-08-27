@@ -18440,7 +18440,7 @@ Both structural arms are shaped around *this* channel and *this* literal; a bloc
 
 ## ADR-0314 — HTTP/2 response header validation: reject a malformed upstream leading block instead of laundering it downstream (phase 92)
 
-> **STATUS: PROPOSED — §Context drafted at the phase-92 SPEC (this entry). §Decision + §Consequences LAND IN PLACE at the phase-92 IMPL per the ADR-0044 in-place edit discipline, after the RETAINED italic footer, with no renumber and no `---` separator (the ADR-0294-0313 shared block form): NO new ADR number is consumed, `DECISIONS.md`'s tail becomes `ADR-0314` at this entry and next-free moves to `ADR-0315`.** ⚠️ This entry ARMS the strict `^> **STATUS: PROPOSED` guard **0 -> 1**. The historical `^**Status:** PROPOSED` line at **ADR-0231** (`:14866`) also reads 1, is a **DECOY**, and must be LEFT ARMED — the disarm at the IMPL must be verified **BY LINE AND ADR**, never by the count alone. ⚠️ An UNANCHORED reading of this guard (`grep -F '> **STATUS: PROPOSED'`) reads **2 at the pre-arm tip and both matches are PROSE ABOUT the guard**, not guard instances; the anchor is load-bearing and the count inflates every time an ADR documents the form.
+> **STATUS: COMPLETE — §Context drafted at the phase-92 SPEC; §Decision + §Consequences APPENDED IN PLACE at the phase-92 IMPL, after the RETAINED italic footer, with no renumber and no `---` separator (the ADR-0294-0313 shared block form).** ⚠️ `^---$` STAYS **216** — this block adds none, and `^## ADR-` stays **313** because §Decision and §Consequences are `###` headings. ⚠️ **The strict PROPOSED guard moves 1 -> 0 at this entry, and the disarm was verified BY LINE AND BY ADR, never by the count alone** — a historical `^**Status:** PROPOSED` line at **ADR-0231** (`:14866`) also reads 1, is a DECOY, and is deliberately LEFT ARMED. ⚠️ **THIS ENTRY DELIBERATELY DOES NOT SPELL THE GUARD STRING ITSELF, DEPARTING FROM THE ADR-0312/0313 PRECEDENT ON PURPOSE.** Those two entries each spelled it in prose, and each thereby became a hit for the next reader's UNANCHORED grep — which is why that unanchored form had drifted to **3** while the record still called it 2. Not spelling it here holds the unanchored form at **2** (both remaining hits being that prior prose) instead of pushing it to 4. **The ANCHORED form is the only one that may ever be gated on.**
 
 ### Context (drafted at the phase-92 SPEC)
 
@@ -18465,3 +18465,182 @@ Both structural arms are shaped around *this* channel and *this* literal; a bloc
 **§Context ¶10 — THE COST FLOOR IS SHORT FOR A SIXTH CONSECUTIVE ROW, AND THE CAUSE IS NOW NAMED RATHER THAN GESTURED AT.** Two independent prototypes measured **`+74 / -0`** and **`+77 / -0`**, both ONE file, both `gofmt` clean and `golangci-lint` rc=0 with zero output. The `+74` splits **code=44, comment=27, blank=3**, and the BRAINSTORM's banked `+44` matches the CODE-ONLY count exactly — so (INFERRED) that prototype was comment-free and `+44` is a **comment-free lower bound**, not an under-enumeration of behaviour. This is the first row in the 87-92 sequence where `reference_measured_prototype_is_a_lower_bound` fires with an identified mechanism rather than the standing "under-enumeration" verdict. ⚠️ Neither figure includes the third router arm required by ¶4-¶5, which lands in a **second file in a second package**, nor the new counter of ¶7.
 
 *§Decision and §Consequences follow at the phase-92 IMPL.*
+
+### Decision (landed at the phase-92 IMPL)
+
+**On the HTTP/2 downstream leg, a response whose UPSTREAM LEADING header block carries a
+connection-specific or otherwise malformed field is REJECTED with a locally generated 502, instead of
+being laundered onto the downstream stream.** The encode-direction mirror of `IsIllegalH2RequestHeader`
+(row 89, decode direction).
+
+**(a) A SECOND, INDEPENDENT VALIDATOR — not a mode flag on `validateResponseTrailers`.**
+`validateResponseHeaders(streamID uint32, fields []hpack.HeaderField) *Error` in
+`internal/filter/hcm/h2/client.go`, sharing the three CARRYING predicates (`hasUppercaseHeaderChar`,
+`isConnectionSpecificField`, the `te` value rule) and deliberately NOT sharing the three that INVERT for
+a leading block: END_STREAM framing (no requirement here), the pseudo-header ban (`:status` is REQUIRED
+here), and the flat `content-length` ban (exactly ONE is legal). The decisive reason a flag was
+impossible: **the duplicate-`content-length` rule is a CROSS-FIELD COUNT across the loop, not a predicate
+over one `(name, value)` pair.**
+
+**(b) FOUR legs, and `hasUppercaseHeaderChar` FIRST — load-bearing**, because every leg below it is a
+CASE-SENSITIVE comparison. The connection-specific and `te` legs are deliberately NOT collapsed into
+`IsIllegalH2RequestHeader`: doing so merges two distinct messages and reddens the existing
+`TestValidateResponseTrailers_Table/te_gzip`.
+
+**(c) `:status` IS NOT VALIDATED, deliberately.** A missing or malformed `:status` is a different
+divergence with its own unmeasured reference behavior; adding it would be an unpriced behavior change.
+
+**(d) THE CALL SITE is inside `if !cs.respHeadersSeen {`, BEFORE `cs.respHeaders = decoded` retains the
+block**, mirroring the trailer path's mechanics exactly and in order: `markReset` FIRST, the `cc.mu`-locked
+`WriteRSTStream(INTERNAL_ERROR)`, `onTxReset()` OUTSIDE the mutex, `cs.finish(verr)`, `return nil`.
+`markReset` FIRST is load-bearing — further peer frames on that id are GUARANTEED when the rejected
+block carried no END_STREAM, and without it they fall through to arms returning CONNECTION-level errors
+that tear the pooled conn down from inside the codec. `cs.respHeadersSeen` is NOT set on the reject path.
+
+**(e) A DEDICATED SENTINEL, `ErrMalformedResponseHeaders` — NOT `ErrMalformedTrailers`.** The trailer
+sentinel's router arm returns `Status: 0` (a downstream stream reset); the reference answers a malformed
+LEADING block with **502**. Reusing the trailer sentinel would silently ship the wrong status.
+
+**(f) A THIRD ROUTER ARM, placed BETWEEN `EvictH2ConnOnError` AND the ctx-cancel check.** After the
+evict because **the eviction IS parity**. Before the ctx-cancel check because that arm branches on
+`ctx.Err()` ALONE and never inspects error identity — placed after it, a downstream cancel racing a
+malformed block would launder the rejection into a `Status: 0` CANCEL and lose the 502
+NON-DETERMINISTICALLY. ⚠️ **THE CONSEQUENCE IS STATED RATHER THAN ASSUMED: a genuine client cancel
+coinciding with a detected malformed block now reports 502 rather than CANCEL.** Cost is +0 lines either
+way; the trade buys determinism on sentinel identity.
+
+**(g) `localOrigin` STAYS UNSET WHILE `LocalOriginErr` STAYS `true`. DO NOT TIDY THEM.** Different
+consumers: `RecordUpstreamResult` feeds OUTLIER DETECTION, where a locally-detected upstream fault is
+exactly the signal to eject; `ActionResponse.localOrigin` feeds RETRY CLASSIFICATION at `retry.go:129`,
+where `true` would classify a perfectly REACHABLE but malformed upstream as a CONNECT FAILURE. **Measured
+cost of getting this wrong: 3 backend-observed attempts on 3 separate TCP connections against the
+reference's 1** — reproduced at the IMPL as NC6.
+
+**(h) ONE new counter, `cluster.<name>.http2.rx_messaging_error`**, registered AT BOOT in
+`registerClusterMetrics` inside the existing `if c.useH2 {` gate, incremented through `incCounter`, and
+delivered to the codec by a NEW option `WithRxMessagingErrorHook` rather than by widening
+`WithResetHooks`. The codec stays free of any `internal/stats` import.
+
+### Consequences (landed at the phase-92 IMPL)
+
+**(i) THE SPEC'S OPEN ARM IS CLOSED AND THE BROAD RULE SURVIVED.** The reference REJECTS an **IDENTICAL**
+duplicate `content-length` (`5`, `5`) with 502, byte-identical to the differing-value arm. ⇒ the leg
+rejects **ANY second `content-length`**; it is NOT narrowed to "differing values". The unit table's
+`duplicate_content_length` arm uses identical values deliberately, to pin exactly that.
+
+**(ii) THE DIVERGENCE SET IS NINE SHAPES, NOT SEVEN.** The `te` leg had never been measured in this
+direction. Measured: `te: gzip` **502**, `te: ""` **502**, while **`te: trailers` is FORWARDED VERBATIM
+and must NOT be rejected.** ⚠️ `te: ""` is the arm an implementer gets wrong — writing
+`value != "" && value != teTrailersValue` looks like hygiene and is measurably wrong. Pinned by the
+`te_empty` arm, and NC7 confirmed that exact mis-implementation reddens **only** that arm.
+
+**(iii) AN EIGHTH-CLASS SHAPE IS SCOPED OUT IN WRITING.** A SINGLE `content-length` with a wrong value
+gives reference **200-then-RST_STREAM(INTERNAL_ERROR), no DATA**, against the subject's silent rewrite.
+⇒ **duplicate-NESS, not value-CORRECTNESS, trips the 502.** It belongs to the banked
+`content-length`-rewrite candidate (now FOUR-legged) and is NOT in row 92. The parity arm
+`single_content_length_wrong_value` pins that it is not rejected here.
+
+**(iv) THE AST-AUDIT GOLDEN MADE THIS A THREE-FILE PRODUCTION CHANGE, AND IT PROVED ITSELF A LIVE
+GUARD.** `router_h2_trailers_test.go` walks the router package AST and pins the MULTISET of
+`ActionResponse` Status literals in `doH2ClusterAction`. With the arm in and the golden unedited the
+suite went **RC=1, RUN=655, FAIL=4**, the golden being the sole failure:
+`… set = [0 0 502 502 502 503 503 503] (n=8), want [0 0 502 502 503 503 503] (n=7)`. Both states were
+measured deliberately; measuring only the green one would have left its liveness unproven.
+⚠️ Its sibling's `t.Logf` census moved **17 -> 18** and correctly did NOT redden — and it **hard-codes no
+number**, so the anticipated "17 -> 18 constant" had nothing to edit. Its silence is not invariance.
+
+**(v) THE VALIDATOR SHIPS COMPLETELY UNGATED BY THE PRE-EXISTING SUITE, AND THAT WAS MEASURED.** Adding
+it moves **ZERO** of 655 tests; deleting its whole body leaves the suite green. **The unit table is the
+only thing that can fail.** Row 92 therefore ships its own guard: **+53 named tests**, run-set diff
+**0 removed / 53 added**.
+
+**(vi) THE INHERITED COUNTER-NAMING PREMISE WAS WRONG.** `http2_tx_reset` exists in **NO `.go` file** —
+it is the Prometheus-FLATTENED projection. envoy-go registers DOTTED names, so the reference's leaf
+`http2.rx_messaging_error` is **convention-native**, not a departure, and flattens byte-for-byte to the
+reference's `cluster_http2_rx_messaging_error`.
+
+**(vii) THE INHERITED "STAT SURFACE" ABSOLUTE IS NOT THE STAT SURFACE, AND IT WAS NOT REPRODUCIBLE.**
+The figure carried through the BRAINSTORM and the SPEC has **ZERO hits in `BEHAVIOR_CONTRACT.md`** — the
+document that IS the stat-surface record, and whose ledger tail is **1207**. Its provenance was an
+**unnamed grep** used as an invariance proxy, and seven candidate commands re-run at the PLAN tip
+returned seven different values, none of them the inherited one.
+⇒ **This row asserts the `+1` DELTA STRUCTURALLY — exactly ONE new `NewCounter` call site, `manager.go`
+14 -> 15 — and cites NO absolute.**
+⚠️ **The inherited figure and its anticipated successor are deliberately NOT SPELLED in this entry**, on
+the ADR-0297 precedent: **restating a wrong number is what propagated it through three consecutive
+stages**, and an entry that spells it becomes another hit for the next reader's grep. A phase needing an
+authoritative absolute must **re-derive it MECHANICALLY** and should expect the result to disagree with
+the documentary chain, which is known to be discontinuous in two places.
+
+**(viii) AN UPPERCASE STAT NAME *PASSES* `IsValidName`** (`a-zA-Z` appears in BOTH character classes), so
+a proposed uppercase negative control would have been **vacuous**. The six NCs actually used — space,
+hyphen, trailing dot, leading digit, empty, trailing newline — all return `false`, and `IsValidName` was
+RUN on the exact full name rather than reasoned about from the regex.
+
+**(ix) THREE HAZARDS WERE DESIGNED AROUND, EACH CONFIRMED BY EXECUTION.** A nil `*stats.Counter.Inc()` is
+a **PROCESS CRASH** (no nil guard, no `recover()` above it) and the counter is `useH2`-gated ⇒ nil on
+every non-H2 cluster, so the increment routes through `incCounter`. Registering a stat inside
+`Registry.Walk` **DEADLOCKS** (RLock held across iteration, `sync.RWMutex` is not reentrant), so
+registration is at BOOT. And **a counter cannot gate a value**, so the field-level assertion lives in the
+unit table and the differential.
+
+**(x) A GUARD THAT NOBODY OWNED WAS FOUND AND CLOSED.** `manager_test.go`'s H2-stats subtests are a
+named-**SUBSET** roster, not an exact set, so all 458 cluster tests stayed green with the new counter
+registered and **pinned by nothing**. Both legs were added: must-EXIST on the H2 cluster, and — the
+load-bearing one — **must-NOT-EXIST on the H1 cluster**, which is what proves the `useH2` gate actually
+gates and makes routing through `incCounter` load-bearing rather than decorative.
+
+**(xi) THE DIFFERENTIAL COVERS FIVE OF THE NINE SHAPES ON THE WIRE, NOT THREE.** `te: gzip` and `te: ""`
+were MEASURED to leak through a `net/http` backend (a code-reading of `x/net/http2/server.go` was
+forbidden as evidence — arm 7 is the standing proof that such a reading gets it wrong). **The departure
+NARROWS from six unit-only shapes to FOUR**: `connection` (deleted by `x/net`), `transfer-encoding`, an
+uppercase wire name, and a duplicate `content-length` — unreachable for a STRUCTURAL reason in the
+library, not a budget reason. Reaching them needs a raw-framer BackendKind, deliberately not bought.
+
+**(xii) ⚠️ THE FIX UNMASKED A LATENT PRE-EXISTING DEPARTURE, VIA COMPENSATING DEFECTS THAT HAD BEEN
+CANCELLING IN THE GATE METRIC.** The differential transcript carried a `content-length` field ARITY.
+Pre-fix the subject forwarded upstream's 200 with `content-length: 6` (arity 1) and the reference
+answered 502 with `content-length: 87` (arity 1) — **1 vs 1, cancelling**. The fix replaces the forwarded
+200 with a locally generated 502, and **`h2LocalReplyHeaders()` emits no Content-Length at all** ⇒ arity
+0 vs 1. **The metric became a discriminator only once this row's defect was fixed.**
+Root cause is **phase 07.1** and spans **SEVEN call sites** (`retry.go` 504; `router_h2.go` three 503s and
+three 502s); the **H1 sibling `localReplyHeaders(bodyLen int)` DOES emit one** and even takes a `bodyLen`
+the H2 version lacks.
+**RESOLUTION, chosen deliberately over two worse options:** it was **NOT fixed** (seven unchartered,
+unpriced sites needing their own contract treatment) and the failing assertion was **NOT deleted**
+(deleting a red assertion to reach green is the failure mode this project exists to prevent). Instead the
+cross-side transcript now carries **the row's contract only** — status and the illegal-name SET, both of
+which converge on all five arms — applying **the fixture's OWN already-documented rule** that local-reply
+composition is an excluded cross-side axis (its 404 bodies are excluded for the same reason); and the
+departure is **PINNED PER SIDE at its measured values (reference 1, subject 0)**, so any future change on
+either side reddens and must be acknowledged. **Banked as a candidate with full evidence.**
+
+**(xiii) THE NC CAMPAIGN REFUTED THE PLAN'S OWN NC DESIGN IN TWO PLACES.** The leg->arm map is wrong in
+**3 of its 4 rows** (measured 6/3/3/1 against a predicted 5/2/1/1 — the ORDER arms are missing from its
+counts), so a campaign gated on those numbers would have read three CORRECT NCs as failures. And
+**the prescribed leg-order NC is VACUOUS, measured**: moving `hasUppercaseHeaderChar` to LAST is a
+behavioral NO-OP, because every sibling leg compares against an all-lowercase literal, so an uppercase
+name matches none of them at any position. ⇒ `uppercase_beats_connection` and
+`uppercase_beats_content_length` **cannot be reddened by any leg permutation**; they are LEG-PRESENCE
+guards and are now **annotated as such in the source** so their green is never misread as evidence that
+leg order is pinned. The genuine order guards are `connection_beats_te` and `te_beats_dup_cl`, reddened
+by reversing the FIELD loop — an NC the IMPL had to invent because the PLAN's could not do the job.
+
+**(xiv) THE FUZZ TARGET FALSIFIED ITS OWN AUTHOR BEFORE IT SAW A MUTATION.** The prescribed assertion
+*"the field name QUOTED, in TRAILING position"* holds for `*Error.Msg` but NOT for `Error()`, which
+appends `": " + Underlying.Error()`; **9 of 11 seeds were RED until the assertion was re-anchored.** The
+oracle is independently written and shares no predicate — proven by NC6, where dropping `upgrade` from
+the shared predicate reddened a seed that a predicate-sharing oracle would have passed.
+
+**(xv) `reference_measured_prototype_is_a_lower_bound` FIRED A THIRD TIME ON THIS ROW, WITH THE SAME
+IDENTIFIED MECHANISM EACH TIME: UNDER-ENUMERATION OF *FILES*, NOT OF LINES.** Production landed
+**+218/-8 across EIGHT files** against a predicted `+174/-1` across three; the differential landed
+**+384/-4** against a predicted `+193/-0`. The unpriced files were the cluster hook wiring (explicitly
+excluded from the estimate), `stream.go`'s falsified doc comment, and the two `te` arms the measurement
+bought.
+
+**(xvi) A ROUTING CLAIM IN THE PLAN WAS FALSE IN A FAIL-UNSAFE DIRECTION.** The prescribed top-level
+`/p92-*` backend paths do **not** match `prefix: "/api"`; they fall to `prefix: "/"` and are answered by
+a **404 direct_response**, never reaching the backend. Had they shipped as written, the anchor would have
+gone red for a reason unrelated to this row — or, both sides returning an identical 404, read as GREEN.
+The paths live under `/api`, and the "ZERO YAML lines" claim survives as a result.

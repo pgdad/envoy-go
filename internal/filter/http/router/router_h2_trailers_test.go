@@ -62,7 +62,20 @@ const (
 // exchange, then serves an unbounded sequence of streams on that ONE
 // connection (the pooled-conn reuse path — the conn-not-evicted assertion
 // depends on a second request landing on this same goroutine).
-func runH2TrailerBackend(conn net.Conn, behavior h2TrailerBehavior, body []byte, trailers []hpack.HeaderField) {
+//
+// leading is the LEADING response header block. Phase 92 Task 9 added it: the
+// response-header-validation arms have to drive blocks that no map can
+// express — DUPLICATE field names (two content-length fields), an UPPERCASE
+// field name, and connection-specific fields such as keep-alive / upgrade /
+// proxy-connection — so the carrier is an ORDERED SLICE and every field is
+// written to the encoder exactly as supplied, in the given wire order, with no
+// filtering, no normalization and no de-duplication.
+//
+// A nil leading selects h2DefaultLeadingBlock(body), which is the block this
+// backend hard-coded before the seam existed, so every pre-seam caller keeps
+// its exact wire output. A NON-nil but EMPTY slice is honored as an
+// intentionally empty leading block, not as "use the default".
+func runH2TrailerBackend(conn net.Conn, behavior h2TrailerBehavior, body []byte, trailers []hpack.HeaderField, leading []hpack.HeaderField) {
 	defer func() { _ = conn.Close() }()
 	prefaceBuf := make([]byte, 24)
 	if _, err := io.ReadFull(conn, prefaceBuf); err != nil {
@@ -92,6 +105,13 @@ func runH2TrailerBackend(conn net.Conn, behavior h2TrailerBehavior, body []byte,
 	// streams); allocate once outside the per-stream loop.
 	var hbuf bytes.Buffer
 	henc := hpack.NewEncoder(&hbuf)
+	// The leading block is loop-invariant — resolve the caller's override (or
+	// the default) once, before the per-stream loop, so every stream on this
+	// connection emits the same field sequence.
+	lead := leading
+	if lead == nil {
+		lead = h2DefaultLeadingBlock(body)
+	}
 	for {
 		streamID, ok := nextH2HeadersStreamID(fr)
 		if !ok {
@@ -104,9 +124,9 @@ func runH2TrailerBackend(conn net.Conn, behavior h2TrailerBehavior, body []byte,
 			continue
 		}
 		hbuf.Reset()
-		_ = henc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
-		_ = henc.WriteField(hpack.HeaderField{Name: "content-type", Value: "text/plain"})
-		_ = henc.WriteField(hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(len(body))})
+		for _, hf := range lead {
+			_ = henc.WriteField(hf)
+		}
 		if err := fr.WriteHeaders(http2.HeadersFrameParam{
 			StreamID:      streamID,
 			BlockFragment: hbuf.Bytes(),
@@ -137,6 +157,19 @@ func runH2TrailerBackend(conn net.Conn, behavior h2TrailerBehavior, body []byte,
 	}
 }
 
+// h2DefaultLeadingBlock is the leading response header block
+// runH2TrailerBackend emits when the caller supplies none. It reproduces,
+// field for field and in order, the block the backend hard-coded before phase
+// 92 Task 9 introduced the caller-supplied seam — keeping it in ONE place is
+// what makes "supply nothing" byte-identical to the pre-seam behavior.
+func h2DefaultLeadingBlock(body []byte) []hpack.HeaderField {
+	return []hpack.HeaderField{
+		{Name: ":status", Value: "200"},
+		{Name: "content-type", Value: "text/plain"},
+		{Name: "content-length", Value: strconv.Itoa(len(body))},
+	}
+}
+
 // nextH2HeadersStreamID reads frames until a HEADERS frame arrives, returning
 // its stream id. Non-HEADERS frames (WINDOW_UPDATE / PING / SETTINGS / the
 // client's own RST_STREAM after a rejected trailer block) are skipped.
@@ -153,8 +186,9 @@ func nextH2HeadersStreamID(fr *http2.Framer) (uint32, bool) {
 }
 
 // startH2TrailerBackend listens on a fresh TLS port with NextProtos=["h2"] and
-// runs runH2TrailerBackend for each accepted conn.
-func startH2TrailerBackend(t *testing.T, pki *h2BackendPKI, behavior h2TrailerBehavior, body []byte, trailers []hpack.HeaderField) net.Listener {
+// runs runH2TrailerBackend for each accepted conn. leading is threaded through
+// unchanged — nil selects the default leading block (see runH2TrailerBackend).
+func startH2TrailerBackend(t *testing.T, pki *h2BackendPKI, behavior h2TrailerBehavior, body []byte, trailers []hpack.HeaderField, leading []hpack.HeaderField) net.Listener {
 	t.Helper()
 	pair, err := stdtls.X509KeyPair(pki.leafCertPEM, pki.leafKeyPEM)
 	if err != nil {
@@ -176,7 +210,7 @@ func startH2TrailerBackend(t *testing.T, pki *h2BackendPKI, behavior h2TrailerBe
 			if err != nil {
 				return
 			}
-			go runH2TrailerBackend(c, behavior, body, trailers)
+			go runH2TrailerBackend(c, behavior, body, trailers, leading)
 		}
 	}()
 	return ln
@@ -198,7 +232,7 @@ func TestRouterActionH2_PopulatesTrailersAtSuccessSite(t *testing.T) {
 		{Name: "grpc-status", Value: "0"},
 		{Name: "grpc-message", Value: "ok"},
 	}
-	ln := startH2TrailerBackend(t, pki, h2TrailerEmit, body, want)
+	ln := startH2TrailerBackend(t, pki, h2TrailerEmit, body, want, nil)
 	defer func() { _ = ln.Close() }()
 
 	c := h2EndpointCluster(t, ln.Addr().String(), pki)
@@ -234,7 +268,7 @@ func TestRouterActionH2_PopulatesTrailersAtSuccessSite(t *testing.T) {
 func TestRouterActionH2_NoTrailersStaysEmpty(t *testing.T) {
 	pki := mkH2BackendPKI(t)
 	body := []byte("upstream-ok\n")
-	ln := startH2TrailerBackend(t, pki, h2TrailerNone, body, nil)
+	ln := startH2TrailerBackend(t, pki, h2TrailerNone, body, nil, nil)
 	defer func() { _ = ln.Close() }()
 
 	c := h2EndpointCluster(t, ln.Addr().String(), pki)
@@ -497,7 +531,8 @@ func TestActionResponseLiterals_OnlySuccessSitePopulatesTrailers(t *testing.T) {
 // values, not by a bare count (a count guard is blind to one site being
 // swapped for another). Every one of them must leave Trailers unset.
 //
-// The expected multiset after phase 84.1 Task 5:
+// The expected multiset after phase 92 (was 7 sites after phase 84.1 Task 5;
+// phase 92 adds the malformed-response-HEADERS 502, making it 8):
 //
 //	503 circuit-breaker admission reject
 //	503 grant-race retries exhausted
@@ -505,6 +540,8 @@ func TestActionResponseLiterals_OnlySuccessSitePopulatesTrailers(t *testing.T) {
 //	502 dial / acquire failure
 //	  0 RoundTrip ctx-cancel        (CANCEL sentinel)
 //	  0 RoundTrip malformed trailers (INTERNAL_ERROR sentinel, Task 5 part B)
+//	502 RoundTrip malformed response headers (phase 92, ADR-0313 — 502, NOT the
+//	    trailer sentinel's Status: 0; the reference answers 502)
 //	502 RoundTrip transport error
 func TestActionResponseLiterals_DoH2ClusterActionNonSuccessSites(t *testing.T) {
 	var got []int
@@ -523,7 +560,7 @@ func TestActionResponseLiterals_DoH2ClusterActionNonSuccessSites(t *testing.T) {
 		t.Errorf("doH2ClusterAction has non-success ActionResponse literals with a non-literal Status: %+v", nonLiteral)
 	}
 	sort.Ints(got)
-	want := []int{0, 0, 502, 502, 503, 503, 503}
+	want := []int{0, 0, 502, 502, 502, 503, 503, 503}
 	if len(got) != len(want) {
 		t.Fatalf("doH2ClusterAction non-Trailers ActionResponse Status set = %v (n=%d), want %v (n=%d)", got, len(got), want, len(want))
 	}
@@ -564,7 +601,7 @@ func TestRouterActionH2_TrailersSurviveRetryExecutorByValue(t *testing.T) {
 	pki := mkH2BackendPKI(t)
 	body := []byte("upstream-ok\n")
 	want := []hpack.HeaderField{{Name: "grpc-status", Value: "0"}}
-	ln := startH2TrailerBackend(t, pki, h2TrailerEmit, body, want)
+	ln := startH2TrailerBackend(t, pki, h2TrailerEmit, body, want, nil)
 	defer func() { _ = ln.Close() }()
 
 	c := h2EndpointCluster(t, ln.Addr().String(), pki)
@@ -614,7 +651,7 @@ func malformedTrailerBlock() []hpack.HeaderField {
 func TestRouterActionH2_MalformedTrailersRSTsStreamAndKeepsConn(t *testing.T) {
 	pki := mkH2BackendPKI(t)
 	body := []byte("upstream-ok\n")
-	ln := startH2TrailerBackend(t, pki, h2TrailerEmit, body, malformedTrailerBlock())
+	ln := startH2TrailerBackend(t, pki, h2TrailerEmit, body, malformedTrailerBlock(), nil)
 	defer func() { _ = ln.Close() }()
 
 	c, reg := h2EndpointClusterWithRegistry(t, ln.Addr().String(), pki)
@@ -785,7 +822,7 @@ func TestRouterActionH2_MalformedTrailersSurvivesRetryExecutor(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pki := mkH2BackendPKI(t)
-			ln := startH2TrailerBackend(t, pki, h2TrailerEmit, []byte("x"), malformedTrailerBlock())
+			ln := startH2TrailerBackend(t, pki, h2TrailerEmit, []byte("x"), malformedTrailerBlock(), nil)
 			defer func() { _ = ln.Close() }()
 
 			c, reg := h2EndpointClusterWithRegistry(t, ln.Addr().String(), pki)
@@ -877,7 +914,7 @@ func TestRouterActionH2_GenuinePerTryTimeoutStillBooks504(t *testing.T) {
 // malformed-trailers test while silently breaking every peer-reset request.
 func TestRouterActionH2_PeerResetInternalErrorStillEvictsAnd502s(t *testing.T) {
 	pki := mkH2BackendPKI(t)
-	ln := startH2TrailerBackend(t, pki, h2TrailerPeerReset, nil, nil)
+	ln := startH2TrailerBackend(t, pki, h2TrailerPeerReset, nil, nil, nil)
 	defer func() { _ = ln.Close() }()
 
 	c, reg := h2EndpointClusterWithRegistry(t, ln.Addr().String(), pki)

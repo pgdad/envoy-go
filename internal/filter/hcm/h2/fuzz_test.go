@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -163,4 +164,154 @@ func (stubAction) WriteH2(_ context.Context, _ H2Request, sw StreamWriter) error
 		{Name: ":status", Value: "404"},
 	}
 	return sw.WriteHeaders(headers, true)
+}
+
+// fuzzRespHeaderStreamID is the non-zero stream id threaded through
+// FuzzValidateResponseHeaderBlock. Zero would be connection-scoped.
+const fuzzRespHeaderStreamID = uint32(11)
+
+// oracleResponseHeaderBlockReject is an INDEPENDENTLY-WRITTEN re-statement of
+// the leading-block rule set, used as the accept/reject oracle for
+// FuzzValidateResponseHeaderBlock. It returns whether the block must be
+// rejected plus the name and value of the field that causes it.
+//
+// ⚠️ IT DELIBERATELY CALLS NONE OF THE PREDICATES THE VALIDATOR CALLS. An
+// oracle sharing isConnectionSpecificField, hasUppercaseHeaderChar or
+// teTrailersValue would prove only that a function equals itself: dropping
+// `upgrade` from the shared set would drop it from BOTH sides and the fuzzer
+// would stay green. The closed name set, the uppercase test and the "trailers"
+// literal are therefore all written out longhand here.
+func oracleResponseHeaderBlockReject(fields []hpack.HeaderField) (reject bool, name, value string) {
+	contentLengthCount := 0
+	for _, hf := range fields {
+		// RFC 9113 §8.2.1 — written out over BYTES rather than by calling
+		// hasUppercaseHeaderChar. (Byte-wise and rune-wise agree: an ASCII
+		// byte in 'A'..'Z' is never part of a multi-byte UTF-8 sequence.)
+		for i := 0; i < len(hf.Name); i++ {
+			if hf.Name[i] >= 'A' && hf.Name[i] <= 'Z' {
+				return true, hf.Name, hf.Value
+			}
+		}
+		// RFC 9113 §8.2.2 — the closed set, spelled out longhand.
+		switch hf.Name {
+		case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
+			return true, hf.Name, hf.Value
+		case "te":
+			// The ONLY legal value is "trailers" — written as a literal, not
+			// as teTrailersValue. A present-but-EMPTY te is a rejection.
+			if hf.Value != "trailers" {
+				return true, hf.Name, hf.Value
+			}
+		case "content-length":
+			contentLengthCount++
+			if contentLengthCount > 1 {
+				return true, hf.Name, hf.Value
+			}
+		}
+	}
+	return false, "", ""
+}
+
+// trailingQuotedToken returns the strconv.Quote-d token a rejection Msg ends
+// with. Call it on *Error.Msg, NOT on Error(): Error() appends
+// ": " + Underlying.Error() after the Msg, so the quoted token is trailing in
+// the Msg only. The opening quote is found by FORWARD scan because no leg's
+// fixed prefix contains a double quote, so the first one in the Msg opens the
+// token; a backward scan would mis-anchor on an ESCAPED quote inside a field
+// name or value the fuzzer produced.
+func trailingQuotedToken(msg string) (string, bool) {
+	if !strings.HasSuffix(msg, `"`) {
+		return "", false
+	}
+	for i := 0; i < len(msg); i++ {
+		if msg[i] != '"' {
+			continue
+		}
+		if s, err := strconv.Unquote(msg[i:]); err == nil {
+			return s, true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+// FuzzValidateResponseHeaderBlock mutates HPACK-encoded LEADING response header
+// blocks, decodes them, and drives validateResponseHeaders.
+//
+// ⚠️ REACHABILITY IS NOT COVERAGE, which is why this target is not redundant
+// with the two above. FuzzFrameStream transitively reaches
+// isConnectionSpecificField via buildRequest, but its only assertion is "no
+// panic + every error begins with h2:" — it can NEVER observe a wrong
+// classification. FuzzHPACKDecode reaches no predicate at all. Before this
+// target the encode/response direction had no fuzz reach whatsoever.
+//
+// Per ADR-0018: 30-second short-budget in CI. Three assertions:
+//  1. no panic (assured by reaching the end of the body);
+//  2. every rejection message carries the "h2:" prefix AND names the offending
+//     field QUOTED, in TRAILING position — the falsifiability discipline
+//     client.go documents for the rule set;
+//  3. the accept/reject verdict agrees with oracleResponseHeaderBlockReject, an
+//     independently-written statement of the closed rule set that shares NO
+//     predicate with the validator.
+//
+// Seeds: a bare legal 200, a legal 200 with a content-type, each of the eight
+// single-field reject shapes, and a duplicate-content-length pair.
+func FuzzValidateResponseHeaderBlock(f *testing.F) {
+	addSeed := func(fields []hpack.HeaderField) {
+		block := newHPACKState(4096).encodeHeaders(fields)
+		// encodeHeaders returns an alias of an internal buffer; copy before storing.
+		cp := make([]byte, len(block))
+		copy(cp, block)
+		f.Add(cp)
+	}
+	status := hpack.HeaderField{Name: ":status", Value: "200"}
+	addSeed([]hpack.HeaderField{status})
+	addSeed([]hpack.HeaderField{status, {Name: "content-type", Value: "text/plain"}})
+	addSeed([]hpack.HeaderField{status, {Name: "connection", Value: "keep-alive"}})
+	addSeed([]hpack.HeaderField{status, {Name: "transfer-encoding", Value: "chunked"}})
+	addSeed([]hpack.HeaderField{status, {Name: "keep-alive", Value: "timeout=5"}})
+	addSeed([]hpack.HeaderField{status, {Name: "upgrade", Value: "websocket"}})
+	addSeed([]hpack.HeaderField{status, {Name: "proxy-connection", Value: "keep-alive"}})
+	addSeed([]hpack.HeaderField{status, {Name: "X-Upper-Case", Value: "yes"}})
+	addSeed([]hpack.HeaderField{status, {Name: "te", Value: "gzip"}})
+	addSeed([]hpack.HeaderField{status, {Name: "te", Value: ""}})
+	addSeed([]hpack.HeaderField{status, {Name: "content-length", Value: "5"}, {Name: "content-length", Value: "5"}})
+
+	f.Fuzz(func(t *testing.T, block []byte) {
+		fields, derr := newHPACKState(4096).decodeBlock(block, true)
+		if derr != nil {
+			// Adversarial input the HPACK layer rejects is out of scope here;
+			// FuzzHPACKDecode owns that surface.
+			return
+		}
+		got := validateResponseHeaders(fuzzRespHeaderStreamID, fields)
+		wantReject, offName, offValue := oracleResponseHeaderBlockReject(fields)
+
+		// (3) verdict parity with the independent oracle.
+		if (got != nil) != wantReject {
+			t.Errorf("validateResponseHeaders rejected=%v, oracle rejected=%v, fields=%+v (err=%v)",
+				got != nil, wantReject, fields, got)
+			return
+		}
+		if got == nil {
+			// (1) no panic: assured by reaching here.
+			return
+		}
+		// (2) the message shape. The "h2:" prefix is a property of the rendered
+		// Error(); the QUOTED-and-TRAILING field name is a property of the
+		// validator's own Msg — Error() appends ": " + the sentinel's text after
+		// it, so the quoted token is trailing in Msg, not in Error().
+		if !strings.HasPrefix(got.Error(), "h2:") {
+			t.Errorf("error %q does not begin with 'h2:'", got.Error())
+		}
+		tok, ok := trailingQuotedToken(got.Msg)
+		if !ok {
+			t.Errorf("message %q does not end with a strconv.Quote-d token naming the offending field", got.Msg)
+			return
+		}
+		if tok != offName && tok != offValue {
+			t.Errorf("message %q names %q, want the offending field's name (%q) or value (%q)",
+				got.Msg, tok, offName, offValue)
+		}
+	})
 }

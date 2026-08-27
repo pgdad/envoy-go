@@ -97,6 +97,15 @@ type ClientConn struct {
 	// stats-agnostic (no internal/stats import). (phase 43.2b, ADR-0254)
 	onRxReset func()
 	onTxReset func()
+	// onRxMessagingError is a nil-guarded behavioral hook fired when this conn
+	// REJECTS an inbound message as malformed at the CODEC layer (phase 92: a
+	// LEADING response header block failing validateResponseHeaders). The cluster
+	// pool wires it to its http2.rx_messaging_error counter at dial
+	// (WithRxMessagingErrorHook); nil for non-pooled conns. It is separate from
+	// the reset hooks because http2.tx_reset moves on BOTH the trailer-reject and
+	// the header-reject path and therefore cannot discriminate them. The codec
+	// stays stats-agnostic (no internal/stats import). (phase 92, ADR-0313)
+	onRxMessagingError func()
 	// resetStreams tracks stream ids this conn has locally reset (RST_STREAM
 	// (CANCEL) sent from RoundTrip's ctx-cancel branch). Response HEADERS/DATA
 	// frames already in flight from the server for such a stream race our
@@ -157,6 +166,19 @@ type ClientConnOption func(*ClientConn)
 // nil-guarded at its existing RST sites. (phase 43.2b, ADR-0254)
 func WithResetHooks(onRx, onTx func()) ClientConnOption {
 	return func(cc *ClientConn) { cc.onRxReset = onRx; cc.onTxReset = onTx }
+}
+
+// WithRxMessagingErrorHook installs the codec-detected malformed-message
+// behavioral hook. May be nil. The pool passes a cluster-counter increment
+// (http2.rx_messaging_error); the codec fires it nil-guarded at its response
+// header-block rejection site.
+//
+// ⚠️ DELIBERATELY A SECOND OPTION, NOT A WIDENED WithResetHooks. That option
+// has three live call sites (internal/cluster/dial_h2.go plus two codec tests)
+// and none of them has anything to say about messaging errors; widening its
+// arity would churn all three for no behavioral gain. (phase 92, ADR-0313)
+func WithRxMessagingErrorHook(onRxMessagingError func()) ClientConnOption {
+	return func(cc *ClientConn) { cc.onRxMessagingError = onRxMessagingError }
 }
 
 // clientStream is the per-stream state for a single in-flight RoundTrip.
@@ -631,6 +653,45 @@ func (cc *ClientConn) onResponseHeaderBlock(streamID uint32, block []byte, endSt
 		return err
 	}
 	if !cs.respHeadersSeen {
+		// Phase 92 (ADR-0313): VALIDATE THE LEADING BLOCK BEFORE RETAINING IT.
+		// Pre-92 this branch stored `decoded` verbatim and nothing anywhere on the
+		// encode path applied an RFC 9113 §8.2.2 filter, so a malformed upstream
+		// leading block was forwarded downstream. The reference answers one with
+		// 502 (measured, contrib-v1.37.2, posture-INVARIANT), which is why the
+		// rejection carries ErrMalformedResponseHeaders and NOT ErrMalformedTrailers
+		// — router_h2.go selects the arm on the SENTINEL, and the trailer
+		// sentinel's arm returns Status: 0 (a downstream stream reset), not 502.
+		//
+		// The reject mechanics mirror the trailing-block site below EXACTLY.
+		// markReset FIRST (before the RST write and before cs.finish releases
+		// RoundTrip, whose deferred cc.streams.Delete removes the map entry) so any
+		// further peer frames on this id — GUARANTEED when the rejected block did
+		// not carry END_STREAM, since the peer never terminated the stream — are
+		// discarded per RFC 9113 §5.1 instead of falling through to the "stream
+		// gone" arms, which return CONNECTION-level errors and would tear the
+		// pooled conn down from inside the codec. Both hooks fire OUTSIDE cc.mu so
+		// the codec mutex is never held across a cluster callback: onTxReset books
+		// the sent RST_STREAM (http2.tx_reset), onRxMessagingError books the
+		// codec-detected malformed message (http2.rx_messaging_error) — the latter
+		// is what discriminates a LEADING-block rejection from a trailer one,
+		// which tx_reset alone cannot.
+		//
+		// ⚠️ cs.respHeadersSeen is NOT set on this path. The stream is finished;
+		// nothing further may read it.
+		if verr := validateResponseHeaders(streamID, decoded); verr != nil {
+			cc.markReset(streamID)
+			cc.mu.Lock()
+			_ = cc.fr.WriteRSTStream(streamID, http2.ErrCodeInternal)
+			cc.mu.Unlock()
+			if cc.onTxReset != nil {
+				cc.onTxReset()
+			}
+			if cc.onRxMessagingError != nil {
+				cc.onRxMessagingError()
+			}
+			cs.finish(verr)
+			return nil
+		}
 		cs.respHeadersSeen = true
 		cs.respHeaders = decoded
 		for _, hf := range decoded {
@@ -670,9 +731,23 @@ func (cc *ClientConn) onResponseHeaderBlock(streamID uint32, block []byte, endSt
 		// respHeadersSeen, so the REAL final HEADERS lands in this branch and
 		// is rejected as a pseudo-header violation (it carries :status). That
 		// is a change from the pre-validation tip, which silently mis-captured
-		// the final block as trailers; the reference FORWARDS 1xx. Failing
-		// loudly is preferred to mis-capturing, but this is a known divergence
-		// — do not read it as accidental.
+		// the final block as trailers. Failing loudly is preferred to
+		// mis-capturing, but this is a known divergence — do not read it as
+		// accidental.
+		//
+		// ⚠️ THE REFERENCE DOES **NOT** FORWARD 1xx, AND THIS COMMENT SAID IT DID
+		// UNTIL PHASE 92 MEASURED IT. contrib-v1.37.2 SWALLOWS an interim
+		// response: it consumes the 1xx block and delivers only the FINAL
+		// response downstream. The corrected target is therefore
+		// DROP-AND-DELIVER, not forward.
+		//
+		// The distinction is load-bearing for whoever charters the banked 1xx
+		// row, because the two targets need different code. Forwarding needs a
+		// downstream write path for the interim block. Drop-and-deliver needs
+		// only that a 1xx leading block leave respHeadersSeen UNSET, so the
+		// real final HEADERS still lands in the leading-block branch. The
+		// second is strictly cheaper, and a row that designed against the old
+		// wording would have bought the wrong one.
 		if verr := validateResponseTrailers(streamID, decoded, endStream); verr != nil {
 			// Reset the UPSTREAM stream too, copying RoundTrip's ctx-cancel
 			// pattern exactly. markReset FIRST (before the RST write and
@@ -726,6 +801,31 @@ func malformedTrailersError(streamID uint32, msg string) *Error {
 		Stream:     streamID,
 		Msg:        msg,
 		Underlying: ErrMalformedTrailers,
+	}
+}
+
+// ErrMalformedResponseHeaders is the sentinel every LEADING response header
+// block rejection carries in the Underlying field of its stream-scoped *Error.
+//
+// ⚠️ IT IS DELIBERATELY NOT ErrMalformedTrailers, AND THE DIFFERENCE IS A
+// MEASURED BEHAVIOR, NOT A NAMING PREFERENCE. router_h2.go's sentinel arm for
+// ErrMalformedTrailers returns Status: 0 — a downstream STREAM RESET. The
+// reference answers a malformed LEADING block with 502 (measured on
+// contrib-v1.37.2, posture-INVARIANT), so this sentinel selects a THIRD arm.
+// Reusing ErrMalformedTrailers would silently ship the wrong status.
+var ErrMalformedResponseHeaders = errors.New("malformed response headers")
+
+// malformedResponseHeadersError builds the stream-scoped rejection, mirroring
+// malformedTrailersError exactly: INTERNAL_ERROR, a NON-ZERO stream id (a
+// connection-scoped error carries 0 and would tear the pooled conn down from
+// inside the codec, which is NOT how the reference books this), and the
+// ErrMalformedResponseHeaders sentinel in Underlying.
+func malformedResponseHeadersError(streamID uint32, msg string) *Error {
+	return &Error{
+		Code:       ErrInternalError,
+		Stream:     streamID,
+		Msg:        msg,
+		Underlying: ErrMalformedResponseHeaders,
 	}
 }
 
@@ -808,6 +908,62 @@ func validateResponseTrailers(streamID uint32, fields []hpack.HeaderField, endSt
 		case name == "content-length":
 			return malformedTrailersError(streamID,
 				"content-length not permitted in a trailer section: "+strconv.Quote(name))
+		}
+	}
+	return nil
+}
+
+// validateResponseHeaders enforces RFC 9113 §8.2.2 / §8.2.1 on an inbound
+// LEADING response header block, returning nil when the block is legal and a
+// STREAM-SCOPED *Error (INTERNAL_ERROR, carrying streamID) when it is not.
+//
+// This is the ENCODE-direction mirror of IsIllegalH2RequestHeader (row 89,
+// DECODE direction) and the leading-block sibling of validateResponseTrailers
+// above. It shares that function's three CARRYING predicates —
+// hasUppercaseHeaderChar, isConnectionSpecificField, and the `te` value rule —
+// and deliberately does NOT share its other three legs, which INVERT for a
+// leading block:
+//
+//   - END_STREAM: a leading block carries no framing requirement. A bodyless
+//     200 sets END_STREAM; a 200 with a body does not. Both are legal.
+//   - pseudo-headers: `:status` is REQUIRED here, not barred.
+//   - `content-length`: exactly ONE is legal. Only a DUPLICATE is not, and
+//     that is a CROSS-FIELD COUNT across the loop — not a predicate over one
+//     (name, value) pair. It is why this cannot be a flag on the trailer
+//     validator.
+//
+// LEG ORDER IS LOAD-BEARING, for the reason the trailer validator documents:
+// hasUppercaseHeaderChar runs FIRST because every leg below it is a
+// CASE-SENSITIVE string comparison. Without it "Connection" and
+// "Content-Length" fall through every other leg untouched.
+//
+// The message names the offending field QUOTED and in TRAILING position. The
+// quoting is load-bearing for falsifiability: an unquoted name is
+// unfalsifiable when it also appears inside the message's own fixed prefix.
+//
+// ⚠️ `host` and `trailer` are barred by RFC 9110 §6.5.1 but FORWARDED VERBATIM
+// by the reference — they PASS here, exactly as they do in the trailer
+// validator. Do not "complete" this list against RFC 9110.
+func validateResponseHeaders(streamID uint32, fields []hpack.HeaderField) *Error {
+	contentLengthSeen := false
+	for _, hf := range fields {
+		name := hf.Name
+		switch {
+		case hasUppercaseHeaderChar(name):
+			return malformedResponseHeadersError(streamID,
+				"uppercase character in header field name not permitted in a response header block: "+strconv.Quote(name))
+		case isConnectionSpecificField(name):
+			return malformedResponseHeadersError(streamID,
+				"connection-specific header field not permitted in a response header block: "+strconv.Quote(name))
+		case name == "te" && hf.Value != teTrailersValue:
+			return malformedResponseHeadersError(streamID,
+				"te header field value not 'trailers': te="+strconv.Quote(hf.Value))
+		case name == "content-length":
+			if contentLengthSeen {
+				return malformedResponseHeadersError(streamID,
+					"duplicate content-length header field in a response header block: "+strconv.Quote(hf.Value))
+			}
+			contentLengthSeen = true
 		}
 	}
 	return nil

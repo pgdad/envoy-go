@@ -195,6 +195,41 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 		// with our stream still in-flight: makeRelease re-checks Closed()+inFlight
 		// and the gauge dec is permit-conserving / once-only).
 		a.cluster.EvictH2ConnOnError(cc, ep)
+		// Phase 92 (ADR-0313): a LOCALLY-DETECTED malformed LEADING response
+		// header block. The reference answers one with 502 (measured on
+		// contrib-v1.37.2, posture-INVARIANT), NOT with the trailer sentinel's
+		// downstream stream reset — which is exactly why the codec carries a
+		// SEPARATE sentinel. errors.Is against h2.ErrMalformedResponseHeaders is
+		// the discriminator; err.Code == h2.ErrInternalError would swallow every
+		// peer RST_STREAM(INTERNAL_ERROR) into this arm.
+		//
+		// ⚠️ PLACEMENT IS LOAD-BEARING ON BOTH SIDES.
+		// AFTER the EvictH2ConnOnError above: the eviction IS the parity
+		// behavior — at default posture the reference also destroys the upstream
+		// conn (upstream_cx_destroy_local 0->1) and resets in-flight siblings.
+		// BEFORE the ctx-cancel check below: that check branches on ctx.Err()
+		// ALONE and never inspects the error identity, so an arm placed after it
+		// would let a downstream cancel racing a malformed block launder the
+		// rejection into a Status: 0 CANCEL and lose the 502 NON-DETERMINISTICALLY.
+		// The stated consequence: a genuine client cancel coinciding with a
+		// detected malformed block now reports 502 rather than CANCEL. That is
+		// the correct trade — the validator demonstrably fired — but it is a
+		// behavior choice, recorded as one.
+		//
+		// ⚠️ localOrigin IS DELIBERATELY LEFT UNSET WHILE LocalOriginErr IS true.
+		// DO NOT TIDY THEM — they feed DIFFERENT CONSUMERS. RecordUpstreamResult
+		// feeds OUTLIER DETECTION, where a locally-detected upstream fault is
+		// exactly the signal to eject the host. ActionResponse.localOrigin feeds
+		// RETRY CLASSIFICATION (retry.go: `rp.on&(retryConnectFail|retryReset)
+		// != 0 && localOrigin`), where true would classify a perfectly REACHABLE
+		// but malformed upstream as a CONNECT FAILURE — measured cost 3
+		// backend-observed attempts on 3 separate TCP conns against the
+		// reference's 1.
+		if errors.Is(err, h2.ErrMalformedResponseHeaders) {
+			a.cluster.IncStatusClass(502)
+			a.cluster.RecordUpstreamResult(picked, cluster.UpstreamResult{StatusCode: 502, LocalOriginErr: true})
+			return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders()}, picked, nil
+		}
 		// Distinguish caller-side ctx-cancel/deadline (→ stream-scoped CANCEL
 		// surfaced upward as *h2.Error so serverStream.dispatch emits
 		// RST_STREAM(CANCEL)) from any other error (→ 502 local reply). The

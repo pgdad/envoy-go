@@ -78,7 +78,8 @@ func (c *Cluster) dialPooledH2To(ctx context.Context, ep Endpoint, release func(
 		return nil, fmt.Errorf("cluster: dial h2: %w", err)
 	}
 	cc, _, ferr := c.h2ConnFromDialed(ctx, raw, ep,
-		h2.WithResetHooks(c.h2RxResetInc, c.h2TxResetInc))
+		h2.WithResetHooks(c.h2RxResetInc, c.h2TxResetInc),
+		h2.WithRxMessagingErrorHook(c.h2RxMessagingErrorInc))
 	if ferr != nil {
 		// h2ConnFromDialed Closed the connWithGauge wrapper on its failure paths
 		// (connDec → release + releaseConn), so both are already freed.
