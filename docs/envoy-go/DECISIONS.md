@@ -18647,7 +18647,7 @@ The paths live under `/api`, and the "ZERO YAML lines" claim survives as a resul
 
 ## ADR-0315 — HTTP/2 local-reply `Content-Length`: always emit, AT THE COMPOSER, WITH THE BODY LENGTH (phase 93)
 
-> **STATUS: PROPOSED — §Context drafted at the phase-93 SPEC (this entry). §Decision + §Consequences LAND IN PLACE at the phase-93 IMPL per the ADR-0044 in-place edit discipline, after the RETAINED italic footer, with no renumber and no `---` separator (the ADR-0294-0314 shared block form): NO new ADR number is consumed, `DECISIONS.md`'s tail becomes `ADR-0315` at this entry and next-free moves to `ADR-0316`.** ⚠️ **THIS ENTRY ARMS THE STRICT `^> **STATUS: PROPOSED` GUARD `0 -> 1`, NOT `1 -> 2`.** The phase-93 router instructed `1 -> 2`, which CONFLATES two different regexes: the canonical house form read **0** on the pre-entry tree, while a SECOND, differently-shaped historical line — `^**Status:** PROPOSED` under `## ADR-0231` — reads **1** and is byte-untouched by this entry. Only a UNION over both forms reads `1 -> 2`. ⚠️ **VERIFY BY LINE AND BY ADR, NEVER BY THE COUNT ALONE.** This is `ADR-0312` §Consequences (x) firing a second time — it recorded the identical two-form hazard in the DISARM direction, and phase 93 is the first row to hit it in the ARM direction. ⚠️ **A third, middle-ground form `^**Status:**.*PROPOSED` reads 23, and the UNANCHORED form reads 90 lines / 101 occurrences — neither may EVER be gated on.**
+> **STATUS: COMPLETE — §Context drafted at the phase-93 SPEC; §Decision + §Consequences APPENDED IN PLACE at the phase-93 IMPL, after the RETAINED italic footer, with no renumber and no `---` separator (the ADR-0294-0314 shared block form).** ⚠️ `^---$` STAYS **216** — this block adds none; `^## ADR-` STAYS **314** and bare `^## ` STAYS **322**, because §Decision and §Consequences are `###` headings; the tail STAYS **ADR-0315**, NO new ADR number is consumed, and next-free STAYS **ADR-0316**. ⚠️ **THE STRICT ANCHORED HOUSE-FORM GUARD MOVED `0 -> 1` AT THE SPEC AND `1 -> 0` AT THIS IMPL, AND BOTH DIRECTIONS WERE VERIFIED BY LINE AND BY ADR, NEVER BY THE COUNT ALONE.** The phase-93 router had instructed `1 -> 2` at the SPEC, which CONFLATES two differently-shaped regexes: the canonical anchored house form read **0** on the pre-entry tree, while a SECOND, historical, differently-shaped line — the `**Status:**`-spelled one under `## ADR-0231` (`:14866`) — reads **1**, is byte-untouched by this entry and by this IMPL, is a DECOY, and is deliberately LEFT ARMED. Only a UNION over both forms reads `1 -> 2`. A session gating on the decoy reads **1** after a CORRECT disarm and wrongly concludes the disarm failed. ⚠️ **This is `ADR-0312` §Consequences (x) firing on BOTH arms of a single row** — phase 93 was the first row to hit it in the ARM direction, at its SPEC, and hit it again in the DISARM direction, at this IMPL. ⚠️ **NO COUNT IS QUOTED HERE FOR THE MIDDLE-GROUND OR THE UNANCHORED FORM, AND NEITHER MAY EVER BE GATED ON.** The SPEC entry did quote both, and **its own figures were already STALE by the IMPL's tip** — an entry's own prose spellings are themselves hits, so those two counts drift with every ADR that so much as discusses them. That is precisely the drift ADR-0314 measured when it chose not to spell the guard string at all, and it is why on a contested count the right number is none. **The ANCHORED house form is the only one that may ever be gated on.**
 
 ### Context (drafted at the phase-93 SPEC)
 
@@ -18672,3 +18672,133 @@ The paths live under `/api`, and the "ZERO YAML lines" claim survives as a resul
 **§Context ¶10 — COST, AND A SIXTH CONSECUTIVE FIRING OF A KNOWN LOWER-BOUND FAILURE.** The BRAINSTORM's `+3 / -0` floor is PRODUCTION-ONLY and is one of at least SEVEN files. Measured at this SPEC by compiling prototype: production `+10 / -8` across two files; the new unit test `+117 / -0`; the fixture driver `+300 / -44`; its unit table `+57 / -10`. Estimated and LABELLED AS SUCH: the fixture README (~`+18 / -8`, eight measured lines needing rewrite), this ADR's own §Context, a `BEHAVIOR_CONTRACT.md` narrative rider (~`+3 / -0`, NO ledger line and NO absolute — the row registers no counter, so the stat surface moves `+0` STRUCTURALLY), and a `writeH2Reply` recompute pin (~`+60 / -0`) that NOBODY had priced and on which the row's entire correctness rests. ⚠️ **`reference_measured_prototype_is_a_lower_bound` FIRES A SIXTH CONSECUTIVE ROW, AGAIN BY UNDER-ENUMERATING *FILES*, NOT LINES.** ⚠️ **And `+3 / -0` was never honestly reachable:** the helper's doc comment claims it *"preserves the three-header insertion order (Content-Type, Date, Server)"*, which the fix falsifies, and any de-rot costs deletions. ⚠️ **A LIVE PRODUCTION BUG WAS FOUND INCIDENTALLY AND IS BANKED, NOT CLAIMED:** on the current tip an H/2 local reply under a default-config compressor is stamped `Content-Encoding: gzip` over an UNCOMPRESSED body — a corruption the H/1 leg does not have, precisely because its composer makes the field present. Either phase-93 design incidentally fixes it; the row does not take credit for a fix it did not design.
 
 *§Decision and §Consequences follow at the phase-93 IMPL.*
+
+### Decision (landed at the phase-93 IMPL)
+
+**On the HTTP/2 leg a locally generated reply emits `Content-Length` ALWAYS — never conditionally on a
+non-empty body — valued at the REAL body length, and it is emitted BY THE COMPOSER.**
+
+**(a) THE SEAM IS THE COMPOSER, `h2LocalReplyHeaders(bodyLen int)`**
+(`internal/filter/http/router/router_h2.go`). The parameterless helper gains one `int` parameter and emits
+`Content-Length` UNCONDITIONALLY, with no `len(body) > 0` guard — the always-emit rule of §Context ¶2 — and
+the H/1 sibling signature `localReplyHeaders(bodyLen int)` is mirrored deliberately, on the §Context ¶6
+finding that the H/1 parameter is inert on the WIRE and load-bearing at the ENCODE SEAM.
+
+**(b) DELIBERATELY NOT IN THE WIRE WRITER `writeH2Reply`**, per §Context ¶3. That writer's three callers
+include the PROXIED-UPSTREAM path, so a writer-side arm would RE-INJECT the `Content-Length` the compressor
+filter deliberately deletes on the compress path, undoing an Envoy-faithful behaviour and diverging the H/2
+leg from its own H/1 sibling. The trailing block stays excluded and MUST STAY SO.
+
+**(c) SEVEN CALL SITES, AND THE SPLIT IS FOUR / THREE.** Four pass `0` — the three body-less 503 sites in
+`router_h2.go` and the synthesized 504 in `internal/filter/http/router/retry.go`; three pass
+`len(bad502Body)`, i.e. **12** (`const bad502Body = "bad gateway\n"`, `internal/filter/http/router/router.go`).
+No site passes a literal length.
+
+**(d) FIELD ORDER: `Content-Length` SITS AFTER `Content-Type`**, preserving the existing Date-before-Server
+order. Header ORDER is not a contract in either direction (§Context ¶2) and must not be chased; the
+placement keeps the helper's own documented insertion order intelligible and is NOT a pinned wire property.
+
+**(e) THE CITATION CORRECTION IS RATIFIED HERE AS A FIRST-CLASS DECISION, NOT AS AN ASIDE.** The always-emit
+doctrine is **recorded and ratified in `ADR-0155`, attributed there to `ADR-0085`**. Re-verified at this
+IMPL's tip: both carrying sentences sit at `:8260` and `:8326`, INSIDE the `## ADR-0155` block
+(`:8187-:8381`), and that ADR merely CITES *"per ADR-0085"* as authority; `## ADR-0085` (`:3282-:3327`) is
+*"Admin-mux reuse + LBP-1 third application"* and contains **ZERO** matches for
+`SendLocalReply|content-length|local reply|local-reply`. ⚠️ **Any future entry asserting the doctrine is IN
+ADR-0085 is refutable by opening `:3282`, and must not restate it.** The phase-93 BRAINSTORM, `ROADMAP.md`
+row 93 and `STATE.md` all carry the mis-attribution; the corrected form above is the one this row's
+descendants inherit.
+
+### Consequences (landed at the phase-93 IMPL)
+
+**(i) THE MEASURED COST, AND EVERY PREDECESSOR ESTIMATE IT REFUTES.** All figures are `git diff --numstat`
+at the IMPL tip — never `--stat`, which is a SUM and not an additions count:
+
+| file | MEASURED | predecessor estimate |
+|---|---|---|
+| production (`router_h2.go` + `retry.go`) | `+14 / -10` | SPEC `+10 / -8` fix-alone; PLAN `+15 / -10` combined — **PLAN REFUTED** |
+| `internal/filter/hcm/h2dispatch_recompute_cl_test.go` (NEW) | `+147 / -0` | SPEC `~+60` — **REFUTED, 2.45x** |
+| `internal/filter/http/router/router_h2_local_reply_cl_test.go` (NEW) | `+104 / -0` | SPEC `~+117` |
+| fixture `driver.go` | `+313 / -69` | SPEC `~+300 / -44` — **REFUTED** |
+| fixture `driver_test.go` | `+216 / -45` | SPEC `~+57 / -10` — **REFUTED, ~3.8x** |
+| fixture `README.md` | `+11 / -9` | SPEC `~+18 / -8` |
+| `BEHAVIOR_CONTRACT.md` | `+21 / -0` | PLAN `~+3 / -0` — **REFUTED, 7x** |
+
+**(ii) `reference_measured_prototype_is_a_lower_bound` FIRES A SEVENTH CONSECUTIVE ROW — AND FIRED
+REPEATEDLY INSIDE THIS ONE.** On the single question of which files carry the claim this row falsifies, the
+SPEC named **one**, the PLAN's agent found **two**, the controller found **three**, and Task 6 then found a
+**NINTH stale `README.md` line** that the PLAN's own eight-line enumeration never named. ⇒ the failure mode
+is under-enumeration BOTH of FILES and of LINES WITHIN an already-named file, and an enumeration is not made
+safe by being explicit. The only sound measure is a fresh sweep at the tip; a prototype's `--numstat` is a
+LOWER BOUND and must be labelled as one wherever it is quoted.
+
+**(iii) A FALSE CLAIM WAS CAUGHT BEFORE SHIPPING: *"THE WIRE BYTES ARE UNCHANGED"* IS FALSE.** §Context ¶6
+asserted the serialized bytes are identical under both candidate designs. Measured: `writeH2Reply` overrides
+a `content-length` **only when the carrier already has one** — unlike `server` and `date` it has **NO
+synthesize-when-absent arm**. That is pinned by `TestWriteH2Reply_ContentLengthRecompute`'s
+`absent_stays_absent` negative control, which PASSES on the unmodified tree. ⇒ the H/2 502 previously
+reached the peer with **no `content-length` at all** and now carries one: a real change to the serialized
+response, and exactly why the fixture's SUBJECT arity moved **0 -> 1**. **What is invariant is the VALUE**
+— the recompute overrides whatever the composer passes — **not the field's PRESENCE.** ⚠️ **THE PLAN'S
+SEPARATE CLAIM THAT THE CROSS-SIDE DIFFERENTIAL TRANSCRIPT HAS ZERO CHURN IS TRUE AND IS UNAFFECTED BY
+THIS**: that transcript records only `status=` and `illegal=` for the phase-92 arms and never carried
+`content-length` at all. **Two different objects were being conflated under one sentence; they must be kept
+distinct — "the transcript does not churn" is not "the wire does not change".**
+
+**(iv) A PLAN GATE WAS ARITHMETICALLY IMPOSSIBLE AND, WORSE, BLIND.** The PLAN prescribed the symbol
+assertion `git grep -c 'h2LocalReplyHeaders(' ... # want 9`, justified as `9 = 7 call sites + 1 definition +
+1 doc-comment mention`. **The doc-comment mention carries no open paren**, so the pattern cannot match it.
+Measured: the count is **8 BEFORE the fix and 8 AFTER it** — INVARIANT across the very change the assertion
+was written to verify. ⇒ **a gate whose metric does not move across the fix is not a gate.** The assertion
+that actually discriminates is `git grep -n 'h2LocalReplyHeaders()' -- internal/` returning **EMPTY**: the
+parameterless spelling must cease to exist. This is `reference_symbol_assertion_needs_qualified_name` and
+`reference_compensating_defects_cancel_in_the_gate_metric` in one line of shell.
+
+**(v) THE PLAN'S PRESCRIBED "BEFORE" BASELINE WAS MEASURED IN THE WRONG STATE.** The PLAN instructed that
+the non-Docker sweep reads `FAIL=6` before the re-baseline. Measured at Task-4 entry it does not: the sweep
+is **GREEN for the driver package** (`FAIL=5`, all five an unrelated `internal/boot` SDS initial-fetch timing
+flake that passed 3/3 on re-run). The mechanism is structural — `driver_test.go` is a **pure comparator**
+test whose rows read `p92WantSubjCLFields` from `driver.go`, so they can only redden **AFTER** the constant
+flips. The PLAN's `FAIL=6` was measured mid-task with `driver.go` already flipped, and reproduces exactly at
+that intermediate state. ⚠️ **The genuinely-red gate at Task-4 entry is the DIFFERENTIAL, which that sweep
+EXCLUDES.** It failed with exactly one error line —
+`p92 subj content-length fields: want 0 on every arm, got keepalive=1,...,te-empty=1 (5 of 5 arms)` — which
+is itself proof that the step-7 cross-side byte compare PASSED and only the step-8 pin fired.
+⇒ **a recorded baseline must name the STATE it was measured in, or it is not a baseline.**
+
+**(vi) THE PHASE-92 PIN WORKED EXACTLY AS DESIGNED, AND THE RE-DERIVATION INVERTED RATHER THAN SHIFTED.**
+Phase 92 wrote that if envoy-go later gained a `Content-Length` on H/2 local replies *"THESE PINS REDDEN and
+a human must consciously re-derive them."* That is precisely what happened. The re-derivation **INVERTED**
+the negative-control row rather than shifting it — a shift would have silently DISARMED it, and the
+counterfactual was measured: at the intermediate state the un-inverted row went RED.
+
+**(vii) THE INSTRUMENT IS REPLACED, NOT DELETED: A DECLARED-VS-DELIVERED PIN, THREE-STATE, BEHIND A ROSTER
+BARRIER.** `declared` is a **three-state** observation — absent / duplicated / parsed integer — and is
+never an `int` with `0` overloaded, because absent and `0` are different facts; a **duplicate yields
+not-OK, never "the first value"** (RFC 9113 §8.1.1). `declared == delivered` (RFC 9110 §8.6) is asserted
+per side as a plain equality and is **NOT relaxed on either side**. The per-side body-length pins hold
+reference **87** / subject **12**, both re-measured live over Docker at this IMPL rather than inherited. A
+**roster barrier** gates the per-arm pins: without it an empty observation slice satisfies every range-loop
+pin VACUOUSLY, which was measured, not reasoned. Everything sits in `AssertDistribution` **BELOW** the
+cross-side byte compare and is non-fail-fast; a `Drive*` placement was measured at phase 92 to **mask the
+very regression it sat beside**.
+
+**(viii) COVERAGE IS BROUGHT WHERE THERE WAS NONE — AND THE GAP THAT REMAINS IS RECORDED AS OPEN.** The row
+inherited **ZERO** unit coverage and brings two test files, each proven in both directions by
+**neutralization** — never by revert, because a literal revert BUILD-BREAKS the new test, and a build break
+is not evidence about a test's discriminating power. ⚠️ **The instrument remains STRUCTURALLY INCAPABLE of
+seeing the body-less 503/504 sites.** Fixture `0004` drives none of them: all five arms terminate on the 502
+path, and the driver's only mention of `503` or `504` is a comment. Seeing those sites needs NEW ARMS.
+**That gap is OPEN. It is not closed by this row and must not be claimed as closed.**
+
+**(ix) THE H/3 DEFECT IS BANKED BY NAME, NOT FIXED** (the §Context ¶9 item). The `h3dispatch.go` Rule B
+comment is wrong **independently of this row** and changes no behaviour: `grep -c 'SetH2Action'
+internal/filter/hcm/h3dispatch.go` reads **0**, so no H/2 carrier can reach `writeH3Reply` at all.
+⚠️ **`TestWriteH3Reply_EmptyBody` passes a NIL carrier and is therefore NOT a guard on the live path — it
+must never be cited as coverage for it.** Rewording that comment is a separate, behaviour-free change.
+
+**(x) NO STAT-SURFACE ABSOLUTE IS QUOTED ANYWHERE IN THIS ENTRY, AND THAT IS DELIBERATE.** The row registers
+no counter, so the stat surface moves `+0` **STRUCTURALLY** — which is the only statement about it that
+cannot rot. Three contested absolutes for that surface are live in this tree at ONE tip, so per
+`reference_a_drift_correction_is_itself_a_claim` the right number here is **none**; and a prohibition that
+SPELLS the figure it prohibits becomes a hit for the next reader's grep and falsifies itself, which the
+phase-93 SPEC demonstrated by doing it. The figure is therefore not spelled here in bare or arrow form.

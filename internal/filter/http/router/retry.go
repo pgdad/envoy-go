@@ -371,7 +371,7 @@ func retryExecutorH2(ctx context.Context, a *routerActionH2, req h2.H2Request) (
 		}
 		if timedOut {
 			a.cluster.IncUpstreamRqPerTryTimeout()
-			resp = ActionResponse{Status: 504, Headers: h2LocalReplyHeaders(), Body: nil} // synthesized 504, override the Status:0/502
+			resp = ActionResponse{Status: 504, Headers: h2LocalReplyHeaders(0), Body: nil} // synthesized 504, override the Status:0/502
 			err = nil
 			if !rp.perTryTimeoutRetriable() {
 				return resp, ep, err

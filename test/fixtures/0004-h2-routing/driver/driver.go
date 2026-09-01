@@ -75,12 +75,14 @@ type h2Driver struct {
 	refBodyCnt  [3]uint64
 	subjBodyCnt [3]uint64
 
-	// Per-side phase-92 `content-length` field arity, one entry per p92Arms()
-	// arm, recorded during DriveReference / DriveSubject and asserted in
-	// AssertDistribution — which the runner calls AFTER the cross-side byte
-	// compare. See p92AssertCLFields for why the pin must sit BELOW that gate.
-	refP92CL  []int
-	subjP92CL []int
+	// Per-side `content-length` observations, one entry per p92Arms() arm and
+	// IN THAT ORDER, recorded during DriveReference / DriveSubject and
+	// asserted in AssertDistribution — which the runner calls AFTER the
+	// cross-side byte compare. See p92AssertCLFields for why the pins must sit
+	// BELOW that gate, and p93CLObs for what each entry carries: the field
+	// arity, the THREE-STATE declared value, and the DELIVERED body length.
+	refP92CL  []p93CLObs
+	subjP92CL []p93CLObs
 
 	rootCAs *x509.CertPool
 }
@@ -295,12 +297,14 @@ func (d *h2Driver) loadTLSConfig() *tls.Config {
 // don't increment the runner's accept counter).
 //
 // Side-effect: *p92CL is appended one entry per phase-92 arm, in p92Arms()
-// order, carrying that arm's downstream `content-length` field ARITY. That
-// observable is deliberately NOT in the cross-side byte stream (see the p92
-// block below and p92AssertCLFields); the caller stashes it per side and
-// AssertDistribution asserts each side against its OWN measured pin, AFTER
-// the runner's cross-side byte compare.
-func (d *h2Driver) drive(ctx context.Context, addr string, counts *[3]uint64, p92CL *[]int) ([]byte, error) {
+// order and TAGGED WITH THAT ARM'S NAME, carrying the arm's downstream
+// `content-length` field arity, its THREE-STATE declared value and the
+// DELIVERED body length (see p93CLObs). Those observables are deliberately NOT
+// in the cross-side byte stream (see the p92 block below, p92AssertCLFields,
+// p93AssertDeclaredDelivered and p93AssertBodyLen); the caller stashes them per
+// side and AssertDistribution asserts each side against its OWN measured pins,
+// AFTER the runner's cross-side byte compare.
+func (d *h2Driver) drive(ctx context.Context, addr string, counts *[3]uint64, p92CL *[]p93CLObs) ([]byte, error) {
 	tlsConf := d.loadTLSConfig()
 
 	var out strings.Builder
@@ -564,22 +568,25 @@ func (d *h2Driver) drive(ctx context.Context, addr string, counts *[3]uint64, p9
 	// in-band on purpose: the two sides are EXPECTED to disagree on it
 	// pre-fix, and the cross-side byte compare IS the assertion.
 	//
-	// ⚠️ `content-length` ARITY IS DELIBERATELY NOT IN THIS LINE — it is
-	// carried out through p92CL and pinned PER SIDE instead. It measures a
-	// pre-existing H/2 LOCAL-REPLY composition departure that is not this
-	// row's charter, and local-reply composition is ALREADY an excluded
-	// cross-side axis in this fixture (the 404 catch-all bodies are not
-	// compared for the same reason). See p92AssertCLFields for the pins and
-	// the README's phase-92 departure note for the root cause.
+	// ⚠️ THE `content-length` OBSERVABLES ARE DELIBERATELY NOT IN THIS LINE —
+	// the field arity, the declared value AND the delivered body length are
+	// all carried out through p92CL and pinned PER SIDE instead. Local-reply
+	// body composition is an EXCLUDED cross-side axis for this fixture
+	// (BEHAVIOR_CONTRACT.md:1993; the 404 catch-all bodies are relaxed for the
+	// same reason), so the two sides' 502 bodies differ by construction and
+	// putting their length into the byte stream would red the compare for a
+	// difference that is ratified. See p92AssertCLFields,
+	// p93AssertDeclaredDelivered and p93AssertBodyLen for the pins, and the
+	// README's phase-92 departure note for the root cause.
 	for _, arm := range p92Arms() {
-		fields, status, failure := p92DriveArm(ctx, addr, tlsConf, arm)
+		fields, status, bodyLen, failure := p92DriveArm(ctx, addr, tlsConf, arm)
 		if failure != "" {
 			fmt.Fprintf(&out, "p92-%s:ERR %s\n", arm.name, failure)
 		}
 		fmt.Fprintf(&out, "p92-%s:status=%d illegal=%s\n",
 			arm.name, status, p92IllegalRendering(fields))
 		if p92CL != nil {
-			*p92CL = append(*p92CL, p92ContentLengthFields(fields))
+			*p92CL = append(*p92CL, p93Observe(arm.name, fields, bodyLen))
 		}
 	}
 	return []byte(out.String()), nil
@@ -1176,9 +1183,13 @@ func p92Fields(path string) []hpack.HeaderField {
 
 // p92DriveArm opens a FRESH TLS(ALPN h2) connection, sends the arm's request
 // with a raw framer, and returns the RESPONSE header fields EXACTLY AS THEY
-// ARRIVED ON THE WIRE, the observed :status, and a NON-EMPTY failure string
-// when the arm did not complete. It NEVER returns an error, so no arm can make
-// a later arm unreachable.
+// ARRIVED ON THE WIRE, the observed :status, the TOTAL DATA-frame payload
+// bytes delivered on the stream, and a NON-EMPTY failure string when the arm
+// did not complete. It NEVER returns an error, so no arm can make a later arm
+// unreachable.
+//
+// ⚠️ THE BODY LENGTH IS A RETURNED OBSERVATION, THE BODY TEXT IS NOT. See the
+// DATA-frame case below for why the two are treated differently.
 //
 // ⚠️ A RAW FRAMER IS REQUIRED, not helpers.H2RoundTrip. That helper hands the
 // response to net/http and then rebuilds the field list from `resp.Header` — a
@@ -1191,9 +1202,9 @@ func p92Fields(path string) []hpack.HeaderField {
 // phase-90 arms use, deliberately reused rather than duplicated so both
 // families scrub byte-identically. Reference and subject dial different
 // addresses, so an unscrubbed error text can never compare equal.
-func p92DriveArm(ctx context.Context, addr string, tlsConf *tls.Config, a p92Arm) ([]hpack.HeaderField, int, string) {
-	fail := func(stage string, err error) ([]hpack.HeaderField, int, string) {
-		return nil, 0, stage + ": " + p90ScrubAddr(err.Error(), addr)
+func p92DriveArm(ctx context.Context, addr string, tlsConf *tls.Config, a p92Arm) ([]hpack.HeaderField, int, int, string) {
+	fail := func(stage string, err error) ([]hpack.HeaderField, int, int, string) {
+		return nil, 0, 0, stage + ": " + p90ScrubAddr(err.Error(), addr)
 	}
 
 	dialer := &tls.Dialer{
@@ -1207,7 +1218,7 @@ func p92DriveArm(ctx context.Context, addr string, tlsConf *tls.Config, a p92Arm
 	conn, ok := raw.(*tls.Conn)
 	if !ok {
 		_ = raw.Close()
-		return nil, 0, "dial: not a TLS connection"
+		return nil, 0, 0, "dial: not a TLS connection"
 	}
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(p92ArmDeadline))
@@ -1215,7 +1226,7 @@ func p92DriveArm(ctx context.Context, addr string, tlsConf *tls.Config, a p92Arm
 	// 0004 is TLS+ALPN-h2, NOT h2c: assert the negotiated protocol BEFORE the
 	// preface is written.
 	if proto := conn.ConnectionState().NegotiatedProtocol; proto != "h2" {
-		return nil, 0, fmt.Sprintf("alpn: negotiated %q, want h2", proto)
+		return nil, 0, 0, fmt.Sprintf("alpn: negotiated %q, want h2", proto)
 	}
 
 	if _, err := io.WriteString(conn, http2.ClientPreface); err != nil {
@@ -1241,11 +1252,12 @@ func p92DriveArm(ctx context.Context, addr string, tlsConf *tls.Config, a p92Arm
 	}
 
 	status := 0
+	bodyLen := 0
 	var fields []hpack.HeaderField
 	for {
 		f, err := fr.ReadFrame()
 		if err != nil {
-			return fields, status, "read-frame: " + p90ScrubAddr(err.Error(), addr)
+			return fields, status, bodyLen, "read-frame: " + p90ScrubAddr(err.Error(), addr)
 		}
 		switch f := f.(type) {
 		case *http2.SettingsFrame:
@@ -1275,24 +1287,31 @@ func p92DriveArm(ctx context.Context, addr string, tlsConf *tls.Config, a p92Arm
 				}
 			}
 			if f.StreamEnded() {
-				return fields, status, ""
+				return fields, status, bodyLen, ""
 			}
 		case *http2.DataFrame:
 			if f.StreamID != p92StreamID {
 				continue
 			}
-			// The body is NOT recorded: a forwarded 200 "p92-ok" and a locally
-			// generated 502 carry different, side-specific text.
+			// ⚠️ THE BODY TEXT IS STILL NOT RECORDED — BUT ITS LENGTH NOW IS.
+			// A forwarded 200 "p92-ok" and a locally generated 502 carry
+			// different, side-specific TEXT, so the BYTES are not a cross-side
+			// contract and never enter the diff stream. The LENGTH is a
+			// different observable and the one an instrument needs: it is what
+			// makes a `content-length` that lies about its own body visible
+			// (RFC 9110 §8.6), and it is asserted PER SIDE in
+			// AssertDistribution, never cross-side.
+			bodyLen += len(f.Data())
 			if f.StreamEnded() {
-				return fields, status, ""
+				return fields, status, bodyLen, ""
 			}
 		case *http2.RSTStreamFrame:
 			if f.StreamID != p92StreamID {
 				continue
 			}
-			return fields, status, fmt.Sprintf("rst-stream code=%v", f.ErrCode)
+			return fields, status, bodyLen, fmt.Sprintf("rst-stream code=%v", f.ErrCode)
 		case *http2.GoAwayFrame:
-			return fields, status, fmt.Sprintf("goaway code=%v", f.ErrCode)
+			return fields, status, bodyLen, fmt.Sprintf("goaway code=%v", f.ErrCode)
 		default:
 			// WINDOW_UPDATE / PRIORITY / unknown: not recorded.
 		}
@@ -1338,10 +1357,12 @@ func p92IllegalRendering(fields []hpack.HeaderField) string {
 
 // p92ContentLengthFields counts the `content-length` FIELDS in a response.
 //
-// ⚠️ COUNT, NEVER VALUE. The two sides' bodies differ by construction — a
-// forwarded 200 "p92-ok" against a locally generated 502 — so the VALUE is not
-// cross-side comparable and only the ARITY is a contract. Arity is also the
-// only observable that a duplicate-`content-length` regression would move.
+// ⚠️ THIS HELPER IS THE ARITY AND ONLY THE ARITY. Arity is the observable a
+// duplicate-`content-length` regression moves, and it is what lets p93Observe
+// tell an ABSENT header from a DUPLICATED one. The VALUE is read separately by
+// p93ContentLength and compared only PER SIDE — never cross-side, because the
+// two sides' 502 bodies still differ by construction (a forwarded 200 "p92-ok"
+// against a locally generated `bad gateway\n`).
 func p92ContentLengthFields(fields []hpack.HeaderField) int {
 	n := 0
 	for _, hf := range fields {
@@ -1352,35 +1373,140 @@ func p92ContentLengthFields(fields []hpack.HeaderField) int {
 	return n
 }
 
-// Phase-92 PER-SIDE `content-length` arity pins.
+// p93CLObs is ONE phase-92 arm's `content-length` observation: what the
+// response DECLARED and what it actually DELIVERED.
+//
+// ⚠️ `declared` IS THREE-STATE, AND `declaredOK` IS THE ONLY LEGAL WAY TO READ
+// IT. A response's `content-length` can be ABSENT, DUPLICATED (malformed per
+// RFC 9113 §8.1.1), or exactly one parsable integer — and ONLY the third state
+// sets declaredOK. Pre-fix this very fixture measured `arity=0
+// declared=<absent>` on all five SUBJECT arms: ABSENT, not zero. Modeling
+// `declared` as a bare int would have reported a `content-length: 0` that was
+// never on the wire and let an absent header pass against an empty body.
+//
+// The arm NAME is carried in the observation so p93AssertRoster can check
+// per-index identity against the LIVE p92Arms() roster.
+type p93CLObs struct {
+	arm        string // p92Arms() arm name this observation came from
+	arity      int    // number of `content-length` FIELDS seen on the wire
+	declared   int    // the parsed value — MEANINGLESS unless declaredOK
+	declaredOK bool   // true iff EXACTLY ONE field carried a parsable value
+	bodyLen    int    // total DATA-frame payload bytes delivered
+}
+
+// p93Observe builds one arm's observation from the wire header fields and the
+// delivered body length p92DriveArm summed off the DATA frames.
+func p93Observe(arm string, fields []hpack.HeaderField, bodyLen int) p93CLObs {
+	declared, ok := p93ContentLength(fields)
+	return p93CLObs{
+		arm:        arm,
+		arity:      p92ContentLengthFields(fields),
+		declared:   declared,
+		declaredOK: ok,
+		bodyLen:    bodyLen,
+	}
+}
+
+// p93ContentLength reads a response's `content-length` VALUE as a three-state
+// observation: (n, true) only when EXACTLY ONE field carries a non-negative
+// decimal, and (0, false) in every other case.
+//
+// ⚠️ A DUPLICATED `content-length` YIELDS declaredOK=false, NEVER "the first
+// value". A duplicate is malformed per RFC 9113 §8.1.1 and its value is
+// meaningless; returning the first would launder a real defect into a
+// plausible number that p93AssertDeclaredDelivered might then accept.
+//
+// ⚠️ THE ZERO RETURNED ON FAILURE IS NOT AN OBSERVATION. Callers MUST branch on
+// the bool: an absent header and a `content-length: 0` are different facts.
+func p93ContentLength(fields []hpack.HeaderField) (int, bool) {
+	var val string
+	n := 0
+	for _, hf := range fields {
+		if strings.ToLower(hf.Name) == "content-length" {
+			val = hf.Value
+			n++
+		}
+	}
+	if n != 1 {
+		return 0, false
+	}
+	v, err := strconv.Atoi(val)
+	if err != nil || v < 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+// declaredString renders the three-state declared value for an error message,
+// naming WHICH non-observation state an arm is in rather than printing a `0`
+// that was never on the wire.
+func (o p93CLObs) declaredString() string {
+	switch {
+	case o.declaredOK:
+		return strconv.Itoa(o.declared)
+	case o.arity == 0:
+		return "absent"
+	case o.arity > 1:
+		return fmt.Sprintf("duplicated(x%d)", o.arity)
+	default:
+		return "unparsable"
+	}
+}
+
+// PER-SIDE `content-length` pins: field arity, and the delivered body length.
 //
 // ⚠️ THESE ARE A DOCUMENTED DEPARTURE, PINNED IN BOTH DIRECTIONS — not an
-// exemption. On every phase-92 arm both sides now answer 502 from a LOCAL
-// REPLY, and the two local replies are composed differently:
+// exemption. On every phase-92 arm both sides answer 502 from a LOCAL REPLY.
+// The two local replies still differ in their body TEXT, but they no longer
+// differ in whether they declare its length:
 //
 //   - the REFERENCE emits a `content-length` on its 502  -> arity 1
-//   - the SUBJECT emits NONE                             -> arity 0
+//   - the SUBJECT now emits one too                      -> arity 1
 //
-// The subject side is `h2LocalReplyHeaders()`
-// (internal/filter/http/router/router_h2.go), which returns Content-Type /
-// Date / Server and NO Content-Length. Its H/1 sibling
-// `localReplyHeaders(bodyLen int)` (router.go) DOES emit one and even takes
-// the bodyLen the H/2 version lacks. The gap dates from phase 07.1 and feeds
-// SEVEN local-reply sites across the 502/503/504 H/2 paths, so closing it is
-// its own behavior-contract row: it is BANKED, not fixed here.
+// ⚠️ PHASE 92 PREDICTED THIS EXACT REDNESS, AND THE PREDICTION CAME TRUE — THE
+// PIN WORKED AS DESIGNED. The comment this block replaces read: "if envoy-go
+// later gains a Content-Length on H/2 local replies, or the reference stops
+// emitting one, THESE PINS REDDEN and a human must consciously re-derive
+// them", and it recorded closing the gap as BANKED — "its own behavior-contract
+// row". THIS row is that row. Phase 93 gave `h2LocalReplyHeaders()`
+// (internal/filter/http/router/router_h2.go) the bodyLen its H/1 sibling
+// `localReplyHeaders(bodyLen int)` (router.go) always had, so it now always
+// emits a Content-Length across the 502/503/504 H/2 local-reply sites. The
+// subject-side pin then went red with precisely that message and was
+// CONSCIOUSLY re-derived 0 -> 1, with its negative control inverted alongside
+// it so the row still fails when the observation disagrees. The pin is
+// re-baselined here, not weakened, and this note is the record of it firing.
 //
-// Pinning it per side rather than cross-side keeps the departure VISIBLE: if
-// envoy-go later gains a Content-Length on H/2 local replies, or the reference
-// stops emitting one, THESE PINS REDDEN and a human must consciously re-derive
-// them. Deleting the observable instead would have hidden it.
+// Pinning per side rather than cross-side keeps the REMAINING departure
+// visible: if either side stops emitting a Content-Length, or either side's
+// local-reply body length moves, these pins redden again and a human must
+// consciously re-derive them again. Deleting the observable would have hidden
+// it.
 //
-// ⚠️ ARITY, NEVER VALUE. The two 502 bodies differ by construction (the
-// reference's own local-reply body against envoy-go's `bad gateway\n`), so the
-// content-length VALUE is not a contract on either side and pinning it would
-// be a false gate.
+// ⚠️ ARITY AND LENGTH, NEVER BODY BYTES — the old "ARITY, NEVER VALUE" rule is
+// NARROWED, not dropped. The two 502 bodies still differ by construction (the
+// reference's own local-reply text against envoy-go's `bad gateway\n`), and
+// local-reply body bytes are an EXCLUDED cross-side axis for this fixture per
+// BEHAVIOR_CONTRACT.md:1993 — so the BYTES are compared on neither side and
+// never enter the diff stream. What IS now pinned is numeric and per-side:
+// each side's delivered body LENGTH against its own measured constant, plus
+// the one genuinely side-INDEPENDENT invariant — a declared `content-length`
+// must equal the body actually delivered (RFC 9110 §8.6). That invariant is
+// NOT a departure and is relaxed on NEITHER side; it is the only pin that can
+// still see a `content-length` lying about its own body now that arity reads 1
+// everywhere.
+//
+// ⚠️ THE BODY-LENGTH VALUES ARE MEASURED, NOT DERIVED. 12 is
+// len("bad gateway\n") on the subject side; 87 is the length of the
+// reference's own 502 local-reply text, read off the wire by the differential
+// run that baselined it. A change to either side's local-reply text moves
+// them, and that is the point.
 const (
 	p92WantRefCLFields  = 1
-	p92WantSubjCLFields = 0
+	p92WantSubjCLFields = 1
+
+	p93WantRefBodyLen  = 87
+	p93WantSubjBodyLen = 12
 )
 
 // p92AssertCLFields checks one side's per-arm `content-length` field arity
@@ -1396,21 +1522,110 @@ const (
 // four siblings, exactly as the runner's first-divergence byte comparator does
 // — and a break that reddens only the first arm is not evidence the other four
 // are pinned at all.
-func p92AssertCLFields(side string, want int, got []int) error {
+func p92AssertCLFields(side string, want int, got []p93CLObs) error {
 	arms := p92Arms()
 	if len(got) != len(arms) {
 		return fmt.Errorf("p92 %s content-length arity: got %d observations, want %d (one per arm)",
 			side, len(got), len(arms))
 	}
 	var bad []string
-	for i, n := range got {
-		if n != want {
-			bad = append(bad, fmt.Sprintf("%s=%d", arms[i].name, n))
+	for i, o := range got {
+		if o.arity != want {
+			bad = append(bad, fmt.Sprintf("%s=%d", arms[i].name, o.arity))
 		}
 	}
 	if len(bad) > 0 {
 		return fmt.Errorf("p92 %s content-length fields: want %d on every arm, got %s (%d of %d arms)",
 			side, want, strings.Join(bad, ","), len(bad), len(arms))
+	}
+	return nil
+}
+
+// p93AssertRoster is the NON-VACUITY BARRIER for the per-arm phase-93 pins.
+//
+// ⚠️ WITHOUT IT, ZERO OBSERVATIONS SATISFIES EVERY PER-ARM PIN. Each pin below
+// is a range loop over the observations, so an EMPTY slice makes every one of
+// them return nil. MEASURED without a barrier: a side that recorded nothing at
+// all passed the declared==delivered pin and BOTH body-length pins silently.
+// The barrier is therefore the GATE for those pins — AssertDistribution runs
+// them only when it holds — so a run with no observations names the missing
+// roster ONCE instead of letting the gated pins report the same absence in
+// three different vocabularies, or worse, not report it at all.
+//
+// ⚠️ THE ROSTER IS READ FROM THE LIVE p92Arms(), NEVER A LITERAL, and identity
+// is checked PER INDEX. A count-only check would accept a five-entry slice
+// holding the WRONG five arms, and a literal 5 would go stale the moment an
+// arm is added, removed or renamed.
+func p93AssertRoster(side string, got []p93CLObs) error {
+	arms := p92Arms()
+	if len(got) != len(arms) {
+		return fmt.Errorf("p93 %s observation roster: got %d observations, want %d (one per p92Arms() arm)",
+			side, len(got), len(arms))
+	}
+	var bad []string
+	for i, o := range got {
+		if o.arm != arms[i].name {
+			bad = append(bad, fmt.Sprintf("[%d]=%q want %q", i, o.arm, arms[i].name))
+		}
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("p93 %s observation roster: arm identity mismatch: %s (%d of %d arms)",
+			side, strings.Join(bad, ","), len(bad), len(arms))
+	}
+	return nil
+}
+
+// p93AssertDeclaredDelivered checks, for ONE side, that every arm's DECLARED
+// `content-length` equals the body length actually DELIVERED on that stream.
+//
+// ⚠️ THIS IS THE ONE PROPERTY HERE THAT IS NOT A DEPARTURE. RFC 9110 §8.6
+// requires a `content-length` to state the real length of the body it
+// accompanies. It must hold on BOTH sides independently, it is relaxed on
+// neither, and it is asserted as plain equality. It is also the ONLY pin that
+// can still see a header lying about its own body now that arity reads 1 on
+// both sides: the arity pin counts fields and cannot, and the per-side length
+// pins only see the delivered half.
+//
+// ⚠️ AN ARM WITH declaredOK=false FAILS THIS PIN. Absent and duplicated both
+// mean "there is no declared length to compare"; treating either as 0 would
+// let a missing or malformed header pass against an empty body.
+//
+// ⚠️ NOT FAIL-FAST ACROSS ARMS — every violating arm is named, never just the
+// first. See p92AssertCLFields for why.
+func p93AssertDeclaredDelivered(side string, got []p93CLObs) error {
+	var bad []string
+	for _, o := range got {
+		if !o.declaredOK || o.declared != o.bodyLen {
+			bad = append(bad, fmt.Sprintf("%s=declared %s/delivered %d", o.arm, o.declaredString(), o.bodyLen))
+		}
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("p93 %s declared != delivered: %s (%d of %d arms)",
+			side, strings.Join(bad, ","), len(bad), len(got))
+	}
+	return nil
+}
+
+// p93AssertBodyLen checks one side's per-arm DELIVERED body length against that
+// side's OWN measured pin.
+//
+// ⚠️ PER SIDE, NEVER CROSS-SIDE. The two 502 local-reply bodies differ by
+// construction and that difference is ratified (BEHAVIOR_CONTRACT.md:1993), so
+// this is a departure recorded in both directions — not a cross-side equality.
+// It is what makes the declared==delivered invariant non-vacuous: without it,
+// a side that delivered 0 bytes and declared 0 would satisfy the invariant.
+//
+// ⚠️ NOT FAIL-FAST ACROSS ARMS — every violating arm is named.
+func p93AssertBodyLen(side string, want int, got []p93CLObs) error {
+	var bad []string
+	for _, o := range got {
+		if o.bodyLen != want {
+			bad = append(bad, fmt.Sprintf("%s=%d", o.arm, o.bodyLen))
+		}
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("p93 %s body length: want %d on every arm, got %s (%d of %d arms)",
+			side, want, strings.Join(bad, ","), len(bad), len(got))
 	}
 	return nil
 }
@@ -1439,7 +1654,7 @@ func parseBackendIdx(body []byte) (int, error) {
 // and records per-backend body counts on d.refBodyCnt for AssertDistribution.
 func (d *h2Driver) DriveReference(ctx context.Context, addr string) ([]byte, error) {
 	var counts [3]uint64
-	var p92CL []int
+	var p92CL []p93CLObs
 	b, err := d.drive(ctx, addr, &counts, &p92CL)
 	if err != nil {
 		return nil, fmt.Errorf("ref drive: %w", err)
@@ -1455,7 +1670,7 @@ func (d *h2Driver) DriveReference(ctx context.Context, addr string) ([]byte, err
 // records per-backend body counts on d.subjBodyCnt for AssertDistribution.
 func (d *h2Driver) DriveSubject(ctx context.Context, addr string) ([]byte, error) {
 	var counts [3]uint64
-	var p92CL []int
+	var p92CL []p93CLObs
 	b, err := d.drive(ctx, addr, &counts, &p92CL)
 	if err != nil {
 		return nil, fmt.Errorf("subj drive: %w", err)
@@ -1469,7 +1684,8 @@ func (d *h2Driver) DriveSubject(ctx context.Context, addr string) ([]byte, error
 
 // AssertDistribution asserts both ref and subj per-cluster RR distributions
 // are exactly [3,3,3] over the 9 router-action /api requests, AND the per-side
-// phase-92 `content-length` arity pins.
+// `content-length` pins: field arity, declared==delivered, and the delivered
+// body length.
 //
 // The runner-supplied refCounts / subjCounts are zero for HTTPSH2 backends
 // (subprocess backends don't increment the in-process counter). The driver
@@ -1488,8 +1704,11 @@ func (d *h2Driver) DriveSubject(ctx context.Context, addr string) ([]byte, error
 // the charter regression. Here both are reported by the same run.
 //
 // ⚠️ EVERY failing property is reported, never just the first: the distribution
-// rule and the two arity pins are independent, and returning on the first would
-// let either mask the others.
+// rule, the two arity pins and the phase-93 declared/delivered pins are
+// independent, and returning on the first would let any of them mask the
+// others. The ONE exception is deliberate — the per-arm phase-93 pins are
+// GATED on p93AssertRoster, because when a side recorded no observations at
+// all those pins pass VACUOUSLY and the roster is the only truthful report.
 func (d *h2Driver) AssertDistribution(refCounts, subjCounts []uint64) error {
 	if len(refCounts) != 3 {
 		return fmt.Errorf("ref backend count: got %d, want 3", len(refCounts))
@@ -1517,6 +1736,31 @@ func (d *h2Driver) AssertDistribution(refCounts, subjCounts []uint64) error {
 	}
 	if err := p92AssertCLFields("subj", p92WantSubjCLFields, subjCL); err != nil {
 		errs = append(errs, err)
+	}
+	// The phase-93 declared/delivered pins, BELOW the byte compare like every
+	// other pin here, and GATED on the roster barrier: each is a range loop
+	// over the per-arm observations, so an empty slice would satisfy all of
+	// them vacuously. p93AssertRoster is what turns "the arms never ran" into a
+	// failure; when it fires the pins it gates are skipped, so the roster is
+	// reported once rather than three times in three vocabularies.
+	for _, side := range []struct {
+		name        string
+		obs         []p93CLObs
+		wantBodyLen int
+	}{
+		{"ref", refCL, p93WantRefBodyLen},
+		{"subj", subjCL, p93WantSubjBodyLen},
+	} {
+		if err := p93AssertRoster(side.name, side.obs); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if err := p93AssertDeclaredDelivered(side.name, side.obs); err != nil {
+			errs = append(errs, err)
+		}
+		if err := p93AssertBodyLen(side.name, side.wantBodyLen, side.obs); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }

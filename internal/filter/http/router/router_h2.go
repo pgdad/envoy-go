@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 
 	"github.com/pgdad/envoy-go/internal/cluster"
@@ -77,7 +78,7 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 
 	// Phase 41 (ADR-0248): circuit-breaker max_requests admission (H2). See doH1ClusterAction.
 	if !a.cluster.TryAcquireRequest() {
-		return ActionResponse{Status: 503, Headers: h2LocalReplyHeaders(), Body: nil}, picked, nil
+		return ActionResponse{Status: 503, Headers: h2LocalReplyHeaders(0), Body: nil}, picked, nil
 	}
 	defer a.cluster.ReleaseRequest()
 
@@ -125,7 +126,7 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 			// Exhausted the bounded retry on the (effectively unreachable) race.
 			// Fall back to the load-shed 503 (NOT a 502 — no upstream connect was
 			// attempted; this is a capacity/race condition, not a gateway error).
-			return ActionResponse{Status: 503, Headers: h2LocalReplyHeaders()}, picked, nil
+			return ActionResponse{Status: 503, Headers: h2LocalReplyHeaders(0)}, picked, nil
 		}
 	}
 	if err != nil {
@@ -135,7 +136,7 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 			// upstream_rq_pending_overflow already incremented in the pool: NO
 			// IncStatusClass (the dedicated overflow counter is the signal), and
 			// NOT localOrigin (a load-shed is not a connect failure for retry_on).
-			return ActionResponse{Status: 503, Headers: h2LocalReplyHeaders()}, picked, nil
+			return ActionResponse{Status: 503, Headers: h2LocalReplyHeaders(0)}, picked, nil
 		}
 		a.cluster.IncStatusClass(502)
 		if !ep.IsZero() { // a host was picked → attribute the local-origin connect failure
@@ -145,7 +146,7 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 		// failure (not a proxied upstream 502), so RetryPolicy.matches treats a
 		// connect-failure retry_on as retriable here. Mirrors the H1 dial-failure
 		// 503 site (doH1ClusterAction sets localOrigin on its synthesized failures).
-		return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders(), localOrigin: true}, picked, nil
+		return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders(len(bad502Body)), localOrigin: true}, picked, nil
 	}
 	// 43.2a: release the stream slot exactly once when this RoundTrip completes
 	// (call-once contract; the slot is returned, promoting the next waiter).
@@ -228,7 +229,7 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 		if errors.Is(err, h2.ErrMalformedResponseHeaders) {
 			a.cluster.IncStatusClass(502)
 			a.cluster.RecordUpstreamResult(picked, cluster.UpstreamResult{StatusCode: 502, LocalOriginErr: true})
-			return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders()}, picked, nil
+			return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders(len(bad502Body))}, picked, nil
 		}
 		// Distinguish caller-side ctx-cancel/deadline (→ stream-scoped CANCEL
 		// surfaced upward as *h2.Error so serverStream.dispatch emits
@@ -247,7 +248,7 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 		// ROUNDTRIP failure (upstream reset/protocol error — NOT a proxied 502),
 		// so a connect-failure retry_on matches. NOT set on the ctx-cancel
 		// Status:0 return above (a client cancel is never a connect failure).
-		return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders(), localOrigin: true}, picked, nil
+		return ActionResponse{Status: 502, Body: []byte(bad502Body), Headers: h2LocalReplyHeaders(len(bad502Body)), localOrigin: true}, picked, nil
 	}
 
 	a.cluster.IncStatusClass(resp.Status)
@@ -289,11 +290,14 @@ func doH2ClusterAction(ctx context.Context, a *routerActionH2, req h2.H2Request)
 // h2LocalReplyHeaders builds the standard local-reply header set for
 // synthesized 5xx H2 responses. Mirrors the Header set previously written by
 // routerActionH2.write502. Phase 07.1 Task 19 (I-3 prereq): returns
-// OrderedHeaders so the action-driven wire-emit path preserves the three-
-// header insertion order (Content-Type, Date, Server) on the H2 HEADERS frame.
-func h2LocalReplyHeaders() envoyhttp.OrderedHeaders {
+// OrderedHeaders so the action-driven wire-emit path preserves the four-
+// header insertion order (Content-Type, Content-Length, Date, Server) on the
+// H2 HEADERS frame. bodyLen is the byte length of the body the caller pairs
+// with these headers (0 for a body-less reply) and supplies Content-Length.
+func h2LocalReplyHeaders(bodyLen int) envoyhttp.OrderedHeaders {
 	return envoyhttp.OrderedHeaders{
 		{Name: "Content-Type", Value: "text/plain"},
+		{Name: "Content-Length", Value: strconv.Itoa(bodyLen)},
 		{Name: "Date", Value: dateHeader()},
 		{Name: "Server", Value: serverHeader()},
 	}
