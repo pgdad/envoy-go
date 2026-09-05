@@ -168,9 +168,14 @@ records only the stable token `rejected`.
   `downstream_cx_total=3`). `no_certificate=1` against `handshake=2` is the
   DISCRIMINATOR the byte observable cannot supply: arms 1 and 3 **both** accept
   at `require=false`, so the accept/reject verdict cannot tell them apart.
-  Still out of scope: `ssl.connection_error` (envoy-go's `other` handshake
-  outcome increments nothing — a named departure) and the
-  `ssl.ciphers/curves/versions` breakdowns.
+  Still out of scope: the `ssl.ciphers/curves/versions` breakdowns.
+  `ssl.connection_error` is NO LONGER a departure: phase 94 (ADR-0316) landed it
+  as the FIFTH listener-scope name, incremented from `outcomeOther` under a
+  CLOSED transport-exclusion predicate. It is deliberately NOT asserted here,
+  because on this fixture it reads **0 on every arm, structurally** — all three
+  arms are certificate-path outcomes and none produces a non-certificate
+  handshake failure, so a pin here would document a vacuous `0 == 0`. The
+  fixture that DOES drive that population is `0120-tls-connection-error`.
 - **Listener-liveness proxies** — an INDEPENDENT boundary, unaffected by the
   retirement above and still LIVE. Never assert
   `/listeners` or `total_listeners_active`; never treat a docker-proxy accept as

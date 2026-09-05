@@ -41,6 +41,7 @@ type helpTextRosterEntry struct {
 var helpTextRoster = []helpTextRosterEntry{
 	{internal: "listener.0_0_0_0_10000.downstream_cx_total"},
 	{internal: "listener.0_0_0_0_10000.downstream_cx_active", gauge: true},
+	{internal: "listener.0_0_0_0_10000.ssl.connection_error"},
 	{internal: "listener.0_0_0_0_10000.ssl.handshake"},
 	{internal: "listener.0_0_0_0_10000.ssl.fail_verify_error"},
 	{internal: "listener.0_0_0_0_10000.ssl.fail_verify_no_cert"},

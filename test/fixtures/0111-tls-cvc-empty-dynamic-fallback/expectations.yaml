@@ -226,9 +226,12 @@
 #   that boundary: envoy-go now registers listener.<addr>.ssl.{handshake,
 #   fail_verify_error,fail_verify_no_cert} on TLS-bearing listeners, so leg (c)
 #   above pins all three CROSS-SIDE. Still UNasserted from that family:
-#   ssl.connection_error (envoy-go's `other` handshake outcome increments nothing —
-#   a NAMED departure, not an omission), the ssl.ciphers/curves/versions
-#   breakdowns, and ssl.no_certificate. That last name DOES exist as of phase 75
+#   ssl.connection_error, the ssl.ciphers/curves/versions breakdowns, and
+#   ssl.no_certificate. ssl.connection_error is NO LONGER a departure — phase 94
+#   (ADR-0316) landed it as the FIFTH listener-scope name, incremented from
+#   outcomeOther under a CLOSED transport-exclusion predicate — but it reads 0 on
+#   every arm HERE, structurally, all three arms being certificate-path outcomes;
+#   0120-tls-connection-error is the fixture that drives that population. That last name DOES exist as of phase 75
 #   and IS asserted CROSS-SIDE — at 0110-tls-require-client-cert-false, NOT here.
 #   This fixture runs require_client_certificate: true on BOTH sides
 #   (envoy-go.yaml / envoy.yaml), so a no-cert connection is REJECTED and booked

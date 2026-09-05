@@ -62,7 +62,7 @@ func pollCounter(t *testing.T, reg *stats.Registry, name string, want uint64, ti
 // changed to return a silent 0. The zero-assertion in
 // TestQUICListener_RegistersSSLNamesAtZero would otherwise pass VACUOUSLY under
 // a break that stops registering the ssl.* counters entirely: nothing
-// registered ⇒ every read is 0 ⇒ "all four are zero" is trivially true.
+// registered ⇒ every read is 0 ⇒ "all five are zero" is trivially true.
 func counterValue(t *testing.T, reg *stats.Registry, name string) int64 {
 	t.Helper()
 	var (
@@ -223,8 +223,9 @@ func TestQUICListener_ServesH3GET(t *testing.T) {
 }
 
 // TestQUICListener_RegistersSSLNamesAtZero pins SPEC §3.4: a QUIC listener
-// registers all FOUR ssl.* counters (the three phase-74 outcome counters plus
-// phase 75's ssl.no_certificate), because startQUIC hard-errors without a
+// registers all FIVE ssl.* counters (the three phase-74 outcome counters plus
+// phase 75's ssl.no_certificate plus phase 94's ssl.connection_error), because
+// startQUIC hard-errors without a
 // TLS config so rt.tlsMode is necessarily true, and they stay permanently ZERO
 // across a COMPLETED HTTP/3 handshake — because quic-go's Accept returns
 // post-handshake, so a QUIC handshake never surfaces as a per-connection event
@@ -270,15 +271,17 @@ func TestQUICListener_RegistersSSLNamesAtZero(t *testing.T) {
 	addr := infos[0].Addr
 	prefix := "listener." + normalizeAddr(addr) + "."
 
-	// (1) REGISTRATION: all four names present, spelled exactly. A cardinality
-	//     assertion would pass with all four misspelled — compare the set.
+	// (1) REGISTRATION: all five names present, spelled exactly. A cardinality
+	//     assertion would pass with all five misspelled — compare the set.
 	//     SORTED: listenerSSLNames sorts, so want must too; ssl.no_certificate
-	//     collates LAST. The phase-75 name stays ZERO here for the SAME
-	//     STRUCTURAL reason as the other three — Manager.Start never launches an
-	//     accept loop for kindQUIC, so serveConnection's TLS block (the ONLY
-	//     ssl.no_certificate Inc site) is unreachable. No volume of H3 traffic
-	//     moves it.
+	//     collates LAST and phase 94's ssl.connection_error collates FIRST (it
+	//     PREPENDS, at index 0). The phase-75 and phase-94 names stay ZERO here
+	//     for the SAME STRUCTURAL reason as the other three — Manager.Start
+	//     never launches an accept loop for kindQUIC, so serveConnection's TLS
+	//     block (the ONLY ssl.no_certificate and ssl.connection_error Inc site)
+	//     is unreachable. No volume of H3 traffic moves them.
 	want := []string{
+		prefix + "ssl.connection_error",
 		prefix + "ssl.fail_verify_error",
 		prefix + "ssl.fail_verify_no_cert",
 		prefix + "ssl.handshake",
@@ -300,7 +303,7 @@ func TestQUICListener_RegistersSSLNamesAtZero(t *testing.T) {
 		t.Errorf("downstream_cx_total = %d, want >= 1", got)
 	}
 
-	// (4) ...and all four ssl.* counters are STILL ZERO.
+	// (4) ...and all five ssl.* counters are STILL ZERO.
 	for _, n := range want {
 		if v := counterValue(t, reg, n); v != 0 {
 			t.Errorf("%s = %d after a completed H3 handshake, want 0", n, v)

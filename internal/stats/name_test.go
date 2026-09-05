@@ -230,14 +230,19 @@ func TestHelpText_AccessLogDropped(t *testing.T) {
 // self-equality is the degradation signature asserted below.
 //
 // ⚠️ wantNames is HAND-LISTED and there is NO REVERSE DIRECTION — nothing walks
-// helpText demanding every envoy_listener_ssl_* key appear here. Landing a fifth
+// helpText demanding every envoy_listener_ssl_* key appear here. Landing a sixth
 // ssl.* helpText entry without extending this slice leaves it SILENTLY
-// UNGUARDED (EXECUTED at the phase-75 PLAN: with the phase-75 entry present and
-// this slice left at three, the whole package stayed GREEN). Any future ssl.*
-// leaf MUST be appended here in the same commit that adds its helpText entry.
+// UNGUARDED. ⚠️ The phase-75 evidence this comment used to cite is FALSE at
+// this tip: helptext_test.go post-dates phase 75 and now reddens a bare
+// helpText addition on its own. The silent gap is now keyed on helpTextRoster:
+// with BOTH the entry and the roster present and this slice left short, the
+// package stays GREEN (NC 6, phase 94) — which is why this slice is mandatory
+// and unguarded. Any future ssl.* leaf MUST be appended here in the same commit
+// that adds its helpText entry AND its helpTextRoster twin.
 func TestHelpText_ListenerSSLHandshakeOutcomes(t *testing.T) {
 	wantNames := []string{
 		"envoy_listener_ssl_handshake",
+		"envoy_listener_ssl_connection_error",
 		"envoy_listener_ssl_fail_verify_error",
 		"envoy_listener_ssl_fail_verify_no_cert",
 		"envoy_listener_ssl_no_certificate",

@@ -221,9 +221,13 @@
 #   this tip: envoy-go now registers listener.<addr>.ssl.{handshake,no_certificate,
 #   fail_verify_error,fail_verify_no_cert} on TLS-bearing listeners, so leg (c)
 #   above pins all four CROSS-SIDE (2 / 1 / 1 / 0). Still UNasserted from that
-#   family: ssl.connection_error (envoy-go's `other` handshake outcome increments
-#   nothing — a NAMED departure, not an omission) and the
-#   ssl.ciphers/curves/versions breakdowns. The accept/reject CONTRAST remains the
+#   family: the ssl.ciphers/curves/versions breakdowns. ssl.connection_error is
+#   NO LONGER a departure: phase 94 (ADR-0316) landed it as the FIFTH
+#   listener-scope name, incremented from outcomeOther under a CLOSED
+#   transport-exclusion predicate. It stays UNasserted HERE because it reads 0 on
+#   every arm of this fixture, structurally — all three arms are certificate-path
+#   outcomes, so a pin would document a vacuous 0 == 0. The fixture that drives
+#   that population is 0120-tls-connection-error. The accept/reject CONTRAST remains the
 #   primary proof obligation and is strictly STRONGER than a subject-only stat — it
 #   is cross-side, and it now has a cross-side STAT beside it. On THIS fixture the
 #   stat is more than a companion, and this is the sharper thing 0110 can say that

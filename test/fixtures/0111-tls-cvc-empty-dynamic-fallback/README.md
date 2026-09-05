@@ -169,8 +169,12 @@ never cross-side string equality (`reference_differential_reference_parses_full_
   RETIRED). envoy-go registers `listener.<addr>.ssl.{handshake,fail_verify_error,
   fail_verify_no_cert}` on TLS-bearing listeners, so the driver's `AssertStats`
   pins all three to exactly `1` on **both** sides (one per arm), scraped from
-  `/stats/prometheus`. Still out of scope: `ssl.connection_error` (envoy-go's
-  `other` outcome increments nothing — a named departure) and
+  `/stats/prometheus`. Still out of scope: `ssl.connection_error` — that name
+  DOES exist as of phase 94 (ADR-0316), incremented from `outcomeOther` under a
+  CLOSED transport-exclusion predicate, so it is no longer a departure; it stays
+  unasserted HERE because all three arms are certificate-path outcomes and it
+  therefore reads 0 on every one of them, structurally (`0120-tls-connection-error`
+  is the fixture that drives that population). Also out of scope:
   **`ssl.no_certificate`** — that name DOES exist as of phase 75 and IS asserted
   cross-side, but **at `0110-tls-require-client-cert-false`, not here**: this
   fixture runs `require_client_certificate: true`, under which a no-cert

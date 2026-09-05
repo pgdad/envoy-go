@@ -514,11 +514,14 @@ func escapeLabelValue(s string) string {
 // helpText maps a Prometheus name to a static English description per
 // BRAINSTORM §4.5. Per Rule SN6, HELP text is NOT byte-equal to Envoy's HELP
 // text — the differential equivalence claim is on values + label keys + types
-// only. Of the 30 entries, the first 10 cover the 13 unique Prometheus names
+// only. Of the 31 entries, the first 10 cover the 13 unique Prometheus names
 // emitted by 06.1 (the four _Nxx counters per HCM and per cluster collapse to
 // envoy_http_downstream_rq_xx and envoy_cluster_upstream_rq_xx respectively per
-// Rule SN4); one is an 06.2 backpressure counter; the next three are the
-// phase-74 listener-scope TLS handshake outcomes; then phase 75's
+// Rule SN4); one is an 06.2 backpressure counter; then phase 94's
+// listener-scope ssl.connection_error — the ERROR-PATH counter for the fourth
+// handshake-outcome bucket, the only ssl.* entry its outcome books
+// CONDITIONALLY; the next three are the phase-74 listener-scope TLS handshake
+// outcomes; then phase 75's
 // listener-scope ssl.no_certificate — a SUCCESS-PATH annotation, not a member of
 // the outcome trichotomy; then ten are phase 79's byte-mirror roots
 // (runtime., access_logs., tracing.), whose Prometheus names are the plain
@@ -526,7 +529,7 @@ func escapeLabelValue(s string) string {
 // last five are phase 80's sds. root, which unlike those three HOISTS its
 // operator-supplied secret segment into an envoy_xds_resource_name label, so all
 // five bases are secret-free and one entry each serves every secret name. All
-// four ssl.* entries have three-dot source names (listener.<addr>.ssl.<leaf>)
+// five ssl.* entries have three-dot source names (listener.<addr>.ssl.<leaf>)
 // that flatten under SN3 to address-free residuals plus an
 // envoy_listener_address label. A name absent from this map emits its own name
 // as its HELP text (prom.go:59-61), so every emitted name wants an entry.
@@ -553,6 +556,7 @@ var helpText = map[string]string{
 	"envoy_server_live":                   "1 if the server is live, 0 otherwise.",
 	"envoy_server_accesslog_dropped":      "Total access-log records dropped due to backpressure (per-process aggregate across all sinks).",
 
+	"envoy_listener_ssl_connection_error":    "Downstream TLS handshakes failed with an SSL protocol error.",
 	"envoy_listener_ssl_handshake":           "Total successful downstream TLS handshakes on the listener.",
 	"envoy_listener_ssl_fail_verify_error":   "Downstream TLS handshakes failed because client certificate chain verification failed.",
 	"envoy_listener_ssl_fail_verify_no_cert": "Downstream TLS handshakes failed because no client certificate was presented where one was required.",

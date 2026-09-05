@@ -1,0 +1,89 @@
+# envoy-go bootstrap for fixture 0120-tls-connection-error.
+#
+# Functionally equivalent to envoy.yaml modulo:
+#   - cluster type: STATIC (envoy-go convention per ADR-0002) vs STRICT_DNS.
+#   - cluster endpoint address: 127.0.0.1 (envoy-go runs on the host loopback;
+#     there is no container boundary and so no DNS indirection) vs
+#     host.docker.internal.
+#   - admin/listener ports independently allocated by the runner.
+#
+# ONE TLS-terminating tcp_proxy listener (l_conn_err) whose DownstreamTlsContext
+# carries require_client_certificate: true, a STATIC inline server cert, an
+# inline validation_context.trusted_ca, and an explicit
+# common_tls_context.tls_params block — the FIRST tls_params YAML in this tree.
+#
+# ⚠️ tls_params carries tls_minimum_protocol_version: TLSv1_2 and NOTHING
+# ELSE. The two pre-1.2 protocol-version enum values MUST NEVER appear in
+# this file:
+# internal/tls/params.go returns "%s is not supported in phase 03" and
+# BOOT-REJECTS envoy-go on either value. The bad-version arm is produced
+# CLIENT-side only.
+#
+# ⚠️ CERT DELIVERY IS inline_string:, NEVER filename: — kept byte-symmetric
+# with the reference side (D-TLSCE-CERTDELIVERY). The subject COULD read
+# filename: paths since it runs on the host, but a divergent data-source
+# specifier across the two sides would make any cert-related divergence
+# ambiguous.
+#
+# Templating: rendered by the driver's mustRender() at SubjectConfig time.
+# Substitution keys:
+#   {{.AdminPort}}    — admin endpoint port (runner-allocated).
+#   {{.ListenerPort}} — l_conn_err listener port (runner-allocated).
+#   {{.BackendPort}}  — TCP echo backend port (runner-allocated, loopback).
+#   .ServerCertIndented — pki/server.pem, pre-indented to 24 spaces.
+#   .ServerKeyIndented  — pki/server.key.pem, pre-indented to 24 spaces.
+#   .CACertIndented     — pki/ca.pem, pre-indented to 22 spaces.
+#
+# NOTE: the three PEM keys above are deliberately written WITHOUT their
+# double-brace template-action delimiters. text/template expands actions inside
+# YAML comments too, and a multi-line PEM expanded into a "#" comment line
+# splatters its continuation lines outside the comment and produces invalid
+# YAML.
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: {{.AdminPort}} }
+
+static_resources:
+  listeners:
+    - name: l_conn_err
+      address:
+        socket_address: { address: 0.0.0.0, port_value: {{.ListenerPort}} }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_2
+                tls_certificates:
+                  - certificate_chain:
+                      inline_string: |
+{{.ServerCertIndented}}
+                    private_key:
+                      inline_string: |
+{{.ServerKeyIndented}}
+                validation_context:
+                  trusted_ca:
+                    inline_string: |
+{{.CACertIndented}}
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_0120
+                cluster: c_echo
+
+  clusters:
+    # c_echo: TCP echo backend (BackendCount=1) on the host loopback.
+    - name: c_echo
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c_echo
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: {{.BackendPort}} }

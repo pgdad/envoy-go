@@ -15,8 +15,10 @@ import (
 	"math/big"
 	"net"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2014,11 +2016,12 @@ func TestNewManager_HCMBuildErrorWrapsAsListenerFilter(t *testing.T) {
 // because both the old name and the old prose claimed the loop registers
 // "exactly the 2" — which stopped being true once a TLS-bearing listener also
 // began carrying the phase-74 `listener.<addr>.ssl.*` counters (three then,
-// four as of phase 75's ssl.no_certificate). The body never asserted the
+// four as of phase 75's ssl.no_certificate, five as of phase 94's
+// ssl.connection_error). The body never asserted the
 // count, so the false claim lived only in the name and the
 // comment and produced no red when the ssl.* family landed; this is a
 // deliberate documentation fix, not a test fix. The exact ssl.* NAME SET is
-// pinned by TestListenerMetrics_TLSListenerRegistersExactlyFourSSLNames, and
+// pinned by TestListenerMetrics_TLSListenerRegistersExactlyFiveSSLNames, and
 // its absence on a plaintext listener by
 // TestListenerMetrics_PlaintextListenerRegistersNoSSLNames.
 //
@@ -2065,18 +2068,18 @@ func TestListenerManager_AllocatesBaseListenerMetrics(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase-74 Task 2 (extended by phase 75): the listener-scope ssl.* counters —
-// registration is gated on rt.tlsMode ALONE (no kind check), so a TLS listener
-// carries exactly FOUR ssl.* names (the three phase-74 handshake-outcome
-// counters plus phase 75's ssl.no_certificate) and a plaintext listener carries
-// none.
+// Phase-74 Task 2 (extended by phases 75 and 94): the listener-scope ssl.*
+// counters — registration is gated on rt.tlsMode ALONE (no kind check), so a
+// TLS listener carries exactly FIVE ssl.* names (the three phase-74
+// handshake-outcome counters plus phase 75's ssl.no_certificate plus phase 94's
+// ssl.connection_error) and a plaintext listener carries none.
 // ---------------------------------------------------------------------------
 
 // listenerSSLNames returns the ssl.* metric names registered at the given
 // listener's scope, sorted. It asserts on the NAME SET, not on a cardinality:
 // the landed precedent (internal/statssink/registration_test.go:26, one of
 // five, all routing through a countMetrics helper that never inspects
-// m.Name()) counts via reg.Walk and WOULD PASS WITH ALL FOUR NAMES
+// m.Name()) counts via reg.Walk and WOULD PASS WITH ALL FIVE NAMES
 // MISSPELLED.
 func listenerSSLNames(reg *stats.Registry, addr string) []string {
 	prefix := "listener." + normalizeAddr(addr) + ".ssl."
@@ -2099,7 +2102,7 @@ func listenerMetricNames(reg *stats.Registry) map[string]bool {
 	return out
 }
 
-// TestListenerMetrics_TLSListenerRegistersExactlyFourSSLNames pins the EXACT
+// TestListenerMetrics_TLSListenerRegistersExactlyFiveSSLNames pins the EXACT
 // SPELLING of all three phase-74 names plus phase 75's ssl.no_certificate on a
 // TLS-bearing listener. A count-only assertion is insufficient — see
 // listenerSSLNames' doc — so this compares the whole sorted name set with
@@ -2107,8 +2110,9 @@ func listenerMetricNames(reg *stats.Registry) map[string]bool {
 //
 // ⚠️ `want` must be in SORTED order: listenerSSLNames sort.Strings'es its
 // result, so DeepEqual against an unsorted want fails on ORDER even when the SET
-// is right. "ssl.no_certificate" collates LAST of the four, so it appends.
-func TestListenerMetrics_TLSListenerRegistersExactlyFourSSLNames(t *testing.T) {
+// is right. Of the five, "ssl.no_certificate" collates LAST (so it appends) and
+// phase 94's "ssl.connection_error" collates FIRST (so it PREPENDS, at index 0).
+func TestListenerMetrics_TLSListenerRegistersExactlyFiveSSLNames(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
 	ts := mkDownstreamTSInline(t, testAlphaCertPEM, testAlphaKeyPEM)
@@ -2135,6 +2139,7 @@ func TestListenerMetrics_TLSListenerRegistersExactlyFourSSLNames(t *testing.T) {
 	addr := ls[0].Addr
 	prefix := "listener." + normalizeAddr(addr) + "."
 	want := []string{
+		prefix + "ssl.connection_error",
 		prefix + "ssl.fail_verify_error",
 		prefix + "ssl.fail_verify_no_cert",
 		prefix + "ssl.handshake",
@@ -2212,7 +2217,7 @@ func TestListenerMetrics_PlaintextListenerRegistersNoSSLNames(t *testing.T) {
 // Break E (the gate dropped) and it STAYED GREEN: both predicates are set at
 // BUILD time (manager.go:692 and :562), entirely upstream of
 // registerListenerMetrics, so neither one can observe a registration bug. Only
-// the four field pointers — non-nil iff tlsMode — actually witness the
+// the five field pointers — non-nil iff tlsMode — actually witness the
 // invariant whose violation is a PRODUCTION CRASH.
 func TestListenerMetrics_GateMatchesInc(t *testing.T) {
 	// (a) a mixed TLS+plaintext listener is REJECTED at build time — this is
@@ -2238,8 +2243,8 @@ func TestListenerMetrics_GateMatchesInc(t *testing.T) {
 	})
 
 	// (b) a TLS listener: rt.tlsMode == true AND every chainInfo has
-	//     tlsCfg != nil AND all FOUR counter fields are NON-NIL (three phase-74
-	//     outcomes + phase 75's sslNoCertificate).
+	//     tlsCfg != nil AND all FIVE counter fields are NON-NIL (three phase-74
+	//     outcomes + phase 75's sslNoCertificate + phase 94's sslConnectionError).
 	t.Run("tls_listener", func(t *testing.T) {
 		cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 		filter := mkTcpProxyFilter(t, "c_echo")
@@ -2296,10 +2301,18 @@ func TestListenerMetrics_GateMatchesInc(t *testing.T) {
 		if rt.sslNoCertificate == nil {
 			t.Error("TLS listener: rt.sslNoCertificate is NIL — Inc would panic the serveConnection goroutine")
 		}
+		// phase 94: the fifth pointer. Same reasoning as the fourth — the Inc
+		// inside `case outcomeOther:` has no nil guard, so a registration that
+		// drops while the Inc remains is a PROCESS CRASH in a background
+		// goroutine rather than a named failure. t.Errorf, not t.Fatalf: a
+		// Fatalf on any earlier pointer would make this one dead code.
+		if rt.sslConnectionError == nil {
+			t.Errorf("TLS listener: rt.sslConnectionError is NIL — Inc would panic the serveConnection goroutine")
+		}
 	})
 
 	// (c) a plaintext listener: rt.tlsMode == false AND every chainInfo has
-	//     tlsCfg == nil AND all FOUR counter fields are NIL. The nil fields
+	//     tlsCfg == nil AND all FIVE counter fields are NIL. The nil fields
 	//     are BY DESIGN — the Inc sites sit inside `if selected.tlsCfg != nil`
 	//     and are therefore unreachable here; do not add nil guards.
 	t.Run("plaintext_listener", func(t *testing.T) {
@@ -2351,6 +2364,11 @@ func TestListenerMetrics_GateMatchesInc(t *testing.T) {
 		// an accidentally ungated registration) shows up right here.
 		if rt.sslNoCertificate != nil {
 			t.Error("plaintext listener: rt.sslNoCertificate is NON-NIL — the rt.tlsMode gate did not hold")
+		}
+		// phase 94: the fifth pointer must be NIL here too — ssl.connection_error
+		// is registered inside the SAME rt.tlsMode block.
+		if rt.sslConnectionError != nil {
+			t.Errorf("plaintext listener: rt.sslConnectionError is NON-NIL — the tlsMode gate leaked")
 		}
 	})
 }
@@ -4568,16 +4586,22 @@ func startMutualTLSListener(t *testing.T, pki handshakeTestPKI) (*stats.Registry
 
 // sslLeafRoster is the COMPLETE set of ssl.* leaf names registered at a
 // TLS-bearing listener's scope: the three phase-74 handshake outcomes plus
-// phase 75's ssl.no_certificate. assertSSLCrossProduct partitions this roster
-// into the arm's expected movers and its expected non-movers, so adding a leaf
-// here automatically extends the NEGATIVE half of all four call sites.
+// phase 75's ssl.no_certificate plus phase 94's ssl.connection_error.
+// assertSSLCrossProduct partitions this roster into the arm's expected movers
+// and its expected non-movers, so adding a leaf here automatically extends the
+// NEGATIVE half of all four call sites.
 //
 // ⚠️ These are BARE LEAF names. The exact-set SPELLING pins
-// (TestListenerMetrics_TLSListenerRegistersExactlyFourSSLNames,
+// (TestListenerMetrics_TLSListenerRegistersExactlyFiveSSLNames,
 // TestQUICListener_RegistersSSLNamesAtZero) keep their own FULLY-QUALIFIED
 // literals and must NEVER be refactored onto this roster: a shared roster would
 // let ONE misspelling satisfy the spelling pin and this helper simultaneously.
-var sslLeafRoster = []string{"handshake", "fail_verify_error", "fail_verify_no_cert", "no_certificate"}
+// ⚠️ This roster guards the Inc SITE, not the PREDICATE. Extending it catches an
+// Inc that leaks onto the cert arms (measured: hoisting the Inc above the switch
+// reddens the two cert tests). It CANNOT catch a broken predicate, because no
+// call site here reaches outcomeOther — see
+// TestServeConnection_SSLConnectionErrorCounter for that guard (phase 94).
+var sslLeafRoster = []string{"handshake", "fail_verify_error", "fail_verify_no_cert", "no_certificate", "connection_error"}
 
 // assertSSLCrossProduct is the CROSS-PRODUCT assertion every increment test
 // owes (reference_probe_must_discriminate): every NAMED counter reaches exactly
@@ -4806,7 +4830,7 @@ func TestServeConnection_SSLNoCertificateIncrements(t *testing.T) {
 }
 
 // TestServeConnection_PlaintextListenerIncrementsNoSSL is Break C's target.
-// A plaintext listener's four ssl.* pointers are NIL (T2's rt.tlsMode gate),
+// A plaintext listener's five ssl.* pointers are NIL (T2's rt.tlsMode gate),
 // so keeping every ssl.* Inc point inside `if selected.tlsCfg != nil` is not a style
 // choice: (*stats.Counter).Inc has NO nil check and internal/listener has NO
 // recover(), so an ssl Inc on a plaintext connection is a nil-pointer PANIC in
@@ -4866,5 +4890,379 @@ func TestServeConnection_PlaintextListenerIncrementsNoSSL(t *testing.T) {
 	// nothing for serveConnection to Inc.
 	if got := listenerSSLNames(reg, addr); len(got) != 0 {
 		t.Errorf("plaintext listener ssl name set = %v, want empty", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase-94 Task 4: isTransportHandshakeErr — the PREDICATE-level table.
+//
+// Every value in this table comes from a REAL server-side crypto/tls handshake
+// over a loopback TCP pair. Hand-written error strings are deliberately absent:
+// crypto/tls exports FOUR error TYPES and ZERO error VALUES on this path, so a
+// hand-written value would pin the test author's guess rather than what
+// production produces (SPEC §0, refutation 1).
+//
+// ⚠️ net.Pipe MUST NOT be used — see connPair's doc.
+// ---------------------------------------------------------------------------
+
+// driveHandshakeFailure runs a SERVER-side TLS handshake over a loopback TCP
+// pair while `client` does whatever it likes with the RAW client end, and
+// returns the SERVER-side handshake error. The server config is one-way TLS
+// (server cert only, no CertificateRequest), so every arm here fails for a
+// reason that is NOT about client certificates.
+//
+// ⚠️ context.Background(), never a WithTimeout ctx: a firing ctx REPLACES the
+// real outcome via the named-return override at crypto/tls/conn.go and every
+// arm would degrade to context.DeadlineExceeded.
+func driveHandshakeFailure(t *testing.T, client func(t *testing.T, c net.Conn)) error {
+	t.Helper()
+	pki := mkTestPKI(t)
+	srvCert, err := stdtls.X509KeyPair(pki.serverCertPEM, pki.serverKeyPEM)
+	if err != nil {
+		t.Fatalf("build server keypair: %v", err)
+	}
+	scfg := &stdtls.Config{Certificates: []stdtls.Certificate{srvCert}}
+
+	cliRaw, srvRaw := connPair(t)
+	errCh := make(chan error, 1)
+	go func() {
+		s := stdtls.Server(srvRaw, scfg)
+		errCh <- s.HandshakeContext(context.Background())
+		_ = s.Close()
+	}()
+	client(t, cliRaw)
+	return <-errCh
+}
+
+// driveBadVersion: a client that offers ONLY TLS 1.1, which the server's default
+// MinVersion (TLS 1.2) rejects. An SSL PROTOCOL error — the reference books it.
+func driveBadVersion(t *testing.T) error {
+	t.Helper()
+	return driveHandshakeFailure(t, func(t *testing.T, c net.Conn) {
+		t.Helper()
+		cc := stdtls.Client(c, &stdtls.Config{
+			InsecureSkipVerify: true, //nolint:gosec // test client; the arm is about VERSION, not trust
+			MinVersion:         stdtls.VersionTLS11,
+			MaxVersion:         stdtls.VersionTLS11,
+		})
+		_ = cc.HandshakeContext(context.Background())
+		_ = cc.Close()
+	})
+}
+
+// drivePlaintext: a client that speaks HTTP/1.1 at a TLS listener. crypto/tls
+// returns a tls.RecordHeaderError BY VALUE. An SSL PROTOCOL error.
+func drivePlaintext(t *testing.T) error {
+	t.Helper()
+	return driveHandshakeFailure(t, func(t *testing.T, c net.Conn) {
+		t.Helper()
+		_, _ = c.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+		_ = c.Close()
+	})
+}
+
+// driveGarbage: bytes that are not a TLS record at all. An SSL PROTOCOL error.
+func driveGarbage(t *testing.T) error {
+	t.Helper()
+	return driveHandshakeFailure(t, func(t *testing.T, c net.Conn) {
+		t.Helper()
+		_, _ = c.Write([]byte{0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55})
+		_ = c.Close()
+	})
+}
+
+// partialClientHello is a well-formed TLS record HEADER (handshake, TLS 1.0
+// legacy version, length 0x0100) followed by FEWER bytes than it promises, so a
+// reader that trusts the header blocks for the remainder.
+var partialClientHello = []byte{0x16, 0x03, 0x01, 0x01, 0x00, 0x01, 0x00, 0x00, 0xfc}
+
+// drivePartialThenFIN: a truncated record, then a clean FIN. TRANSPORT failure —
+// crypto/tls converts the short read to io.ErrUnexpectedEOF.
+func drivePartialThenFIN(t *testing.T) error {
+	t.Helper()
+	return driveHandshakeFailure(t, func(t *testing.T, c net.Conn) {
+		t.Helper()
+		_, _ = c.Write(partialClientHello)
+		_ = c.Close()
+	})
+}
+
+// driveZeroThenFIN: a clean FIN with no bytes at all. TRANSPORT failure — a
+// bare io.EOF. ⚠️ This is the arm the io.EOF term of the predicate exists for,
+// and the reference books NOTHING on it.
+func driveZeroThenFIN(t *testing.T) error {
+	t.Helper()
+	return driveHandshakeFailure(t, func(t *testing.T, c net.Conn) {
+		t.Helper()
+		_ = c.Close()
+	})
+}
+
+// drivePartialThenRST: a truncated record, then an ABORTIVE close (SO_LINGER 0
+// makes Close send RST rather than FIN). TRANSPORT failure — syscall.ECONNRESET.
+func drivePartialThenRST(t *testing.T) error {
+	t.Helper()
+	return driveHandshakeFailure(t, func(t *testing.T, c net.Conn) {
+		t.Helper()
+		tc, ok := c.(*net.TCPConn)
+		if !ok {
+			t.Fatalf("connPair client end is %T, want *net.TCPConn — SetLinger is unavailable", c)
+		}
+		_, _ = tc.Write(partialClientHello)
+		if err := tc.SetLinger(0); err != nil {
+			t.Fatalf("SetLinger(0): %v", err)
+		}
+		_ = tc.Close()
+	})
+}
+
+func TestIsTransportHandshakeErr(t *testing.T) {
+	// Each arm drives a REAL server-side crypto/tls handshake failure over a
+	// loopback TCP pair — never net.Pipe, which deadlocks a client-cert
+	// handshake. The values are what production actually produces.
+	cases := []struct {
+		name        string
+		drive       func(t *testing.T) error // returns the SERVER-side handshake error
+		wantIsTrans bool
+	}{
+		{"bad_version_TLS11_client", driveBadVersion, false},
+		{"plaintext_http", drivePlaintext, false},
+		{"garbage_bytes", driveGarbage, false},
+		{"partial_hello_then_FIN", drivePartialThenFIN, true},
+		{"zero_bytes_then_FIN", driveZeroThenFIN, true},
+		{"partial_then_RST", drivePartialThenRST, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.drive(t)
+			if err == nil {
+				t.Fatalf("%s: handshake unexpectedly SUCCEEDED — the arm is vacuous", tc.name)
+			}
+			if got := isTransportHandshakeErr(err); got != tc.wantIsTrans {
+				t.Errorf("%s: isTransportHandshakeErr(%T %q) = %v, want %v",
+					tc.name, err, err.Error(), got, tc.wantIsTrans)
+			}
+			// NON-VACUITY: every arm must classify to outcomeOther, or it is
+			// pinning a different question than this row's.
+			if o := classifyHandshakeErr(err); o != outcomeOther {
+				t.Errorf("%s: classifyHandshakeErr = %v, want outcomeOther", tc.name, o)
+			}
+		})
+	}
+}
+
+func TestIsTransportHandshakeErr_ReadsIdentityNotText(t *testing.T) {
+	// syscall.ECONNRESET.Error() is BYTE-IDENTICAL to this string, but a bare
+	// errors.New carrying that text is a *errors.errorString with no Is/Unwrap,
+	// so errors.Is is FALSE. If this test ever flips, the predicate has started
+	// matching message text — the exact practice the design forbids.
+	synth := errors.New("connection reset by peer")
+	if synth.Error() != syscall.ECONNRESET.Error() {
+		t.Fatalf("precondition lost: the synthetic text no longer matches the sentinel's")
+	}
+	if isTransportHandshakeErr(synth) {
+		t.Errorf("isTransportHandshakeErr matched a SYNTHETIC string error — it is reading TEXT, not identity")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase-94 Task 5: THE COUNTER TABLE — the guard that makes the PREDICATE
+// falsifiable.
+//
+// sslLeafRoster / assertSSLCrossProduct CANNOT do this job: no call site of
+// theirs reaches outcomeOther at all (PLAN §0.1, measured 2x2). These tests
+// drive the REAL listener and the REAL Inc site.
+// ---------------------------------------------------------------------------
+
+// gaugeValue is counterValue's GAUGE sibling: it reads the registry gauge named
+// `name` ONCE and returns its value, and t.Errorf's when `name` is ABSENT rather
+// than returning a silent 0 (the same non-vacuity reasoning counterValue's doc
+// gives — nothing registered would otherwise make every "is zero" assertion
+// trivially true).
+//
+// ⚠️ Gauge's accessor is Load() int64 — there is NO Value() method
+// (internal/stats/gauge.go:56). This mirrors counterValue's type-assertion shape
+// rather than switching on Type().
+//
+// ⚠️ NEVER register a stat inside Registry.Walk: the callback runs under RLock
+// and registering re-enters the write lock, DEADLOCKING the process
+// (reference_registry_walk_lock_inversion).
+func gaugeValue(t *testing.T, reg *stats.Registry, name string) int64 {
+	t.Helper()
+	var (
+		val   int64
+		found bool
+	)
+	reg.Walk(func(m stats.Metric) {
+		if m.Name() != name {
+			return
+		}
+		if g, ok := m.(*stats.Gauge); ok {
+			val = g.Load()
+			found = true
+		}
+	})
+	if !found {
+		t.Errorf("gauge %q is not registered", name)
+		return -1
+	}
+	return val
+}
+
+// awaitDrained is the release barrier: it waits until `want` connections have
+// been accepted AND all of them have finished serveConnection. Polling the
+// gauge is sound because serveConnection defers downstreamCxActive.Dec(), which
+// runs AFTER the handshake-outcome switch — so active==0 proves every outcome
+// has been booked. NO SLEEPS.
+func awaitDrained(t *testing.T, reg *stats.Registry, addr string, want int64) {
+	t.Helper()
+	prefix := "listener." + normalizeAddr(addr) + "."
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if counterValue(t, reg, prefix+"downstream_cx_total") >= want &&
+			gaugeValue(t, reg, prefix+"downstream_cx_active") == 0 {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatalf("release barrier timed out: downstream_cx_total never reached %d with active back at 0", want)
+}
+
+// --- the six single-cause dialers, each driving EXACTLY ONE connection --------
+
+// dialMaxTLS11 offers ONLY TLS 1.1, which the listener's floor rejects. SSL
+// PROTOCOL error.
+func dialMaxTLS11(t *testing.T, addr string) {
+	t.Helper()
+	c, err := stdtls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, &stdtls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // this arm is about VERSION, not trust
+		MinVersion:         stdtls.VersionTLS11,
+		MaxVersion:         stdtls.VersionTLS11,
+	})
+	if err == nil {
+		t.Errorf("dialMaxTLS11: handshake SUCCEEDED — the arm is vacuous")
+		_ = c.Close()
+	}
+}
+
+// dialPlaintextHTTP speaks HTTP/1.1 at a TLS listener. SSL PROTOCOL error
+// (tls.RecordHeaderError).
+func dialPlaintextHTTP(t *testing.T, addr string) {
+	t.Helper()
+	c := dialRaw(t, addr)
+	_, _ = c.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+	_ = c.Close()
+}
+
+// dialGarbage writes bytes that are not a TLS record at all. SSL PROTOCOL error.
+func dialGarbage(t *testing.T, addr string) {
+	t.Helper()
+	c := dialRaw(t, addr)
+	_, _ = c.Write([]byte{0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55})
+	_ = c.Close()
+}
+
+// dialPartialThenFIN sends a truncated record then a clean FIN. TRANSPORT
+// failure (io.ErrUnexpectedEOF).
+func dialPartialThenFIN(t *testing.T, addr string) {
+	t.Helper()
+	c := dialRaw(t, addr)
+	_, _ = c.Write(partialClientHello)
+	_ = c.Close()
+}
+
+// dialZeroThenFIN connects and closes with no bytes at all. TRANSPORT failure
+// (a bare io.EOF) — the arm the predicate's io.EOF term exists for.
+func dialZeroThenFIN(t *testing.T, addr string) {
+	t.Helper()
+	c := dialRaw(t, addr)
+	_ = c.Close()
+}
+
+// dialPartialThenRST sends a truncated record then an ABORTIVE close.
+// TRANSPORT failure (syscall.ECONNRESET).
+func dialPartialThenRST(t *testing.T, addr string) {
+	t.Helper()
+	c := dialRaw(t, addr)
+	_, _ = c.Write(partialClientHello)
+	if err := c.SetLinger(0); err != nil {
+		t.Fatalf("SetLinger(0): %v", err)
+	}
+	_ = c.Close()
+}
+
+// dialRaw opens a plain TCP connection to addr and returns it as a *net.TCPConn
+// (SetLinger is needed by the RST arm).
+func dialRaw(t *testing.T, addr string) *net.TCPConn {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial %s: %v", addr, err)
+	}
+	tc, ok := c.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("dial %s returned %T, want *net.TCPConn", addr, c)
+	}
+	return tc
+}
+
+func TestServeConnection_SSLConnectionErrorCounter(t *testing.T) {
+	// Every arm drives ONE real connection into a REAL listener and asserts the
+	// fifth counter AND that no other ssl.* leaf moved. Arms are single-cause.
+	// ⚠️ counterValue returns int64, NOT uint64. Keep `want` int64 or the
+	// comparison will not compile.
+	cases := []struct {
+		name string
+		dial func(t *testing.T, addr string) // drives exactly one connection
+		want int64
+	}{
+		{"bad_version_TLS11_client", dialMaxTLS11, 1},
+		{"plaintext_http", dialPlaintextHTTP, 1},
+		{"garbage_bytes", dialGarbage, 1},
+		{"partial_hello_then_FIN", dialPartialThenFIN, 0},
+		{"zero_bytes_then_FIN", dialZeroThenFIN, 0},
+		{"partial_then_RST", dialPartialThenRST, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pki := mkTestPKI(t)
+			reg, addr := startOneWayTLSListener(t, pki)
+			tc.dial(t, addr)
+			awaitDrained(t, reg, addr, 1)
+
+			got := counterValue(t, reg, "listener."+normalizeAddr(addr)+".ssl.connection_error")
+			if got != tc.want {
+				t.Errorf("%s: ssl.connection_error = %d, want %d", tc.name, got, tc.want)
+			}
+			// ⚠️ ASSERT WHICH DID NOT FIRE. A pin proving connection_error moved
+			// says nothing about whether a cert counter also moved.
+			for _, leaf := range []string{"handshake", "fail_verify_error", "fail_verify_no_cert", "no_certificate"} {
+				if v := counterValue(t, reg, "listener."+normalizeAddr(addr)+".ssl."+leaf); v != 0 {
+					t.Errorf("%s: ssl.%s = %d, want 0 — only connection_error may move on this arm", tc.name, leaf, v)
+				}
+			}
+		})
+	}
+}
+
+func TestServeConnection_SSLConnectionErrorCounter_Stacked(t *testing.T) {
+	// The three EXCLUDED arms then ONE INCLUDED arm, on the SAME listener.
+	// A bare `== 0` on an exclusion arm is indistinguishable from "nothing ran";
+	// stacking makes the excluded arms observable — they must contribute ZERO to
+	// a counter that a single later arm drives to EXACTLY 1.
+	// NC EVIDENCE: with the predicate removed this reads 4; with the Inc removed
+	// it reads 0. Only the correct implementation reads 1.
+	pki := mkTestPKI(t)
+	reg, addr := startOneWayTLSListener(t, pki)
+
+	dialPartialThenFIN(t, addr)
+	dialZeroThenFIN(t, addr)
+	dialPartialThenRST(t, addr)
+	dialPlaintextHTTP(t, addr)
+	awaitDrained(t, reg, addr, 4)
+
+	if got := counterValue(t, reg, "listener."+normalizeAddr(addr)+".ssl.connection_error"); got != 1 {
+		t.Errorf("stacked: ssl.connection_error = %d, want 1 "+
+			"(3 transport arms must contribute 0, 1 protocol arm must contribute 1)", got)
 	}
 }

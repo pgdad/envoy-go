@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	bootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
@@ -172,9 +173,9 @@ type listenerRuntime struct {
 	// 06.1 metric fields (per SPEC §6 — listener-scope only). Allocated by
 	// registerListenerMetrics at Start time (post-bind, pre-Freeze) and
 	// Inc/Dec'd from the accept-loop hot path. The two cx metrics are
-	// registered for EVERY listener; the four ssl.* counters are registered
+	// registered for EVERY listener; the five ssl.* counters are registered
 	// only when rt.tlsMode is set (phase 74 — TLS-chains-only, matching the
-	// reference), so on a plaintext listener all four pointers stay NIL.
+	// reference), so on a plaintext listener all five pointers stay NIL.
 	downstreamCxTotal   *stats.Counter
 	downstreamCxActive  *stats.Gauge
 	sslHandshake        *stats.Counter // phase 74: successful downstream TLS handshakes
@@ -185,6 +186,12 @@ type listenerRuntime struct {
 	// sslFailVerifyNoCert (a FAILED handshake) — the two are disjoint by
 	// construction, one living on each side of the HandshakeContext error check.
 	sslNoCertificate *stats.Counter // phase 75: completed handshake, no client cert presented
+	// sslConnectionError is phase 94's ERROR-PATH counter for the fourth outcome
+	// bucket. It is the ONLY ssl.* counter that outcomeOther maps to
+	// CONDITIONALLY: it Inc's on an SSL PROTOCOL error and stays put on a
+	// TRANSPORT failure (see isTransportHandshakeErr). The handshakeOutcome
+	// taxonomy stays FOUR while this scope's counters go to FIVE.
+	sslConnectionError *stats.Counter // phase 94: handshake failed with an SSL PROTOCOL error
 	// 08.2 (Task 5) drain fast-path field. Field-local (not chasing back through
 	// *Manager) to minimize hot-path indirection per ADR-0094.
 	dm *drain.Manager
@@ -361,7 +368,8 @@ func normalizeAddr(addr string) string {
 // Pre-Freeze (Task 12 owns the Freeze call after the admin server is up).
 //
 // The two cx metrics are unconditional. The three phase-74 ssl.* counters plus
-// the one phase-75 ssl.* counter (ssl.no_certificate — four in total) are all
+// the one phase-75 ssl.* counter (ssl.no_certificate) plus the one phase-94
+// ssl.* counter (ssl.connection_error — five in total) are all
 // gated on rt.tlsMode, matching the reference, which registers listener.<addr>.ssl.*
 // on TLS-bearing chains ONLY (a plaintext listener carries zero ssl.* names while
 // carrying 15+ other zero-valued names in the same scope — probed at the phase-74
@@ -386,17 +394,24 @@ func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
 		rt.sslFailVerifyError = r.NewCounter(prefix + "ssl.fail_verify_error")
 		rt.sslFailVerifyNoCert = r.NewCounter(prefix + "ssl.fail_verify_no_cert")
 		rt.sslNoCertificate = r.NewCounter(prefix + "ssl.no_certificate")
+		rt.sslConnectionError = r.NewCounter(prefix + "ssl.connection_error")
 	}
 }
 
 // handshakeOutcome classifies a downstream TLS handshake result into the three
-// counted buckets plus a fourth that counts NOTHING. It is an ERROR-PATH
+// UNCONDITIONALLY counted buckets plus a fourth that counts CONDITIONALLY. It
+// is an ERROR-PATH
 // taxonomy: the classifier is consumed at exactly one site (the handshake-error
 // branch, see the switch below serveConnection's step (6)) and never sees a
 // successful handshake.
 //
-// ⚠️ "three counted buckets" counts OUTCOMES, not ssl.* COUNTERS — the listener
-// scope carries FOUR ssl.* counters as of phase 75. Phase 75 added
+// ⚠️ The bucket counts here count OUTCOMES, not ssl.* COUNTERS — the listener
+// scope carries FIVE ssl.* counters as of phase 94, against FOUR outcomes. The
+// taxonomy and the counter family are DELIBERATELY not in bijection: phase 75's
+// ssl.no_certificate has no outcome variant at all (it is booked on the SUCCESS
+// fall-through), and phase 94's ssl.connection_error is the only counter whose
+// outcome — outcomeOther — books it CONDITIONALLY, on the SSL-protocol-error
+// side of isTransportHandshakeErr. Phase 75 added
 // ssl.no_certificate WITHOUT adding a handshakeOutcome variant, and that is
 // deliberate: no_certificate is a SUCCESS-path annotation, Inc'd after the error
 // branch has already returned, entirely OUTSIDE the classifyHandshakeErr switch.
@@ -407,9 +422,15 @@ func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
 //
 // ⚠️ outcomeVerifyError means "certificate CHAIN VERIFICATION failed" — NOT
 // "client cert rejected". A cert/private-key mismatch and a malformed DER never
-// reach certs[0].Verify() inside crypto/tls and land in outcomeOther, which
-// increments nothing. The reference books those under ssl.connection_error; that
-// asymmetry is a NAMED DEPARTURE (ADR-0296, BEHAVIOR_CONTRACT B5).
+// reach certs[0].Verify() inside crypto/tls and land in outcomeOther, which as
+// of phase 94 increments ssl.connection_error — both of those shapes are SSL
+// PROTOCOL errors, so isTransportHandshakeErr is false for them and the counter
+// moves. The phase-74 departure (outcomeOther incrementing NOTHING while the
+// reference booked ssl.connection_error) is CLOSED by ADR-0316; see
+// BEHAVIOR_CONTRACT.md's "### Downstream TLS handshake-outcome stats"
+// subsection. ⚠️ The former "BEHAVIOR_CONTRACT B5" cite was a PHANTOM: that file
+// carries no B-numbered step scheme, and its only B5 tokens belong to unrelated
+// AMEND-B5 contexts. Cite the SUBSECTION HEADING, never a B-number.
 //
 // ⚠️ The no-cert arm is matched by STRING. crypto/tls exports four error TYPES
 // and ZERO error VALUES, so there is no sentinel to compare against. The text is
@@ -453,6 +474,35 @@ func classifyHandshakeErr(err error) handshakeOutcome {
 		return outcomeNoCert
 	}
 	return outcomeOther
+}
+
+// isTransportHandshakeErr reports whether a downstream TLS handshake error is a
+// TRANSPORT failure rather than an SSL PROTOCOL error. The reference books
+// ssl.connection_error IFF BoringSSL reports a protocol error (ADR-0316 §Context
+// ¶2, measured); a transport EOF or reset books NOTHING under ssl.*.
+//
+// The POSITIVE population is open-ended and untypeable. The COMPLEMENT is closed
+// and every member is errors.Is-able, so this matches the complement and the
+// caller Inc()s otherwise. There is DELIBERATELY no message-text matching here —
+// unlike the outcomeNoCert arm, which needs it because crypto/tls exports four
+// error TYPES and ZERO error VALUES.
+//
+// ⚠️ TWO of the five terms are DEFENSIVE and UNEXERCISED, not one. No measured
+// arm produces net.ErrClosed, and none produces context.DeadlineExceeded either
+// -- the latter appears in this package's tests ONLY as a hand-written value in
+// TestClassifyHandshakeErr, which calls the classifier directly and never
+// reaches this predicate. Both are retained because a closed listener racing an
+// in-flight handshake and a handshake deadline are real shapes, but no test in
+// this tree drives either and none claims to. The three terms that ARE
+// exercised, each by a distinct arm: io.ErrUnexpectedEOF (partial ClientHello
+// then FIN), io.EOF (zero bytes then FIN), syscall.ECONNRESET (partial then
+// RST, arriving wrapped in a *net.OpError).
+func isTransportHandshakeErr(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, context.DeadlineExceeded)
 }
 
 // validateQUICOptions strict-rejects the udp_listener_config.quic_options tuning
@@ -1288,14 +1338,25 @@ func (rt *listenerRuntime) serveConnection(ctx context.Context, raw net.Conn) {
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			// phase 74: book the outcome before logging. `err` is scoped to this
 			// if-init, so this is the only place it is in scope.
-			// outcomeOther deliberately increments NOTHING — the reference books
-			// those under ssl.connection_error, a name this row does not land.
-			// That asymmetry is a NAMED DEPARTURE (ADR-0296, BEHAVIOR_CONTRACT B5).
+			// ⚠️ The phase-74 note that "outcomeOther deliberately increments
+			// NOTHING" is SUPERSEDED by the case outcomeOther: arm below (phase
+			// 94, ADR-0316): the name ssl.connection_error IS landed and the
+			// departure is CLOSED. Its phantom "BEHAVIOR_CONTRACT B5" cite is
+			// replaced by the real anchor — BEHAVIOR_CONTRACT.md's
+			// "### Downstream TLS handshake-outcome stats" subsection.
 			switch classifyHandshakeErr(err) {
 			case outcomeVerifyError:
 				rt.sslFailVerifyError.Inc()
 			case outcomeNoCert:
 				rt.sslFailVerifyNoCert.Inc()
+			case outcomeOther:
+				// phase 94: the reference books ssl.connection_error IFF BoringSSL
+				// reports an SSL PROTOCOL error; a TRANSPORT EOF or reset books
+				// NOTHING under ssl.*. The predicate matches the closed transport
+				// COMPLEMENT and we Inc otherwise (ADR-0316).
+				if !isTransportHandshakeErr(err) {
+					rt.sslConnectionError.Inc()
+				}
 			}
 			log.Printf("listener %q: handshake: %v", rt.name, err)
 			_ = pkConn.Close()

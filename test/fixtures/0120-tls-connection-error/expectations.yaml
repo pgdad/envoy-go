@@ -1,0 +1,242 @@
+# Phase 94 fixture 0120-tls-connection-error expectations
+# (ADR-0019 — prose; the enforcers are the driver's own per-side arm checks, the
+# runner's CompareBytes, and the driver's AssertStats. This file is
+# documentation, not an input to any code path.)
+#
+# ## The proposition
+#
+#   A downstream TLS handshake that fails with an SSL PROTOCOL error increments
+#   listener.<addr>.ssl.connection_error. A downstream connection that fails with
+#   a TRANSPORT condition — a clean FIN before any TLS byte, a reset, a timeout —
+#   increments NOTHING under ssl.*.
+#
+#   The distinction is the whole point. A counter that fires on every failed
+#   handshake would look identical on four of this fixture's five arms; only the
+#   clean-FIN arm separates "the counter CAN move" from "the predicate
+#   DISCRIMINATES".
+#
+# ## Firsts (this fixture, in this tree)
+#
+#   - FIRST fixture to drive deliberately FAILING TLS handshakes that are NOT
+#     certificate failures. 0110 and 0111 drive failing handshakes, but every one
+#     of theirs is a certificate-verification failure.
+#   - FIRST fixture to ship a common_tls_context.tls_params block, in BOTH
+#     configs, booted on both sides.
+#   - the tree's FIRST COMMITTED clientAuth leaf (pki/client.pem).
+#   ⚠️ A mid-build probe appeared to REFUTE that third first and was itself
+#   wrong: it decoded every *.pem PRESENT ON DISK under test/ and found
+#   test/fixtures/0018-http-rbac/pki/client.pem. That file is NOT committed --
+#   0018/pki/.gitignore lists it and pki/gen.go's init() regenerates it on every
+#   test-binary load; the only TRACKED files there are .gitignore, gen.go and
+#   gen_test.go. Re-derived over `git ls-files` (tracked files ONLY), exactly one
+#   committed leaf under test/ carries TLS Web Client Authentication and it is
+#   this one. WHEN TWO MEASUREMENTS DISAGREE, FIND THE VARIABLE: here it was
+#   COMMITTED vs PRESENT ON DISK, and both probes reported truthfully about
+#   different things.
+#
+# ## Topology
+#
+#   l_conn_err — ONE TLS-terminating tcp_proxy listener. Its DownstreamTlsContext
+#                carries:
+#                  require_client_certificate: true
+#                  common_tls_context.tls_params:
+#                    tls_minimum_protocol_version: TLSv1_2   <- the floor arm (i)
+#                                                               violates
+#                  common_tls_context.tls_certificates = [{ inline_string server
+#                    leaf + key }]                            <- STATIC, committed
+#                  common_tls_context.validation_context.trusted_ca =
+#                    { inline_string CA PEM }                 <- STATIC, committed
+#                No tls_inspector — one filter chain, no SNI match.
+#   c_echo     — TCP echo backend (BackendCount=1). Only arm (v) ever reaches it.
+#                The runner rejects BackendCount()==0, so 1 is the floor; the
+#                backend is NOT decorative — see "why the echo round-trip" below.
+#
+#   Reference in-container ports: admin 9901, listener 10126.
+#   Subject ports: admin and listener are both runner-allocated.
+#
+# ## The five arms, in the FIXED order driveSide runs them
+#
+#   Every arm runs against ONE side inside a SINGLE DriveReference/DriveSubject
+#   pair — one fixture directory is one runner branch, so there is exactly one
+#   Drive pair and exactly one AssertStats.
+#
+#   ord | arm         | what the client does                    | connection_error | handshake
+#   ----+-------------+-----------------------------------------+------------------+----------
+#    1  | (v) valid   | full mTLS handshake, client cert         |        +0        |    +1
+#       |             | FORCE-SENT, then an echo round-trip      |                  |
+#    2  | (i) bad_ver | ClientHello with MAX version TLS 1.1     |        +1        |    +0
+#    3  | (ii) plain  | plain TCP, writes "GET / HTTP/1.1..."    |        +1        |    +0
+#    4  | (iii) garb  | plain TCP, writes DE AD BE EF 00 11      |        +1        |    +0
+#    5  | (iv) FIN    | plain TCP, writes ZERO bytes, closes     |        +0        |    +0
+#
+#   Those deltas are MEASURED, per arm, with a before/after /stats/prometheus
+#   snapshot around each arm, on BOTH sides — the reference (pinned
+#   envoyproxy/envoy contrib-v1.37.2) and the subject (envoy-go). The two sides
+#   produced IDENTICAL deltas on every row.
+#
+#   ORDER IS LOAD-BEARING. The positive arm runs FIRST so that a broken upstream
+#   is caught before any negative arm can be misread.
+#
+# ## Why arm (v) asserts the ECHO ROUND-TRIP and not just the handshake
+#
+#   MEASURED: a cluster that cannot reach its backend lets the CLIENT report
+#   HANDSHAKE=OK while the reference's ssl.handshake reads 0, because tcp_proxy
+#   tears the downstream connection down before the handshake is booked. A
+#   handshake-only client check would therefore report success while the positive
+#   control was silently zero, and AssertStats would go RED with the config
+#   looking fine. The echo round-trip is what closes that gap, and it is why
+#   BackendCount()==1 is a real backend rather than a formality.
+#
+# ## Why the bad-version arm is CLIENT-side only
+#
+#   The obvious way to express arm (i) would be to lower the listener's floor in
+#   YAML. That is forbidden here: envoy-go's internal/tls/params.go BOOT-REJECTS
+#   the two pre-1.2 protocol-version enum values, so a config-side expression of
+#   this arm would take the SUBJECT DOWN AT BOOT instead of producing a handshake
+#   failure. Neither YAML contains either value.
+#
+#   The client-side form has its own trap, and it is guarded in the driver: since
+#   Go 1.22 the DEFAULT client minimum is TLS 1.2, so setting only MaxVersion
+#   would make the dial fail LOCALLY, send nothing, and let the server observe a
+#   clean FIN. Arm (i) would silently DEGRADE into a second copy of arm (iv) and
+#   book connection_error +0. The driver lowers MinVersion to TLS 1.0 alongside
+#   MaxVersion, and the measurement confirms the hello reaches the wire: the
+#   reference answers "protocol version not supported", a SERVER alert.
+#
+# ## Why every arm force-sends its client certificate and logs what it sent
+#
+#   Go's polite client (Certificates:) runs SupportsCertificate filtering against
+#   the server's advertised acceptable-CA list and SILENTLY sends an EMPTY chain
+#   when it does not match. An arm that hits that path measures the CLIENT, not
+#   the server, while every byte comparison stays green. The driver installs
+#   GetClientCertificate and log.Printf's the chain length actually handed to the
+#   stack, per arm and per side. MEASURED: client_cert_chain_len=1 on every
+#   handshaking arm, and ssl.no_certificate stays 0 on both sides.
+#
+# ## What AssertStats pins — ABSOLUTE values, both sides
+#
+#   ssl.connection_error   == 3   (arms (i), (ii), (iii); NOT (iv), NOT (v))
+#   ssl.handshake          == 1   (arm (v) only)
+#   ssl.fail_verify_error  == 0   NEGATIVE HALF
+#   ssl.fail_verify_no_cert== 0   NEGATIVE HALF
+#
+#   The values are ABSOLUTE, not deltas: nothing pre-moves l_conn_err's ssl.*
+#   counters. AssertStats runs at runner step 10, strictly after both Drives and
+#   CompareBytes; reference readiness polls admin 9901 rather than the TLS port,
+#   and the subject parses a stdout sentinel, so driveSide's five arms are the
+#   ONLY connections l_conn_err ever sees on either side.
+#
+#   ⚠️ THIS IS ARM ARITHMETIC. Adding a sixth arm invalidates both numbers.
+#
+#   The two zero pins are the NEGATIVE HALF and they are not decoration: a pin
+#   proving connection_error moved says nothing about whether a CERTIFICATE
+#   counter also moved. An implementation that booked every failed handshake
+#   under all three names would satisfy the positive half alone.
+#
+#   Over-firing controls, MEASURED on both sides, identical:
+#     3x clean-FIN    -> connection_error +0
+#     3x valid        -> handshake +3, connection_error +0
+#     2x bad-version  -> connection_error +2, handshake +0
+#   A positive arm cannot catch an OVER-firing counter; these can.
+#
+# ## Cross-side divergences DELIBERATELY LEFT UNASSERTED
+#
+#   1. THE envoy_listener_address LABEL VALUE. MEASURED live:
+#        reference: envoy_listener_ssl_connection_error{envoy_listener_address="0.0.0.0_10126"} 3
+#        subject:   envoy_listener_ssl_connection_error{envoy_listener_address="___12127"} 3
+#      envoy-go binds [::] and its listener port is runner-allocated, so the
+#      label value can never match cross-side. AssertStats therefore keys on the
+#      metric NAME and strips the label set ENTIRELY. Keying on the name resolves
+#      all three cross-side scope divergences at once — dotted address form, IPv6
+#      bracket normalization, and stat_prefix — because the Prometheus NAME
+#      carries none of them.
+#
+#   2. ARM (iii)'s WIRE-LEVEL REPLY. MEASURED: the reference answers the garbage
+#      bytes with a fatal TLS alert record (first bytes 15 03 01 00 02 02), while
+#      envoy-go answers with NOTHING and the client's read returns n=0 err=EOF.
+#      BOTH are valid rejections. This is why driveSide returns a NON-NIL EMPTY
+#      []byte on both sides rather than the bytes it read: returning read bytes
+#      would fail CompareBytes for a reason that is not this row's subject. The
+#      arm inspects its read result for exactly ONE forbidden outcome — the
+#      payload coming back verbatim, which would mean the port did not terminate
+#      TLS at all.
+#
+#   3. THE CLIENT-VISIBLE ALERT TEXT on every failing arm. BoringSSL and Go
+#      crypto/tls emit different alerts for the same rejection, so no cross-side
+#      equality can be built on error text. normalizeTLSErr collapses every
+#      failure to one token for the log. The drive bytes can only distinguish
+#      FAILED from SUCCEEDED; WHICH failure occurred is a STATS question, and
+#      that is where all discrimination lives.
+#
+# ## Cert delivery
+#
+#   inline_string:, NEVER filename:, on BOTH sides (D-TLSCE-CERTDELIVERY). pki/
+#   exists on the HOST, where envoy-go runs; it does NOT exist inside the
+#   reference container, and this fixture implements no ReferenceLogMounter
+#   bind-mount. The subject COULD read filename: paths, but a divergent
+#   data-source specifier across the two sides would make any cert-related
+#   divergence ambiguous, so both sides are kept byte-symmetric.
+
+fixture: 0120-tls-connection-error
+proposition: >-
+  Connection-level TLS failures that never reach certificate verification
+  increment listener.<addr>.ssl.connection_error; a transport truncation that
+  produces no TLS protocol error increments nothing under ssl.*.
+
+listeners:
+  - name: l_conn_err
+    reference_port: 10126
+    subject_port: runner-allocated
+    tls: DownstreamTlsContext, require_client_certificate=true,
+         tls_params.tls_minimum_protocol_version=TLSv1_2
+
+arms:
+  - id: v
+    order: 1
+    name: valid
+    drives: full mTLS handshake with a FORCE-SENT client cert, then an echo round-trip
+    connection_error_delta: 0
+    handshake_delta: 1
+  - id: i
+    order: 2
+    name: bad_version
+    drives: ClientHello whose maximum offered version is TLS 1.1
+    connection_error_delta: 1
+    handshake_delta: 0
+  - id: ii
+    order: 3
+    name: plaintext
+    drives: plain TCP, writes an HTTP/1.1 request line to the TLS port
+    connection_error_delta: 1
+    handshake_delta: 0
+  - id: iii
+    order: 4
+    name: garbage
+    drives: plain TCP, writes six non-TLS bytes
+    connection_error_delta: 1
+    handshake_delta: 0
+  - id: iv
+    order: 5
+    name: clean_fin
+    drives: plain TCP, writes ZERO bytes, closes cleanly
+    connection_error_delta: 0
+    handshake_delta: 0
+    role: >-
+      THE DISCRIMINATING NEGATIVE CONTROL. Exercises the io.EOF term of
+      isTransportHandshakeErr. Without that term this arm goes RED on the
+      subject side.
+
+stats_assertions:
+  keyed_on: metric name only; the label set is stripped entirely
+  both_sides: true
+  absolute_not_delta: true
+  values:
+    envoy_listener_ssl_connection_error: 3
+    envoy_listener_ssl_handshake: 1
+    envoy_listener_ssl_fail_verify_error: 0
+    envoy_listener_ssl_fail_verify_no_cert: 0
+
+unasserted_divergences:
+  - envoy_listener_address label value (reference "0.0.0.0_10126" vs subject "___<port>")
+  - arm (iii) wire reply (reference fatal alert record vs subject EOF with zero bytes)
+  - client-visible alert text on every failing arm (BoringSSL vs Go crypto/tls)
