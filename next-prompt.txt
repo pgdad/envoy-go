@@ -190,16 +190,16 @@ extract () { grep -oE '^[[:space:]]*_ "github\.com/pgdad/envoy-go/test/fixtures/
 
 ## ⚠️ THE ARCHIVE GUARD
 
-⚠️ **THE STRICT `163` IS NOT THE ENTRY COUNT.** Re-measured at this tip: loose **226** = strict **163** + parenthetical **63**, exactly — **the triple reconciles only under these ANCHORED-OCCURRENCE forms:**
+⚠️ **THE STRICT `163` IS NOT THE ENTRY COUNT.** Re-measured at THIS tip (phase-95 IMPL close, `STATE_HISTORY.md` **554**): loose **227** = strict **163** + parenthetical **64**, exactly — **the triple reconciles only under these ANCHORED-OCCURRENCE forms:**
 ```sh
 H=docs/envoy-go/STATE_HISTORY.md
-grep -oE '^- \*\*prior active-phase:\*\* ' $H | wc -l   # strict         163
-grep -oE '^- \*\*prior active-phase \('    $H | wc -l   # parenthetical   63
-grep -oE '^- \*\*prior active-phase'       $H | wc -l   # loose          226  = 163 + 63
+grep -oE '^- \*\*prior active-phase:\*\* ' $H | wc -l   # strict         163  <- DELTA 0 across a correct close
+grep -oE '^- \*\*prior active-phase \('    $H | wc -l   # parenthetical   64  <- +1 per close
+grep -oE '^- \*\*prior active-phase'       $H | wc -l   # loose          227  = 163 + 64
 ```
 ⚠️ The unanchored `grep -c 'prior active-phase'` counts LINES and coincides by accident; the colon form is a FOURTH regex. **Name the form or the figure is meaningless.** ⚠️ **`grep -F` WITH A PATTERN STARTING `- ` HITS THE FLAG TRAP** — pass `--` first. **The guard is SOUND as a DELTA-0 SHAPE check** (a correctly-shaped parenthetical append moves the STRICT form by 0 — verified again at this close) **but the number is a SUBSET.**
 
-⚠️ **THE ARCHIVE'S POSITIVE CONTROLS ARE SELF-INCREMENTING.** This stage's archive line names NO control figure. ⚠️ **AND THE RAW LINE DELTA IS `+2`, NOT `+1`** — the entry is a blank line PLUS the entry line. `SPEC.md` §10 forecast `+1` and its own commit landed `+2`, contradicting the precedent immediately before it. **This close: `STATE_HISTORY.md` 550 -> 552.** An IMPL close evicts the phase-94 SPEC entry (`2026-09-02`) if the five-entry cap still binds — but **READ, DO NOT PREDICT.**
+⚠️ **THE ARCHIVE'S POSITIVE CONTROLS ARE SELF-INCREMENTING.** This stage's archive line names NO control figure. ⚠️ **AND THE RAW LINE DELTA IS `+2`, NOT `+1`** — the entry is a blank line PLUS the entry line. `SPEC.md` §10 forecast `+1` and its own commit landed `+2`, contradicting the precedent immediately before it. **The phase-95 IMPL close: `STATE_HISTORY.md` 552 -> 554**, evicting the phase-94 SPEC entry (`2026-09-02`), with the strict guard DELTA 0 exactly as promised. **A BRAINSTORM close evicts the next-oldest entry if the five-entry cap still binds — but READ, DO NOT PREDICT.** ⚠️ **AND READ THE DATES CAREFULLY THIS TIME: the post-roll §Recent list carries TWO entries dated `2026-09-07` at its HEAD**, so a date read now meets a TIE. It sits at the NEWEST position, where it cannot affect which entry is oldest — but that is a fact you must VERIFY at your tip, not inherit from this sentence.
 
 ## ⚠️ PORT BANDING
 
