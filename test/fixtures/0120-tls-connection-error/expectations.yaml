@@ -11,9 +11,17 @@
 #   increments NOTHING under ssl.*.
 #
 #   The distinction is the whole point. A counter that fires on every failed
-#   handshake would look identical on four of this fixture's five arms; only the
+#   handshake would look identical on six of this fixture's seven arms; only the
 #   clean-FIN arm separates "the counter CAN move" from "the predicate
 #   DISCRIMINATES".
+#
+#   Phase 95 extends the row with a SECOND proposition, carried by arms (vi) and
+#   (vii):
+#
+#     A downstream ALPN offer that overlaps NOTHING in the listener's
+#     alpn_protocols must still COMPLETE the handshake with no protocol
+#     selected — it books ssl.handshake, NOT ssl.connection_error. An offer
+#     that DOES overlap must negotiate the FIRST configured entry.
 #
 # ## Firsts (this fixture, in this tree)
 #
@@ -39,6 +47,12 @@
 #   l_conn_err — ONE TLS-terminating tcp_proxy listener. Its DownstreamTlsContext
 #                carries:
 #                  require_client_certificate: true
+#                  common_tls_context.alpn_protocols = ["h2", "http/1.1"]
+#                                                           <- the phase-95 key,
+#                                                              FIRST key of
+#                                                              common_tls_context,
+#                                                              BYTE-IDENTICAL on
+#                                                              both sides
 #                  common_tls_context.tls_params:
 #                    tls_minimum_protocol_version: TLSv1_2   <- the floor arm (i)
 #                                                               violates
@@ -54,28 +68,104 @@
 #   Reference in-container ports: admin 9901, listener 10126.
 #   Subject ports: admin and listener are both runner-allocated.
 #
-# ## The five arms, in the FIXED order driveSide runs them
+# ## The seven arms, in the FIXED order driveSide runs them
 #
 #   Every arm runs against ONE side inside a SINGLE DriveReference/DriveSubject
 #   pair — one fixture directory is one runner branch, so there is exactly one
 #   Drive pair and exactly one AssertStats.
 #
-#   ord | arm         | what the client does                    | connection_error | handshake
-#   ----+-------------+-----------------------------------------+------------------+----------
-#    1  | (v) valid   | full mTLS handshake, client cert         |        +0        |    +1
-#       |             | FORCE-SENT, then an echo round-trip      |                  |
-#    2  | (i) bad_ver | ClientHello with MAX version TLS 1.1     |        +1        |    +0
-#    3  | (ii) plain  | plain TCP, writes "GET / HTTP/1.1..."    |        +1        |    +0
-#    4  | (iii) garb  | plain TCP, writes DE AD BE EF 00 11      |        +1        |    +0
-#    5  | (iv) FIN    | plain TCP, writes ZERO bytes, closes     |        +0        |    +0
+#   ord | arm          | what the client does                   | connection_error | handshake
+#   ----+--------------+----------------------------------------+------------------+----------
+#    1  | (v) valid    | full mTLS handshake, client cert        |        +0        |    +1
+#       |              | FORCE-SENT, then an echo round-trip     |                  |
+#    2  | (i) bad_ver  | ClientHello with MAX version TLS 1.1    |        +1        |    +0
+#    3  | (ii) plain   | plain TCP, writes "GET / HTTP/1.1..."   |        +1        |    +0
+#    4  | (iii) garb   | plain TCP, writes DE AD BE EF 00 11     |        +1        |    +0
+#    5  | (iv) FIN     | plain TCP, writes ZERO bytes, closes    |        +0        |    +0
+#    6  | (vi)         | full mTLS handshake, client cert        |        +0        |    +1
+#       | alpn_mismatch| FORCE-SENT, ALPN offer ["bogus/9"]      |                  |
+#       |              | overlapping NOTHING, then an echo       |                  |
+#    7  | (vii)        | full mTLS handshake, client cert        |        +0        |    +1
+#       | alpn_overlap | FORCE-SENT, ALPN offer ["h2",           |                  |
+#       |              | "http/1.1"] overlapping the listener's  |                  |
+#       |              | list, then an echo; pins negotiated=h2  |                  |
 #
 #   Those deltas are MEASURED, per arm, with a before/after /stats/prometheus
 #   snapshot around each arm, on BOTH sides — the reference (pinned
 #   envoyproxy/envoy contrib-v1.37.2) and the subject (envoy-go). The two sides
-#   produced IDENTICAL deltas on every row.
+#   produced IDENTICAL deltas on every row — with ONE deliberate exception, the
+#   tip divergence this row exists to gate:
+#
+#   ⚠️ ROW 6 IS THE REFERENCE'S ARITHMETIC AND THE POST-FIX SUBJECT'S. At the
+#   UN-FIXED envoy-go tip arm (vi) books connection_error +1 / handshake +0
+#   instead — envoy-go aborts the handshake with no_application_protocol where
+#   the reference completes it with no protocol selected and SERVES the echo.
+#   The fixture is therefore RED on the SUBJECT SIDE ONLY, with EXACTLY two
+#   errors, until phase 95's TCP downstream ALPN fallback lands:
+#       subject: ssl.connection_error = 4, want 3
+#       subject: ssl.handshake        = 2, want 3
+#   That RED is the row's deterministic cross-side gate, not a fixture defect.
+#
+#   Arm (vii) books +0/+1 on BOTH sides BEFORE and AFTER the fix. It is
+#   deliberately NOT part of the tip divergence — see "Why arm (vii) exists"
+#   below.
 #
 #   ORDER IS LOAD-BEARING. The positive arm runs FIRST so that a broken upstream
-#   is caught before any negative arm can be misread.
+#   is caught before any negative arm can be misread. Arms (vi) and (vii) were
+#   APPENDED LAST so arms (i)-(v) keep their order and their record() indices.
+#   Adding alpn_protocols to both YAMLs moved arms (i)-(v) by ZERO on BOTH
+#   sides: the no-alpn and with-alpn runs produced BYTE-IDENTICAL delta
+#   sequences per side.
+#
+# ## Why arm (vii) exists: THE COUNTERS ARE BLIND TO alpn_protocols
+#
+#   Arm (vii) is the ONLY observable in this fixture that can see the
+#   alpn_protocols key at all. That is not a design preference, it is a
+#   MEASUREMENT, taken in BOTH directions on a booted pair:
+#
+#     - Delete alpn_protocols from the SUBJECT yaml alone: ON THE SIX-ARM SHAPE
+#       THIS MEASUREMENT WAS TAKEN ON — i.e. BEFORE arm (vii) existed, when the
+#       pins were connection_error 3 / handshake 2 — the fixture STAYED GREEN
+#       (RC=0, FAILCOUNT=0) with BOTH sides reading 3 / 2. The stat counters
+#       could not tell a listener that carries the key plus the phase-95
+#       fallback from a listener that carries NO key at all.
+#       ⚠️ PAST TENSE DELIBERATELY. That measurement is EXACTLY WHY arm (vii)
+#       was added, and it is retained as the evidence. At the SEVEN-arm shape
+#       that is actually landed (pins 3 / 3) the same subject-side deletion IS
+#       CAUGHT — by arm (vii), whose negotiated_protocol reads "" against the
+#       reference's "h2" and which is STRICT, so driveSide errors and the
+#       runner t.Fatalf's. It is STILL not caught by ssl.connection_error or
+#       ssl.handshake: the counters remain blind, which is the whole point.
+#       Do NOT "reconcile" handshake_delta back down to 2 on the strength of
+#       the paragraph above.
+#     - Delete it from the REFERENCE yaml alone: RED, but BYTE-IDENTICAL to the
+#       un-fixed-tip RED. Red for the tip bug, not for the missing YAML edit —
+#       CONFOUNDED, and therefore not evidence either.
+#
+#   The reason is structural: arms (i)-(v) send no ALPN extension at all and arm
+#   (vi) sends one that overlaps nothing, so none of the six can distinguish the
+#   two configurations through ssl.connection_error / ssl.handshake. Under the
+#   SAME subject-side deletion, arm (vii)'s negotiated protocol reads "" on the
+#   subject while the reference reads "h2". A guard that cannot fail is not a
+#   guard: arm (vii) is what makes "both YAMLs were edited" an assertable fact.
+#
+# ## Why arm (vi) RECORDS its outcome and never fails its drive
+#
+#   Arm (vi) uses log.Printf ONLY. It NEVER appends to the driver's probs slice,
+#   so it can never make driveSide return an error.
+#
+#   That is forced by the runner. A drive that returns an error hits
+#   t.Fatalf("subj drive: %v", err) and ABORTS the subtest BEFORE runner step 10
+#   runs — so AssertStats, the cross-side stat assertion this arm exists to
+#   make, becomes DEAD CODE on exactly the side under test, and the fixture goes
+#   red for the wrong reason with the diagnostic the row needs suppressed. The
+#   discrimination lives in the ssl.* counters, not in the drive result.
+#   (fixture.TB has no Logf; log.Printf is the recording channel.)
+#
+#   Arm (vii) by contrast IS STRICT — it appends to probs, including on a
+#   negotiated-protocol mismatch. It can afford to be: it passes on BOTH sides
+#   before AND after the fix, so it can never abort the subtest before
+#   AssertStats runs.
 #
 # ## Why arm (v) asserts the ECHO ROUND-TRIP and not just the handshake
 #
@@ -115,18 +205,24 @@
 #
 # ## What AssertStats pins — ABSOLUTE values, both sides
 #
-#   ssl.connection_error   == 3   (arms (i), (ii), (iii); NOT (iv), NOT (v))
-#   ssl.handshake          == 1   (arm (v) only)
+#   ssl.connection_error   == 3   (arms (i), (ii), (iii); NOT (iv), (v), (vi), (vii))
+#   ssl.handshake          == 3   (arms (v), (vi), (vii))
 #   ssl.fail_verify_error  == 0   NEGATIVE HALF
 #   ssl.fail_verify_no_cert== 0   NEGATIVE HALF
+#
+#   And, per side, INSIDE arm (vii) rather than in AssertStats:
+#
+#   ConnectionState().NegotiatedProtocol == "h2"   (arm (vii) only)
 #
 #   The values are ABSOLUTE, not deltas: nothing pre-moves l_conn_err's ssl.*
 #   counters. AssertStats runs at runner step 10, strictly after both Drives and
 #   CompareBytes; reference readiness polls admin 9901 rather than the TLS port,
-#   and the subject parses a stdout sentinel, so driveSide's five arms are the
+#   and the subject parses a stdout sentinel, so driveSide's seven arms are the
 #   ONLY connections l_conn_err ever sees on either side.
 #
-#   ⚠️ THIS IS ARM ARITHMETIC. Adding a sixth arm invalidates both numbers.
+#   ⚠️ THIS IS ARM ARITHMETIC. Adding an EIGHTH arm invalidates both numbers.
+#   Phase 95 already moved them once: appending arms (vi) and (vii) left
+#   connection_error at 3 and took handshake from 1 to 3.
 #
 #   The two zero pins are the NEGATIVE HALF and they are not decoration: a pin
 #   proving connection_error moved says nothing about whether a CERTIFICATE
@@ -225,6 +321,52 @@ arms:
       THE DISCRIMINATING NEGATIVE CONTROL. Exercises the io.EOF term of
       isTransportHandshakeErr. Without that term this arm goes RED on the
       subject side.
+  - id: vi
+    order: 6
+    name: alpn_mismatch
+    drives: >-
+      full mTLS handshake with a FORCE-SENT client cert and an ALPN offer
+      ["bogus/9"] overlapping NOTHING in the listener's alpn_protocols, then an
+      echo round-trip
+    connection_error_delta: 0
+    handshake_delta: 1
+    tip_divergence: >-
+      THE PHASE-95 ARM. The deltas above are the reference's and the POST-FIX
+      subject's. At the un-fixed envoy-go tip the subject books
+      connection_error +1 / handshake +0 instead, aborting the handshake with
+      no_application_protocol, and the fixture is RED on the subject side with
+      exactly two errors. That RED is this row's deterministic cross-side gate.
+    strictness: >-
+      TOLERANT — records its outcome with log.Printf and NEVER appends to probs.
+      A failing drive hits the runner's t.Fatalf("subj drive: %v", err), which
+      aborts the subtest BEFORE step 10 and makes AssertStats dead code on
+      exactly the side under test.
+  - id: vii
+    order: 7
+    name: alpn_overlap
+    drives: >-
+      full mTLS handshake with a FORCE-SENT client cert and an ALPN offer
+      ["h2", "http/1.1"] that OVERLAPS the listener's alpn_protocols, then an
+      echo round-trip
+    connection_error_delta: 0
+    handshake_delta: 1
+    negotiated_protocol: h2
+    role: >-
+      THE ONLY ARM THAT CAN OBSERVE alpn_protocols AT ALL. MEASURED both
+      directions ON THE SIX-ARM SHAPE, i.e. BEFORE this arm existed: deleting
+      the key from the subject yaml alone LEFT the stat counters reading 3/2 on
+      both sides and the fixture GREEN, while deleting it from the reference
+      yaml alone was red BYTE-IDENTICALLY to the tip bug and is therefore
+      confounded. ⚠️ The "fixture GREEN" half of that sentence is PAST TENSE and
+      describes the shape WITHOUT this arm — it is the reason this arm exists,
+      not a statement about the fixture as it now stands. With this arm present
+      the same subject-side deletion is CAUGHT: this arm's negotiated protocol
+      reads "" against the reference's "h2" and this arm is STRICT. The stat
+      counters stay blind to it either way.
+    strictness: >-
+      STRICT — appends to probs, including on a negotiated-protocol mismatch.
+      It can afford to: it passes on BOTH sides before AND after the fix, so it
+      can never abort the subtest before AssertStats runs.
 
 stats_assertions:
   keyed_on: metric name only; the label set is stripped entirely
@@ -232,9 +374,13 @@ stats_assertions:
   absolute_not_delta: true
   values:
     envoy_listener_ssl_connection_error: 3
-    envoy_listener_ssl_handshake: 1
+    envoy_listener_ssl_handshake: 3
     envoy_listener_ssl_fail_verify_error: 0
     envoy_listener_ssl_fail_verify_no_cert: 0
+
+per_side_client_assertions:
+  # NOT part of AssertStats: asserted inside arm (vii)'s drive, per side.
+  negotiated_protocol: h2
 
 unasserted_divergences:
   - envoy_listener_address label value (reference "0.0.0.0_10126" vs subject "___<port>")

@@ -280,7 +280,8 @@ func TestParseValidationSecret_WrongOneof(t *testing.T) {
 // TestParseValidationSecret_CVCRejects: lifting the SDS envelope is NOT license to
 // silently accept CertificateValidationContext sub-fields envoy-go cannot honor
 // (reference_strict_reject_sibling_typeurl_gap). Each mirrors an inline reject
-// (internal/tls/config.go:234-245) with an `xds: sds:`-prefixed DISTINCT substring
+// (internal/tls/config.go, the inline `default:` arm of NewDownstreamConfig's
+// validation-context switch) with an `xds: sds:`-prefixed DISTINCT substring
 // (ADR-0080). Errorf per row so one failure does not mask the rest.
 func TestParseValidationSecret_CVCRejects(t *testing.T) {
 	caPEM, _ := selfSignedPEM(t)

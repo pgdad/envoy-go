@@ -1,9 +1,13 @@
 // Package driver is the differential fixture driver for
 // 0120-tls-connection-error: the listener-scope ssl.connection_error
-// differential. It drives FIVE arms against ONE TLS-terminating tcp_proxy
+// differential. It drives SEVEN arms against ONE TLS-terminating tcp_proxy
 // listener — three connection-level TLS PROTOCOL failures that must increment
-// listener.<addr>.ssl.connection_error, one successful mTLS echo, and one
-// clean-FIN transport truncation that must NOT increment it.
+// listener.<addr>.ssl.connection_error, one successful mTLS echo, one
+// clean-FIN transport truncation that must NOT increment it, one mTLS
+// handshake carrying an ALPN offer that overlaps NOTHING in the listener's
+// alpn_protocols, which must COMPLETE with no protocol selected (phase 95),
+// and one carrying an OVERLAPPING offer, which must negotiate "h2" — the only
+// arm that can SEE the alpn_protocols key at all.
 package driver
 
 import (
@@ -67,10 +71,10 @@ const (
 	// subtraction). Nothing pre-moves l_conn_err's ssl.* counters: AssertStats
 	// runs at runner step 10, strictly after both Drives and CompareBytes;
 	// reference readiness polls admin 9901 (not the TLS port) and the subject
-	// parses a stdout sentinel, so driveSide's five arms are the ONLY connections
-	// l_conn_err ever sees on either side.
+	// parses a stdout sentinel, so driveSide's seven arms are the ONLY
+	// connections l_conn_err ever sees on either side.
 	//
-	// ⚠️ THESE ARE ARM ARITHMETIC. Adding a sixth arm INVALIDATES them.
+	// ⚠️ THESE ARE ARM ARITHMETIC. Adding an EIGHTH arm INVALIDATES them.
 	//
 	// MEASURED per-arm on BOTH sides (before/after snapshot per arm, reference =
 	// the pinned Envoy image, subject = envoy-go at this tip):
@@ -81,13 +85,53 @@ const (
 	//   (ii) plaintext HTTP       +1                 +0
 	//   (iii) garbage bytes       +1                 +0
 	//   (iv) clean FIN, 0 bytes   +0                 +0
+	//   (vi) valid + bogus ALPN   +0                 +1
+	//   (vii) valid + h2 ALPN     +0                 +1
+	//
+	// ⚠️ THE (vi) ROW IS THE REFERENCE'S ARITHMETIC AND THE POST-FIX SUBJECT'S.
+	// At the un-fixed tip the subject books +1/+0 on that arm instead — it
+	// aborts the handshake with no_application_protocol — so the fixture is RED
+	// on the subject side with EXACTLY two errors until phase 95's TCP
+	// downstream ALPN fallback lands:
+	//   subject: ssl.connection_error = 4, want 3
+	//   subject: ssl.handshake = 2, want 3
+	// That RED is this row's deterministic cross-side gate, not a defect in the
+	// fixture. Arm (vii) books +0/+1 on BOTH sides at the un-fixed tip AND after
+	// the fix — it is the arm that PROVES both YAMLs carry alpn_protocols, and
+	// it is deliberately NOT part of the tip divergence.
 	//
 	// Over-firing controls, both sides: 3x clean-FIN -> +0; 3x valid ->
 	// handshake +3 only; 2x bad-version -> connection_error +2 only. A positive
 	// arm alone cannot catch an OVER-firing counter
 	// (reference_positive_arm_cannot_catch_overfiring); those controls can.
 	wantConnectionError = 3
-	wantHandshake       = 1
+	wantHandshake       = 3
+
+	// wantNegotiatedProtocol is arm (vii)'s per-side pin: the protocol the
+	// server MUST select when the client's offer OVERLAPS the listener's
+	// alpn_protocols. It is the FIRST entry of the configured list, and it is
+	// the ONLY observable in this fixture that can see the YAML key at all.
+	//
+	// ⚠️ IT EXISTS BECAUSE THE COUNTERS CANNOT SEE THE KEY. MEASURED, both
+	// directions, on booted pairs, ON THE SIX-ARM SHAPE — i.e. BEFORE this arm
+	// existed, when the pins were wantConnectionError/wantHandshake = 3/2:
+	// deleting alpn_protocols from the SUBJECT YAML alone left both counters
+	// reading 3/2 on BOTH sides and the whole fixture GREEN (RC=0,
+	// FAILCOUNT=0) — a listener with the key plus the phase-95 fallback and a
+	// listener with NO key at all were INDISTINGUISHABLE on arms (i)-(vi),
+	// because (i)-(v) send no ALPN extension and (vi) sends one that overlaps
+	// nothing. THAT MEASUREMENT IS EXACTLY WHY THIS ARM WAS ADDED; it is the
+	// evidence that the counters are blind, and it is retained as such.
+	//
+	// ⚠️ RE-SCOPED at the phase-95 final review (finding F4) — DO NOT read the
+	// paragraph above as a present-tense statement about the SEVEN-arm shape.
+	// At the landed seven-arm shape the pins are 3/3, and the same subject-side
+	// deletion is CAUGHT: this pin reads "" on the subject against the
+	// reference's "h2", the arm record()s a prob, driveSide returns an error,
+	// and the runner's t.Fatalf reddens the fixture. It is caught BY ARM (vii)
+	// — still NOT by ssl.connection_error / ssl.handshake, which remain blind.
+	// A guard that cannot fail is not a guard (topic_gate_hygiene).
+	wantNegotiatedProtocol = "h2"
 )
 
 // connErrDriver is the fixture driver. It is stateless: every arm builds its
@@ -159,7 +203,7 @@ func (d *connErrDriver) DriveSubject(ctx context.Context, addr string) ([]byte, 
 	return d.driveSide(ctx, "subject", addr)
 }
 
-// driveSide sequences all five arms against ONE side, in a FIXED order, and
+// driveSide sequences all seven arms against ONE side, in a FIXED order, and
 // returns a NON-NIL EMPTY slice so CompareBytes has a defined result on both
 // sides.
 //
@@ -223,6 +267,54 @@ func (d *connErrDriver) driveSide(ctx context.Context, side, addr string) ([]byt
 	// this arm the fixture proves only that the counter CAN move, never that the
 	// predicate DISCRIMINATES — and this arm is what exercises the io.EOF term.
 	record("clean_fin", d.expectCleanFIN(ctx, side, addr))
+
+	// (vi) ⚠️ THE PHASE-95 ARM, APPENDED LAST so arms (i)-(v) keep their order
+	// and their record() indices. A valid client cert plus an ALPN offer
+	// ["bogus/9"] that overlaps NOTHING in the listener's alpn_protocols. The
+	// pinned reference COMPLETES this handshake with NO protocol selected and
+	// SERVES the connection (MEASURED: handshake +1, connection_error +0, and
+	// the echo round-trip returns); envoy-go at the un-fixed tip ABORTS it with
+	// no_application_protocol (connection_error +1, handshake +0).
+	//
+	// ⚠️ THIS ARM RECORDS ITS OUTCOME — IT NEVER APPENDS TO probs. A failing
+	// drive returns an error to the runner, whose t.Fatalf("subj drive: %v",
+	// err) aborts the subtest BEFORE step 10 runs, making AssertStats — the
+	// cross-side assertion this arm exists to make — DEAD CODE on exactly the
+	// side under test (reference_fatalf_makes_assertions_unreachable, at the
+	// fixture layer). The discrimination lives in the ssl.* counters, not in
+	// the drive result. ⚠️ fixture.TB has no Logf; log.Printf is the recording
+	// channel.
+	if np, echo, err := d.alpnEcho(ctx, side, "alpn_mismatch", addr, []string{"bogus/9"}, []byte(probePayload)); err != nil {
+		log.Printf("0120 %s arm=alpn_mismatch OUTCOME=FAILED err=%v (recorded, NOT fatal)", side, err)
+	} else if !bytes.Equal(echo, []byte(probePayload)) {
+		log.Printf("0120 %s arm=alpn_mismatch OUTCOME=ECHO-MISMATCH negotiated=%q got=%q (recorded, NOT fatal)", side, np, echo)
+	} else {
+		log.Printf("0120 %s arm=alpn_mismatch OUTCOME=SERVED negotiated=%q echo=OK (recorded, NOT fatal)", side, np)
+	}
+
+	// (vii) valid client cert + an OVERLAPPING ALPN offer ["h2","http/1.1"],
+	// pinning the SELECTED protocol per side. THE ONLY ARM THAT CAN OBSERVE THE
+	// alpn_protocols KEY — see wantNegotiatedProtocol for the measurement that
+	// forced it.
+	//
+	// ⚠️ UNLIKE ARM (vi) THIS ARM IS STRICT — it DOES append to probs. It can
+	// afford to be: it passes on BOTH sides at the un-fixed tip and after the
+	// fix, so it can never abort the subtest before AssertStats runs on the side
+	// under test. Arm (vi) is the one that diverges at the tip, and that is
+	// exactly why (vi) only records.
+	switch np, echo, err := d.alpnEcho(ctx, side, "alpn_overlap", addr, []string{"h2", "http/1.1"}, []byte(probePayload)); {
+	case err != nil:
+		record("alpn_overlap", fmt.Errorf("handshake/roundtrip FAILED: %w", err))
+	case !bytes.Equal(echo, []byte(probePayload)):
+		record("alpn_overlap", fmt.Errorf("echo mismatch: got %q want %q", echo, probePayload))
+	case np != wantNegotiatedProtocol:
+		record("alpn_overlap", fmt.Errorf("negotiated protocol = %q, want %q — the listener's "+
+			"common_tls_context.alpn_protocols is MISSING or does not lead with %q on this side",
+			np, wantNegotiatedProtocol, wantNegotiatedProtocol))
+	default:
+		log.Printf("0120 %s arm=alpn_overlap negotiated=%q (want %q) echo=OK", side, np, wantNegotiatedProtocol)
+		record("alpn_overlap", nil)
+	}
 
 	if len(probs) > 0 {
 		return nil, fmt.Errorf("%s: %s", side, strings.Join(probs, "; "))
@@ -313,6 +405,44 @@ func (d *connErrDriver) mtlsEcho(ctx context.Context, side, addr string, payload
 		return nil, fmt.Errorf("read echo: %w", err)
 	}
 	return echo, nil
+}
+
+// alpnEcho is the ALPN-carrying arm body: a full mTLS handshake whose
+// ClientHello advertises `offer`, followed by the SAME echo round-trip arm (v)
+// performs. It returns the protocol the server SELECTED — the empty string when
+// the server completed the handshake without selecting one, which is the exact
+// outcome phase 95 makes envoy-go produce for a non-overlapping offer.
+//
+// ⚠️ The echo round-trip is not decorative here either: a handshake that
+// completes against a listener whose upstream is broken reports OK client-side
+// while the server books nothing (see mtlsEcho). "SERVED" means bytes came
+// back, not merely that the handshake returned.
+func (d *connErrDriver) alpnEcho(ctx context.Context, side, arm, addr string, offer []string, payload []byte) (string, []byte, error) {
+	cfg, err := baseTLSConfig(side, arm)
+	if err != nil {
+		return "", nil, err
+	}
+	cfg.NextProtos = offer
+	raw, err := dialWithDeadline(ctx, addr)
+	if err != nil {
+		return "", nil, err
+	}
+	defer func() { _ = raw.Close() }()
+
+	conn := stdtls.Client(raw, cfg)
+	defer func() { _ = conn.Close() }()
+	if err := conn.HandshakeContext(ctx); err != nil {
+		return "", nil, fmt.Errorf("handshake: %w", err)
+	}
+	negotiated := conn.ConnectionState().NegotiatedProtocol
+	if _, err := conn.Write(payload); err != nil {
+		return negotiated, nil, fmt.Errorf("write: %w", err)
+	}
+	echo := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, echo); err != nil {
+		return negotiated, nil, fmt.Errorf("read echo: %w", err)
+	}
+	return negotiated, echo, nil
 }
 
 // expectHandshakeFailure is arm (i): a TLS ClientHello whose MAXIMUM offered
@@ -477,7 +607,8 @@ func (d *connErrDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr st
 		// POSITIVE HALF: the three protocol-error arms moved the counter, and
 		// ONLY those three. An EXACT equality, not a floor: a floor could not
 		// tell a discriminating predicate from one that also fires on the
-		// clean-FIN arm (that would read 4).
+		// clean-FIN arm, or on arm (vi)'s ALPN mismatch (either would read 4).
+		// Arm (vii)'s overlapping offer must not move it either.
 		if v := got["envoy_listener_ssl_connection_error"]; v != wantConnectionError {
 			t.Errorf("%s: ssl.connection_error = %d, want %d "+
 				"(arms bad_version + plaintext + garbage each Inc; the clean-FIN "+
@@ -488,7 +619,9 @@ func (d *connErrDriver) AssertStats(t fixture.TB, refAdminAddr, subjAdminAddr st
 		// pin is what catches a listener whose upstream is broken: a
 		// handshake-only client check reports OK while this reads 0.
 		if v := got["envoy_listener_ssl_handshake"]; v != wantHandshake {
-			t.Errorf("%s: ssl.handshake = %d, want %d (only arm (v) completes a handshake)",
+			t.Errorf("%s: ssl.handshake = %d, want %d (arms (v), (vi) and (vii) each complete "+
+				"a handshake — (vi) offers an ALPN list overlapping NOTHING and the server "+
+				"must still COMPLETE it with no protocol selected)",
 				side.name, v, wantHandshake)
 		}
 		// ⚠️ NEGATIVE HALF — assert WHICH DID NOT FIRE. A pin proving

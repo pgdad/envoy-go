@@ -139,6 +139,12 @@ const (
 // through Task 9 are gone — chain selection now happens BEFORE the TLS
 // handshake, and each selected chainInfo carries its own per-chain
 // *stdtls.Config that is passed directly to stdtls.Server.
+//
+// Phase 95 (ADR-0317): a per-chain GetConfigForClient RETURNS, installed by
+// internal/tls.NewDownstreamConfig via installALPNMismatchFallback on that
+// per-chain *stdtls.Config. It is NOT the phase-03 SNI dispatch callback the
+// paragraph above records as deleted: it does ALPN mismatch fallback ONLY,
+// never SNI dispatch and never chain selection, and it has no error path.
 type listenerRuntime struct {
 	name    string
 	addr    string
@@ -709,8 +715,29 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 	if dfc := l.GetDefaultFilterChain(); dfc != nil {
 		var dfcTLS *stdtls.Config
 		if ts := dfc.GetTransportSocket(); ts != nil {
-			// sdsProvider: see the filter_chains[] call site above.
-			dc, err := internaltls.NewDownstreamConfig(ts, baseDir, sdsProvider)
+			var dc *internaltls.DownstreamConfig
+			var err error
+			if kind == kindQUIC {
+				// Phase 95 final-review fix (F1): MIRROR the kind branch the
+				// filter_chains[] loop above already carries. Before this, the
+				// default chain called the TCP builder UNCONDITIONALLY, so a QUIC
+				// listener carrying only a default_filter_chain with a plain
+				// DownstreamTlsContext built through NewDownstreamConfig — which
+				// installs the phase-95 ALPN-mismatch fallback — and
+				// quicTLSConfig() handed that config straight to quic.Listen,
+				// silently disabling negotiateALPN's RFC 9001 Section 8.1
+				// rejection (predicated on len(serverProtos) != 0). The plain
+				// shape now boot-rejects with NewQUICDownstreamConfig's existing
+				// "unexpected quic transport_socket type_url" error — the SAME
+				// config-parity reject filter_chains[] already produces for it.
+				// This is not new TLS policy in the listener package (SPEC §3.2);
+				// it makes the default chain consistent with the per-chain path.
+				// See ADR-0317 D-ALPNFB-TCPONLY.
+				dc, err = internaltls.NewQUICDownstreamConfig(ts, baseDir)
+			} else {
+				// sdsProvider: see the filter_chains[] call site above.
+				dc, err = internaltls.NewDownstreamConfig(ts, baseDir, sdsProvider)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("listener: %q: default_filter_chain: %w", name, err)
 			}

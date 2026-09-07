@@ -969,6 +969,121 @@ func TestBuildListenerRuntime_QUICMandatoryTLS(t *testing.T) {
 	}
 }
 
+// mkQUICListenerDefaultChain builds a QUIC listener (the
+// udp_listener_config.quic_options kindQUIC discriminant) with ZERO
+// filter_chains[] and ONLY a default_filter_chain carrying ts. manager.go's
+// clause-1 check accepts this shape (the union of filter_chains[] and
+// default_filter_chain must contribute at least one chain), and
+// (*listenerRuntime).quicTLSConfig returns rt.defaultChain.tlsCfg FIRST — so
+// whatever this chain's transport_socket builds is what reaches quic.Listen.
+func mkQUICListenerDefaultChain(t *testing.T, clusterName string, ts *corev3.TransportSocket) *listenerv3.Listener {
+	t.Helper()
+	filter := mkTcpProxyFilter(t, clusterName)
+	return &listenerv3.Listener{
+		Name: "quic_listener_default_chain",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+				Protocol:      corev3.SocketAddress_UDP,
+			},
+		}},
+		UdpListenerConfig: &listenerv3.UdpListenerConfig{
+			QuicOptions: &listenerv3.QuicProtocolOptions{},
+		},
+		DefaultFilterChain: &listenerv3.FilterChain{
+			TransportSocket: ts,
+			Filters:         []*listenerv3.Filter{filter},
+		},
+	}
+}
+
+// TestBuildListenerRuntime_QUICDefaultFilterChain_PlainTLSRejects is the
+// phase-95 final-review regression pin for the ONE behavioral hole this row
+// opened (finding F1).
+//
+// Before the fix, the default_filter_chain build site called
+// internaltls.NewDownstreamConfig UNCONDITIONALLY — it did not carry the
+// `kind == kindQUIC` branch the filter_chains[] loop has. So a QUIC listener
+// with only a default_filter_chain whose transport_socket is a PLAIN
+// DownstreamTlsContext built through the TCP builder, which means
+// installALPNMismatchFallback was installed on it, and quicTLSConfig() then
+// handed that very config to quic.Listen. A client offering a non-overlapping
+// ALPN then received a clone with NextProtos == nil, making negotiateALPN's
+// `if quic && len(serverProtos) != 0` guard FALSE — silently disabling the
+// RFC 9001 Section 8.1 rejection that ADR-0317 D-ALPNFB-TCPONLY says must
+// never be disabled.
+//
+// The fix mirrors the branch the filter_chains[] loop already has, so this
+// shape now BOOT-REJECTS with NewQUICDownstreamConfig's existing type_url
+// error — byte-for-byte the config-parity reject filter_chains[] already
+// produces for the same shape. No new TLS policy lands in the listener
+// package.
+//
+// ⚠️ CITATION CORRECTED at the scoped re-review (finding F-D). This comment
+// used to cite "TestBuildListenerRuntime_QUICKind's sibling roster" for the
+// filter_chains[] half of that parity. There is no such roster:
+// TestBuildListenerRuntime_QUICKind (:935) is a POSITIVE build test with no
+// reject arm. The filter_chains[] half is in fact pinned NOWHERE in this
+// package — the only in-package hit for the reject string is this test's own
+// assertion below; internal/tls/config_test.go pins the BUILDER's error, not
+// the listener-level parity. So dropping the kind branch at the
+// filter_chains[] site would leave this package GREEN. Stated plainly rather
+// than papered over with a citation that does not hold.
+func TestBuildListenerRuntime_QUICDefaultFilterChain_PlainTLSRejects(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	ts := mkDownstreamTSInlineALPN(t, testAlphaCertPEM, testAlphaKeyPEM, []string{"h3"})
+	l := mkQUICListenerDefaultChain(t, "c_echo", ts)
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err == nil {
+		// The hole: the plain DownstreamTlsContext went through the TCP builder.
+		rt := mgr.runtimes[0]
+		cfg := rt.quicTLSConfig()
+		if cfg != nil && cfg.GetConfigForClient != nil {
+			t.Fatalf("HOLE: a QUIC default_filter_chain built through the TCP builder — quicTLSConfig() returns a config with GetConfigForClient != nil (NextProtos=%v), so the phase-95 ALPN-mismatch fallback is installed on the config handed to quic.Listen and negotiateALPN's RFC 9001 Section 8.1 rejection is DISABLED", cfg.NextProtos)
+		}
+		t.Fatalf("expected the config-parity reject for a plain DownstreamTlsContext on a QUIC default_filter_chain, got a successful build (quicTLSConfig()=%v)", cfg)
+	}
+	if !strings.Contains(err.Error(), "unexpected quic transport_socket type_url") {
+		t.Errorf("error %q is not NewQUICDownstreamConfig's type_url reject", err.Error())
+	}
+	if !strings.Contains(err.Error(), "default_filter_chain") {
+		t.Errorf("error %q does not name the default_filter_chain build site", err.Error())
+	}
+}
+
+// TestBuildListenerRuntime_QUICDefaultFilterChain_QUICWrappedKeepsNextProtos is
+// the positive companion of the F1 regression pin: a PROPERLY QUIC-wrapped
+// default_filter_chain still builds, its config still carries NextProtos, and
+// it carries NO GetConfigForClient — so negotiateALPN's
+// `if quic && len(serverProtos) != 0` guard stays ARMED on the config that
+// reaches quic.Listen.
+func TestBuildListenerRuntime_QUICDefaultFilterChain_QUICWrappedKeepsNextProtos(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	ts := mkQUICDownstreamTS(t, testAlphaCertPEM, testAlphaKeyPEM, []string{"h3"})
+	l := mkQUICListenerDefaultChain(t, "c_echo", ts)
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager(quic listener, quic-wrapped default_filter_chain): %v", err)
+	}
+	rt := mgr.runtimes[0]
+	if rt.kind != kindQUIC {
+		t.Errorf("kind = %d, want kindQUIC", rt.kind)
+	}
+	cfg := rt.quicTLSConfig()
+	if cfg == nil {
+		t.Fatal("quicTLSConfig() = nil, want the default_filter_chain's config")
+	}
+	if !containsStr(cfg.NextProtos, "h3") {
+		t.Errorf("NextProtos = %v, want it to carry h3 (the RFC 9001 guard is predicated on a NON-EMPTY server list)", cfg.NextProtos)
+	}
+	if cfg.GetConfigForClient != nil {
+		t.Error("GetConfigForClient is non-nil on a QUIC default_filter_chain config: the ALPN-mismatch fallback must never reach the QUIC path (ADR-0317 D-ALPNFB-TCPONLY)")
+	}
+}
+
 // TestBuildListenerRuntime_QUICStrictRejects verifies the phase-61.1
 // quic_options tuning sub-field strict-reject roster (ADR-0080): each
 // sub-field the minimal slice does not honor produces a distinct-substring
@@ -1083,7 +1198,11 @@ func TestNewManager_SingleChain_Plaintext_Unchanged(t *testing.T) {
 }
 
 // TestNewManager_MultiChain_SNIHappy verifies that two TLS chains with distinct
-// server_names route correctly via GetConfigForClient.
+// server_names route correctly through the unified pre-handshake chain-match
+// path (listenerfilter.SelectChain over chainSpecs/defaultSpec, exercised here
+// via selectByServerNameFromMgr). The SNI-dispatch callback this comment used
+// to name was deleted at phase 07.2 Task 10 — see the note on
+// selectByServerNameFromMgr above.
 func TestNewManager_MultiChain_SNIHappy(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
@@ -4478,9 +4597,11 @@ func TestClassifyHandshakeErr_TLS12(t *testing.T) {
 // ⚠️ mkDownstreamTSRequireClientCert (:653) is NOT reusable here (PLAN-74 F2):
 // it carries require_client_certificate WITHOUT a trusted_ca, which the phase-67
 // / ADR-0289 anchorless-validation-context rule REJECTS AT BOOT ("require needs
-// an anchor", internal/tls/config.go:68). A test reusing it would fail inside
-// NewManager and never reach a handshake at all. Both fields together are what
-// yields stdtls.RequireAndVerifyClientCert (internal/tls/config.go:65).
+// an anchor" — internal/tls/config.go, NewDownstreamConfig's THREE-WAY ClientAuth
+// doc bullet "no anchor + require=true -> boot REJECT"). A test reusing it would
+// fail inside NewManager and never reach a handshake at all. Both fields together
+// are what yields stdtls.RequireAndVerifyClientCert (the sibling bullet in that
+// same list, "anchor + require=true -> RequireAndVerifyClientCert").
 func mkDownstreamTSMutualTLS(t *testing.T, certPEM, keyPEM, caPEM []byte) *corev3.TransportSocket {
 	t.Helper()
 	inner := &tlsv3.DownstreamTlsContext{
@@ -4745,7 +4866,9 @@ func TestServeConnection_SSLFailVerifyNoCertIncrements(t *testing.T) {
 // ⚠️ This helper exists because startMutualTLSListener CANNOT supply phase 75's
 // positive arm: mkDownstreamTSMutualTLS sets require_client_certificate: true
 // PLUS a trusted_ca, which yields stdtls.RequireAndVerifyClientCert
-// (internal/tls/config.go:65), so a no-cert client's handshake FAILS and books
+// (internal/tls/config.go, NewDownstreamConfig's THREE-WAY ClientAuth doc bullet
+// "anchor + require=true -> RequireAndVerifyClientCert"), so a no-cert client's
+// handshake FAILS and books
 // ssl.fail_verify_no_cert instead of ever reaching the success fall-through.
 //
 // mkTLSChain(nil, ...) leaves FilterChainMatch nil ⇒ this is the DEFAULT chain
@@ -4768,6 +4891,44 @@ func startOneWayTLSListener(t *testing.T, pki handshakeTestPKI) (*stats.Registry
 	t.Cleanup(cancel)
 	if err := mgr.Start(ctx); err != nil {
 		t.Fatalf("listener.Start (one-way TLS): %v", err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	ls := mgr.Listeners()
+	if len(ls) != 1 {
+		t.Fatalf("Listeners() len = %d, want 1", len(ls))
+	}
+	return reg, ls[0].Addr
+}
+
+// startOneWayTLSListenerALPN is startOneWayTLSListener with ALPN. It is
+// identical in every respect except that the transport socket is
+// mkDownstreamTSInlineALPN (tls_handshake_negative_test.go, SAME package —
+// reused, not duplicated), so the chain's *stdtls.Config ADVERTISES alpn in
+// NextProtos and the ALPN-mismatch fallback installed by internal/tls
+// (ADR-0317) is in play.
+//
+// ⚠️ Like its sibling it sends NO CertificateRequest, so EVERY handshake that
+// COMPLETES on this listener books ssl.no_certificate as well as ssl.handshake.
+// That is why the table rows using it expect {handshake: 1, no_certificate: 1}
+// and NOT handshake alone.
+func startOneWayTLSListenerALPN(t *testing.T, pki handshakeTestPKI, alpn []string) (*stats.Registry, string) {
+	t.Helper()
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", startEchoBackend(t))
+	ts := mkDownstreamTSInlineALPN(t, string(pki.serverCertPEM), string(pki.serverKeyPEM), alpn)
+	l := mkTLSListener("l_ssl_oneway_alpn", "127.0.0.1", 0, []*listenerv3.FilterChain{
+		mkTLSChain(nil, ts, mkTcpProxyFilter(t, "c_echo")),
+	})
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	reg := stats.NewRegistry()
+	mgr, err := NewManager(boot, cm, reg, testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("listener.NewManager (one-way TLS + ALPN): %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("listener.Start (one-way TLS + ALPN): %v", err)
 	}
 	t.Cleanup(mgr.Stop)
 
@@ -5191,6 +5352,54 @@ func dialPartialThenRST(t *testing.T, addr string) {
 	_ = c.Close()
 }
 
+// --- rows 7 and 8: the first two arms in this table whose handshake SUCCEEDS -
+
+// dialOfferALPN completes a TLS handshake offering exactly `offer` and asserts
+// that the handshake SUCCEEDED with NO protocol negotiated — the measured
+// reference behavior for an ALPN offer that overlaps none of the chain's
+// alpn_protocols (ADR-0317).
+//
+// ⚠️ "the dial returned no error" is itself a load-bearing assertion here.
+// PRE-FIX, row 7's dial FAILS with `tls: no application protocol`, so the row
+// is red from THIS function as well as from the counters; the six original
+// rows never reach a completed handshake at all.
+//
+// InsecureSkipVerify is used for the same reason dialMaxTLS11 uses it: the
+// table's dial signature is func(t, addr) and carries no PKI, and these arms
+// are about ALPN, not trust.
+func dialOfferALPN(t *testing.T, addr string, offer []string) {
+	t.Helper()
+	c, err := stdtls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, &stdtls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // this arm is about ALPN, not trust
+		MinVersion:         stdtls.VersionTLS12,
+		NextProtos:         offer,
+	})
+	if err != nil {
+		t.Errorf("dialOfferALPN(%v): handshake FAILED: %v — a non-overlapping ALPN offer must still COMPLETE", offer, err)
+		return
+	}
+	if got := c.ConnectionState().NegotiatedProtocol; got != "" {
+		t.Errorf("dialOfferALPN(%v): negotiated protocol = %q, want %q", offer, got, "")
+	}
+	_ = c.Close()
+}
+
+// dialALPNBogus is row 7's dialer: an offer that overlaps NOTHING the listener
+// advertises. It is the only offer shape in this table that the stdlib's
+// http11fallback cannot serve.
+func dialALPNBogus(t *testing.T, addr string) {
+	t.Helper()
+	dialOfferALPN(t, addr, []string{"bogus/9"})
+}
+
+// dialALPNHTTP11 is row 8's (the control's) dialer: http/1.1 against an
+// h2-ONLY listener — the exact shape crypto/tls's http11fallback already
+// serves, which is why row 8 is GREEN AT THE TIP.
+func dialALPNHTTP11(t *testing.T, addr string) {
+	t.Helper()
+	dialOfferALPN(t, addr, []string{"http/1.1"})
+}
+
 // dialRaw opens a plain TCP connection to addr and returns it as a *net.TCPConn
 // (SetLinger is needed by the RST arm).
 func dialRaw(t *testing.T, addr string) *net.TCPConn {
@@ -5211,22 +5420,96 @@ func TestServeConnection_SSLConnectionErrorCounter(t *testing.T) {
 	// fifth counter AND that no other ssl.* leaf moved. Arms are single-cause.
 	// ⚠️ counterValue returns int64, NOT uint64. Keep `want` int64 or the
 	// comparison will not compile.
+	//
+	// `listen` defaults to startOneWayTLSListener when nil, so the six original
+	// rows keep their (no-ALPN) listener. `wantLeaves` is MERGED OVER A ZERO
+	// DEFAULT: the loop below walks the FIXED four-leaf list and reads
+	// tc.wantLeaves[leaf], which is 0 both for an absent key and for a nil map.
+	// Every row therefore STILL asserts which counters did NOT fire — the
+	// negative half of the six original rows survives the refactor intact
+	// (next-prompt.txt §7g).
 	cases := []struct {
 		name string
-		dial func(t *testing.T, addr string) // drives exactly one connection
-		want int64
+		// listen builds the listener under test. nil ⇒ startOneWayTLSListener.
+		listen func(t *testing.T, pki handshakeTestPKI) (*stats.Registry, string)
+		dial   func(t *testing.T, addr string) // drives exactly one connection
+		want   int64
+		// wantLeaves overrides the zero default for the four non-connection_error
+		// ssl.* leaves. An absent key means "must be 0".
+		wantLeaves map[string]int64
 	}{
-		{"bad_version_TLS11_client", dialMaxTLS11, 1},
-		{"plaintext_http", dialPlaintextHTTP, 1},
-		{"garbage_bytes", dialGarbage, 1},
-		{"partial_hello_then_FIN", dialPartialThenFIN, 0},
-		{"zero_bytes_then_FIN", dialZeroThenFIN, 0},
-		{"partial_then_RST", dialPartialThenRST, 0},
+		{name: "bad_version_TLS11_client", dial: dialMaxTLS11, want: 1},
+		{name: "plaintext_http", dial: dialPlaintextHTTP, want: 1},
+		{name: "garbage_bytes", dial: dialGarbage, want: 1},
+		{name: "partial_hello_then_FIN", dial: dialPartialThenFIN, want: 0},
+		{name: "zero_bytes_then_FIN", dial: dialZeroThenFIN, want: 0},
+		{name: "partial_then_RST", dial: dialPartialThenRST, want: 0},
+
+		// Row 7 — the ONLY row in this table that DISCRIMINATES the fix. The
+		// offer overlaps neither advertised protocol and is not the http/1.1
+		// shape crypto/tls's http11fallback special-cases, so PRE-FIX the
+		// handshake ABORTS with `tls: no application protocol` and this row reads
+		// connection_error 1 / handshake 0. Post-fix it completes.
+		//
+		// ⚠️ wantLeaves IS {handshake: 1, no_certificate: 1}, NOT {handshake: 1}.
+		// startOneWayTLSListenerALPN sends no CertificateRequest, so every
+		// COMPLETING handshake also books ssl.no_certificate. A map written from
+		// "handshake == 1, rest 0" would go RED against a CORRECT implementation.
+		{
+			name: "alpn_mismatch_bogus",
+			listen: func(t *testing.T, pki handshakeTestPKI) (*stats.Registry, string) {
+				return startOneWayTLSListenerALPN(t, pki, []string{"h2", "http/1.1"})
+			},
+			dial:       dialALPNBogus,
+			want:       0,
+			wantLeaves: map[string]int64{"handshake": 1, "no_certificate": 1},
+		},
+		// Row 8 (CONTROL) — http/1.1 against an h2-only listener.
+		//
+		// ⚠️ STATE ITS ACTUAL SCOPE: row 8's value is entirely PRE-FIX. It is
+		// GREEN AT THE TIP because crypto/tls's own http11fallback already serves
+		// exactly this shape, which is what makes it the discrimination guard: a
+		// "fix" that handled only row 8 would leave row 7 red, and a table
+		// containing only row 8 would prove nothing. POST-FIX, however, the
+		// ALPN-mismatch callback intercepts this offer BEFORE http11fallback ever
+		// runs, so row 8 is green under BOTH a correct fix and a stdlib-only one
+		// — ONLY ROW 7 DISCRIMINATES. The post-fix guard against the callback
+		// OVER-firing (an overlapping offer must still negotiate the overlap) is
+		// the control arm in
+		// TestNewManager_LiveHandshake_ALPNMismatch_CompletesWithNoProtocol, NOT
+		// this row.
+		{
+			name: "alpn_http11_vs_h2_only",
+			listen: func(t *testing.T, pki handshakeTestPKI) (*stats.Registry, string) {
+				return startOneWayTLSListenerALPN(t, pki, []string{"h2"})
+			},
+			dial:       dialALPNHTTP11,
+			want:       0,
+			wantLeaves: map[string]int64{"handshake": 1, "no_certificate": 1},
+		},
 	}
+	leaves := []string{"handshake", "fail_verify_error", "fail_verify_no_cert", "no_certificate"}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// A wantLeaves key outside the fixed leaf list would be SILENTLY
+			// IGNORED by the merge below — a vacuous expectation. Reject it.
+			for k := range tc.wantLeaves {
+				known := false
+				for _, leaf := range leaves {
+					if leaf == k {
+						known = true
+					}
+				}
+				if !known {
+					t.Fatalf("%s: wantLeaves key %q is not one of %v — it would never be asserted", tc.name, k, leaves)
+				}
+			}
+			listen := tc.listen
+			if listen == nil {
+				listen = startOneWayTLSListener
+			}
 			pki := mkTestPKI(t)
-			reg, addr := startOneWayTLSListener(t, pki)
+			reg, addr := listen(t, pki)
 			tc.dial(t, addr)
 			awaitDrained(t, reg, addr, 1)
 
@@ -5235,10 +5518,13 @@ func TestServeConnection_SSLConnectionErrorCounter(t *testing.T) {
 				t.Errorf("%s: ssl.connection_error = %d, want %d", tc.name, got, tc.want)
 			}
 			// ⚠️ ASSERT WHICH DID NOT FIRE. A pin proving connection_error moved
-			// says nothing about whether a cert counter also moved.
-			for _, leaf := range []string{"handshake", "fail_verify_error", "fail_verify_no_cert", "no_certificate"} {
-				if v := counterValue(t, reg, "listener."+normalizeAddr(addr)+".ssl."+leaf); v != 0 {
-					t.Errorf("%s: ssl.%s = %d, want 0 — only connection_error may move on this arm", tc.name, leaf, v)
+			// says nothing about whether a cert counter also moved. wantLeaves is
+			// merged over a ZERO default, so a row with an absent or EMPTY map
+			// still asserts all four leaves are 0.
+			for _, leaf := range leaves {
+				wantLeaf := tc.wantLeaves[leaf] // zero default: nil/absent reads 0
+				if v := counterValue(t, reg, "listener."+normalizeAddr(addr)+".ssl."+leaf); v != wantLeaf {
+					t.Errorf("%s: ssl.%s = %d, want %d — only the leaves named in wantLeaves may move on this arm", tc.name, leaf, v, wantLeaf)
 				}
 			}
 		})
@@ -5264,5 +5550,386 @@ func TestServeConnection_SSLConnectionErrorCounter_Stacked(t *testing.T) {
 	if got := counterValue(t, reg, "listener."+normalizeAddr(addr)+".ssl.connection_error"); got != 1 {
 		t.Errorf("stacked: ssl.connection_error = %d, want 1 "+
 			"(3 transport arms must contribute 0, 1 protocol arm must contribute 1)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase-95 Task 7 (SPEC §5.3): the ALPN-mismatch fallback must NOT weaken
+// downstream client authentication.
+//
+// The fallback (internal/tls/config.go, installALPNMismatchFallback — installed
+// from NewDownstreamConfig immediately after commonTLSContextToConfig returns) hands
+// crypto/tls a SECOND *stdtls.Config out of GetConfigForClient whenever the
+// offered ALPN set overlaps none of the advertised one. That alternate config is
+// what terminates the handshake, so every client-auth field it carries —
+// ClientAuth and ClientCAs — is load-bearing. The install call sits BEFORE those
+// two fields are assigned, so a build-time snapshot of cfg would capture
+// ClientAuth == NoClientCert and ClientCAs == nil: mandatory mTLS silently
+// becoming anonymous access. This test is that bypass's detector.
+// ---------------------------------------------------------------------------
+
+// mkDownstreamTSMutualTLSALPN is the transport socket SPEC §5.3 needs and that
+// NEITHER landed helper supplies (PLAN §0.11): mkDownstreamTSMutualTLS (:4484)
+// carries mandatory mTLS but NO alpn_protocols, so the fallback is never
+// installed at all (installALPNMismatchFallback returns early on
+// len(NextProtos) == 0) and the mismatch branch is unreachable;
+// mkDownstreamTSInlineALPN (tls_handshake_negative_test.go:88) carries ALPN but
+// no validation context and no require_client_certificate, so there is no
+// client authentication left to weaken. Only BOTH together put the alternate
+// config on the client-auth path.
+//
+// Both fields are required together for the same reason mkDownstreamTSMutualTLS
+// records: require_client_certificate WITHOUT a trusted_ca is a BOOT REJECT
+// ("require needs an anchor", internal/tls/config.go), so the test would die in
+// NewManager and never reach a handshake.
+func mkDownstreamTSMutualTLSALPN(t *testing.T, certPEM, keyPEM, caPEM []byte, alpn []string) *corev3.TransportSocket {
+	t.Helper()
+	inner := &tlsv3.DownstreamTlsContext{
+		RequireClientCertificate: wrapperspb.Bool(true),
+		CommonTlsContext: &tlsv3.CommonTlsContext{
+			AlpnProtocols: alpn,
+			TlsCertificates: []*tlsv3.TlsCertificate{{
+				CertificateChain: &corev3.DataSource{
+					Specifier: &corev3.DataSource_InlineBytes{InlineBytes: certPEM},
+				},
+				PrivateKey: &corev3.DataSource{
+					Specifier: &corev3.DataSource_InlineBytes{InlineBytes: keyPEM},
+				},
+			}},
+			ValidationContextType: &tlsv3.CommonTlsContext_ValidationContext{
+				ValidationContext: &tlsv3.CertificateValidationContext{
+					TrustedCa: &corev3.DataSource{
+						Specifier: &corev3.DataSource_InlineBytes{InlineBytes: caPEM},
+					},
+				},
+			},
+		},
+	}
+	a, err := anypb.New(inner)
+	if err != nil {
+		t.Fatalf("anypb.New DownstreamTlsContext (mutual TLS + ALPN): %v", err)
+	}
+	return &corev3.TransportSocket{
+		Name:       "envoy.transport_sockets.tls",
+		ConfigType: &corev3.TransportSocket_TypedConfig{TypedConfig: a},
+	}
+}
+
+// startMutualTLSALPNListener is startMutualTLSListener's ALPN-bearing sibling:
+// the same single-chain / no-FilterChainMatch / tcp_proxy-to-echo shape (so the
+// chain is the DEFAULT chain and no tls_inspector is needed), but the transport
+// socket also advertises alpn_protocols.
+//
+// ⚠️ A REAL listener on PORT 0, not net.Pipe: net.Pipe is synchronous and
+// unbuffered, so on the RequireAndVerifyClientCert no-cert arm the server blocks
+// writing its alert while the client is still blocked mid-write, and the test
+// HANGS to the package panic timeout with no failing assertion
+// (reference_netpipe_deadlocks_client_cert_handshake, and connPair's own doc at
+// :4290). connPair itself is not reusable here either: these arms need the
+// listener's serveConnection path and its ssl.* Inc points, not a bare conn pair.
+//
+// ⚠️ EACH ARM GETS ITS OWN LISTENER AND ITS OWN REGISTRY. SPEC §5.3 describes
+// "one listener", but the discriminating assertion is an EXACT-VALUE triple
+// (ssl.fail_verify_no_cert == 1 AND ssl.connection_error == 0 AND
+// ssl.handshake == 0) and ssl.handshake == 0 is unstateable on a listener that
+// the control arm has already driven to a completed handshake. Exact equality
+// over a delta is the point (a delta assertion cannot say ssl.handshake never
+// moved on THIS chain), so the listener is per-arm and every row is single-cause.
+func startMutualTLSALPNListener(t *testing.T, pki handshakeTestPKI, alpn []string) (*stats.Registry, string) {
+	t.Helper()
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", startEchoBackend(t))
+	ts := mkDownstreamTSMutualTLSALPN(t, pki.serverCertPEM, pki.serverKeyPEM, pki.caCertPEM, alpn)
+	l := mkTLSListener("l_ssl_mtls_alpn", "127.0.0.1", 0, []*listenerv3.FilterChain{
+		mkTLSChain(nil, ts, mkTcpProxyFilter(t, "c_echo")),
+	})
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	reg := stats.NewRegistry()
+	mgr, err := NewManager(boot, cm, reg, testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("listener.NewManager (mutual TLS + ALPN): %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("listener.Start (mutual TLS + ALPN): %v", err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	ls := mgr.Listeners()
+	if len(ls) != 1 {
+		t.Fatalf("Listeners() len = %d, want 1", len(ls))
+	}
+	return reg, ls[0].Addr
+}
+
+// alpnAuthProbe is one arm's complete observation.
+//
+// ⚠️ `served` is a POST-HANDSHAKE APPLICATION ROUND TRIP, not a completed
+// handshake, and the distinction is the whole point of this test. Under the
+// pre-built-snapshot bug a certificate-less client does not merely get a
+// completed handshake — it gets bytes echoed back through the proxy. A probe
+// that stopped at HandshakeComplete (openssl s_client answers exactly that
+// question) would also have to contend with TLS 1.3, where the client's
+// Handshake returns BEFORE the server's rejection alert arrives, so
+// hsCompleted is true on a REJECTED connection at 1.3 and false at 1.2 for the
+// identical server behavior. The round trip is version-invariant; hsCompleted
+// is recorded for the record and deliberately NOT asserted.
+type alpnAuthProbe struct {
+	hsCompleted bool
+	served      bool
+	negotiated  string
+	certSent    bool
+	clientErr   error // handshake error, else the round-trip error
+}
+
+// driveALPNAuthProbe opens exactly ONE connection to addr and drives it to a
+// terminal outcome: rejected, or served.
+//
+// ⚠️ sendCert installs GetClientCertificate rather than Certificates, and the
+// callback RECORDS that it fired. A Go client silently WITHHOLDS a certificate
+// whose issuer is absent from the server's CertificateRequest
+// (reference_go_client_cert_withholding), which would degrade the valid-cert arm
+// into the no-cert arm and make it vacuous. certSent is therefore an ASSERTION
+// at the call site, not a log line — and it is a SECOND, independent detector of
+// the bypass: an alternate config carrying ClientAuth == NoClientCert sends no
+// CertificateRequest at all, so the callback never runs and certSent reads
+// false even though the client holds a perfectly valid certificate.
+//
+// The flag is a BUFFERED CHANNEL rather than a plain bool: crypto/tls may run
+// the handshake on its own goroutine when the dial carries a cancellable
+// context, so a bare bool would be a data race under -race on whichever path the
+// stdlib takes. A channel is race-free without pulling a new import into this
+// file — which matters, because adding one would shift every line number below
+// the import block.
+func driveALPNAuthProbe(t *testing.T, addr string, pki handshakeTestPKI,
+	offer []string, sendCert bool, minVer, maxVer uint16,
+) alpnAuthProbe {
+	t.Helper()
+
+	// Buffered to 1 and filled with a NON-BLOCKING send, so the callback never
+	// blocks even if crypto/tls were to invoke it more than once.
+	certSentCh := make(chan struct{}, 1)
+	certSent := func() bool {
+		select {
+		case <-certSentCh:
+			// Put it back: certSent() is read on several return paths.
+			certSentCh <- struct{}{}
+			return true
+		default:
+			return false
+		}
+	}
+	cfg := &stdtls.Config{
+		ServerName: "localhost", // mkTestPKI's server leaf CN/SAN
+		RootCAs:    pki.serverRoots,
+		NextProtos: offer,
+		MinVersion: minVer,
+		MaxVersion: maxVer,
+	}
+	if sendCert {
+		trusted := pki.clientTrusted
+		cfg.GetClientCertificate = func(*stdtls.CertificateRequestInfo) (*stdtls.Certificate, error) {
+			select {
+			case certSentCh <- struct{}{}:
+			default:
+			}
+			return &trusted, nil
+		}
+	}
+
+	out := alpnAuthProbe{}
+	conn, err := stdtls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, cfg)
+	if err != nil {
+		out.clientErr = err
+		out.certSent = certSent()
+		return out
+	}
+	defer func() { _ = conn.Close() }()
+
+	cs := conn.ConnectionState()
+	out.hsCompleted = cs.HandshakeComplete
+	out.negotiated = cs.NegotiatedProtocol
+
+	// THE ROUND TRIP. startEchoBackend echoes, so a byte-exact reply proves the
+	// connection reached the tcp_proxy terminal and the upstream — i.e. that the
+	// client was SERVED, not merely admitted to a handshake.
+	payload := []byte("p95-task7-alpn-auth-probe")
+	if derr := conn.SetDeadline(time.Now().Add(5 * time.Second)); derr != nil {
+		t.Fatalf("SetDeadline: %v", derr)
+	}
+	if _, werr := conn.Write(payload); werr != nil {
+		out.clientErr = werr
+		out.certSent = certSent()
+		return out
+	}
+	buf := make([]byte, len(payload))
+	if _, rerr := io.ReadFull(conn, buf); rerr != nil {
+		out.clientErr = rerr
+		out.certSent = certSent()
+		return out
+	}
+	out.served = string(buf) == string(payload)
+	out.certSent = certSent()
+	return out
+}
+
+// assertSSLLeavesExact asserts an EXACT value for EVERY leaf in sslLeafRoster,
+// so each call is a full cross-product: the named movers AND the silent ones.
+// It is assertSSLCrossProduct's exact-value sibling — that helper POLLS its
+// positive half for >= 1, which cannot express this row's discriminating
+// requirement that ssl.handshake be exactly 0 on a rejected arm. Callers must
+// have crossed the awaitDrained release barrier first; counterValue reads once
+// and t.Errorf's on an ABSENT name rather than returning a silent 0.
+//
+// ⚠️ counterValue walks the registry under RLock. NEVER register a stat inside
+// Registry.Walk — registering re-enters the write lock and DEADLOCKS the process
+// (reference_registry_walk_lock_inversion).
+func assertSSLLeavesExact(t *testing.T, reg *stats.Registry, addr string, want map[string]int64) {
+	t.Helper()
+	prefix := "listener." + normalizeAddr(addr) + ".ssl."
+	for _, leaf := range sslLeafRoster {
+		if got := counterValue(t, reg, prefix+leaf); got != want[leaf] {
+			t.Errorf("%s = %d, want %d", prefix+leaf, got, want[leaf])
+		}
+	}
+	// A leaf named in want but absent from sslLeafRoster would be asserted
+	// NOWHERE — a typo would silently delete an expectation.
+	known := map[string]bool{}
+	for _, leaf := range sslLeafRoster {
+		known[leaf] = true
+	}
+	for k := range want {
+		if !known[k] {
+			t.Errorf("wantLeaves names %q, which is not in sslLeafRoster — the expectation is asserted nowhere", k)
+		}
+	}
+}
+
+// TestServeConnection_ALPNMismatch_PreservesClientAuth is the security-relevant
+// test of the phase-95 row: it proves the ALPN-mismatch fallback does not weaken
+// downstream client authentication.
+//
+// ⚠️ THE DISCRIMINATOR IS THE SERVER-SIDE COUNTER TRIPLE, NOT THE CLIENT ERROR
+// STRING (PLAN §0.3). SPEC §5.3 asks that arm (b)'s failure "carry the
+// client-certificate signature". Taken literally on the client-visible text that
+// assertion FAILS AGAINST THE CORRECT IMPLEMENTATION at TLS 1.2, where the
+// client reads `remote error: tls: handshake failure` with no `certificate`
+// substring at all: crypto/tls sends alertCertificateRequired only at TLS 1.3
+// and alertHandshakeFailure otherwise. The version-invariant discriminator is
+// ssl.fail_verify_no_cert == 1 AND ssl.connection_error == 0 AND
+// ssl.handshake == 0 — which error fired AND which did not. The one
+// client-string assertion kept below is scoped to the TLS 1.3 row EXPLICITLY.
+//
+// ⚠️ ssl.no_certificate is in arm (b)'s expectation at 0 for a specific reason
+// (PLAN §0.3's fifth signature): under the bypass arm (b) reads
+// no_certificate == 1 ALONGSIDE handshake == 1 — a "handshake completed with no
+// client certificate" pair that CANNOT occur on a require_client_certificate
+// chain. sslLeafRoster's cross-product pins it.
+//
+// The control arm is the over-firing guard: a fallback that fired when an
+// overlap DOES exist would read negotiated == "" there. Arm (a) is arm (b)'s
+// under-firing partner: without it, arm (b) alone is satisfied by not
+// implementing the fallback at all — and at the un-fixed tip BOTH are red,
+// arm (b) because `no application protocol` fires exactly where the certificate
+// error must (PLAN §0.11: SPEC §12's cell 8 is narrower than it claims).
+func TestServeConnection_ALPNMismatch_PreservesClientAuth(t *testing.T) {
+	const (
+		h2   = "h2"
+		h11  = "http/1.1"
+		junk = "bogus/9"
+	)
+
+	tests := []struct {
+		name string
+		// arm inputs
+		offer          []string
+		sendCert       bool
+		minVer, maxVer uint16
+		// arm expectations
+		wantServed     bool
+		wantNegotiated string
+		wantLeaves     map[string]int64
+		// wantCertErrText is asserted ONLY where it is non-empty, i.e. the
+		// TLS 1.3 row: see the version table in the doc comment above.
+		wantCertErrText string
+	}{
+		{
+			name: "control_validcert_overlapping_offer",
+			// The over-firing guard: an OVERLAPPING offer must still negotiate
+			// the overlap, so the fallback must NOT have fired here.
+			offer: []string{h11}, sendCert: true,
+			minVer: stdtls.VersionTLS12, maxVer: stdtls.VersionTLS13,
+			wantServed: true, wantNegotiated: h11,
+			wantLeaves: map[string]int64{"handshake": 1},
+		},
+		{
+			name: "a_validcert_mismatched_offer",
+			// The fallback fires. The handshake must COMPLETE with no protocol
+			// selected AND the client must still have been asked for — and have
+			// sent — its certificate.
+			offer: []string{junk}, sendCert: true,
+			minVer: stdtls.VersionTLS12, maxVer: stdtls.VersionTLS13,
+			wantServed: true, wantNegotiated: "",
+			wantLeaves: map[string]int64{"handshake": 1},
+		},
+		{
+			name: "b_withheldcert_mismatched_offer_TLS13",
+			// The bypass detector. A client with NO certificate must be
+			// REJECTED, and it must be the CERTIFICATE error that fires.
+			offer: []string{junk}, sendCert: false,
+			minVer: stdtls.VersionTLS13, maxVer: stdtls.VersionTLS13,
+			wantServed: false,
+			wantLeaves: map[string]int64{"fail_verify_no_cert": 1},
+			// TLS 1.3 ONLY: crypto/tls sends alertCertificateRequired here.
+			wantCertErrText: "certificate",
+		},
+		{
+			name: "b_withheldcert_mismatched_offer_TLS12",
+			// Same server behavior, different alert code — hence NO client
+			// string assertion on this row. The counter triple is what carries it.
+			offer: []string{junk}, sendCert: false,
+			minVer: stdtls.VersionTLS12, maxVer: stdtls.VersionTLS12,
+			wantServed: false,
+			wantLeaves: map[string]int64{"fail_verify_no_cert": 1},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pki := mkTestPKI(t)
+			reg, addr := startMutualTLSALPNListener(t, pki, []string{h2, h11})
+
+			got := driveALPNAuthProbe(t, addr, pki, tc.offer, tc.sendCert, tc.minVer, tc.maxVer)
+			t.Logf("arm=%s hsCompleted=%v served=%v negotiated=%q certSent=%v clientErr=%v",
+				tc.name, got.hsCompleted, got.served, got.negotiated, got.certSent, got.clientErr)
+
+			if got.served != tc.wantServed {
+				t.Errorf("served = %v, want %v (clientErr=%v) — served means a full APPLICATION ROUND TRIP "+
+					"through the proxy, not a completed handshake", got.served, tc.wantServed, got.clientErr)
+			}
+			if tc.wantServed && got.negotiated != tc.wantNegotiated {
+				t.Errorf("NegotiatedProtocol = %q, want %q", got.negotiated, tc.wantNegotiated)
+			}
+			if tc.sendCert && !got.certSent {
+				// NOT a log line. Under the bypass the alternate config carries
+				// ClientAuth == NoClientCert, so no CertificateRequest reaches
+				// the client and this reads false with a valid cert in hand.
+				t.Errorf("certSent = false — GetClientCertificate never fired, so this arm never "+
+					"presented a certificate at all and is VACUOUS (clientErr=%v)", got.clientErr)
+			}
+			if tc.wantCertErrText != "" {
+				if got.clientErr == nil {
+					t.Errorf("clientErr = nil, want an error containing %q", tc.wantCertErrText)
+				} else if !strings.Contains(got.clientErr.Error(), tc.wantCertErrText) {
+					t.Errorf("clientErr = %v, want it to contain %q (TLS1.3-scoped: crypto/tls sends "+
+						"alertCertificateRequired only at 1.3)", got.clientErr, tc.wantCertErrText)
+				}
+			}
+
+			// Release barrier: exactly ONE connection was driven, and the ssl.*
+			// Inc runs in serveConnection's goroutine. Poll the gauge — NO SLEEPS.
+			awaitDrained(t, reg, addr, 1)
+			assertSSLLeavesExact(t, reg, addr, tc.wantLeaves)
+		})
 	}
 }

@@ -2602,3 +2602,213 @@ func TestVerifyIfGiven_NilPool_Unconstructible(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 95 (tls-alpn-mismatch-fallback) — SPEC section 5.4 guard pins.
+//
+// These pin the guards of installALPNMismatchFallback at the
+// NewDownstreamConfig seam rather than through a live handshake. Every context
+// is built with the package's own helpers (makeTransportSocket / inlineBytes /
+// pki) so the input is production-representative: a hand-rolled *stdtls.Config
+// could carry a shape no production path ever produces.
+//
+// ⚠️ SCOPE, recorded at the phase-95 final review (finding F5): the entry
+// function carries THREE guards but they are NOT three separately-tested ones.
+// Exactly ONE is live and pinned here — len(cfg.NextProtos) == 0, the
+// chain-advertises-no-ALPN case, which is the observable SPEC section 12
+// negative control cell 9 reddens. The other two (cfg == nil,
+// cfg.GetConfigForClient != nil) are DEFENSIVE AND CURRENTLY UNREACHABLE:
+// commonTLSContextToConfig returns either (nil, err) or (non-nil, nil), and no
+// caller assigns GetConfigForClient before the install. They are retained as
+// cheap invariants and no pin below claims to exercise them.
+// ---------------------------------------------------------------------------
+
+// alpnFallbackAdvertised is the alpn_protocols list every phase-95 guard pin
+// advertises on the chain.
+var alpnFallbackAdvertised = []string{"h2", "http/1.1"}
+
+// alpnEqual reports exact, order-sensitive list equality. RFC 7301 protocol IDs
+// are opaque octet sequences, so the comparison is case-SENSITIVE.
+func alpnEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// mkALPNDownstreamTS builds a production-representative downstream
+// TransportSocket carrying the inline test leaf, the given alpn_protocols
+// (nil => the field is absent) and, when requireClientCert is true,
+// require_client_certificate:true beside an inline trusted_ca (ADR-0147
+// requires the pair; require:true alone is rejected).
+func mkALPNDownstreamTS(t *testing.T, alpn []string, requireClientCert bool) *corev3.TransportSocket {
+	t.Helper()
+	common := &tlsv3.CommonTlsContext{
+		TlsCertificates: []*tlsv3.TlsCertificate{
+			{
+				CertificateChain: inlineBytes(pki.leafCertPEM),
+				PrivateKey:       inlineBytes(pki.leafKeyPEM),
+			},
+		},
+		AlpnProtocols: alpn,
+	}
+	dtc := &tlsv3.DownstreamTlsContext{CommonTlsContext: common}
+	if requireClientCert {
+		dtc.RequireClientCertificate = &wrapperspb.BoolValue{Value: true}
+		common.ValidationContextType = &tlsv3.CommonTlsContext_ValidationContext{
+			ValidationContext: &tlsv3.CertificateValidationContext{
+				TrustedCa: inlineBytes(pki.caPEM),
+			},
+		}
+	}
+	return makeTransportSocket(t, dtc)
+}
+
+// alpnFallbackBuild builds the downstream config and fails the test if the
+// build itself errors — every guard pin below assumes a live *stdtls.Config.
+func alpnFallbackBuild(t *testing.T, ts *corev3.TransportSocket) *stdtls.Config {
+	t.Helper()
+	dc, err := NewDownstreamConfig(ts, "", nil)
+	if err != nil {
+		t.Fatalf("NewDownstreamConfig: unexpected error: %v", err)
+	}
+	if dc == nil || dc.TLSConfig == nil {
+		t.Fatalf("NewDownstreamConfig returned dc=%v with a nil TLSConfig", dc)
+	}
+	return dc.TLSConfig
+}
+
+// TestNewDownstreamConfig_ALPNFallback_NoALPNChain_NoCallback pins the
+// len(cfg.NextProtos) == 0 guard: a chain that advertises no alpn_protocols
+// must be left with a nil GetConfigForClient. This is the observable that
+// SPEC section 12 cell 9 (guard removed) reddens.
+func TestNewDownstreamConfig_ALPNFallback_NoALPNChain_NoCallback(t *testing.T) {
+	cfg := alpnFallbackBuild(t, mkALPNDownstreamTS(t, nil, false))
+	if len(cfg.NextProtos) != 0 {
+		t.Errorf("no-ALPN chain: NextProtos = %v, want empty", cfg.NextProtos)
+	}
+	if cfg.GetConfigForClient != nil {
+		t.Errorf("no-ALPN chain: GetConfigForClient is NON-nil, want nil")
+	}
+}
+
+// TestNewDownstreamConfig_ALPNFallback_ALPNChain_CallbackInstalled pins the
+// install itself AND the property that the BASE config is never emptied: the
+// advertised list must survive installation untouched, because the stdlib
+// serves it from this very config on every overlapping handshake.
+func TestNewDownstreamConfig_ALPNFallback_ALPNChain_CallbackInstalled(t *testing.T) {
+	cfg := alpnFallbackBuild(t, mkALPNDownstreamTS(t, alpnFallbackAdvertised, false))
+	if cfg.GetConfigForClient == nil {
+		t.Errorf("ALPN chain: GetConfigForClient is nil — the fallback is NOT installed")
+	}
+	if !alpnEqual(cfg.NextProtos, alpnFallbackAdvertised) {
+		t.Errorf("ALPN chain: base NextProtos = %v, want %v — the base config must never be emptied", cfg.NextProtos, alpnFallbackAdvertised)
+	}
+}
+
+// TestNewDownstreamConfig_ALPNFallback_MutualTLSChain_ClientAuthCompleted pins
+// SPEC section 0.1 at the seam: on a require_client_certificate:true chain that
+// ALSO advertises alpn_protocols, the returned config must carry the COMPLETED
+// client-auth values (installPool writes them AFTER the install anchor) beside
+// an installed fallback. A build-time snapshot taken at the anchor would carry
+// ClientAuth=NoClientCert / ClientCAs=nil — an authentication bypass.
+func TestNewDownstreamConfig_ALPNFallback_MutualTLSChain_ClientAuthCompleted(t *testing.T) {
+	cfg := alpnFallbackBuild(t, mkALPNDownstreamTS(t, alpnFallbackAdvertised, true))
+	if cfg.ClientAuth != stdtls.RequireAndVerifyClientCert {
+		t.Errorf("mTLS+ALPN chain: ClientAuth = %v, want RequireAndVerifyClientCert", cfg.ClientAuth)
+	}
+	if cfg.ClientCAs == nil {
+		t.Errorf("mTLS+ALPN chain: ClientCAs is nil, want the completed trusted_ca pool")
+	}
+	if cfg.GetConfigForClient == nil {
+		t.Errorf("mTLS+ALPN chain: GetConfigForClient is nil — the fallback is NOT installed")
+	}
+}
+
+// alpnFallbackDriveNoop drives the installed callback with the given offer and
+// asserts the stdlib-is-already-correct outcome: (nil, nil). t.Helper() so each
+// arm's failure is reported at its own call site.
+func alpnFallbackDriveNoop(t *testing.T, cb func(*stdtls.ClientHelloInfo) (*stdtls.Config, error), label string, offered []string) {
+	t.Helper()
+	alt, err := cb(&stdtls.ClientHelloInfo{SupportedProtos: offered})
+	if err != nil {
+		t.Errorf("%s: callback returned err = %v, want nil — the callback has no error path (a non-nil error sends alertInternalError)", label, err)
+	}
+	if alt != nil {
+		t.Errorf("%s: callback returned a NON-nil *stdtls.Config (NextProtos=%v), want nil — the stdlib's own paths are already correct here", label, alt.NextProtos)
+	}
+}
+
+// TestNewDownstreamConfig_ALPNFallback_CallbackDirect drives the installed
+// GetConfigForClient callback DIRECTLY, on a require_client_certificate chain,
+// and pins all three of its outcomes plus the two properties that make it safe.
+//
+// The chain is mTLS on purpose: SPEC section 0.1's authentication bypass is a
+// property of WHICH config the mismatch path serves, and it is only observable
+// when the base config carries client-auth values the install anchor had not yet
+// assigned.
+func TestNewDownstreamConfig_ALPNFallback_CallbackDirect(t *testing.T) {
+	cfg := alpnFallbackBuild(t, mkALPNDownstreamTS(t, alpnFallbackAdvertised, true))
+	cb := cfg.GetConfigForClient
+	if cb == nil {
+		t.Fatalf("GetConfigForClient is nil — the fallback is NOT installed; there is nothing to drive")
+	}
+	baseAuth, baseCAs := cfg.ClientAuth, cfg.ClientCAs
+	if baseAuth != stdtls.RequireAndVerifyClientCert || baseCAs == nil {
+		t.Fatalf("precondition: base ClientAuth=%v ClientCAs==nil? %v, want RequireAndVerifyClientCert beside a populated pool", baseAuth, baseCAs == nil)
+	}
+
+	// Arms 1 and 2 — the stdlib's own paths already match the reference, so the
+	// callback must decline to substitute anything.
+	alpnFallbackDriveNoop(t, cb, "absent offer (empty SupportedProtos)", nil)
+	alpnFallbackDriveNoop(t, cb, "overlapping offer", []string{"h2"})
+
+	// Arm 3 — the mismatch branch: the alternate config.
+	alt, err := cb(&stdtls.ClientHelloInfo{SupportedProtos: []string{"bogus/9"}})
+	if err != nil {
+		t.Errorf("non-overlapping offer: callback returned err = %v, want nil", err)
+	}
+	if alt == nil {
+		t.Fatalf("non-overlapping offer: callback returned a nil *stdtls.Config, want the alternate — the mismatch branch was NOT taken")
+	}
+	t.Logf("ALT: ClientAuth=%v ClientCAs==base? %v NextProtos=%v callback==nil? %v",
+		alt.ClientAuth, alt.ClientCAs == baseCAs, alt.NextProtos, alt.GetConfigForClient == nil)
+
+	if alt.NextProtos != nil {
+		t.Errorf("ALT NextProtos = %v, want nil — the alternate must advertise nothing so crypto/tls takes its own \"server advertises nothing\" branch and completes the handshake", alt.NextProtos)
+	}
+	if alt.GetConfigForClient != nil {
+		t.Errorf("ALT GetConfigForClient is NON-nil, want nil — the callback is never dispatched twice")
+	}
+	// SPEC section 0.1, as a direct unit: a build-time snapshot taken at the
+	// install anchor would carry NoClientCert / a nil pool here, and mandatory
+	// mTLS would silently become anonymous access for any client offering a
+	// protocol this listener does not advertise.
+	if alt.ClientAuth != baseAuth {
+		t.Errorf("ALT ClientAuth = %v, want %v — AUTHENTICATION BYPASS: the mismatch path would serve a weaker client-auth policy", alt.ClientAuth, baseAuth)
+	}
+	if alt.ClientCAs != baseCAs {
+		t.Errorf("ALT ClientCAs is not the base pool (alt pool nil? %v) — AUTHENTICATION BYPASS: the mismatch path would verify against a different or absent CA pool", alt.ClientCAs == nil)
+	}
+
+	// ⚠️ MANDATORY, AND THE WHOLE POINT OF THIS TEST: re-read the BASE config
+	// AFTER the callback has been driven. PLAN section 0.9 measured that
+	// without this, SPEC section 12 cell 10 — emptying cfg.NextProtos IN PLACE
+	// instead of on the clone — is completely invisible: alt.NextProtos,
+	// alt.GetConfigForClient, alt.ClientAuth and alt.ClientCAs ALL stay green
+	// under it, because Clone() faithfully copies an already-emptied slice.
+	// Cell 10 is also a live DATA RACE in production, a handshake goroutine
+	// writing the shared base *stdtls.Config, which is a second and independent
+	// reason the clone is mandatory.
+	if !alpnEqual(cfg.NextProtos, alpnFallbackAdvertised) {
+		t.Errorf("base NextProtos AFTER callback = %v, want %v — the base config was mutated", cfg.NextProtos, alpnFallbackAdvertised)
+	}
+	if cfg.GetConfigForClient == nil {
+		t.Errorf("base GetConfigForClient AFTER callback is nil, want the installed callback — the base config was mutated")
+	}
+}

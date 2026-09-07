@@ -83,7 +83,8 @@ func parseSecret(resource *anypb.Any, wantName, baseDir string) (*stdtls.Certifi
 // parseValidationSecret unmarshals an SDS-delivered resource into a
 // tls.v3.Secret, verifies it carries the validation_context oneof arm under the
 // requested name, holds the served CertificateValidationContext to the SAME
-// support surface as the inline path (internal/tls/config.go:234-245 — lifting
+// support surface as the inline path (internal/tls/config.go, the inline
+// `default:` arm of NewDownstreamConfig's validation-context switch — lifting
 // the SDS envelope is not license to silently accept CVC sub-fields envoy-go
 // cannot honor, reference_strict_reject_sibling_typeurl_gap), and loads
 // trusted_ca into an *x509.CertPool.
@@ -100,7 +101,8 @@ func parseSecret(resource *anypb.Any, wantName, baseDir string) (*stdtls.Certifi
 // internal/tls.loadDataSource. Keep internal/xds's dep set at internal/stats only.
 //
 // crl is NOT rejected — the inline path does not check it either
-// (config.go:233-246), so rejecting here would be a NEW asymmetry. A documented
+// (the inline `default:` arm of NewDownstreamConfig's validation-context
+// switch), so rejecting here would be a NEW asymmetry. A documented
 // SHARED gap, deferred to the CVC-feature follow-on (SPEC-65 §6).
 func parseValidationSecret(resource *anypb.Any, wantName, baseDir string) (*x509.CertPool, error) {
 	var sec tlsv3.Secret

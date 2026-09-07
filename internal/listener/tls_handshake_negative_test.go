@@ -23,10 +23,14 @@ import (
 //
 // This mirrors reference Envoy: with no filter-chain match Envoy closes the
 // connection (bumping `no_filter_chain_match`) rather than terminating TLS on a
-// wrong chain. envoy-go reaches the same outcome via SelectChain returning an
-// error from the GetConfigForClient callback, which the Go TLS server turns
-// into a handshake abort. The negative live-handshake path was previously
-// covered only at the chain-selection level.
+// wrong chain. envoy-go reaches the same outcome BEFORE the handshake starts:
+// since phase 07.2 Task 10 chain selection runs in serveConnection, and a
+// SelectChain error closes the connection without ever handing it to
+// stdtls.Server, so the client observes the handshake failing. There is no
+// SNI-dispatch callback involved. (The phase-95 ALPN-mismatch fallback of
+// ADR-0317 is the tree's only per-handshake callback on a downstream chain; it
+// never dispatches on SNI and has no error path at all.) The negative
+// live-handshake path was previously covered only at the chain-selection level.
 func TestNewManager_LiveHandshake_UnmatchedSNI_NoCatchAll_Aborts(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
@@ -84,7 +88,10 @@ func TestNewManager_LiveHandshake_UnmatchedSNI_NoCatchAll_Aborts(t *testing.T) {
 
 // mkDownstreamTSInlineALPN mirrors mkDownstreamTSInline but sets
 // alpn_protocols on the CommonTlsContext, so the chain's *stdtls.Config
-// carries NextProtos and the server ENFORCES ALPN overlap.
+// ADVERTISES those protocols in NextProtos. It does NOT make the server
+// enforce overlap: an offer that overlaps none of them falls back to a
+// handshake with no protocol selected, matching the measured reference
+// (ADR-0317).
 func mkDownstreamTSInlineALPN(t *testing.T, certPEM, keyPEM string, alpn []string) *corev3.TransportSocket {
 	t.Helper()
 	inner := &tlsv3.DownstreamTlsContext{
@@ -110,15 +117,23 @@ func mkDownstreamTSInlineALPN(t *testing.T, certPEM, keyPEM string, alpn []strin
 	}
 }
 
-// TestNewManager_LiveHandshake_ALPNNegotiationFailure_Aborts closes the
-// remaining runtime TLS-handshake-failure gap from the 2026-07-11 test-gap
-// analysis (§4 item 3): a listener whose DownstreamTlsContext advertises
-// alpn_protocols must ABORT the handshake for a client that offers only a
-// non-overlapping protocol (crypto/tls: no_application_protocol — matching
-// reference Envoy, which alerts no_application_protocol on ALPN mismatch),
-// while a client offering an overlapping protocol completes the handshake
-// and observes the negotiated protocol.
-func TestNewManager_LiveHandshake_ALPNNegotiationFailure_Aborts(t *testing.T) {
+// TestNewManager_LiveHandshake_ALPNMismatch_CompletesWithNoProtocol pins the
+// MEASURED reference behavior for a TCP downstream chain whose
+// DownstreamTlsContext advertises alpn_protocols. Booted against the
+// digest-pinned reference (envoyproxy/envoy:contrib-v1.37.2), a client that
+// offers ONLY a non-overlapping protocol gets a COMPLETED handshake with
+// ConnectionState().NegotiatedProtocol == "", the connection is SERVED (the
+// reference finished a full echo round trip, not merely a handshake), and the
+// listener books ssl.handshake +1 with ssl.connection_error +0. envoy-go
+// reaches the same outcome through the ALPN-mismatch fallback installed on the
+// per-chain *stdtls.Config by internal/tls (ADR-0317); it does NOT abort and
+// it does NOT alert no_application_protocol.
+//
+// The overlapping-offer control runs FIRST and asserts the negotiated protocol
+// by exact equality: it is the over-firing guard (a fallback that fired when an
+// overlap DOES exist would read ""), and running it first makes the
+// ssl.handshake == 2 arithmetic unambiguous.
+func TestNewManager_LiveHandshake_ALPNMismatch_CompletesWithNoProtocol(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
 	ts := mkDownstreamTSInlineALPN(t, testAlphaCertPEM, testAlphaKeyPEM, []string{"h2", "http/1.1"})
@@ -127,7 +142,8 @@ func TestNewManager_LiveHandshake_ALPNNegotiationFailure_Aborts(t *testing.T) {
 		mkTLSChain(nil, ts, filter), // single catch-all TLS chain
 	})
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
+	reg := stats.NewRegistry()
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, reg, nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -146,7 +162,8 @@ func TestNewManager_LiveHandshake_ALPNNegotiationFailure_Aborts(t *testing.T) {
 	addr := ls[0].Addr
 	caPool := testCAPool(t)
 
-	// Control: an overlapping ALPN offer completes and negotiates.
+	// Control (FIRST, and the over-firing guard): an overlapping ALPN offer
+	// must still complete AND negotiate the overlap.
 	okConn, err := stdtls.DialWithDialer(
 		&net.Dialer{Timeout: 2 * time.Second}, "tcp", addr,
 		&stdtls.Config{ServerName: "alpha.envoy-go.test", RootCAs: caPool, MinVersion: stdtls.VersionTLS12, NextProtos: []string{"http/1.1"}},
@@ -159,13 +176,30 @@ func TestNewManager_LiveHandshake_ALPNNegotiationFailure_Aborts(t *testing.T) {
 	}
 	_ = okConn.Close()
 
-	// Non-overlapping ALPN offer → the handshake must NOT succeed.
-	badConn, err := stdtls.DialWithDialer(
+	// Mismatch arm: a NON-overlapping ALPN offer must still COMPLETE, with no
+	// protocol selected. This is the reference behavior measured in §0.7.
+	mismatchConn, err := stdtls.DialWithDialer(
 		&net.Dialer{Timeout: 2 * time.Second}, "tcp", addr,
 		&stdtls.Config{ServerName: "alpha.envoy-go.test", RootCAs: caPool, MinVersion: stdtls.VersionTLS12, NextProtos: []string{"bogus/9"}},
 	)
-	if err == nil {
-		_ = badConn.Close()
-		t.Fatal("TLS handshake offering only a non-overlapping ALPN protocol SUCCEEDED; expected an aborted handshake (no_application_protocol)")
+	if err != nil {
+		t.Fatalf("dial with a non-overlapping ALPN offer failed: %v — the reference COMPLETES this handshake (ADR-0317)", err)
+	}
+	if got := mismatchConn.ConnectionState().NegotiatedProtocol; got != "" {
+		t.Errorf("negotiated ALPN on a non-overlapping offer = %q, want %q", got, "")
+	}
+	_ = mismatchConn.Close()
+
+	// Both arms drained, the counters must read the reference's arithmetic:
+	// two completed handshakes, zero connection errors. Poll the gauge — NO
+	// SLEEPS — and read with counterValue, which int64-types the result and
+	// t.Errorf's on an ABSENT counter rather than reading a vacuous 0.
+	awaitDrained(t, reg, addr, 2)
+	prefix := "listener." + normalizeAddr(addr) + ".ssl."
+	if got := counterValue(t, reg, prefix+"connection_error"); got != int64(0) {
+		t.Errorf("ssl.connection_error = %d, want 0 — an ALPN mismatch is not a connection error", got)
+	}
+	if got := counterValue(t, reg, prefix+"handshake"); got != int64(2) {
+		t.Errorf("ssl.handshake = %d, want 2 — both the overlapping and the non-overlapping offer complete", got)
 	}
 }

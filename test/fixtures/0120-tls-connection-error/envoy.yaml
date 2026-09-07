@@ -66,6 +66,14 @@ static_resources:
               "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
               require_client_certificate: true
               common_tls_context:
+                # ⚠️ alpn_protocols is the SUBJECT of phase 95. It is the FIRST key of
+                # common_tls_context and is BYTE-IDENTICAL on both sides (same key,
+                # same value, same position) — the 0004/0079/0080/0119 shape. A
+                # client whose offer OVERLAPS this list negotiates "h2" (arm (vii));
+                # a client whose offer overlaps NOTHING must still COMPLETE the
+                # handshake with no protocol selected (arm (vi)) — the reference
+                # SERVES such a connection, and envoy-go must not abort it.
+                alpn_protocols: ["h2", "http/1.1"]
                 tls_params:
                   tls_minimum_protocol_version: TLSv1_2
                 tls_certificates:

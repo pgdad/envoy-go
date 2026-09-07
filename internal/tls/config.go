@@ -21,8 +21,16 @@ const (
 )
 
 // DownstreamConfig is the phase-03 output of parsing a DownstreamTlsContext.
-// Callers embed cfg.TLSConfig in the chain's per-chain *stdtls.Config used by
-// the listener's GetConfigForClient callback.
+// cfg.TLSConfig IS the chain's per-chain *stdtls.Config: since phase 07.2
+// (Task 10) chain selection happens BEFORE the TLS handshake, and the selected
+// chain's config is passed DIRECTLY to stdtls.Server. There is no
+// listener-level GetConfigForClient callback and has not been since phase 07.2.
+//
+// Phase 95 installs the tree's first real GetConfigForClient since phase 03 —
+// see installALPNMismatchFallback below. It is per-chain, it does ALPN
+// mismatch fallback ONLY (never SNI dispatch, never chain selection), and it
+// has no error path at all: every return is (nil, nil) or (alt, nil). See
+// ADR-0317.
 type DownstreamConfig struct {
 	TLSConfig *stdtls.Config
 }
@@ -54,6 +62,7 @@ func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string, provider xd
 	if err != nil {
 		return nil, err
 	}
+	installALPNMismatchFallback(cfg)
 	require := ctx.GetRequireClientCertificate().GetValue()
 	common := ctx.GetCommonTlsContext()
 
@@ -265,6 +274,16 @@ func NewDownstreamConfig(ts *corev3.TransportSocket, baseDir string, provider xd
 // mandatory-TLS empty-cert error are reused). QUIC carries no SDS in phase 61.1,
 // so the provider argument to commonTLSContextToConfig is nil. Errors begin with
 // "tls: downstream: ". (Phase 61.1, ADR-0279.)
+//
+// The phase-95 ALPN-mismatch fallback (installALPNMismatchFallback) is
+// deliberately NOT installed on this path: negotiateALPN's RFC 9001 Section 8.1
+// rejection is itself predicated on len(serverProtos) != 0, so emptying
+// NextProtos here would silently DISABLE a mandated rejection. See ADR-0317.
+// Since the phase-95 final review (finding F1) BOTH of internal/listener's
+// build sites — the filter_chains[] loop AND default_filter_chain — route a
+// kindQUIC listener here, so a QUIC listener cannot reach the TCP builder's
+// installer by any config shape; a plain DownstreamTlsContext on either site
+// now hits the type_url reject below.
 func NewQUICDownstreamConfig(ts *corev3.TransportSocket, baseDir string) (*DownstreamConfig, error) {
 	if ts == nil {
 		return nil, fmt.Errorf("tls: downstream: nil transport_socket")
@@ -579,4 +598,69 @@ func commonTLSContextToConfig(c *tlsv3.CommonTlsContext, baseDir, side string, p
 	cfg.NextProtos = append(cfg.NextProtos, c.GetAlpnProtocols()...)
 
 	return cfg, nil
+}
+
+// installALPNMismatchFallback makes a TCP downstream chain match reference Envoy
+// on a NON-OVERLAPPING ALPN offer. The reference selects nothing and COMPLETES
+// the handshake (BoringSSL alpn_select_cb -> SSL_TLSEXT_ERR_NOACK); crypto/tls
+// instead alerts no_application_protocol (handshake_server.go negotiateALPN).
+// Handing the stdlib a config with an EMPTY NextProtos takes its own
+// "server advertises nothing" branch and reproduces the reference exactly.
+//
+// Installed ONLY here, at the single entry of NewDownstreamConfig, never in
+// NewQUICDownstreamConfig: negotiateALPN's RFC 9001 Section 8.1 guard is itself
+// predicated on len(serverProtos) != 0, so emptying NextProtos on the QUIC path
+// would silently DISABLE a mandated rejection. See ADR-0317.
+//
+// ⚠️ That is a claim about the PATH, not merely about the SYMBOL, and it was
+// FALSE until the phase-95 final review (finding F1). internal/listener's
+// default_filter_chain build site called NewDownstreamConfig UNCONDITIONALLY,
+// with none of the kind == kindQUIC branch its filter_chains[] loop carries, so
+// a QUIC listener carrying only a default_filter_chain with a plain
+// DownstreamTlsContext reached THIS function and quicTLSConfig() then handed the
+// result to quic.Listen. BOTH listener build sites now route kindQUIC to
+// NewQUICDownstreamConfig, so no QUIC listener can reach this installer;
+// internal/listener's TestBuildListenerRuntime_QUICDefaultFilterChain_*
+// regression pair holds that shut.
+//
+// The alternate config is cloned PER HANDSHAKE, not pre-built: at this anchor
+// cfg.ClientCAs and cfg.ClientAuth are not yet assigned (installPool writes them
+// below), so a build-time snapshot would serve a mismatched-ALPN client a config
+// with NoClientCert — an authentication bypass on a require_client_certificate
+// chain. ADR-0317 Context.
+func installALPNMismatchFallback(cfg *stdtls.Config) {
+	// Of the three entry guards exactly ONE is live: len(cfg.NextProtos) == 0,
+	// the chain-advertises-no-ALPN case, exercised by SPEC section 12 negative
+	// control cell 9. The other two are DEFENSIVE AND CURRENTLY UNREACHABLE and
+	// are kept as cheap invariants, not as tested behavior —
+	// commonTLSContextToConfig returns either (nil, err) or (non-nil, nil), so
+	// cfg == nil cannot hold at this call site, and no caller assigns
+	// GetConfigForClient before this install, so cfg.GetConfigForClient != nil
+	// cannot hold either. Recorded at the phase-95 final review (finding F5).
+	if cfg == nil || len(cfg.NextProtos) == 0 || cfg.GetConfigForClient != nil {
+		return
+	}
+	cfg.GetConfigForClient = func(hi *stdtls.ClientHelloInfo) (*stdtls.Config, error) {
+		if len(hi.SupportedProtos) == 0 || alpnOverlaps(cfg.NextProtos, hi.SupportedProtos) {
+			return nil, nil // no-op: the stdlib's own paths are already correct
+		}
+		alt := cfg.Clone()
+		alt.NextProtos = nil
+		alt.GetConfigForClient = nil // never dispatched twice; nil'd so the invariant is local
+		return alt, nil
+	}
+}
+
+// alpnOverlaps reports whether any offered protocol exactly equals an advertised
+// one. RFC 7301 protocol IDs are opaque octet sequences, so the comparison is
+// exact and case-SENSITIVE — the same comparison crypto/tls negotiateALPN makes.
+func alpnOverlaps(advertised, offered []string) bool {
+	for _, a := range advertised {
+		for _, o := range offered {
+			if a == o {
+				return true
+			}
+		}
+	}
+	return false
 }
