@@ -1,0 +1,175 @@
+# Phase 96 fixture 0121-listener-default-chain-tls expectations
+# (ADR-0019 — prose; the enforcers are the driver's own per-side arm checks, the
+# runner's CompareBytes, and the driver's AssertStats. This file is
+# documentation, not an input to any code path.)
+#
+# ## The proposition
+#
+#   On a listener that carries NO filter_chains[] key at all — one whose only
+#   chain is its default_filter_chain, and whose only TLS context lives there —
+#   both sides register the five listener-scope ssl.* counters, and both book
+#   ssl.handshake AND ssl.no_certificate once per COMPLETED handshake. The
+#   listener carries no require_client_certificate and no validation_context, so
+#   it sends no CertificateRequest; a handshake that completes without a client
+#   certificate therefore moves TWO counters, not one. The three failure
+#   classifiers stay at zero, because no arm drives a failure.
+#
+#   ⚠️ ssl.no_certificate IS THE SECOND MOVER, NOT A ZERO. A forecast map of
+#   {handshake: N, everything else: 0} would fail against CORRECT code, on BOTH
+#   sides, at every drive count. That is the single most likely way to get this
+#   row wrong, and it is why the map below was MEASURED on both sides before it
+#   was written.
+#
+# ## The three arms and the measured per-side values
+#
+#   The drive count is N = 3, by decision. N = 1 is viable and strictly weaker:
+#   the value 1 is consistent both with a per-connection counter and with a
+#   fire-once one, so N = 1 cannot discriminate them. N = 3 can. Each arm is one
+#   fresh TCP connection, one TLS handshake verified against the committed
+#   fixture CA with ServerName l_dfc.fixture.test, and one full HTTP/1.1 round
+#   trip; each asserts HTTP 200 and the direct_response body BEFORE any counter
+#   is believed. Connection: close plus a per-arm dial guarantees exactly three
+#   handshakes — a pooled connection would book ONE and the pins would read 1
+#   against a want of 3 with nothing wrong on either side.
+#
+#   arm            handshake  no_certificate  fail_verify_error  fail_verify_no_cert  connection_error
+#   tls_http_1       +1            +1                +0                  +0                 +0
+#   tls_http_2       +1            +1                +0                  +0                 +0
+#   tls_http_3       +1            +1                +0                  +0                 +0
+#   ------------------------------------------------------------------------------------------------
+#   TOTAL, per side   3             3                 0                   0                  0
+#
+#   Measured at N=1 and N=3, on BOTH sides, all five values identical
+#   cross-side:
+#
+#     stat                       ref N=1  subj N=1  ref N=3  subj N=3
+#     ssl.handshake                    1         1        3         3
+#     ssl.no_certificate               1         1        3         3
+#     ssl.fail_verify_error            0         0        0         0
+#     ssl.fail_verify_no_cert          0         0        0         0
+#     ssl.connection_error             0         0        0         0
+#
+#   Liveness co-assertion, both sides: listener.<addr>.downstream_cx_total = 3.
+#
+#   ⚠️ EXACT EQUALITY, NEVER A FLOOR. A floor cannot tell a per-connection
+#   counter from an over-firing one, which is the entire reason N is 3 rather
+#   than 1.
+#
+#   ⚠️ THE SUBJECT-SIDE FIGURES ARE THE POST-FIX ONES. At the un-fixed tip the
+#   subject registers ZERO of the five names and the FIRST completing handshake
+#   kills the process at internal/listener/manager.go:1393 — the success-path
+#   rt.sslHandshake.Inc() on a nil counter. The row is therefore RED on the
+#   subject side, at the DRIVE step rather than at AssertStats (the process is
+#   dead before the stats leg can run), until the tlsMode predicate is widened
+#   to see a TLS default_filter_chain. That RED is this row's deterministic
+#   cross-side gate, not a defect in the fixture.
+#
+# ## Firsts (this fixture, in this tree)
+#
+#   - FIRST fixture whose listener carries NO filter_chains[] key AT ALL. Every
+#     other TLS fixture in the tree expresses its chain(s) under filter_chains[];
+#     0121's sole chain is default_filter_chain. ⚠️ Adding filter_chains[] to
+#     either bootstrap makes the fixture VACUOUS — the shape IS the subject.
+#   - FIRST fixture to assert cross-side ssl.* on a default_filter_chain. 0120 is
+#     the only earlier cross-side ssl.* assertion at all, and its TLS lives in a
+#     normal filter_chains[0] slot.
+#   - FIRST fixture to pin ssl.no_certificate as a MOVER rather than as a zero.
+#     0120 pins fail_verify_no_cert at 0 on a listener that DOES send a
+#     CertificateRequest; 0121 pins no_certificate at the handshake count on one
+#     that does not.
+#   - FIRST TLS fixture in the tree with THREE PEMs and no committed client leaf.
+#     The absence is load-bearing: a client leaf would invite an arm that
+#     presents one, and ssl.no_certificate would stop being the second mover.
+#
+# ## The direct_response choice, and the reason behind it
+#
+#   The listener's single route is direct_response {status: 200, body:
+#   inline_string}. It is NOT a route to the placeholder cluster, and that is
+#   deliberate: a route to a fast-failing upstream SUPPRESSES the listener-scope
+#   ssl.* counters on the reference side
+#   (reference_ssl_stats_suppressed_by_fast_failing_upstream) — the connection is
+#   torn down before the handshake is booked, and the pin then reads 0 with the
+#   configuration looking entirely correct and the client reporting a successful
+#   handshake. direct_response makes that failure mode structurally impossible:
+#   no upstream is ever dialled.
+#
+#   The placeholder cluster is retained anyway and cannot be dropped: an omitted
+#   clusters: key BOOT-REJECTS envoy-go, and the runner t.Fatalf's on
+#   BackendCount() < 1. BackendCount() returns 1 and nothing ever connects to
+#   the allocated backend port.
+#
+# ## What is deliberately NOT asserted — a CLOSED enumeration
+#
+#   ⚠️ BOTH LISTS BELOW ARE CLOSED. A listener-scope ssl.* name appearing in
+#   NEITHER the asserted map above nor this list would read as ASSERTED, which it
+#   would not be. Asserted: exactly the five ssl.* names plus
+#   downstream_cx_total. Not asserted: exactly the fourteen items below.
+#
+#   1. no_filter_chain_match.
+#      ⚠️ NOT ASSERTED AT ALL — NOT EVEN == 0. The divergence on this name is
+#      NAME-level, not value-level. The reference emits
+#      listener.0.0.0.0_10127.no_filter_chain_match: 0 (measured, alongside
+#      listener.admin.no_filter_chain_match: 0); the subject does not emit the
+#      NAME. The string occurs exactly once in the whole repository outside
+#      docs/, as a comment in
+#      internal/listener/tls_handshake_negative_test.go:25 — there is no
+#      production site. Because the driver's scrapeProm returns the ZERO VALUE
+#      for a missing key, a `== 0` pin would pass on the subject FOR THE WRONG
+#      REASON: silently vacuous rather than red, forever. downstream_cx_total
+#      stands in its place as the liveness co-assertion — it is emitted
+#      unconditionally by both sides.
+#
+#   2-13. The TWELVE reference-only listener-scope ssl.* names. Measured on the
+#      reference at N=3 under the anchored matcher ^listener\.[^:]*\.ssl\. —
+#      seventeen names, of which five are the asserted map and twelve are these:
+#
+#        certificate.<name>.expiration_unix_time_seconds
+#          (measured: certificate.unnamed_cert_e3b0c442.expiration_unix_time_seconds)
+#        ciphers.<suite>        (measured: ciphers.TLS_AES_256_GCM_SHA384)
+#        curves.<curve>         (measured: curves.X25519)
+#        fail_verify_cert_hash
+#        fail_verify_san
+#        ocsp_staple_failed
+#        ocsp_staple_omitted
+#        ocsp_staple_requests
+#        ocsp_staple_responses
+#        session_reused
+#        versions.<version>     (measured: versions.TLSv1.3)
+#        was_key_usage_invalid
+#
+#      ⚠️ NEVER ASSERT A NAME-SET EQUALITY HERE. The subject's five are a strict
+#      subset of the reference's seventeen (comm -23 measured EMPTY), so a set
+#      equality would be red against CORRECT code on both sides.
+#
+#      ⚠️ AND NEVER TAKE A PRESENCE SET BEFORE THE DRIVE. Measured on the
+#      reference: FOURTEEN listener-scope ssl.* names at boot (N=0) and
+#      SEVENTEEN only after the first handshake. The three latecomers are the
+#      dynamic families ciphers.<suite>, curves.<curve> and versions.<version>;
+#      no sigalgs.* family appeared at all. AssertStats runs at runner step 10,
+#      strictly after both Drives, so the landed design is safe — this note
+#      exists so a LATER arm is not written pre-drive.
+#
+#   14. The envoy_listener_address label value. It differs by construction: the
+#      reference renders envoy_listener_address="0.0.0.0_10127" while the subject
+#      binds the IPv6 wildcard on a runner-allocated port. scrapeProm therefore
+#      keys on the metric NAME with the LABEL SET STRIPPED ENTIRELY. Stripping is
+#      REQUIRED, not a convenience: any label-preserving key is cross-side
+#      incomparable here by construction.
+#
+# ## The anchoring trap
+#
+#   ⚠️ Every ssl match in this fixture is ANCHORED — ^listener\.[^:]*\.ssl\. on
+#   the dotted /stats side, ^envoy_listener_ssl on the prometheus side. An
+#   UNANCHORED `grep ssl` over the reference's full /stats on this very shape
+#   reads 24 lines against the anchored form's 17: the extras are the
+#   http.<prefix>.downstream_cx_ssl_active/_total pairs. On the subject the
+#   unanchored form has its own false witness, server.acce**ssl**og_dropped.
+#   Both witnesses appear simultaneously, one per side, on the same config pair.
+#
+# ## What CompareBytes compares
+#
+#   driveSide returns the concatenated response BODIES of the three arms — not
+#   headers, not the raw responses. The body is the direct_response
+#   inline_string, byte-identical in both bootstraps by construction, while
+#   status lines and header sets carry per-implementation divergences that are
+#   not this row's subject.

@@ -145,6 +145,7 @@ import (
 	_ "github.com/pgdad/envoy-go/test/fixtures/0118-runtime-static-layer/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0119-grpc-unary-trailers/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0120-tls-connection-error/driver"
+	_ "github.com/pgdad/envoy-go/test/fixtures/0121-listener-default-chain-tls/driver"
 	"github.com/pgdad/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

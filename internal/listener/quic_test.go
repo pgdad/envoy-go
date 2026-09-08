@@ -224,12 +224,22 @@ func TestQUICListener_ServesH3GET(t *testing.T) {
 
 // TestQUICListener_RegistersSSLNamesAtZero pins SPEC §3.4: a QUIC listener
 // registers all FIVE ssl.* counters (the three phase-74 outcome counters plus
-// phase 75's ssl.no_certificate plus phase 94's ssl.connection_error), because
-// startQUIC hard-errors without a
-// TLS config so rt.tlsMode is necessarily true, and they stay permanently ZERO
+// phase 75's ssl.no_certificate plus phase 94's ssl.connection_error), and they
+// stay permanently ZERO
 // across a COMPLETED HTTP/3 handshake — because quic-go's Accept returns
 // post-handshake, so a QUIC handshake never surfaces as a per-connection event
 // on the TCP serveConnection path that could increment them.
+//
+// ⚠️ THE ASSERTION ABOVE IS CORRECT AND UNCHANGED — five names registered,
+// permanently zero across a COMPLETED HTTP/3 handshake. Only the REASON is
+// replaced. This doc used to say "startQUIC hard-errors without a TLS config so
+// rt.tlsMode is necessarily true". That is FALSE and is repealed by ADR-0318:
+// quicTLSConfig() (quic.go:56-58) returns rt.defaultChain.tlsCfg BEFORE
+// consulting chainByName, so a QUIC listener with zero filter_chains[] and a
+// QUIC-wrapped default_filter_chain satisfied startQUIC's mandatory-TLS check and
+// still built with tlsMode == false, registering NONE of the five. rt.tlsMode is
+// true here because phase 96 widened the write site to cover both structural
+// slots — and the shape that used to register zero now registers five.
 //
 // ⚠️ This is PARITY, not a departure. The reference behaves IDENTICALLY:
 // ssl.handshake: 0 after five successful H3 connections, and connection_error: 0

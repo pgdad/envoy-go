@@ -2323,25 +2323,47 @@ func TestListenerMetrics_PlaintextListenerRegistersNoSSLNames(t *testing.T) {
 }
 
 // TestListenerMetrics_GateMatchesInc pins the invariant that makes the whole
-// design safe: the REGISTRATION gate (rt.tlsMode) and the Inc guard
-// (selected.tlsCfg != nil) are EQUIVALENT, because a listener is all-TLS or
-// all-plaintext and never both (manager.go:575, ADR-0033 cl.5/ADR-0078 cl.5).
-// If they ever diverge the failure mode is a NIL-POINTER PANIC in the
-// serveConnection GOROUTINE — *stats.Counter.Inc has no nil guard
-// (internal/stats/counter.go) and internal/listener has no recover() — i.e. a
+// design safe, and ⚠️ THE POINTER ASSERTIONS ARE ITS LOAD-BEARING HALF —
+// without them this test is decorative. V1 executed the
+// tlsMode-vs-tlsCfg-only version under Break E (the gate dropped) and it
+// STAYED GREEN, because both of those predicates are set at BUILD time —
+// tlsMode at the sole `tlsMode: anyTLS` write (manager.go:825), tlsCfg at the
+// two chainInfo writes (manager.go:675 for filter_chains[] and :765 for the
+// default slot) — entirely upstream of registerListenerMetrics, so neither one
+// can observe a registration bug. Only the five field pointers, non-nil iff
+// the registration gate fired, actually witness the invariant whose violation
+// is a PRODUCTION CRASH: (*stats.Counter).Inc has no nil guard
+// (internal/stats/counter.go) and internal/listener has no recover(), so a
+// divergence is a NIL-POINTER PANIC in the serveConnection GOROUTINE — a
 // process crash, not a wrong count. That is why this is its own test.
 //
-// ⚠️ THE POINTER ASSERTIONS ARE THE LOAD-BEARING HALF, and without them this
-// test is decorative. V1 executed the tlsMode-vs-tlsCfg-only version under
-// Break E (the gate dropped) and it STAYED GREEN: both predicates are set at
-// BUILD time (manager.go:692 and :562), entirely upstream of
-// registerListenerMetrics, so neither one can observe a registration bug. Only
-// the five field pointers — non-nil iff tlsMode — actually witness the
-// invariant whose violation is a PRODUCTION CRASH.
+// ⚠️ CORRECTED AT PHASE 96 (ADR-0318). This comment used to claim the
+// REGISTRATION gate (rt.tlsMode) and the Inc guard (selected.tlsCfg != nil)
+// are EQUIVALENT "because a listener is all-TLS or all-plaintext and never
+// both". THAT IS NOT WHY, and the class this row fixes is the counterexample.
+// The mixed-chain reject (manager.go:683, error text at :687, ADR-0033
+// cl.5/ADR-0078 cl.5) constrains filter_chains[] ONLY, while ADR-0080
+// §Decision 3 gives default_filter_chain an INDEPENDENT TLS posture — a
+// listener may legally carry a TLS default slot beside plaintext
+// filter_chains[], or the reverse — so there is no all-or-nothing listener
+// invariant to lean on. The two gates agree only because rt.tlsMode is written
+// from a predicate covering BOTH structural slots. Before ADR-0318 that
+// predicate read filter_chains[] alone: a TLS-only default slot left tlsMode
+// FALSE while `selected.tlsCfg != nil` was TRUE, none of the five counters was
+// registered, and the first completing handshake SIGSEGV'd the process. Arms
+// (d), (e) and (f) pin exactly that shape.
 func TestListenerMetrics_GateMatchesInc(t *testing.T) {
-	// (a) a mixed TLS+plaintext listener is REJECTED at build time — this is
-	//     what makes "all-TLS or all-plaintext" an invariant rather than a
-	//     hope, and hence what makes the two gates equivalent at all.
+	// (a) a mixed TLS+plaintext listener is REJECTED at build time. That reject
+	//     is real and this arm still pins it.
+	//
+	//     ⚠️ The inference that used to follow — "and hence what makes the two
+	//     gates equivalent at all" — is STRUCK, not merely softened. The
+	//     mixed-TLS cross-check (`if anyTLS && anyPlaintext`, manager.go:683)
+	//     constrains filter_chains[] ONLY; ADR-0080 §Decision 3 gives
+	//     default_filter_chain an INDEPENDENT TLS posture and the cross-check
+	//     never sees that slot. So this reject never made a listener
+	//     "all-TLS or all-plaintext", and the two gates were never equivalent
+	//     for the reason stated here. See ADR-0318.
 	t.Run("mixed_rejected_at_build", func(t *testing.T) {
 		cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 		filter := mkTcpProxyFilter(t, "c_echo")
@@ -2398,9 +2420,17 @@ func TestListenerMetrics_GateMatchesInc(t *testing.T) {
 				t.Errorf("TLS listener: chain %q has tlsCfg == nil", n)
 			}
 		}
-		if rt.defaultChain != nil && rt.defaultChain.tlsCfg == nil {
-			t.Error("TLS listener: defaultChain has tlsCfg == nil")
-		}
+		// ⚠️ NO defaultChain assertion here. Phase 96 DELETED the mirror
+		// `if rt.defaultChain != nil && rt.defaultChain.tlsCfg == nil` that sat
+		// at this spot. It was DEAD (arm (b) builds no default_filter_chain at
+		// all) and, had it ever gone live, it would have been a FALSE POSITIVE:
+		// ADR-0080 §Decision 3 explicitly authorizes a PLAINTEXT
+		// default_filter_chain beside a TLS filter_chains[] entry, which is
+		// precisely the arrangement §Consequences (c) illustrates as legal.
+		// There is no correct assertion to replace it with, so it is deleted
+		// rather than inverted (its plaintext-arm counterpart at (c) IS
+		// invertible, and was inverted).
+
 		// THE LOAD-BEARING HALF.
 		if rt.sslHandshake == nil {
 			t.Error("TLS listener: rt.sslHandshake is NIL — Inc would panic the serveConnection goroutine")
@@ -2431,9 +2461,20 @@ func TestListenerMetrics_GateMatchesInc(t *testing.T) {
 	})
 
 	// (c) a plaintext listener: rt.tlsMode == false AND every chainInfo has
-	//     tlsCfg == nil AND all FIVE counter fields are NIL. The nil fields
-	//     are BY DESIGN — the Inc sites sit inside `if selected.tlsCfg != nil`
-	//     and are therefore unreachable here; do not add nil guards.
+	//     tlsCfg == nil AND all FIVE counter fields are NIL.
+	//
+	//     ⚠️ The sentence that stood here — "The nil fields are BY DESIGN — the
+	//     Inc sites sit inside `if selected.tlsCfg != nil` and are therefore
+	//     unreachable here; do not add nil guards" — was FALSE AND ACTIVELY
+	//     HARMFUL: it is the instruction that would have prevented phase 96's
+	//     crash from ever being caught, because it treats the Inc guard as
+	//     self-sufficient. Keeping the Inc sites inside `if selected.tlsCfg !=
+	//     nil` IS still right. But that guard is NOT what makes a plaintext
+	//     listener safe. What makes it safe is that the REGISTRATION gate and
+	//     the Inc guard AGREE on this shape — and until phase 96 they did not
+	//     agree on the shape where the default slot alone carries TLS, which
+	//     SIGSEGV'd the process. Safety is the two predicates agreeing, never
+	//     either one alone. See ADR-0318.
 	t.Run("plaintext_listener", func(t *testing.T) {
 		cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 		boot := mkBoot(0, []*listenerv3.Listener{
@@ -2465,8 +2506,33 @@ func TestListenerMetrics_GateMatchesInc(t *testing.T) {
 				t.Errorf("plaintext listener: chain %q has tlsCfg != nil", n)
 			}
 		}
-		if rt.defaultChain != nil && rt.defaultChain.tlsCfg != nil {
-			t.Error("plaintext listener: defaultChain has tlsCfg != nil")
+		// INVERTED AT PHASE 96 (ADR-0318). What stood here treated
+		// `defaultChain.tlsCfg != nil` as a FAILURE on a tlsMode==false
+		// listener — it flagged the CRASHING configuration as the thing not to
+		// have, on the one arm where it can never occur, so it was DEAD. Under
+		// the fix that combination cannot arise at all: a TLS
+		// default_filter_chain now SETS tlsMode. The post-fix invariant is an
+		// IFF over BOTH structural slots — the five counter pointers are
+		// non-nil iff ANY chain reachable on this listener, INCLUDING the
+		// default slot, carries TLS — and it is asserted here with arm (c)'s
+		// polarity intact: this is still the plaintext listener, so both
+		// disjuncts are false and rt.tlsMode must be false.
+		//
+		// The two disjuncts deliberately OVERLAP. manager.go inserts the
+		// default chain into chainByName under defaultSpec.Name, so
+		// anyChainCarriesTLS already sees the default slot today; naming
+		// defaultChainCarriesTLS separately keeps the invariant readable and
+		// keeps it correct if that insertion ever changes.
+		anyChainCarriesTLS := false
+		for _, ci := range rt.chainByName {
+			if ci.tlsCfg != nil {
+				anyChainCarriesTLS = true
+			}
+		}
+		defaultChainCarriesTLS := rt.defaultChain != nil && rt.defaultChain.tlsCfg != nil
+		if want := anyChainCarriesTLS || defaultChainCarriesTLS; rt.tlsMode != want {
+			t.Errorf("plaintext listener: rt.tlsMode = %v, want %v — the REGISTRATION gate must be true iff some reachable chain carries TLS, INCLUDING the default slot (anyChainCarriesTLS=%v defaultChainCarriesTLS=%v)",
+				rt.tlsMode, want, anyChainCarriesTLS, defaultChainCarriesTLS)
 		}
 		// THE LOAD-BEARING HALF.
 		if rt.sslHandshake != nil {
@@ -2488,6 +2554,191 @@ func TestListenerMetrics_GateMatchesInc(t *testing.T) {
 		// is registered inside the SAME rt.tlsMode block.
 		if rt.sslConnectionError != nil {
 			t.Errorf("plaintext listener: rt.sslConnectionError is NON-NIL — the tlsMode gate leaked")
+		}
+	})
+
+	// (d) SHAPE A of the phase-96 class: a TCP listener whose ONLY chain is a
+	//     TLS-carrying default_filter_chain — ZERO filter_chains[] entries. The
+	//     class is "the default slot carries TLS and filter_chains[] does not",
+	//     never a chain count; arm (e) is the same class with a chain present.
+	//
+	//     ⚠️ BUILD/REGISTRATION ARM — IT NEVER DIALS. Task 2's
+	//     TestServeConnection_DefaultFilterChainTLS_ShapeA_NoFilterChains owns
+	//     the live-handshake half and ABORTS THE BINARY at the un-fixed tip
+	//     (nil rt.sslHandshake.Inc in the accept-loop goroutine, no recover()).
+	//     This arm asserts the identical pre-dial posture with no traffic, so
+	//     the same defect surfaces as a NAMED test failure instead of a
+	//     process crash — which is what lets it live inside this test at all.
+	//
+	//     ⚠️ NOT arm (c)'s `for n, ci := range rt.chainByName` loop:
+	//     manager.go inserts the default chain into that map under
+	//     defaultSpec.Name, so the loop would fire on this arm's OWN TLS
+	//     default chain. assertDefaultChainTLSPosture asserts, in order and
+	//     each with its own t.Errorf: rt.tlsMode true · rt.defaultChain and its
+	//     tlsCfg non-nil · len(rt.chainSpecs) == 0 · all five ssl.* pointers
+	//     non-nil.
+	t.Run("default_chain_tls_zero_filter_chains", func(t *testing.T) {
+		mgr, _, _ := startOneWayTLSListenerDefaultChain(t, mkTestPKI(t))
+		if len(mgr.runtimes) != 1 {
+			t.Fatalf("runtimes len = %d, want 1", len(mgr.runtimes))
+		}
+		assertDefaultChainTLSPosture(t, mgr.runtimes[0], 0)
+	})
+
+	// (e) SHAPE B of the phase-96 class, and the arm that makes it a CLASS: the
+	//     listener has ONE filter_chains[] entry, but it is INELIGIBLE by
+	//     construction — its filter_chain_match pins destination_port to
+	//     resolvedPort+1, so it can never be selected — and it is PLAINTEXT, so
+	//     filter_chains[] contributes NO TLS posture. The TLS lives entirely in
+	//     default_filter_chain, exactly as in arm (d), and the outcome is
+	//     identical.
+	//
+	//     ⚠️ THEREFORE buildListenerRuntime's `len(chains) == 0 &&
+	//     l.GetDefaultFilterChain() == nil` guard IS NOT THE BOUNDARY of this
+	//     defect and widening it is not the repair: len(chains) is 1 here and
+	//     the posture is broken identically. The broken thing is the anyTLS
+	//     predicate that feeds tlsMode, which never looks at the default slot.
+	//
+	//     ⚠️ BUILD/REGISTRATION ARM — IT NEVER DIALS, for the same reason as
+	//     arm (d). Task 3's
+	//     TestServeConnection_DefaultFilterChainTLS_ShapeB_IneligibleFilterChain
+	//     owns the crashing live-traffic half.
+	t.Run("default_chain_tls_ineligible_plaintext_chain", func(t *testing.T) {
+		pki := mkTestPKI(t)
+		cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+
+		probeLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("probe listen: %v", err)
+		}
+		resolvedPort := uint32(probeLn.Addr().(*net.TCPAddr).Port)
+		_ = probeLn.Close()
+
+		l := &listenerv3.Listener{
+			Name: "l_gate_dfc_tls_shapeb",
+			Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+				SocketAddress: &corev3.SocketAddress{
+					Address:       "127.0.0.1",
+					PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: resolvedPort},
+				},
+			}},
+			FilterChains: []*listenerv3.FilterChain{
+				{
+					// INELIGIBLE: destination_port can never match the port
+					// this listener is bound to. Plaintext, so it contributes
+					// no TLS posture.
+					FilterChainMatch: &listenerv3.FilterChainMatch{DestinationPort: wrapperspb.UInt32(resolvedPort + 1)},
+					Filters:          []*listenerv3.Filter{mkTcpProxyFilter(t, "c_echo")},
+				},
+			},
+			DefaultFilterChain: &listenerv3.FilterChain{
+				TransportSocket: mkDownstreamTSInline(t, string(pki.serverCertPEM), string(pki.serverKeyPEM)),
+				Filters:         []*listenerv3.Filter{mkTcpProxyFilter(t, "c_echo")},
+			},
+		}
+		boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+		mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+		if err != nil {
+			t.Fatalf("listener.NewManager (default-chain TLS, ineligible filter_chains[0]): %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := mgr.Start(ctx); err != nil {
+			t.Fatalf("listener.Start (default-chain TLS, ineligible filter_chains[0]): %v", err)
+		}
+		defer mgr.Stop()
+
+		if len(mgr.runtimes) != 1 {
+			t.Fatalf("runtimes len = %d, want 1", len(mgr.runtimes))
+		}
+		// ONE filter_chains[] entry — the count differs from arm (d)'s zero and
+		// NOTHING else about the outcome does.
+		assertDefaultChainTLSPosture(t, mgr.runtimes[0], 1)
+	})
+
+	// (f) a QUIC listener whose ONLY chain is a TLS-carrying
+	//     default_filter_chain (shape A-QUIC: udp_listener_config.quic_options,
+	//     ZERO filter_chains[], one DefaultFilterChain with a
+	//     QuicDownstreamTransport). QUIC is mandatory-TLS, so rt.tlsMode must be
+	//     true and all five ssl.* pointers must be non-nil.
+	//
+	//     ⚠️ THIS IS A REGISTRATION PIN, NOT A TRAFFIC PIN. The kindQUIC path
+	//     never reaches serveConnection: Manager.Start dispatches kindQUIC to
+	//     startQUIC (manager.go, `if rt.kind == kindQUIC`), which launches
+	//     quicAcceptLoop -> serveQUICConnection (quic.go), while the five ssl.*
+	//     Inc sites all sit inside serveConnection on the TCP accept loop. So on
+	//     this listener the counters stay permanently ZERO no matter what
+	//     traffic arrives, and THAT IS PARITY — unchanged by this row. What this
+	//     arm pins is that they get REGISTERED at all: the registration gate is
+	//     `if rt.tlsMode` inside registerListenerMetrics, and a QUIC listener
+	//     whose TLS lives only in the default slot must not slip past it.
+	//
+	//     🔴 mgr.Start(ctx) IS LOAD-BEARING HERE. registerListenerMetrics has
+	//     exactly two call sites — manager.go's Start (TCP) and quic.go's
+	//     startQUIC (QUIC) — and BOTH run at Start time, never at NewManager
+	//     time. An arm modeled on
+	//     TestBuildListenerRuntime_QUICDefaultFilterChain_QUICWrappedKeepsNextProtos,
+	//     which calls only NewManager, would read five nil pointers whether or
+	//     not the tlsMode predicate is widened: red for the wrong reason, and a
+	//     negative control that fires on the absence of Start rather than on the
+	//     defect. Arms (b) and (c) are the correct template; this copies them.
+	t.Run("quic_default_chain_tls", func(t *testing.T) {
+		cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+		ts := mkQUICDownstreamTS(t, testAlphaCertPEM, testAlphaKeyPEM, []string{"h3"})
+		l := mkQUICListenerDefaultChain(t, "c_echo", ts)
+		boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+		mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+		if err != nil {
+			t.Fatalf("listener.NewManager (quic, TLS default_filter_chain): %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := mgr.Start(ctx); err != nil {
+			t.Fatalf("listener.Start (quic, TLS default_filter_chain): %v", err)
+		}
+		defer mgr.Stop()
+
+		if len(mgr.runtimes) != 1 {
+			t.Fatalf("runtimes len = %d, want 1", len(mgr.runtimes))
+		}
+		rt := mgr.runtimes[0]
+		if !rt.tlsMode {
+			t.Errorf("quic default-chain TLS: rt.tlsMode = false, want true — QUIC is mandatory-TLS and the default slot carries the transport_socket")
+		}
+		if rt.kind != kindQUIC {
+			t.Errorf("quic default-chain TLS: rt.kind = %d, want kindQUIC (%d)", rt.kind, kindQUIC)
+		}
+		// NON-VACUITY, asserted on the fields this shape actually populates.
+		// ⚠️ Deliberately NOT arm (c)'s `for n, ci := range rt.chainByName`
+		// loop and NOT its `len(rt.chainByName) == 0` guard: manager.go inserts
+		// the default chain into chainByName under defaultSpec.Name, so that
+		// loop would fire on this arm's OWN TLS default chain, and that guard
+		// would pass for the wrong reason here (len(chainSpecs) == 0 while
+		// len(chainByName) == 1).
+		if rt.defaultChain == nil {
+			t.Fatal("quic default-chain TLS: rt.defaultChain is nil — the arm built the wrong shape, every assertion below would be vacuous")
+		}
+		if rt.defaultChain.tlsCfg == nil {
+			t.Errorf("quic default-chain TLS: rt.defaultChain.tlsCfg = nil, want non-nil")
+		}
+		if got := len(rt.chainSpecs); got != 0 {
+			t.Errorf("quic default-chain TLS: len(rt.chainSpecs) = %d, want 0 — shape A-QUIC has ZERO filter_chains[] entries", got)
+		}
+		// THE LOAD-BEARING HALF.
+		if rt.sslHandshake == nil {
+			t.Errorf("quic default-chain TLS: rt.sslHandshake is NIL — registerListenerMetrics' `if rt.tlsMode` gate did not fire")
+		}
+		if rt.sslFailVerifyError == nil {
+			t.Errorf("quic default-chain TLS: rt.sslFailVerifyError is NIL — registerListenerMetrics' `if rt.tlsMode` gate did not fire")
+		}
+		if rt.sslFailVerifyNoCert == nil {
+			t.Errorf("quic default-chain TLS: rt.sslFailVerifyNoCert is NIL — registerListenerMetrics' `if rt.tlsMode` gate did not fire")
+		}
+		if rt.sslNoCertificate == nil {
+			t.Errorf("quic default-chain TLS: rt.sslNoCertificate is NIL — registerListenerMetrics' `if rt.tlsMode` gate did not fire")
+		}
+		if rt.sslConnectionError == nil {
+			t.Errorf("quic default-chain TLS: rt.sslConnectionError is NIL — registerListenerMetrics' `if rt.tlsMode` gate did not fire")
 		}
 	})
 }
@@ -4997,6 +5248,15 @@ func TestServeConnection_SSLNoCertificateIncrements(t *testing.T) {
 // recover(), so an ssl Inc on a plaintext connection is a nil-pointer PANIC in
 // the serveConnection GOROUTINE — a process crash, not a test failure.
 //
+// ⚠️ THE TEST'S BEHAVIOR IS CORRECT AND UNCHANGED; only its rationale is
+// corrected. This doc used to endorse `selected.tlsCfg != nil` as the SUFFICIENT
+// guard. It is NECESSARY, not sufficient — and phase 96 proved that by execution.
+// On a listener whose only TLS is its default_filter_chain the guard was TRUE
+// while registration had been skipped, and the first completing handshake
+// dereferenced nil at rt.sslHandshake.Inc(). Sufficiency comes from the
+// REGISTRATION gate covering every shape the Inc guard admits, which is what
+// widening the tlsMode write site delivers. See ADR-0318.
+//
 // ⚠️ This test is GREEN ON ARRIVAL. Break C is what makes it evidence.
 func TestServeConnection_PlaintextListenerIncrementsNoSSL(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", startEchoBackend(t))
@@ -5932,4 +6192,276 @@ func TestServeConnection_ALPNMismatch_PreservesClientAuth(t *testing.T) {
 			assertSSLLeavesExact(t, reg, addr, tc.wantLeaves)
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// phase 96 — the default_filter_chain TLS-posture class.
+//
+// THE CLASS is "the default slot carries TLS and filter_chains[] does not".
+// It is NOT a chain count: shape A has ZERO filter_chains[] entries and shape B
+// has ONE, and both crash the process identically. See
+// TestServeConnection_DefaultFilterChainTLS_ShapeB_IneligibleFilterChain.
+// ---------------------------------------------------------------------------
+
+// startOneWayTLSListenerDefaultChain is startOneWayTLSListener's
+// default-slot sibling: the SAME mkDownstreamTSInline transport socket (server
+// cert only — NO validation context, NO require_client_certificate), the SAME
+// tcp_proxy-to-echo terminal, built with the SAME package helpers — but the
+// transport socket is carried by DefaultFilterChain and FilterChains is EMPTY.
+//
+// Because the transport socket is byte-identical to its sibling's, the phase-95
+// convention that sibling documents carries over verbatim: it sends NO
+// CertificateRequest, so EVERY handshake that COMPLETES on this listener books
+// ssl.no_certificate as well as ssl.handshake.
+//
+// ⚠️ SIGNATURE: this returns the *Manager alongside (reg, addr), where the
+// PLAN's interface line named (*stats.Registry, string). The row's PRIMARY
+// assertion is a POINTER assertion on mgr.runtimes[0] — sslHandshake == nil is
+// the CAUSE and the SIGSEGV is only the EFFECT — and the two-value shape cannot
+// reach the runtime. Callers that want only (reg, addr) discard the first
+// value; the later QUIC/registration arms mirror this same three-value shape.
+//
+// ⚠️ No hand-rolled *stdtls.Config anywhere: a config no production path
+// produces is an invented input, and the whole point of this row is that
+// buildListenerRuntime's OWN output leaves the five counters nil.
+func startOneWayTLSListenerDefaultChain(t *testing.T, pki handshakeTestPKI) (*Manager, *stats.Registry, string) {
+	t.Helper()
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", startEchoBackend(t))
+	ts := mkDownstreamTSInline(t, string(pki.serverCertPEM), string(pki.serverKeyPEM))
+	// FilterChains deliberately EMPTY — the TLS posture lives entirely in the
+	// default slot. mkTLSListener with a nil chain slice is the minimal edit to
+	// startOneWayTLSListener's listener literal.
+	l := mkTLSListener("l_ssl_oneway_dfc", "127.0.0.1", 0, nil)
+	l.DefaultFilterChain = &listenerv3.FilterChain{
+		TransportSocket: ts,
+		Filters:         []*listenerv3.Filter{mkTcpProxyFilter(t, "c_echo")},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	reg := stats.NewRegistry()
+	mgr, err := NewManager(boot, cm, reg, testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("listener.NewManager (one-way TLS, default chain): %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("listener.Start (one-way TLS, default chain): %v", err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	ls := mgr.Listeners()
+	if len(ls) != 1 {
+		t.Fatalf("Listeners() len = %d, want 1", len(ls))
+	}
+	return mgr, reg, ls[0].Addr
+}
+
+// assertDefaultChainTLSPosture is the ORDERED pre-dial assertion both members of
+// the phase-96 class owe, factored so the two shapes cannot drift apart. It
+// asserts, in order: rt.tlsMode is true · rt.defaultChain and its tlsCfg are
+// non-nil · len(rt.chainSpecs) == wantChainSpecs · and then all FIVE ssl.*
+// counter pointers are non-nil.
+//
+// ⚠️ EVERY property here is a t.Errorf, never a t.Fatalf — a Fatalf on the
+// first property would make every later one dead code, and the ORDER is the
+// whole diagnostic: the tlsMode line is the CAUSE, the five pointer lines are
+// the mechanism, and the SIGSEGV that follows the first handshake is only the
+// effect. Setup failures stay fatal, in the starters, where they belong.
+//
+// ⚠️ This is ALSO the N=0 half of both rows. It runs BEFORE any connection is
+// opened, so the five pointer checks assert exactly the pre-traffic claim: at
+// the un-fixed tip this listener boots having registered ZERO of the five ssl.*
+// counters, where the reference registers all of them for a TLS listener. The
+// hole exists before a single byte crosses the wire; the crash is what happens
+// when traffic finds it.
+func assertDefaultChainTLSPosture(t *testing.T, rt *listenerRuntime, wantChainSpecs int) {
+	t.Helper()
+	if !rt.tlsMode {
+		t.Errorf("rt.tlsMode = false, want true — default_filter_chain carries a transport_socket, "+
+			"so this listener terminates TLS; wantChainSpecs=%d", wantChainSpecs)
+	}
+	switch {
+	case rt.defaultChain == nil:
+		t.Errorf("rt.defaultChain = nil, want non-nil")
+	case rt.defaultChain.tlsCfg == nil:
+		t.Errorf("rt.defaultChain.tlsCfg = nil, want non-nil — the default slot's transport_socket was parsed away")
+	}
+	if got := len(rt.chainSpecs); got != wantChainSpecs {
+		t.Errorf("len(rt.chainSpecs) = %d, want %d", got, wantChainSpecs)
+	}
+	// THE CAUSE, not the effect. registerListenerMetrics gates all five on
+	// rt.tlsMode (manager.go, `if rt.tlsMode {`), so a false tlsMode leaves
+	// every one of these NIL and the first completing handshake dereferences
+	// nil at rt.sslHandshake.Inc(). A nil *stats.Counter Inc is a PROCESS
+	// CRASH, not a test failure: there is no recover() on the accept-loop
+	// goroutine.
+	if rt.sslHandshake == nil {
+		t.Errorf("rt.sslHandshake = nil, want non-nil — the SUCCESS-path Inc dereferences this")
+	}
+	if rt.sslFailVerifyError == nil {
+		t.Errorf("rt.sslFailVerifyError = nil, want non-nil")
+	}
+	if rt.sslFailVerifyNoCert == nil {
+		t.Errorf("rt.sslFailVerifyNoCert = nil, want non-nil")
+	}
+	if rt.sslNoCertificate == nil {
+		t.Errorf("rt.sslNoCertificate = nil, want non-nil")
+	}
+	if rt.sslConnectionError == nil {
+		t.Errorf("rt.sslConnectionError = nil, want non-nil")
+	}
+}
+
+// TestServeConnection_DefaultFilterChainTLS_ShapeA_NoFilterChains is member ONE
+// of the phase-96 class: a listener whose ONLY chain is default_filter_chain,
+// and that chain carries a transport_socket.
+//
+// The class is "the default slot carries TLS and filter_chains[] does not" —
+// never a chain count. Member TWO
+// (TestServeConnection_DefaultFilterChainTLS_ShapeB_IneligibleFilterChain) has a
+// filter_chains[] entry and fails identically.
+//
+// ORDER IS THE POINT. assertDefaultChainTLSPosture runs BEFORE any connection is
+// opened and records the cause (tlsMode false ⇒ five nil counters ⇒ zero of the
+// five registered at N=0). Only then does the row drive a REAL handshake and a
+// REAL application round trip through driveALPNAuthProbe — "the handshake
+// completed" is not "the connection was served", and only the echoed payload
+// proves the second. At the un-fixed tip that round trip kills the process at
+// manager.go's rt.sslHandshake.Inc(); the pre-dial failures are what identify
+// WHY.
+//
+// ⚠️ sendCert is false: this listener sends no CertificateRequest, so a
+// certificate-less client handshake succeeds and books BOTH ssl.handshake and
+// ssl.no_certificate — which is exactly the two-mover cross product asserted at
+// the end. assertSSLCrossProduct polls those two for exactly 1 and reads every
+// other member of sslLeafRoster with counterValue, which t.Errorf's on an
+// ABSENT name rather than returning a silent 0. Exactly ONE round trip is driven
+// so "exactly 1" is the right expectation.
+func TestServeConnection_DefaultFilterChainTLS_ShapeA_NoFilterChains(t *testing.T) {
+	pki := mkTestPKI(t)
+	mgr, reg, addr := startOneWayTLSListenerDefaultChain(t, pki)
+
+	if len(mgr.runtimes) != 1 {
+		t.Fatalf("len(mgr.runtimes) = %d, want 1", len(mgr.runtimes))
+	}
+	// Shape A: ZERO filter_chains[] entries.
+	assertDefaultChainTLSPosture(t, mgr.runtimes[0], 0)
+
+	got := driveALPNAuthProbe(t, addr, pki, nil, false, stdtls.VersionTLS12, stdtls.VersionTLS13)
+	t.Logf("shapeA hsCompleted=%v served=%v negotiated=%q certSent=%v clientErr=%v",
+		got.hsCompleted, got.served, got.negotiated, got.certSent, got.clientErr)
+	if !got.hsCompleted {
+		t.Errorf("hsCompleted = false, want true (clientErr=%v)", got.clientErr)
+	}
+	if !got.served {
+		t.Errorf("served = false, want true (clientErr=%v) — served means a full APPLICATION ROUND TRIP "+
+			"through the proxy, not a completed handshake", got.clientErr)
+	}
+
+	assertSSLCrossProduct(t, reg, addr, "handshake", "no_certificate")
+}
+
+// TestServeConnection_DefaultFilterChainTLS_ShapeB_IneligibleFilterChain is
+// member TWO of the phase-96 class, and it is the arm that makes the class a
+// CLASS.
+//
+// ⚠️ THE CLASS IS "the default slot carries TLS and filter_chains[] does not" —
+// it is NEVER a chain count. Shape A
+// (TestServeConnection_DefaultFilterChainTLS_ShapeA_NoFilterChains) has ZERO
+// filter_chains[] entries; this shape has ONE, an INELIGIBLE plaintext chain
+// whose filter_chain_match pins destination_port to resolvedPort+1 so it can
+// never be selected. Both listeners boot with tlsMode false, register ZERO of
+// the five ssl.* counters, and die on the first completing handshake at the
+// SAME frame. Pinning only shape A would narrow a class into a claim about one
+// member.
+//
+// ⚠️ THEREFORE the `len(chains) == 0 && l.GetDefaultFilterChain() == nil` guard
+// in manager.go's buildListenerRuntime IS NOT THE BOUNDARY of this defect, and
+// widening it is not the repair. len(chains) is 1 here and the crash is
+// identical; the broken thing is the anyTLS PREDICATE that feeds tlsMode, which
+// never looks at the default slot at all.
+//
+// Built from the landed TestUnifiedDispatchDefaultFilterChainFallback skeleton:
+// the probe-listener port resolution, the ineligible destination_port match and
+// the default-slot fallback are that test's arrangement, unchanged. The two
+// departures are deliberate and named: the default chain gains
+// mkDownstreamTSInline as its transport_socket (keeping its Filters), and both
+// chains proxy to a byte-echo backend rather than the skeleton's tag-byte
+// backends, because driveALPNAuthProbe proves "served" by reading its own
+// payload back — a one-byte tag cannot answer that.
+func TestServeConnection_DefaultFilterChainTLS_ShapeB_IneligibleFilterChain(t *testing.T) {
+	pki := mkTestPKI(t)
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", startEchoBackend(t))
+
+	probeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe listen: %v", err)
+	}
+	resolvedPort := uint32(probeLn.Addr().(*net.TCPAddr).Port)
+	_ = probeLn.Close()
+
+	l := &listenerv3.Listener{
+		Name: "l_dfc_tls_fallback",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: resolvedPort},
+			},
+		}},
+		FilterChains: []*listenerv3.FilterChain{
+			{
+				// INELIGIBLE by construction: destination_port can never match
+				// the port this listener is bound to. It is plaintext, so
+				// filter_chains[] contributes NO TLS posture.
+				FilterChainMatch: &listenerv3.FilterChainMatch{DestinationPort: wrapperspb.UInt32(resolvedPort + 1)},
+				Filters:          []*listenerv3.Filter{mkTcpProxyFilter(t, "c_echo")},
+			},
+		},
+		DefaultFilterChain: &listenerv3.FilterChain{
+			TransportSocket: mkDownstreamTSInline(t, string(pki.serverCertPEM), string(pki.serverKeyPEM)),
+			Filters:         []*listenerv3.Filter{mkTcpProxyFilter(t, "c_echo")},
+		},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	reg := stats.NewRegistry()
+	mgr, err := NewManager(boot, cm, reg, testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager (default-chain TLS, ineligible filter_chains[0]): %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start (default-chain TLS, ineligible filter_chains[0]): %v", err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	ls := mgr.Listeners()
+	if len(ls) != 1 {
+		t.Fatalf("Listeners() len = %d, want 1", len(ls))
+	}
+	addr := ls[0].Addr
+	if len(mgr.runtimes) != 1 {
+		t.Fatalf("len(mgr.runtimes) = %d, want 1", len(mgr.runtimes))
+	}
+	// Shape B: ONE filter_chains[] entry — the count differs from shape A's
+	// zero and NOTHING else about the outcome does.
+	assertDefaultChainTLSPosture(t, mgr.runtimes[0], 1)
+
+	// sendCert is false: the default slot's transport socket is
+	// mkDownstreamTSInline, so the server sends no CertificateRequest and a
+	// certificate-less handshake completes, booking BOTH ssl.handshake and
+	// ssl.no_certificate. Exactly ONE round trip, so exactly 1 is the right
+	// expectation for each mover.
+	got := driveALPNAuthProbe(t, addr, pki, nil, false, stdtls.VersionTLS12, stdtls.VersionTLS13)
+	t.Logf("shapeB hsCompleted=%v served=%v negotiated=%q certSent=%v clientErr=%v",
+		got.hsCompleted, got.served, got.negotiated, got.certSent, got.clientErr)
+	if !got.hsCompleted {
+		t.Errorf("hsCompleted = false, want true (clientErr=%v)", got.clientErr)
+	}
+	if !got.served {
+		t.Errorf("served = false, want true (clientErr=%v) — served means a full APPLICATION ROUND TRIP "+
+			"through the proxy, not a completed handshake", got.clientErr)
+	}
+
+	assertSSLCrossProduct(t, reg, addr, "handshake", "no_certificate")
 }

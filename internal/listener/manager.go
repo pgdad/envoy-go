@@ -386,9 +386,22 @@ func normalizeAddr(addr string) string {
 // moves it (ssl.handshake: 0 after five successful HTTP/3 connections;
 // connection_error: 0 on a failure arm where the TCP comparator in the same
 // process and the same scrape fired), so envoy-go doing the same is EXACT
-// PARITY, and gating QUIC out would be the DEPARTURE. This is sufficient for
-// QUIC by construction: startQUIC hard-errors when the chain carries no TLS
-// config (quic.go:33-36), so every QUIC listener that boots has tlsMode == true.
+// PARITY, and gating QUIC out would be the DEPARTURE. THAT DECISION IS UNCHANGED
+// by phase 96 (ADR-0296 §Decision (a) survives; ADR-0318 amends only its
+// justification).
+//
+// ⚠️ The claim that stood here — "this is sufficient for QUIC by construction:
+// startQUIC hard-errors when the chain carries no TLS config (quic.go:33-36), so
+// every QUIC listener that boots has tlsMode == true" — was FALSE and is
+// REPEALED. quicTLSConfig() (quic.go:56-58) returns rt.defaultChain.tlsCfg FIRST,
+// before consulting chainByName, so a QUIC listener with zero filter_chains[] and
+// a QUIC-wrapped default_filter_chain satisfied startQUIC's mandatory-TLS check
+// and still built with tlsMode == false, registering none of the five names.
+// Sufficiency now comes from the WRITE site instead: tlsMode is computed from a
+// predicate covering BOTH structural slots (the filter_chains[] accumulator OR
+// the default slot's own tlsCfg), which is why this row widened that write rather
+// than adding a kind check here. See ADR-0318.
+//
 // Do NOT re-express this as "has a TCP-style TLS transport socket" — that form
 // would wrongly exclude QuicDownstreamTransport.
 func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
@@ -822,7 +835,7 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 	rt := &listenerRuntime{
 		name:                    name,
 		addr:                    fmt.Sprintf("%s:%d", addr.GetAddress(), addr.GetPortValue()),
-		tlsMode:                 anyTLS,
+		tlsMode:                 anyTLS || (defaultChain != nil && defaultChain.tlsCfg != nil),
 		kind:                    kind,
 		chainSpecs:              chainSpecs,
 		defaultSpec:             defaultSpec,
