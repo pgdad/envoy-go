@@ -973,9 +973,16 @@ func TestBuildListenerRuntime_QUICMandatoryTLS(t *testing.T) {
 // udp_listener_config.quic_options kindQUIC discriminant) with ZERO
 // filter_chains[] and ONLY a default_filter_chain carrying ts. manager.go's
 // clause-1 check accepts this shape (the union of filter_chains[] and
-// default_filter_chain must contribute at least one chain), and
-// (*listenerRuntime).quicTLSConfig returns rt.defaultChain.tlsCfg FIRST — so
-// whatever this chain's transport_socket builds is what reaches quic.Listen.
+// default_filter_chain must contribute at least one chain), and whatever this
+// chain's transport_socket builds is what reaches quic.Listen.
+//
+// ⚠️ THAT CONCLUSION IS UNCHANGED BY PHASE 97; ITS REASON IS NOT. The reason
+// used to be (*listenerRuntime).quicTLSConfig's defaultChain-FIRST precedence.
+// It is now the Start-time chain selection: with ZERO filter_chains[] the
+// rt.chainSpecs slice is empty, so SelectChain finds no eligible indexed chain
+// and returns the default spec, and quicTLSConfig returns that chain's tlsCfg
+// from its FIRST step. The default slot now being consulted LAST does not change
+// the outcome here, because it is the only candidate there is.
 func mkQUICListenerDefaultChain(t *testing.T, clusterName string, ts *corev3.TransportSocket) *listenerv3.Listener {
 	t.Helper()
 	filter := mkTcpProxyFilter(t, clusterName)
@@ -996,6 +1003,80 @@ func mkQUICListenerDefaultChain(t *testing.T, clusterName string, ts *corev3.Tra
 			Filters:         []*listenerv3.Filter{filter},
 		},
 	}
+}
+
+// mkQUICListenerChains builds a QUIC listener for the phase-97
+// chain-selection arms: exactly ONE filter_chains[0] carrying a REAL HCM
+// terminal, plus (optionally) a default_filter_chain that also carries a real
+// HCM terminal. `fcm` is installed verbatim as filter_chains[0]'s
+// filter_chain_match — nil means NO match block at all, i.e. an empty match,
+// i.e. a universally-eligible catch-all chain.
+//
+// It parents on the mkQUICListenerHCM shape, NOT mkQUICListener: mkQUICListener's
+// terminal is a tcp_proxy, which serves no H3 whatsoever — serveQUICConnection
+// logs "chain terminal is not H3-capable" and closes the connection, so an arm
+// built on it could never observe WHICH chain served.
+//
+// Each chain gets its OWN stat_prefix ("quic_fc0" vs "quic_dfc") and its OWN
+// direct_response body (`body` vs `defaultBody`), so an arm can identify the
+// serving chain from the wire.
+//
+// 🔴 THE stat_prefix COLLISION IS A BOOT PANIC, NOT A TEST FAILURE. Two HCMs
+// sharing one stat_prefix across two chains of ONE listener panic the process
+// with `panic: stats: duplicate metric registration:
+// "http.<prefix>.downstream_rq_total"`. Nothing in non-test internal/listener
+// recovers, so the TEST BINARY aborts. That is why the two prefixes here are
+// distinct constants and must stay distinct.
+//
+// ⚠️ THIS BUILDER DEPENDS ON TWO STRUCTURAL ASYMMETRIES BETWEEN THE TWO CHAIN
+// SLOTS, AND CONSUMES THEM AS A FIXTURE RATHER THAN REPAIRING THEM:
+//
+//  1. A filter_chains[i] with no transport_socket BOOT-REJECTS on a QUIC
+//     listener — manager.go's per-chain loop returns
+//     `quic listener requires a transport_socket (mandatory TLS)`. The
+//     default_filter_chain slot carries NO such kind check: its
+//     transport_socket branch is simply skipped and dfcTLS is left nil, and the
+//     listener builds. So `defaultTLS == false` is only expressible in the
+//     DEFAULT slot; filter_chains[0] here is therefore ALWAYS QUIC-TLS-wrapped.
+//
+//  2. That asymmetry is the banked D2-QUICTS divergence. This builder does NOT
+//     fix it — it USES it, because a TLS-less default slot is exactly the
+//     fixture some phase-97 arms need. Any repair of D2-QUICTS must revisit the
+//     `defaultTLS=false` callers of this builder.
+//
+// Certificates are hard-wired to testAlphaCertPEM/testAlphaKeyPEM and ALPN to
+// ["h3"], matching mkQUICListenerHCM; no arm in this phase varies them.
+func mkQUICListenerChains(t *testing.T, fcm *listenerv3.FilterChainMatch, body string, withDefault bool, defaultTLS bool, defaultBody string) *listenerv3.Listener {
+	t.Helper()
+	l := &listenerv3.Listener{
+		Name: "quic_listener_chains",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+				Protocol:      corev3.SocketAddress_UDP,
+			},
+		}},
+		UdpListenerConfig: &listenerv3.UdpListenerConfig{
+			QuicOptions: &listenerv3.QuicProtocolOptions{},
+		},
+		FilterChains: []*listenerv3.FilterChain{{
+			FilterChainMatch: fcm,
+			TransportSocket:  mkQUICDownstreamTS(t, testAlphaCertPEM, testAlphaKeyPEM, []string{"h3"}),
+			Filters:          []*listenerv3.Filter{mkHCMFilterQUICChain(t, "quic_fc0", body)},
+		}},
+	}
+	if withDefault {
+		var dts *corev3.TransportSocket
+		if defaultTLS {
+			dts = mkQUICDownstreamTS(t, testAlphaCertPEM, testAlphaKeyPEM, []string{"h3"})
+		}
+		l.DefaultFilterChain = &listenerv3.FilterChain{
+			TransportSocket: dts,
+			Filters:         []*listenerv3.Filter{mkHCMFilterQUICChain(t, "quic_dfc", defaultBody)},
+		}
+	}
+	return l
 }
 
 // TestBuildListenerRuntime_QUICDefaultFilterChain_PlainTLSRejects is the
@@ -1958,6 +2039,67 @@ func mkHCMFilterWithCodec(t *testing.T, codecType hcmv3.HttpConnectionManager_Co
 	a, err := anypb.New(hcmProto)
 	if err != nil {
 		t.Fatalf("anypb.New HCM: %v", err)
+	}
+	return &listenerv3.Filter{
+		Name:       "envoy.filters.network.http_connection_manager",
+		ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: a},
+	}
+}
+
+// mkHCMFilterQUICChain builds a listenerv3.Filter carrying an HCM
+// typed_config parameterized by BOTH stat_prefix AND direct_response body, so
+// two chains on ONE listener can be told apart by what they serve. It is the
+// phase-97 chain-selection sibling of mkHCMFilterWithCodec, NOT a mutation of
+// it — mkHCMFilterWithCodec hard-wires "ingress_http" / 200 "OK\n" and other
+// tests depend on those exact values.
+//
+// 🔴 stat_prefix is a REQUIRED parameter, not a convenience. Two HCMs sharing
+// one stat_prefix inside a SINGLE listener register
+// "http.<prefix>.downstream_rq_total" twice and the stats registry PANICS at
+// boot:
+//
+//	panic: stats: duplicate metric registration: "http.<prefix>.downstream_rq_total"
+//
+// There is no recover() anywhere in non-test internal/listener, so that panic
+// ABORTS THE TEST BINARY rather than failing a test. Every caller that builds
+// more than one chain MUST pass distinct prefixes.
+//
+// The direct_response status is 222 — a non-1xx sentinel. A 111 was observed
+// to come back as 200 on the H3 path while 222 comes back as 222, so an arm
+// that wants to know WHICH chain served must read the BODY, and the status is
+// only a coarse "this chain, not some framework default" marker.
+//
+// codec_type is HTTP3: internal/filter/hcm/config.go gates HTTP3 solely on
+// lc.IsQUIC (NOT on HasTLS), so this filter builds on a QUIC listener in both
+// the filter_chains[] slot and the transport_socket-less default slot.
+func mkHCMFilterQUICChain(t *testing.T, statPrefix, body string) *listenerv3.Filter {
+	t.Helper()
+	hcmProto := &hcmv3.HttpConnectionManager{
+		CodecType:  hcmv3.HttpConnectionManager_HTTP3,
+		StatPrefix: statPrefix,
+		RouteSpecifier: &hcmv3.HttpConnectionManager_RouteConfig{
+			RouteConfig: &routev3.RouteConfiguration{
+				VirtualHosts: []*routev3.VirtualHost{{
+					Name:    "vh_default",
+					Domains: []string{"*"},
+					Routes: []*routev3.Route{{
+						Match: &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Path{Path: "/health"}},
+						Action: &routev3.Route_DirectResponse{DirectResponse: &routev3.DirectResponseAction{
+							Status: 222,
+							Body:   &corev3.DataSource{Specifier: &corev3.DataSource_InlineString{InlineString: body}},
+						}},
+					}},
+				}},
+			},
+		},
+		HttpFilters: []*hcmv3.HttpFilter{{
+			Name:       "envoy.filters.http.router",
+			ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: mkRouterAny(t)},
+		}},
+	}
+	a, err := anypb.New(hcmProto)
+	if err != nil {
+		t.Fatalf("anypb.New HCM(stat_prefix=%q): %v", statPrefix, err)
 	}
 	return &listenerv3.Filter{
 		Name:       "envoy.filters.network.http_connection_manager",

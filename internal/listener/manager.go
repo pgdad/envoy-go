@@ -393,10 +393,19 @@ func normalizeAddr(addr string) string {
 // ⚠️ The claim that stood here — "this is sufficient for QUIC by construction:
 // startQUIC hard-errors when the chain carries no TLS config (quic.go:33-36), so
 // every QUIC listener that boots has tlsMode == true" — was FALSE and is
-// REPEALED. quicTLSConfig() (quic.go:56-58) returns rt.defaultChain.tlsCfg FIRST,
-// before consulting chainByName, so a QUIC listener with zero filter_chains[] and
+// REPEALED, and it STAYS repealed: a QUIC listener with zero filter_chains[] and
 // a QUIC-wrapped default_filter_chain satisfied startQUIC's mandatory-TLS check
 // and still built with tlsMode == false, registering none of the five names.
+// Only the MECHANISM behind that has changed. It used to be quicTLSConfig()'s
+// resolution order — rt.defaultChain.tlsCfg FIRST, then a range over the
+// rt.chainByName MAP. Phase 97 deleted that map range and moved the default slot
+// LAST, behind a Start-time filter_chain_match selection and then rt.chainSpecs
+// in SLICE order; rt.chainByName survives only as a name -> *chainInfo lookup,
+// never as an iteration order. Under the new order that same shape still
+// resolves to the default slot's tlsCfg — the Start-time selection over an EMPTY
+// chainSpecs returns the default spec — so quic.Listen still receives a non-nil
+// config, startQUIC's mandatory-TLS reject still does not fire, and the repealed
+// claim is no more true now than it was then.
 // Sufficiency now comes from the WRITE site instead: tlsMode is computed from a
 // predicate covering BOTH structural slots (the filter_chains[] accumulator OR
 // the default slot's own tlsCfg), which is why this row widened that write rather

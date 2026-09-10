@@ -1,0 +1,174 @@
+# Phase 97 fixture 0122-quic-chain-selection expectations (ADR-0019 — prose;
+# the driver is the enforcer via drive()/CompareBytes/AssertStats; this file
+# is documentation, not machine-evaluated).
+#
+# ## Topology (ONE UDP/QUIC listener, TWO chains)
+#
+#   l_qcs — one QUIC/UDP listener (udp_listener_config.quic_options{}) that
+#           carries BOTH chain slots at once:
+#
+#     filter_chains[0] "fc_indexed"
+#       NO filter_chain_match key at all ⇒ UNIVERSALLY ELIGIBLE.
+#       Own transport_socket envoy.transport_sockets.quic
+#       (QuicDownstreamTransport, DownstreamTlsContext, ALPN "h3",
+#       inline_string ECDSA P-256 cert/key — the same testAlphaCertPEM/
+#       testAlphaKeyPEM pair, SAN alpha.envoy-go.test, that
+#       internal/listener/manager_test.go and fixture 0104 prove).
+#       HCM codec_type HTTP3, stat_prefix chain_indexed,
+#       http3_protocol_options{}, route prefix "/" ->
+#       direct_response 222 "chain-indexed\n".
+#
+#     default_filter_chain "fc_default"
+#       The LAST-RESORT slot. Its OWN transport_socket (same shape, same
+#       PEMs). HCM stat_prefix chain_default, route prefix "/" ->
+#       direct_response 222 "chain-default\n".
+#
+#   c_backend — STATIC cluster, subject-side ONLY (BackendCount=1, driver-
+#           allocated port, NEVER dialed — both routes are direct_responses).
+#           The reference bootstrap carries NO clusters section (contrib-Envoy
+#           boots fine with zero clusters); envoy-go's cluster manager
+#           hard-rejects a bootstrap with an absent/empty
+#           static_resources.clusters, so the subject template MUST carry it.
+#
+# Reference Envoy contrib-v1.37.2 (Docker, run BY DIGEST
+# sha256:7edd5b0fd763d32c3dfcfd0061f9c2ea63eebd8cdf7f88d974d3adfc99453be8,
+# verified against docs/envoy-go/ENVOY_TARGET.md:3-4; admin 0.0.0.0:9901,
+# listener 0.0.0.0:15122/UDP) vs envoy-go (in-process, admin
+# 127.0.0.1:<subjAdminPort>, listener 127.0.0.1:<subjListenerPort>/UDP).
+#
+# ## THE PROPOSITION
+#
+#   An eligible indexed chain must serve, and the last-resort default slot
+#   must NOT pre-empt it. This is phase 97 arm (a): at the un-fixed tip
+#   quicChain() returned the default slot ahead of an eligible empty-match
+#   filter_chains[0], evaluating NO dimension of any filter_chain_match.
+#
+#   The two chains answer the SAME path with the SAME status (222) and
+#   DIFFERENT bodies, so the BODY ALONE names the chain that served.
+#
+# ## Workload
+#
+# One HTTP/3 GET /health per side via helpers.H3RoundTrip (fresh
+# http3.Transport per call, pinned dial to the resolved UDP addr,
+# InsecureSkipVerify client TLS, NextProtos=["h3"]).
+#
+# This fixture does NOT implement fixture.HTTPExpectations — the runner's
+# HTTPExpectations re-drive is HTTP/1-over-TCP only and cannot reach a
+# QUIC/UDP listener (reference_http_expectations_tcp_only). Status and body
+# are asserted in-band by drive(); the body is ALSO returned for the runner's
+# cross-side CompareBytes.
+#
+# ## Asserted (in-band by drive(), ABSOLUTELY, per side)
+#
+#   status == 222
+#   body   == "chain-indexed\n"
+#
+#   ⚠️ The absolute per-side body assertion is NOT redundant with
+#   CompareBytes. CompareBytes is cross-side only: if BOTH sides regressed to
+#   the default chain they would agree byte-for-byte and CompareBytes would
+#   pass vacuously. A body of "chain-default\n" is reported BY NAME as the
+#   phase-97 defect, not as a generic mismatch.
+#
+# ## Asserted (cross-side EXACT via CompareBytes)
+#
+#   Response body: "chain-indexed\n" on both sides.
+#
+# ## Asserted (AssertStats — a NAMED SUBSET of exactly TWO names per side)
+#
+#   http.chain_indexed.downstream_rq_total  >= 1  (both sides)
+#   http.chain_default.downstream_rq_total  == 0  (both sides)
+#
+#   Each is preceded by an explicit PRESENCE assertion.
+#
+#   🔴 WHY THE PRESENCE ASSERTION EXISTS. A scrape map returns the ZERO VALUE
+#   for a MISSING key, so a `== 0` pin on a name the subject never emits
+#   would be SILENTLY VACUOUS — green, not red. Both names were therefore
+#   scraped on BOTH sides at this tip BEFORE either was pinned:
+#
+#     ref  http.chain_indexed.downstream_rq_total: 1
+#     ref  http.chain_default.downstream_rq_total: 0
+#     subj http.chain_indexed.downstream_rq_total: 1
+#     subj http.chain_default.downstream_rq_total: 0
+#
+#   chain_default's counter is PRESENT AT ZERO on both sides, not absent, so
+#   the `== 0` pin reads a real counter and the pin is REAL. The presence
+#   assertion keeps it that way: if a side ever stops emitting that scope,
+#   the PRESENCE check — not the value check — is what goes red.
+#
+#   🔴 WHY ONLY TWO NAMES, NEVER A WHOLE MAP. Measured on this exact shape at
+#   this tip: the reference emits 156 `http.chain_*` stat lines across the
+#   two HCM scopes while envoy-go emits 10 (546 vs 29 lines in the whole
+#   scrape). The reference ADDITIONALLY emits a listener-qualified
+#   `listener.<addr>.http.<prefix>.*` scope of exactly 12 lines that envoy-go
+#   emits ZERO of. ⚠️ AND THE LISTENER ADDRESS TOKEN DIFFERS CROSS-SIDE —
+#   `listener.0.0.0.0_15122.*` on the reference vs
+#   `listener.127_0_0_1_<port>.*` on the subject (different address AND a
+#   different dot-mangling convention) — so any assertion keyed on the full
+#   listener-scoped name is cross-side INFEASIBLE, not merely noisy.
+#
+#   Per-property Errorf (NOT Fatalf —
+#   reference_fatalf_makes_assertions_unreachable) so all eight checks run
+#   even if one already failed. Fatalf is reserved for a broken precondition
+#   (the /stats scrape itself failing).
+#
+# ## UNasserted — a CLOSED enumeration
+#
+# Everything asserted is listed above. The following are the ONLY things
+# deliberately excluded; a name in NEITHER list reads as asserted.
+#
+#   1. The `listener.<addr>.http.<prefix>.*` scope (12 lines on the
+#      reference, 0 on the subject) — the subject has no such scope at all,
+#      and the address token is cross-side infeasible.
+#   2. All `ssl.*` counters (14 listener-scoped lines on the reference, 5 on
+#      the subject). Handshake accounting on a QUIC transport socket is
+#      0121's subject, not this row's; this row asserts CHAIN SELECTION.
+#   3. All histograms (any non-`name: value` admin line — the driver's
+#      scrapeStats skips every line whose value does not ParseUint).
+#   4. All `tracing.*` — no tracing provider is configured on either side.
+#   5. The other 154/8 `http.chain_*` names outside the two pinned ones
+#      (rq_2xx, cx_*, rq_active, no_route, ...) — envoy-go emits only stats
+#      it actually increments (reference_stats_sink_emits_used_only), so a
+#      whole-map or per-name-set comparison is not meaningful here.
+#   6. Response header set equality, and QUIC/H3 transport-level framing
+#      (ALPN negotiation cadence, QUIC version negotiation, 0-RTT). Only the
+#      decoded HTTP semantics — status, body, and which HCM scope counted the
+#      request — are in scope.
+#
+# ## Admin probe
+#
+#   ProbeAdmin issues GET /ready against BOTH admin endpoints over
+#   HTTP-over-TCP (admin stays TCP even for a QUIC data listener) — the
+#   0003/0104 precedent.
+#
+# ## Non-vacuous decode proof
+#
+#   AssertStats log.Printf's the live scraped values AND their presence flags
+#   on both sides (fixture.TB has no Logf —
+#   reference_fixture_tb_has_no_logf). A green client round-trip alone does
+#   not prove the request landed on the INDEXED chain's HCM; the paired
+#   `chain_indexed >= 1` / `chain_default == 0` counters do.
+#
+# ## Why the INELIGIBLE arm does not ride here
+#
+#   The phase-97 roster also covers the arm where the indexed chain is
+#   INELIGIBLE and there is no default slot (the reference closes the
+#   connection with "no filter chain found"). That arm CANNOT ride in this
+#   directory: one fixture directory dispatches to exactly ONE runner branch
+#   (reference_differential_fixture_dispatch_constraint), and the
+#   differential harness supports exactly ONE UDP listener per fixture, so a
+#   second listener carrying the ineligible shape is not constructible here.
+#   Those arms live in internal/listener/quic_test.go's ten-arm roster
+#   (Tasks 2-16), which is where they were proven RED at the un-fixed tip
+#   and GREEN after the repair.
+#
+# Cross-refs: SPEC-97 §6.1 (port census) + ADR-0319 + ADR-0080 (chain match) +
+#             phase 61.1/61.2/61.3 (QUIC/UDP substrate, H3 codec, 0104) +
+#             reference_differential_backendcount_min_one +
+#             reference_differential_asserter_dispatch +
+#             reference_http_expectations_tcp_only +
+#             reference_fixture_tb_has_no_logf +
+#             reference_fatalf_makes_assertions_unreachable +
+#             reference_stats_sink_emits_used_only +
+#             reference_listener_stat_scope_cross_side_divergence +
+#             reference_differential_fixture_dispatch_constraint +
+#             reference_fixture_cert_delivery_to_reference_container.

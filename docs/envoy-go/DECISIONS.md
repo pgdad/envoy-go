@@ -18957,7 +18957,7 @@ phase-93 SPEC demonstrated by doing it. The figure is therefore not spelled here
 
 **§Context ¶5 — TWO REPAIRS STOP THE CRASH AND THEY ENCODE OPPOSITE PARITY ANSWERS; THE MEASUREMENT CHOOSES, NOT THE DIFF SIZE.** Widening the gate registers the five names; nil-guarding the five increment sites registers none. Before ¶2 both were defensible and neither had been measured. After ¶2 the second is not merely different — it would leave a listener that **serves TLS** reporting **zero** `ssl.*` names where the reference reports its full set, shipping a silent observability hole as a fix. **Two repairs that differ only in an unmeasured stat surface are not interchangeable, and the smaller diff is not the tiebreaker.**
 
-**§Context ¶6 — A SECOND MEMBER OF THE SAME ROOT CAUSE, REFUTED FIRST-HAND, AND CLOSED BY THE SAME PREDICATE.** `quicTLSConfig()` returns `rt.defaultChain.tlsCfg` **before** consulting `chainByName`, so a QUIC listener with zero `filter_chains[]` and a QUIC-wrapped `default_filter_chain` does **not** trip `startQUIC`'s mandatory-TLS reject: it builds with `tlsMode == false`, starts, and registers **zero** `ssl.*` names. The symptom differs — the increment sites are structurally unreachable on a QUIC listener, so there is no crash — but the cause and the repair are identical. **[PRECISION CORRECTED at the phase-96 IMPL: this paragraph said *“`Manager.Start` launches no accept loop for `kindQUIC`”*, which is FALSE. `Manager.Start`'s FIRST range loop dispatches `kindQUIC` to `startQUIC`, which DOES launch `quicAcceptLoop` -> `serveQUICConnection` (`quic.go:88`/`:104`). What is skipped is the TCP accept loop: the SECOND range loop `continue`s on `rt.kind == kindQUIC`, and `serveConnection` — the sole `Inc` site for every name in this family — has exactly ONE call site, inside `acceptLoop` on that TCP path. The conclusion is unchanged; only the mechanism is now stated accurately.]** The shape is already constructed by an existing test that asserts nothing about the gate.
+**§Context ¶6 — A SECOND MEMBER OF THE SAME ROOT CAUSE, REFUTED FIRST-HAND, AND CLOSED BY THE SAME PREDICATE.** A QUIC listener with zero `filter_chains[]` and a QUIC-wrapped `default_filter_chain` does **not** trip `startQUIC`'s mandatory-TLS reject: it built with `tlsMode == false`, started, and registered **zero** `ssl.*` names. **[MECHANISM CORRECTED at the phase-97 IMPL — THE CONCLUSION ABOVE IS UNTOUCHED AND ADR-0318's REPAIR STANDS.** This paragraph gave the reason as *“`quicTLSConfig()` returns `rt.defaultChain.tlsCfg` **before** consulting `chainByName`”*, and the mechanism half of that is now false in both of its parts. **(i)** The PRECEDENCE is DEAD (ADR-0319 §Decision): the default slot is consulted **LAST**, behind a Start-time `filter_chain_match` selection and then `rt.chainSpecs` in **SLICE** order. **(ii)** ⚠️ **NOT** *“the map is no longer consulted”* — what phase 97 deleted is the map-ORDER ITERATION; `rt.chainByName` survives as the `name -> *chainInfo` **lookup table** the TCP and QUIC selection paths both still read. **The diagnosis, the shape and the repair all survive; only the mechanism sentence dies** — the boot outcome recorded here holds under BOTH orders, because with an EMPTY `chainSpecs` and a non-nil default spec the Start-time selection returns the default spec at its FIRST step rather than by fall-through.]** The symptom differs — the increment sites are structurally unreachable on a QUIC listener, so there is no crash — but the cause and the repair are identical. **[PRECISION CORRECTED at the phase-96 IMPL: this paragraph said *“`Manager.Start` launches no accept loop for `kindQUIC`”*, which is FALSE. `Manager.Start`'s FIRST range loop dispatches `kindQUIC` to `startQUIC`, which DOES launch `quicAcceptLoop` -> `serveQUICConnection` (`quic.go:88`/`:104`). What is skipped is the TCP accept loop: the SECOND range loop `continue`s on `rt.kind == kindQUIC`, and `serveConnection` — the sole `Inc` site for every name in this family — has exactly ONE call site, inside `acceptLoop` on that TCP path. The conclusion is unchanged; only the mechanism is now stated accurately.]** The shape is already constructed by an existing test that asserts nothing about the gate.
 
 **§Context ¶7 — THE FALSE INVARIANT HAS TEN LIVE CARRIERS AND THREE OF THEM ARE NORMATIVE.** **[CORRECTED at the phase-96 PLAN: this paragraph said NINE.** The SPEC's enumeration excluded *“historical copies under `docs/envoy-go/phases/`”*, and that exclusion rule structurally could not reach `ROADMAP.md:136` — row 74's notes cell — which is not under that path and is a live governing document carrying the corollary VERBATIM. All nine SPEC cites were EXACT at tip, so this is an ADDITION, not a drift correction; the tenth site is corrected at Task 16, in the same edit that flips row 96. ⚠️ **State an exclusion as a PREDICATE and then test every live file against it**, rather than listing the directories you happen to be thinking of.]** A tree-wide case-insensitive sweep over production `.go`, test `.go` and `docs/` finds the claim stated in this ADR's own predecessors and in the behaviour contract, not only in test comments. **Fixing the code without reconciling the whole occurrence set would repeat the phase-95 failure at a larger scale**, and the sites deliberately LEFT are enumerated with their reasons rather than skipped in silence — several nearby statements are accurate descriptions of gate placement and of the crash mechanism, and they stay.
 
@@ -19017,9 +19017,16 @@ loop dispatches `kindQUIC` to `startQUIC`, which DOES launch `quicAcceptLoop` ->
 (`quic.go:88`/`:104`). The accurate claim is that `Manager.Start`'s SECOND range loop — the TCP accept-loop launch loop — `continue`s on `rt.kind == kindQUIC`, and `serveConnection` (the sole `Inc` site for every name in this family) has exactly ONE call site, inside `acceptLoop` on that TCP path, so those Inc sites are structurally unreachable on a QUIC listener and the counters remain
 permanently zero. That
 was already parity with the reference and it is unchanged; the row closes the REGISTRATION half, which was
-a real divergence (`quicTLSConfig()` returns `rt.defaultChain.tlsCfg` before consulting `chainByName`, so
-a QUIC listener with zero `filter_chains[]` and a QUIC-wrapped default chain booted with
-`tlsMode == false`).
+a real divergence (a QUIC listener with zero `filter_chains[]` and a QUIC-wrapped default chain booted
+with `tlsMode == false` and registered none of the five). **[MECHANISM CORRECTED at the phase-97 IMPL —
+THE DIVERGENCE, AND THIS ROW's CLOSURE OF IT, ARE UNTOUCHED.** The parenthetical used to give the reason
+as *“`quicTLSConfig()` returns `rt.defaultChain.tlsCfg` before consulting `chainByName`”*. That
+PRECEDENCE is dead (ADR-0319 §Decision): the default slot is consulted LAST, behind a Start-time
+`filter_chain_match` selection and then `rt.chainSpecs` in SLICE order, and both map-order iterations are
+deleted. ⚠️ **NOT** *“the map is no longer consulted”* — `rt.chainByName` survives as the
+`name -> *chainInfo` lookup table the TCP and QUIC selection paths both still read; its use as an ORDERING
+is what died. The boot outcome described here is unchanged under the new order, because with an EMPTY
+`chainSpecs` the Start-time selection returns the default spec at its FIRST step.]**
 
 **(c) The cross-side surface is pinned by a new differential fixture,
 `0121-listener-default-chain-tls`** — the first fixture in this tree whose listener carries NO
@@ -19051,7 +19058,7 @@ measuring the reference remains banked and deserves its own row.
 
 ## ADR-0319 — QUIC filter-chain selection must call the mandated algorithm: the reference has no QUIC exception, and envoy-go evaluates `filter_chain_match` there not at all (phase 97)
 
-> **STATUS: PROPOSED — §Context drafted at the phase-97 SPEC; §Decision + §Consequences to be APPENDED IN PLACE at the phase-97 IMPL, after the RETAINED italic footer, no renumber and no `---` separator (the ADR-0294-0318 shared block form).** ⚠️ **THE HOUSE `PROPOSED` GUARD IS RE-ARMED BY THIS BLOCK AND IS DISARMED BY THE PHASE-97 IMPL — AND NO COUNT OF EITHER MATCHER IS WRITTEN ANYWHERE IN IT, DELIBERATELY**: this line is itself a hit of the strict form, so any figure it named would be falsified by its own landing, as the phase-93 SPEC demonstrated by doing it. **Verify by LINE and by ADR** — resolve any hit by a BACKWARD `^## ADR-` heading search — **never by the count alone**, and never conflate the strict house form with the unrelated **ADR-0231 decoy** at `DECISIONS.md:14866`, a different matcher entirely, which is **BYTE-UNTOUCHED** by this row. ⚠️ `^---$` is UNMOVED — this block adds none. ⚠️ **Next-free is derived from the TAIL, never the heading count**, which collides at the single `ADR-0209` gap; ⚠️ **and the heading regex `^## ADR-[0-9]+[:—]` is itself holed by `## ADR-0127 v2`.** **ROW 97 STAYS `in-progress` THROUGH THIS SPEC** — `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` are **BYTE-UNTOUCHED at this stage**, a scope MEASURED across the phase-94, -95 and -96 SPEC commits (`307f2e3d`, `9ed6a620`, `da6ea191`), each of which touches exactly five files and neither of those two — not inferred from wording. This is a **Core-listener / QUIC-dispatch MAINTENANCE row claiming NO family ordinal** (the row-85 through row-91, row-95 and row-96 precedent); the HTTP/3 family stays open and this row consumes none of its banked bullets. It **APPLIES** ADR-0080 §Decision 1 and §Decision 2 and ADR-0081's algorithm to a path that reached around them; it **SUPERSEDES nothing**, and it does **not** disturb ADR-0296 or ADR-0318.
+> **STATUS: ACCEPTED — §Context drafted at the phase-97 SPEC; §Decision + §Consequences APPENDED IN PLACE at the phase-97 IMPL, after the RETAINED italic footer, no renumber and no `---` separator (the ADR-0294-0318 shared block form).** ⚠️ **THE HOUSE `PROPOSED` GUARD WAS RE-ARMED BY THIS BLOCK AT THE SPEC AND IS DISARMED BY THIS FLIP — AND NO COUNT OF EITHER MATCHER IS WRITTEN ANYWHERE IN IT, DELIBERATELY**: while it read PROPOSED this line was itself a hit of the strict form, so any figure it named would have been falsified by its own landing, as the phase-93 SPEC demonstrated by doing it. **Verify by LINE and by ADR** — resolve any hit by a BACKWARD `^## ADR-` heading search — **never by the count alone**, and never conflate the strict house form with the unrelated **ADR-0231 decoy** at `DECISIONS.md:14866`, a different matcher entirely, which is **BYTE-UNTOUCHED** by this row. ⚠️ `^---$` is UNMOVED — this block adds none. ⚠️ **Next-free is derived from the TAIL, never the heading count**, which collides at the single `ADR-0209` gap; ⚠️ **and the heading regex `^## ADR-[0-9]+[:—]` is itself holed by `## ADR-0127 v2`.** **ROW 97 STAYS `in-progress` THROUGH THIS SPEC** — `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` are **BYTE-UNTOUCHED at this stage**, a scope MEASURED across the phase-94, -95 and -96 SPEC commits (`307f2e3d`, `9ed6a620`, `da6ea191`), each of which touches exactly five files and neither of those two — not inferred from wording. This is a **Core-listener / QUIC-dispatch MAINTENANCE row claiming NO family ordinal** (the row-85 through row-91, row-95 and row-96 precedent); the HTTP/3 family stays open and this row consumes none of its banked bullets. It **APPLIES** ADR-0080 §Decision 1 and §Decision 2 and ADR-0081's algorithm to a path that reached around them; it **SUPERSEDES nothing**, and it does **not** disturb ADR-0296 or ADR-0318.
 
 ### Context (drafted at the phase-97 SPEC)
 
@@ -19061,7 +19068,7 @@ measuring the reference remains banked and deserves its own row.
 
 **§Context ¶3 — THE DEFECT IS TOTAL NON-EVALUATION, NOT MERELY AN INVERTED PREFERENCE, AND THE ARM THAT SEPARATES THEM WAS NEVER RUN.** With an **ineligible** indexed chain and **no** default slot, the reference closes the connection with `no filter chain found`; envoy-go **serves it anyway**. ⚠️ **THEREFORE EVERY SUBJECT ROW THAT AGREES WITH THE REFERENCE ON AN INELIGIBLE-PLUS-DEFAULT ARM IS A FALSE AGREEMENT** — the subject answers *default* on every arm, so agreement there is a property of the constant answer and not of any mechanism. A gate built only on those arms would be vacuous.
 
-**§Context ¶4 — THE ROOT CAUSE IS REACHING AROUND A CORRECT SEAM INTO A MAP THAT CONTAINS THE SLOT BEING ORDERED.** The TCP path selects with `listenerfilter.SelectChain(inputs, rt.chainSpecs, rt.defaultSpec)` over an ORDERED slice and resolves the winner through `rt.chainByName`. The QUIC path calls neither `SelectChain` nor `chainSpecs`: both accessors index `rt.chainByName` directly, and that map is **not** the `filter_chains[]` set — the boot path inserts the default slot into it under its own key. So the fallback loops range over the union, in nondeterministic order, and can return the default chain by map-order accident while reading as though they were choosing an indexed one.
+**§Context ¶4 — THE ROOT CAUSE IS REACHING AROUND A CORRECT SEAM INTO A MAP THAT CONTAINS THE SLOT BEING ORDERED.** The TCP path selects with `listenerfilter.SelectChain(inputs, rt.chainSpecs, rt.defaultSpec)` over an ORDERED slice and resolves the winner through `rt.chainByName`. The QUIC path called neither `SelectChain` nor `chainSpecs`: both accessors indexed `rt.chainByName` directly, and that map is **not** the `filter_chains[]` set — the boot path inserts the default slot into it under its own key. So the fallback loops ranged over the union, in nondeterministic order, and could return the default chain by map-order accident while reading as though they were choosing an indexed one. **[RE-TENSED at the phase-97 IMPL, and the DIAGNOSIS is what survives:** the root cause this paragraph names is unchanged and is exactly what §Decision repairs. What stops being true in the PRESENT tense is the mechanism — §Decision deletes BOTH map-order iterations, so no accessor ranges over `rt.chainByName` any more. ⚠️ **NOT** *“the map is no longer consulted”*, which would be a fresh false claim: `rt.chainByName` survives as the `name -> *chainInfo` **lookup table** that the TCP and QUIC selection paths both still read. Its use as an ORDERING is what died.**]**
 
 **§Context ¶5 — THE TWO ACCESSORS RUN AT TWO MOMENTS AND HAVE TWO JOBS; COLLAPSING THEM IS AS WRONG AS LEAVING THEM SPLIT.** `quicTLSConfig()` is called at Start to give `quic.Listen` one `*stdtls.Config` before any connection exists, **and again per connection**; `quicChain()` is called per connection only. A repair that makes the TLS accessor depend on per-connection state is unimplementable at the first site. The decision is therefore to give the chain selector a connection parameter and leave the TLS accessor connection-independent, with both expressed in terms of one selector so they cannot name different chains for the same inputs.
 
@@ -19078,3 +19085,129 @@ measuring the reference remains banked and deserves its own row.
 **§Context ¶11 — WHAT THIS ADR DOES NOT DECIDE.** It does not decide per-connection certificate selection, nor repeal ADR-0317's QUIC restriction. It does not repair D2-QUICTS. It does not decide `parseChainSpec`'s `transport_protocol` over-strictness against the unconstrained proto field, which remains unmeasured. It does not restate ADR-0025's superseded `len(filter_chains) == 1` clause, whose status line is stale and is recorded rather than edited. It quotes no absolute stat-surface figure anywhere, and it asserts nothing about any stat family other than the two per-chain HCM counters it pins.
 
 *§Decision and §Consequences follow at the phase-97 IMPL.*
+
+### Decision (landed at the phase-97 IMPL)
+
+**The QUIC path calls the SAME chain-match algorithm the TCP path calls, and it calls it on the SAME
+ordered inputs.** ADR-0080 §Decision 1 and §Decision 2 and ADR-0081's algorithm hold on QUIC unmodified;
+there is no QUIC exception to discover, because the pinned reference has none (§Context ¶2). The whole
+repair lands in `internal/listener/quic.go`. Nothing outside that file changes behaviour: the boot path,
+`listenerfilter.SelectChain`, `registerListenerMetrics` and ADR-0318's widened `rt.tlsMode` gate are all
+byte-untouched by this row.
+
+**1 — The resolved bind address is captured BEFORE the Start-time TLS-config call.** `startQUIC` assigns
+`rt.addr` from `udpConn.LocalAddr()` immediately after `net.ListenUDP` and before `quicTLSConfig()` runs,
+so the Start-time selection evaluates `destination_port` / `prefix_ranges` against the port the socket
+actually holds. Pre-bind that string may still read `":0"`, which would have made every port-bearing
+`filter_chain_match` evaluate against port **0**. The deliberate, recorded side effect is that on
+`startQUIC`'s two failure paths `rt.addr` now holds the RESOLVED address where it previously held the
+configured one, so `Manager.Start`'s bind-failure text names the resolved port for a `port_value: 0`
+listener; the socket IS bound on both paths, so the resolved address is the more accurate one.
+
+**2 — One inputs builder, stamping the two constants unconditionally and the per-connection facts from the
+connection.** `quicChainMatchInputs` stamps `transport_protocol` and the application protocol
+unconditionally — this closes §Context ¶8's silent hole, where `parseChainSpec` accepted
+`transport_protocol: "quic"`, stored it, and could never match it because the QUIC path never constructed
+the input struct at all. Per connection it fills the destination and source from **comma-ok asserted**
+`*net.UDPAddr` values and the `server_names` input from the connection's TLS state, which carries the
+actual SNI (§Context ¶7). `conn == nil` is the Start-time moment: the constants and the bound destination
+are stamped, the per-connection dimensions are left empty.
+
+**3 — One selector.** `selectQUICChain` runs `listenerfilter.SelectChain(inputs, rt.chainSpecs,
+rt.defaultSpec)` — the ORDERED slice plus the default slot in its LAST-RESORT position — and resolves the
+winning spec through `rt.chainByName`, returning **nil** on error. This is the TCP path's exact shape.
+
+**4 — The chain accessor takes the connection, and the nil-to-close path is KEPT.** `quicChain(conn)`
+returns the `*chainInfo` that must serve `conn`, and a nil selection CLOSES the connection. That is not a
+convenience: §Context ¶3 measured the reference closing with `no filter chain found` on an
+ineligible-indexed-chain-with-no-default-slot listener while envoy-go served it anyway. **Keeping the
+close IS the parity fix**, not a leftover.
+
+**5 — The TLS-config accessor stays CONNECTION-INDEPENDENT, and both map-order iterations are DELETED.**
+`quic.Listen` demands one `*stdtls.Config` before any connection exists, so a repair that made this
+accessor depend on per-connection state would be unimplementable at its first call site (§Context ¶5).
+`quicTLSConfig()` therefore keeps its nullary signature and resolves in a **stated, deterministic** order:
+(1) the Start-time selection `selectQUICChain(nil)`; failing that (2) the first TLS-bearing chain in
+`rt.chainSpecs` **SLICE** order, i.e. the operator's own `filter_chains[]` ordering; failing that (3) the
+default slot, **LAST**, because `default_filter_chain` must never pre-empt an indexed chain. Both
+`for _, ci := range rt.chainByName` loops are **removed rather than documented** — documenting a
+nondeterministic loop does not make it deterministic. ⚠️ **`rt.chainByName` is NOT deleted and is NOT
+"no longer consulted"**: it survives as the `name -> *chainInfo` **lookup table** that the TCP and QUIC
+selection paths both still read. What died is its use as an ORDERING. Connection-independence is also
+what keeps the two call moments — `startQUIC` and the `&http3.Server{...}` literal in
+`serveQUICConnection` — returning the same pointer, which is precisely the cross-wiring §Context ¶1
+found: TLS identity from one chain and filters from another inside a single connection.
+
+**NO boot-time chain-count reject is added.** §Context ¶9's precondition — *"the minimal QUIC slice
+supports exactly one chain"* — stops being a precondition rather than becoming an enforced one: the path
+now supports N chains by the mandated algorithm. A count reject would refuse configs the pinned reference
+ACCEPTS and SERVES.
+
+**The phase-97 BRAINSTORM's own prototype shape is REJECTED, and diff size is not the tiebreaker.** It
+preferred `filter_chains[0]` unconditionally — right for the empty-match arm, **wrong** for the three
+ineligible-indexed-chain arms where the reference serves the default slot. Two repairs that both stop the
+headline symptom are not interchangeable; the measurement chooses (§Context ¶6).
+
+### Consequences (landed at the phase-97 IMPL)
+
+**(a) The evidence, stated with its controls, because agreement alone is not evidence here.** Eleven
+`TestQUICChainSelection_*` unit arms in `internal/listener/quic_test.go`, and **every one of them is red
+under at least one negative control** — the union over the controls this row actually RAN leaves no arm
+green under all of them. That mattered more than usual: §Context ¶3 established that the un-fixed subject
+answers *default* on every arm, so an ineligible-plus-default arm agrees with the reference for a reason
+the mechanism cannot supply, and a gate built only on those would be vacuous. The arm ROSTER was
+**set-differenced by NAME**, not counted, against the pre-task tip, because a `+0/+0` arm deletion passes
+every counter. One roster row was DELETED as vacuous rather than run — its mutation had no path to a
+failure — and that deletion is recorded, not hidden. One control (`quicChainMatchInputs` zero-struct)
+**contradicted its own predicted roster**: it reddened one arm where three had been predicted, and the
+contradiction is recorded as a coverage finding.
+
+**(b) The cross-side surface is pinned by a new differential fixture, `0122-quic-chain-selection`,**
+reference in-container listener port **15122**. It PASSES live against the pinned reference. The full
+`TestDifferential` suite ran in the FOREGROUND at `-count=1`: **124 subtests PASS, 0 FAIL, 0 SKIP**, with
+the ran-set set-differenced against the fixture directory list in **both** directions (both `comm` legs
+EMPTY). The skip count is reported explicitly because a SKIP — not a FAIL — is how a mis-registered
+fixture fails: an unregistered driver makes the suite print `PASS` and return **rc 0**, so rc was
+discarded as evidence for that control and the static import-vs-directory set-difference used instead.
+
+**(c) +0 stat NAMES. This row changes WHICH chain serves, not which counters exist.** No counter is
+registered, renamed or retired; no registration predicate moves. `BEHAVIOR_CONTRACT.md`'s `### Stat
+surface` ledger carries a `+0, UNCHANGED` chain entry on the phase-96 form, and **no absolute is quoted**
+— three mutually inconsistent stat-surface absolutes are live in this tree at one tip, and enforcement is
+the per-phase delta guards, never a total. The five `listener.<normalized-addr>.ssl.*` names stay
+registered-and-permanently-zero on a QUIC listener, which is PARITY and is untouched by this row: those
+Inc sites are structurally unreachable on the QUIC path for a reason that never depended on chain
+selection.
+
+**(d) ⚠️ RESIDUAL, STATED RATHER THAN HIDDEN — SELECTION IS PER CONNECTION, THE CERTIFICATE IS CHOSEN
+ONCE AT START.** `quicTLSConfig()` is connection-independent by construction (§Decision 5), so if a
+per-connection match dimension — `server_names` is the live one — moves the winner to a chain carrying a
+**different leaf**, that connection is served by the RIGHT filters under the OTHER chain's certificate.
+🔴 **THIS WAS NOT MEASURED.** It is REASONED from the mechanism, and it is bounded above by the matching-
+SNI arm; every probe chain in this row carried the same leaf, so the certificate axis was never exercised.
+It is recorded here as an open, unmeasured residual and not as a result. Closing it requires a
+per-client config callback on the QUIC path, which ADR-0317's `D-ALPNFB-TCPONLY` forbids there for an
+unrelated reason and which an existing test pins as ABSENT — so the closure is a decision for another
+record, not an implementation detail this row could have folded in.
+
+**(e) ADR-0318 is AMENDED IN PLACE, NOT SUPERSEDED, and the amendment leads with what survives.** Its
+decision, its conclusion and its repair are untouched. Two present-tense carriers of the OLD precedence —
+ADR-0318 §Context ¶6 and ADR-0318 §Consequences (b) — asserted that `quicTLSConfig()` returns
+`rt.defaultChain.tlsCfg` before consulting `chainByName`; that MECHANISM half is dead and is corrected in
+place, while the diagnosis and the boot outcome each hold under BOTH orders (with an EMPTY `chainSpecs`
+the Start-time selection returns the default spec at its FIRST step). ⚠️ The correction deliberately does
+**not** say *“the map is no longer consulted”*, which would be a NEW false claim. `BEHAVIOR_CONTRACT.md`'s
+carrier of the same sentence is corrected identically, and its embedded `quic.go` line anchor is
+**DROPPED rather than renumbered** — it was wrong twice over, and line anchors rot. ADR-0319 §Context ¶4
+is re-tensed for the same reason. ⚠️ **The phase-97 PLAN attributes the §Consequences (b) carrier to
+“ADR-0319 §Context”. That is wrong on both axes** — the line sits below ADR-0318's heading and above
+ADR-0319's, inside ADR-0318's §Consequences — and the attribution was re-verified here by backward
+`^## ADR-` heading search rather than taken from the brief.
+
+**(f) What this row does NOT do.** It does not decide per-connection certificate selection (see (d)), does
+not repeal ADR-0317's QUIC restriction, does not repair D2-QUICTS (the reference's listener-add reject of
+a `transport_socket`-less `default_filter_chain` on a QUIC listener, which fails CLOSED and is a
+config-validation gap, not a selection one), and does not decide `parseChainSpec`'s `transport_protocol`
+over-strictness against the unconstrained proto field. It supersedes nothing. It quotes no absolute
+stat-surface figure. The `source_type` and source-address dimensions are covered by the mechanism but
+were **not measured on the reference** and are deliberately unasserted.
