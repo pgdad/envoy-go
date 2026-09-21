@@ -687,11 +687,11 @@ func TestQUICChainSelection_IneligibleIndexedChainNoDefaultSlotSelectsNothing(t 
 // falls through to the default slot — which is exactly the shape of the bug
 // this phase pins.
 //
-// PARSE PRECONDITION: `parseChainSpec`'s enum gate accepts exactly
-// {"", "tls", "raw_buffer", "quic"} (manager.go:985-991), so NEITHER arm may
-// boot-reject and both are genuine runtime arms. This is verified by BUILDING
-// both listeners — each arm's NewManager t.Fatalf names a boot-reject
-// explicitly — not by reading the switch.
+// PARSE PRECONDITION: `"quic"` parses, so NEITHER arm may boot-reject and both
+// are genuine runtime arms. `parseChainSpec` copies `transport_protocol`
+// through verbatim — after ADR-0320 there is no enum gate and no closed value
+// set. Verified by BUILDING both listeners — each arm's NewManager t.Fatalf
+// names a boot-reject explicitly — not by reading the parse path.
 func TestQUICChainSelection_TransportProtocolQUICMatches(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	fcm := &listenerv3.FilterChainMatch{TransportProtocol: "quic"}
@@ -699,7 +699,7 @@ func TestQUICChainSelection_TransportProtocolQUICMatches(t *testing.T) {
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err != nil {
-		t.Fatalf("precondition: NewManager(quic, transport_protocol=%q filter_chains[0] + QUIC-TLS default slot) BOOT-REJECTED: %v — parseChainSpec's enum gate must accept %q, or this arm is not a runtime arm at all", "quic", err, "quic")
+		t.Fatalf("precondition: NewManager(quic, transport_protocol=%q filter_chains[0] + QUIC-TLS default slot) BOOT-REJECTED: %v — parseChainSpec must accept %q verbatim (there is no enum gate after ADR-0320), or this arm is not a runtime arm at all", "quic", err, "quic")
 	}
 	rt := mgr.runtimes[0]
 
@@ -765,10 +765,10 @@ func TestQUICChainSelection_TransportProtocolQUICMatches(t *testing.T) {
 // apart, `"quic"` vs `"tls"` — excludes both, because no constant answer and
 // no dropped comparison is right on both arms at once.
 //
-// PARSE PRECONDITION: `"tls"` is in parseChainSpec's accepted enum domain
-// alongside `"quic"` (manager.go:985-991), so this arm boot-builds too and is
-// a genuine runtime arm rather than a rejection pin. Verified by BUILDING the
-// listener, not by reading the switch.
+// PARSE PRECONDITION: `"tls"` parses exactly as `"quic"` does, so this arm
+// boot-builds too and is a genuine runtime arm rather than a rejection pin.
+// `parseChainSpec` copies `transport_protocol` verbatim — after ADR-0320 there is
+// no enum gate. Verified by BUILDING the listener, not by reading the parse path.
 func TestQUICChainSelection_TransportProtocolTLSDoesNotMatch(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	fcm := &listenerv3.FilterChainMatch{TransportProtocol: "tls"}
@@ -776,7 +776,7 @@ func TestQUICChainSelection_TransportProtocolTLSDoesNotMatch(t *testing.T) {
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
 	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
 	if err != nil {
-		t.Fatalf("precondition: NewManager(quic, transport_protocol=%q filter_chains[0] + QUIC-TLS default slot) BOOT-REJECTED: %v — parseChainSpec's enum gate must accept %q, or this arm is a rejection pin and not a runtime arm", "tls", err, "tls")
+		t.Fatalf("precondition: NewManager(quic, transport_protocol=%q filter_chains[0] + QUIC-TLS default slot) BOOT-REJECTED: %v — parseChainSpec must accept %q verbatim (there is no enum gate after ADR-0320), or this arm is a rejection pin and not a runtime arm", "tls", err, "tls")
 	}
 	rt := mgr.runtimes[0]
 
@@ -814,6 +814,95 @@ func TestQUICChainSelection_TransportProtocolTLSDoesNotMatch(t *testing.T) {
 	// collapsing "wrong chain" and "an excluded chain was selected".
 	if got == indexed {
 		t.Errorf("non-matching chain not selected: quicChain() returned filter_chains[0] %p, whose filter_chain_match names transport_protocol %q — a QUIC connection is %q and there is no reverse wildcard, so this chain must be ineligible", indexed, "tls", "quic")
+	}
+}
+
+// TestQUICChainSelection_TransportProtocolBogusDoesNotMatch is phase-98's
+// THIRD sibling to the (d)/(e) pair above: arm (e) with the single string
+// `"tls"` replaced by `"totally_bogus_value"`. Everything else about the two
+// listeners is byte-identical.
+//
+// WHY IT EXISTS, IN ONE SENTENCE (PLAN §4(c), §5.3): it is the only committed
+// arm that reddens under NC roster row 1 via the QUIC listener-construction
+// path, and without it the four quic_test.go narration edits of Task 14 are an
+// unpinned prose change.
+//
+// ⚠️ ITS MARGINAL DISCRIMINATING POWER IS NARROW, AND SAYING SO IS THE POINT.
+// Under NC roster row 1 the §5.1 parse arm ALSO reddens, so what this arm
+// uniquely catches is a kind-scoped restoration of the enum gate — a gate put
+// back for QUIC listeners only — and nothing else. At the runtime layer it
+// adds nothing: `matches` (chainmatch.go:128) compares
+// `c.TransportProtocol != inputs.TransportProtocol`, and `"tls" != "quic"` and
+// `"totally_bogus_value" != "quic"` traverse the IDENTICAL branch, already
+// pinned by arm (e). At the parse layer it adds nothing either:
+// `parseChainSpec` takes no listener-kind argument, so a QUIC parse arm runs
+// byte-identical code to the TCP parse arm. What it uniquely traverses is the
+// QUIC-kind `buildListenerRuntime` boot path carrying a bogus value. Do not
+// read this arm as independent evidence that the dimension is enforced.
+//
+// PROPERTY: (*listenerRuntime).quicChain() must select the
+// default_filter_chain. A QUIC connection's transport protocol is "quic", not
+// "totally_bogus_value"; `matches` compares by exact case-sensitive `!=`
+// (chainmatch.go:128) and the CHAIN's non-empty value has no wildcard
+// reading, so filter_chains[0] is INELIGIBLE and SelectChain's empty-eligible
+// branch hands back the default slot. An unknown string is a NON-MATCHING
+// VALUE, not a configuration error — which is the whole of SPEC.md §14.
+//
+// 🔴 THIS ARM WAS RED AT THE UN-FIXED TIP, AND IT FAILED AT THE BOOT STEP,
+// NOT AT A PROPERTY. `parseChainSpec`'s enum gate THEN accepted exactly
+// {"", "tls", "raw_buffer", "quic"} and returned
+// `transport_protocol %q must be "tls", "raw_buffer", "quic", or empty` for
+// anything else, so NewManager refused the listener and the arm never reached
+// quicChain(). That boot reject IS the divergence this phase repairs: the
+// reference accepts the string, boots, and serves. Task 11 LIFTED the gate;
+// after it, this arm must fail — if at all — on a PROPERTY line instead.
+func TestQUICChainSelection_TransportProtocolBogusDoesNotMatch(t *testing.T) {
+	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+	fcm := &listenerv3.FilterChainMatch{TransportProtocol: "totally_bogus_value"}
+	l := mkQUICListenerChains(t, fcm, "FC0\n", true, true, "DFC\n")
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager(quic, transport_protocol=%q filter_chains[0] + QUIC-TLS default slot) BOOT-REJECTED: %v — an unknown transport_protocol is a NON-MATCHING VALUE, not a config error, so parseChainSpec must accept it and let chain selection decide", "totally_bogus_value", err)
+	}
+	rt := mgr.runtimes[0]
+
+	idxKey := l.Name + "/filter_chains[0]"
+	dfcKey := l.Name + "/default_filter_chain"
+	indexed := rt.chainByName[idxKey]
+	dflt := rt.chainByName[dfcKey]
+	if indexed == nil {
+		t.Fatalf("precondition: chainByName[%q] is absent (keys: %v)", idxKey, quicChainKeys(rt))
+	}
+	if dflt == nil {
+		t.Fatalf("precondition: chainByName[%q] is absent (keys: %v)", dfcKey, quicChainKeys(rt))
+	}
+	if indexed == dflt {
+		t.Fatalf("precondition: chainByName[%q] and chainByName[%q] are the SAME *chainInfo (%p) — a pointer-equality assertion would be vacuous", idxKey, dfcKey, indexed)
+	}
+	// PRECONDITION — the bogus string really reached the parsed spec. This is
+	// the dimension of the lift that arm (e) cannot see: a gate that stopped
+	// REJECTING but also stopped STORING would leave TransportProtocol "",
+	// chainmatch.go:128 would skip the dimension, filter_chains[0] would be
+	// universally eligible, and this arm's "want default slot" would be
+	// wrong for the right-looking reason.
+	if got := quicChainSpecByName(t, rt, idxKey).TransportProtocol; got != "totally_bogus_value" {
+		t.Fatalf("precondition: chainSpecs[%q].TransportProtocol = %q, want %q — the configured value must be STORED verbatim, not dropped to \"\", or this arm's ineligibility is fictional", idxKey, got, "totally_bogus_value")
+	}
+
+	got := rt.quicChain(nil)
+
+	// PROPERTY 1 — an unknown transport_protocol falls back to the default
+	// slot.
+	if got != dflt {
+		t.Errorf("unknown transport_protocol falls back: quicChain() = %p, want default_filter_chain = %p (a QUIC connection's transport protocol is %q, not %q, and the comparison is exact and case-sensitive)", got, dflt, "quic", "totally_bogus_value")
+	}
+
+	// PROPERTY 2 — the non-matching chain is not selected. Stated separately
+	// so a failure names filter_chains[0] and the offending value rather than
+	// collapsing "wrong chain" and "an excluded chain was selected".
+	if got == indexed {
+		t.Errorf("non-matching chain not selected: quicChain() returned filter_chains[0] %p, whose filter_chain_match names transport_protocol %q — a QUIC connection is %q and an unknown value matches nothing, so this chain must be ineligible", indexed, "totally_bogus_value", "quic")
 	}
 }
 

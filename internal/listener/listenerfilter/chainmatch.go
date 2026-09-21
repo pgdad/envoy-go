@@ -27,9 +27,9 @@ type ChainSpec struct {
 	// internal/listener/manager.go:chainSpecificityRank logic at the
 	// tie-breaker level.
 	ServerNames []string
-	// TransportProtocol: "" means unspecified; "tls" or "raw_buffer" means
-	// the chain requires the listener-filter pipeline to have set
-	// inputs.TransportProtocol to the matching value.
+	// TransportProtocol: "" means unspecified; any non-empty string requires
+	// the connection's detected transport protocol to equal it exactly, set by
+	// the listener-filter pipeline or defaulted to raw_buffer on TCP.
 	TransportProtocol string
 	// ApplicationProtocols: empty means unspecified; non-empty means
 	// inputs.ApplicationProtocols must contain at least one matching entry.

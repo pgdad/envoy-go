@@ -19214,7 +19214,7 @@ were **not measured on the reference** and are deliberately unasserted.
 
 ## ADR-0320 — `filter_chain_match.transport_protocol` is a free-form string, and a TCP connection no listener filter classified is `raw_buffer` (phase 98)
 
-> **STATUS: PROPOSED — §Context drafted at the phase-98 SPEC; §Decision + §Consequences are APPENDED IN PLACE at the phase-98 IMPL, after the RETAINED italic footer below, with no renumber and no `---` separator (the ADR-0294-0319 shared block form).** ⚠️ **THIS BLOCK RE-ARMS THE HOUSE `PROPOSED` GUARD, AND NO COUNT OF EITHER MATCHER IS WRITTEN ANYWHERE IN IT, DELIBERATELY** — this line is itself a hit of the strict form, so any figure it named would be falsified by its own landing. **Verify by LINE and by ADR** (backward `^## ADR-` heading search), **never by the count alone**, and never conflate the strict house form with the unrelated **ADR-0231 decoy** at `DECISIONS.md:14866`, which is **BYTE-UNTOUCHED** by this row. **ROW 98 STAYS `in-progress` THROUGH THIS SPEC**; `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` are byte-untouched at this stage, a scope MEASURED across four prior SPEC commits. This is a **Listener / chain-match MAINTENANCE row claiming NO family ordinal**. It **APPLIES** ADR-0080 and ADR-0081's algorithm to an input and a parse gate that diverged from the pinned reference; it **SUPERSEDES nothing**, and it does not disturb ADR-0279 (which lifted `"quic"` alone, accurately for its phase) or ADR-0319 (which recorded this question as undecided and unmeasured, accurately for its phase).
+> **STATUS: ACCEPTED — §Context drafted at the phase-98 SPEC; §Decision + §Consequences APPENDED IN PLACE at the phase-98 IMPL, after the RETAINED italic footer, with no renumber and no `---` separator (the ADR-0294-0319 shared block form).** ⚠️ **THE HOUSE `PROPOSED` GUARD WAS RE-ARMED BY THIS BLOCK AT THE SPEC AND IS DISARMED BY THIS FLIP — AND NO COUNT OF EITHER MATCHER IS WRITTEN ANYWHERE IN IT, DELIBERATELY**: while it read PROPOSED this line was itself a hit of the strict form, so any figure it named would have been falsified by its own landing. **Verify by LINE and by ADR** (backward `^## ADR-` heading search), **never by the count alone**, and never conflate the strict house form with the unrelated **ADR-0231 decoy** at `DECISIONS.md:14866`, which is **BYTE-UNTOUCHED** by this row. **ROW 98 STAYS `in-progress` THROUGH THIS SPEC**; `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` are byte-untouched at this stage, a scope MEASURED across four prior SPEC commits. This is a **Listener / chain-match MAINTENANCE row claiming NO family ordinal**. It **APPLIES** ADR-0080 and ADR-0081's algorithm to an input and a parse gate that diverged from the pinned reference; it **SUPERSEDES nothing**, and it does not disturb ADR-0279 (which lifted `"quic"` alone, accurately for its phase) or ADR-0319 (which recorded this question as undecided and unmeasured, accurately for its phase).
 
 ### Context (drafted at the phase-98 SPEC)
 
@@ -19230,6 +19230,130 @@ were **not measured on the reference** and are deliberately unasserted.
 
 **§Context ¶6 — THE BEHAVIOUR CHANGE THAT CAN MOVE LIVE TRAFFIC.** A config that booted before this row and carries a `transport_protocol: raw_buffer` chain on a listener without `tls_inspector` will, after it, serve that chain instead of the fallback. That is the parity direction, and it is the only change here that affects a previously-bootable configuration.
 
-**§Context ¶7 — WHAT THIS ADR DOES NOT DECIDE.** It does not touch SNI matching, SNI precedence or case, the `"*"` server-name tier, or the unreachable catch-all count check. It adds no `no_filter_chain_match` counter and registers, renames or removes no stat name. It does not change QUIC input stamping. It does not measure the listener-filter-timeout fall-through on the reference, which the repair also covers by construction and which remains inferred. It quotes no absolute stat-surface figure.
+**§Context ¶7 — WHAT THIS ADR DOES NOT DECIDE.** It does not touch SNI matching, SNI precedence or case, the `"*"` server-name tier, or the unreachable catch-all count check. It adds no `no_filter_chain_match` counter and registers, renames or removes no stat name. It does not change QUIC input stamping. It does not measure the listener-filter-timeout fall-through on the reference, which the repair also covers by construction and which remains inferred. It quotes no absolute stat-surface figure. **[RE-TENSED at the phase-98 IMPL — THE NON-DECISION SURVIVES; THE WORD *INFERRED* DOES NOT.** This ADR still decides nothing about `listener_filters_timeout`. What changed is the evidence: the phase-98 PLAN §0.3 MEASURED the fall-through ON THE REFERENCE, on a byte-equivalent shape. With `listener_filters_timeout: 1s` and `tls_inspector` installed, a client silent for 2500 ms is served by the `transport_protocol: raw_buffer` chain (`chain_indexed` 1, `chain_default` 0, `downstream_pre_cx_timeout` 1, with `listener filter times out after 1000 ms` and `fallback to default listener filter` in the log); the MATCHED NEGATIVE — a byte-identical listener whose chain spells `tls` — falls to the default chain, so the dimension IS enforced on that path rather than chain 0 winning by index; and under `continue_on_listener_filters_timeout: false` the connection is DROPPED (`downstream_cx_total` 0). ⚠️ **What that licenses is bounded, and the bound is the point:** the timeout arm and the immediate-send arm agree by TWO MECHANISMS, not one path — the immediate arm reaches `raw_buffer` because the inspector ACTIVELY classified a non-TLS stream, the timeout arm with no classification at all — and the discriminators are the `downstream_pre_cx_timeout` delta and the inspector's own `recv` log lines. **What is established is that the repair's "stamp after the pipeline regardless of how it ended" matches the reference's observable, and no more.** ⚠️ **NOT** *"the subject's timeout fall-through is now covered"*, which would be a fresh false claim in the opposite direction. The clause *"which the repair also covers by construction"* survives only as a statement about PLACEMENT: §0.2 showed the `== ""` guard is UNREACHABLE on any timeout path today, because `tls_inspector` is the only listener filter in the tree and all five of its return paths write the field, and §0.1 measured the subject NOT ENFORCING the timeout at all. That subject-side gap is BANKED as a separate divergence (§Consequences (g)), not folded in here.**]**
 
 *§Decision and §Consequences follow at the phase-98 IMPL.*
+
+### Decision (landed at the phase-98 IMPL)
+
+**`filter_chain_match.transport_protocol` is a FREE-FORM STRING at parse time, and a TCP connection that no
+listener filter classified carries the detected transport protocol `raw_buffer` at selection time.** Both
+halves are the pinned reference's measured behaviour (§Context ¶2, §Context ¶3), and neither is a new
+algorithm: ADR-0080's two-pass selection and ADR-0081's specificity ordering are untouched, and
+`listenerfilter.matches()` — which already compared this dimension exactly, treated a chain's empty value
+as unspecified and had no reverse wildcard — is untouched too (§Context ¶4). The whole repair lands in
+`internal/listener/manager.go`, **`+4 / -9` by `git diff --numstat`**. `internal/listener/quic.go` is
+**byte-untouched**.
+
+**1 — The parse-time enum gate is DELETED, not widened.** `parseChainSpec`'s
+`switch tp { case "", "tls", "raw_buffer", "quic": … default: return nil, fmt.Errorf(…) }` becomes the
+plain assignment `spec.TransportProtocol = fm.GetTransportProtocol()`. Widening the allow-list would have
+re-run the same category error one value later: the proto field is an unconstrained `string`, so **no
+finite allow-list can be the reference's behaviour**, and a value outside one is not a config error but a
+chain that never matches (§Context ¶1). ⚠️ **This LIFTS a reject, and a lifted reject's enforcement must
+land in the same change.** The enforcement here is `matches()`'s exact comparison, which was already
+correct and is proven so by an arm that pins STORAGE and NON-ELIGIBILITY against three realistic detected
+values — replacing an old arm that pinned only that an error message named the bad value.
+
+**2 — The TCP default is stamped at the ENTRY of chain selection, under an `== ""` guard.** In
+`serveConnection`, immediately before `listenerfilter.SelectChain` and after the listener-filter pipeline
+has ended by ANY route, an empty `inputs.TransportProtocol` is set to `"raw_buffer"`. **The placement is
+the decision:** one install covers every path that reaches selection — no listener filters configured at
+all, the pipeline running to completion, a `StopIteration`, and the
+`continue_on_listener_filters_timeout` fall-through — and costs one branch. ⚠️ **The guard makes this a
+SECOND WRITER, never an overwrite:** a classification `tls_inspector` has already made survives, and one
+arm pins exactly that, because the failure it guards against (a stamp that clobbers `"tls"`) is invisible
+to every plaintext arm in this row.
+
+**3 — The default is NOT pushed down into `SelectChain`.** The selector is shared with the QUIC path,
+whose reference input is `quic` and which stamps it unconditionally (ADR-0319 §Decision 2). A default
+installed inside the callee would silently make an unclassified input mean `raw_buffer` for **every**
+caller, including callers that have no business defaulting. `SelectChain` therefore stays PURE with
+respect to this dimension, and that purity is pinned by its own arm in the `listenerfilter` package rather
+than left as a convention.
+
+**4 — The comparison stays EXACT and CASE-SENSITIVE.** `RAW_BUFFER` does not match a plaintext connection
+on the reference (§Context ¶2), unlike that same reference's SNI matching. Nothing here introduces a case
+fold, a wildcard or a synonym set, and the chain's empty value keeps meaning *unspecified*, not
+*`raw_buffer`*.
+
+**5 — No stat name moves, and no registration predicate moves.** The parse edit touches no registry; the
+stamp writes a local struct field read only by `SelectChain`. `registerListenerMetrics` and ADR-0318's
+widened `rt.tlsMode` gate are byte-untouched by this row.
+
+### Consequences (landed at the phase-98 IMPL)
+
+**(a) THE ONE BEHAVIOUR CHANGE THAT CAN MOVE TRAFFIC ON A CONFIG THAT ALREADY BOOTED.** A listener with no
+`tls_inspector` (indeed with no `listener_filters` at all) carrying a `transport_protocol: raw_buffer`
+chain used to leave that chain permanently ineligible, so the connection fell to `default_filter_chain` —
+or was CLOSED where there is none. After this row it matches, and **the `raw_buffer` chain serves instead
+of the fallback.** That is the parity direction: the reference has always served the `raw_buffer` chain
+there, and envoy-go now agrees. It is the only change in this row that a previously-bootable configuration
+can feel, and an operator whose `raw_buffer` chain was dead weight will find it live. The other half of
+the row — the lifted parse reject — can only turn a **boot failure** into a boot, and so cannot move
+traffic on a config that already started.
+
+**(b) THE EVIDENCE, STATED WITH ITS NEGATIVE CONTROLS, BECAUSE AGREEMENT IS NOT EVIDENCE.** Three unit
+arms drive the real `serveConnection` over a loopback TCP pair: a no-listener-filter connection reaching a
+`raw_buffer` chain, a MATCHED NEGATIVE on a byte-equivalent listener whose chain spells `tls` (which must
+still fall to the default), and a TLS client through `tls_inspector` whose `"tls"` classification must
+survive the stamp. Two more pin `SelectChain`'s purity and its matched negative; one pins the re-pointed
+parse behaviour; one pins that a bogus value is stored and never matches on the QUIC
+listener-construction path. **Every one of the six negative-control rows this row's plan chartered was
+RUN, and each reddened EXACTLY its predicted arm set with ZERO collateral** — including the row that
+stamps `"raw_buffer"` unconditionally, which is invisible to both plaintext arms and is caught by the
+`tls_inspector` arm ALONE, and the row that moves the stamp into `SelectChain`, which is invisible to
+every production path and is caught by the purity arm alone. At the fixed tip the seven-package
+reverse-dependency sweep reads **0 failures** over 398 `=== RUN` lines, with the anchored panic gate at 0.
+
+**(c) THE CROSS-SIDE SURFACE IS A NEW DIFFERENTIAL FIXTURE — REGISTERED, AND NOT YET SCORED AT THIS
+RECORD'S TIP.** `0123-listener-transport-protocol` pairs three plaintext TCP listeners differing in
+EXACTLY ONE STRING (`totally_bogus_value` / `raw_buffer` / `tls`, reference ports 15123 / 15223 / 15224),
+each with one indexed chain and one default slot. ⚠️ **The absence of `listener_filters` on all three is a
+load-bearing experimental control, not an omission** — adding any listener filter makes `tls_inspector`
+stamp `raw_buffer` from envoy-go's own pipeline, and the fixture then runs GREEN over a live divergence in
+the exact dimension it claims to cover. ⚠️ **Stated rather than implied: the fixture has been Docker-run
+only at the UN-FIXED tip, where the subject boot-REJECTED on the bogus value and no arm was scored.** Its
+green is owed by this row's own final gate task and is not asserted here.
+
+**(d) THE DIFFERENTIAL PAIR CANNOT EXCLUDE A CONSTANT `raw_buffer` STAMP; ONE UNIT ARM CAN.** The
+`raw_buffer` / `tls` listener pair excludes a subject that stamps a constant `"tls"`, and excludes one
+that stamps nothing — but it is **BLIND to a subject that stamps the constant `"raw_buffer"`**, which is
+the very constant this row installs: such a subject leaves the `tls`-spelling chain ineligible, the
+default chain serves, and DEFAULT is exactly what that listener expects. The arm that excludes it is the
+`tls_inspector` one, which is why that arm must carry a real TLS client and why its failure observable is
+a **dial timeout** rather than a response byte. This is recorded because a gate's discrimination is a
+claim like any other, and the fixture's own prose asserted a stronger pair than the pair supports.
+
+**(e) +0 STAT NAMES.** Nothing here registers, renames or retires a counter, and no registration predicate
+moves. `BEHAVIOR_CONTRACT.md`'s `### Stat surface` ledger carries a `+0, UNCHANGED` chain entry on the
+phase-96/97 form, and **no absolute is quoted** — three mutually inconsistent stat-surface absolutes are
+live in this tree at one tip, and enforcement is the per-phase delta guards, never a total. What the row
+can change is WHICH chain's per-chain HCM counters a connection is attributed to: a redistribution across
+existing names, never a new one. ⚠️ Deliberately NOT added: a `no_filter_chain_match`-style counter for
+the close path.
+
+**(f) §Context ¶7 IS RE-TENSED IN PLACE, NOT OVERWRITTEN, AND THE CORRECTION LEADS WITH WHAT SURVIVES.**
+That paragraph, drafted at the phase-98 SPEC, said the reference's listener-filter-timeout fall-through
+*"remains inferred"*. **The phase-98 PLAN MEASURED it on the reference** — the timeout fires at 1000 ms,
+the `raw_buffer` chain serves, the matched negative falls to the default, and
+`continue_on_listener_filters_timeout: false` DROPS the connection. The non-decision survives verbatim
+(this ADR still decides nothing about `listener_filters_timeout`); the word *inferred* does not, and the
+in-place bracket says so with the measurement attached. ⚠️ **The correction deliberately stops short of
+*"the timeout fall-through is now covered"***, which would be a fresh false claim in the other direction:
+on the SUBJECT the timeout is not enforced at all, and the `== ""` guard is unreachable on any timeout
+path because `tls_inspector` is the only listener filter in the tree and all five of its return paths
+write the field. See (g).
+
+**(g) WHAT THIS ROW DOES NOT DO, INCLUDING ONE FALSEHOOD IT KNOWINGLY LEAVES STANDING.**
+`listener_filters_timeout` is **NOT ENFORCED** on the subject — measured through the real binary, a client
+silent for ten seconds on a one-second listener was still served, because the peeker delegates to a
+deadline-free `bufio` read and the pipeline checks its context only after `Inspect` returns; the subject
+also has no `downstream_pre_cx_timeout` stat to pin. That is a **THIRD divergence on an adjacent
+dimension, BANKED and not chartered**: its repair is a different mechanism in a different file, and this
+row was already widened once. It falsifies `BEHAVIOR_CONTRACT.md`'s dispatch-protocol bullet claiming the
+timeout is honoured in a `[1s, 60s]` envelope, **and that bullet is deliberately LEFT STANDING and
+RECORDED rather than repaired here** — repairing it inside this row would smuggle an unmeasured third
+divergence into a scope whose subject repair was never measured. This row also does not touch SNI
+matching, precedence or case; does not change QUIC input stamping; does not address the unreachable
+catch-all count check; and supersedes nothing. It quotes no absolute stat-surface figure.

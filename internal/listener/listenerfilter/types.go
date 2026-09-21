@@ -41,9 +41,9 @@ type ChainMatchInputs struct {
 	// ServerName is the SNI extracted from the ClientHello by tls_inspector.
 	// Empty when no TLS inspection happened or the ClientHello had no SNI.
 	ServerName string
-	// TransportProtocol is "tls" if a TLS ClientHello was detected,
-	// "raw_buffer" if the byte preamble was non-TLS, or "" if no listener
-	// filter inspected the connection.
+	// TransportProtocol is "tls" if a TLS ClientHello was detected, "raw_buffer" if the byte preamble was non-TLS,
+	// and "" if no listener filter inspected the connection. That "" is true only as the pipeline returns:
+	// serveConnection is a SECOND writer and stamps "raw_buffer" at the entry of chain selection (ADR-0320).
 	TransportProtocol string
 	// ApplicationProtocols is the ALPN offer list extracted from the
 	// ClientHello by tls_inspector. Empty when no TLS inspection happened

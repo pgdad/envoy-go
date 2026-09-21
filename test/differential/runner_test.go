@@ -147,6 +147,7 @@ import (
 	_ "github.com/pgdad/envoy-go/test/fixtures/0120-tls-connection-error/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0121-listener-default-chain-tls/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0122-quic-chain-selection/driver"
+	_ "github.com/pgdad/envoy-go/test/fixtures/0123-listener-transport-protocol/driver"
 	"github.com/pgdad/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

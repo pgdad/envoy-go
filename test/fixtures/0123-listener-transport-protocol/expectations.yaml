@@ -1,0 +1,294 @@
+# Phase 98 fixture 0123-listener-transport-protocol expectations (ADR-0019 —
+# prose; the enforcers are driver/driver.go's own per-side arm checks in
+# AssertStats, the runner's cross-side CompareBytes, and the runner's admin
+# probe. This file is documentation, not an input to any code path.)
+#
+# ⚠️ MEASURED, NOT ASSUMED, AT THIS TIP: nothing reads this file.
+# `git grep -n expectations -- 'test/differential/*.go'` reads ZERO lines
+# (rc=1), and no package under `test/` imports a YAML library at all. There is
+# therefore NO schema to conform to — the only thing a reader may rely on is
+# that every claim below was measured, and that a claim NOT listed here is not
+# asserted anywhere.
+#
+# ## Topology (THREE plaintext TCP listeners, TWO chain slots each)
+#
+#   Every listener carries ONE indexed chain (`fc_indexed`) whose
+#   `filter_chain_match` sets `transport_protocol` and NOTHING else, plus a
+#   last-resort `default_filter_chain` (`fc_default`) with no match key. The
+#   three listeners differ in EXACTLY ONE STRING; everything else — shape,
+#   route, status, filter list — is rendered from one template by
+#   `renderBootstrap`, for BOTH sides.
+#
+#     listener  fc_indexed transport_protocol  ref port  expected BOTH sides
+#     l_bogus   totally_bogus_value            15123     DEFAULT
+#     l_raw     raw_buffer                     15223     INDEXED
+#     l_tls     tls                            15224     DEFAULT
+#
+#   ⚠️ NO `listener_filters` KEY ON ANY LISTENER, AND NO `transport_socket` ON
+#   ANY CHAIN. Both absences are LOAD-BEARING and are stated as hazards below.
+#   `l_tls` is named for the STRING in its match, not for any TLS it
+#   terminates — all three listeners are plaintext.
+#
+#   c_unused — a STATIC cluster NO route ever dials (every route on every chain
+#           is a `direct_response`). It is rendered on BOTH sides so the two
+#           bootstraps stay shape-identical. It exists because envoy-go's
+#           cluster manager boot-rejects a bootstrap whose
+#           `static_resources.clusters` key is absent, and because the runner
+#           rejects `BackendCount() == 0`.
+#
+# Reference Envoy contrib-v1.37.2 (Docker, run BY DIGEST per
+# docs/envoy-go/ENVOY_TARGET.md; admin 0.0.0.0:9901, listeners 0.0.0.0:15123,
+# :15223, :15224) vs envoy-go (in-process, admin 127.0.0.1:<subjAdminPort>,
+# listeners 127.0.0.1:<subjListenerPort>, +1, +2).
+#
+# ## THE PROPOSITION
+#
+#   On a PLAINTEXT TCP listener that carries NO listener filter, reference
+#   Envoy stamps the connection's transport_protocol as "raw_buffer" BEFORE
+#   filter-chain selection runs. A chain matching on `raw_buffer` is therefore
+#   ELIGIBLE and serves. envoy-go left that input EMPTY, the exact-value branch
+#   in `listenerfilter.SelectChain` rejected the chain, and the listener fell
+#   through to its default chain.
+#
+#   Separately, envoy-go BOOT-REJECTED any `transport_protocol` string outside
+#   {tls, raw_buffer, quic, ""} that the reference ACCEPTS, boots and serves.
+#   `l_bogus` carries that string, so at the un-fixed tip the SUBJECT DOES NOT
+#   BOOT and this fixture fails at the subject-start step, not at an assertion.
+#
+#   The two chains of each listener answer the SAME path with the SAME status
+#   (200) and DIFFERENT bodies, so THE BODY ALONE NAMES THE CHAIN THAT SERVED.
+#   All six bodies are distinct across the whole fixture, so one observed body
+#   names both the listener and the chain.
+#
+# ## Workload
+#
+#   ONE HTTP/1.1 `GET /tp` per listener per side (`armCount == 1`), via
+#   `helpers.HTTPRoundTrip`, through `DriveReferenceMulti` / `DriveSubjectMulti`.
+#   ⚠️ The two counter pins below are ARITHMETIC OVER `armCount` — changing it
+#   invalidates both.
+#
+#   This fixture does NOT implement `fixture.HTTPExpectations`. Status and body
+#   are asserted per arm in `AssertStats` from the recorded observations, and
+#   the per-listener byte stream is ALSO returned for the runner's cross-side
+#   `CompareBytes`.
+#
+# ## Asserted (in AssertStats, ABSOLUTELY, PER SIDE, PER LISTENER)
+#
+#   For each of the three arms, on `ref` and on `subj` independently:
+#
+#     status == 200
+#     body   == the arm's wantBody, i.e.
+#                 l_bogus -> "bogus-default\n"
+#                 l_raw   -> "raw-indexed\n"     <- THE HEADLINE ARM
+#                 l_tls   -> "tls-default\n"
+#
+#     http.<indexedPrefix>.downstream_rq_total == 1 if the arm expects INDEXED,
+#                                                 else 0
+#     http.<defaultPrefix>.downstream_rq_total == 1 if the arm expects DEFAULT,
+#                                                 else 0
+#
+#   i.e. the six pinned counter names, and their pinned VALUES:
+#
+#     http.bogus_indexed.downstream_rq_total  == 0
+#     http.bogus_default.downstream_rq_total  == 1
+#     http.raw_indexed.downstream_rq_total    == 1
+#     http.raw_default.downstream_rq_total    == 0
+#     http.tls_indexed.downstream_rq_total    == 0
+#     http.tls_default.downstream_rq_total    == 1
+#
+#   ⚠️ The body is the PRIMARY discriminator and the counters are
+#   CORROBORATION, in that order and not the other way round: a body is
+#   controlled by this fixture (the `direct_response` strings are ours), a
+#   counter is controlled by each proxy's stats implementation.
+#
+#   ⚠️ The absolute per-side assertions are NOT redundant with `CompareBytes`.
+#   `CompareBytes` is cross-side ONLY: if BOTH sides answered DEFAULT on
+#   `l_raw` they would agree byte-for-byte and the comparison would pass
+#   VACUOUSLY. That is exactly the un-fixed-tip-with-the-reject-lifted state,
+#   so the vacuous-agreement case here is not hypothetical.
+#
+#   Per-property `Errorf`, never `Fatalf`, so all three arms report on both
+#   sides even after one has failed. `Fatalf` is reserved for a broken
+#   precondition: the `/stats` scrape failing, or a side having no recorded
+#   drive.
+#
+# ## 🔴 WHY THE VALUE PAIR, AND WHY A NAME-PRESENCE PIN WOULD BE VACUOUS
+#
+#   A scrape map returns the ZERO VALUE for a MISSING key, so a `== 0` pin on a
+#   name a side never emits would be silently green rather than red. The
+#   presence check in `assertArm` exists to close that hole, AND IT IS ONLY
+#   THAT — a guard. IT IS NOT THE ASSERTION.
+#
+#   ⚠️ A PIN THAT ASSERTS ONLY "THE NAME IS PRESENT" IS VACUOUS ON BOTH SIDES.
+#   Measured this stage: the reference publishes the per-chain counters AT `0`
+#   BEFORE ANY TRAFFIC AT ALL — a pre-traffic scrape of the phase-97 two-chain
+#   shape read 168 lines matching `chain_(indexed|default)`, including the
+#   whole `downstream_cx_*` family, with ZERO connections made. The per-chain
+#   HCM stat scope is created at CONFIG time, not at first request. Such a pin
+#   is satisfied FROM BOOT and proves nothing about which chain served.
+#
+#   ⇒ The non-vacuous assertion is the VALUE PAIR (served chain 1, non-served
+#   chain 0) PLUS ITS MIRROR ARM. `l_raw` and `l_tls` are that mirror: one
+#   string apart, same shape, OPPOSITE expected chains.
+#
+#   The `== 0` halves are known SATISFIABLE rather than vacuous, by measurement
+#   on the subject at this tip (one GET per listener against a hand-repaired
+#   subject, flat `/stats`):
+#
+#     http.bogus_default.downstream_rq_total: 1
+#     http.bogus_indexed.downstream_rq_total: 0
+#     http.raw_default.downstream_rq_total: 1
+#     http.raw_indexed.downstream_rq_total: 0
+#     http.tls_default.downstream_rq_total: 1
+#     http.tls_indexed.downstream_rq_total: 0
+#
+#   All six names PRESENT, including the three non-serving ones at 0. The
+#   reference half of that proof needs Docker and is Task 9's.
+#
+# ## 🔴 TWO WAYS THIS FIXTURE SILENTLY DISARMS ITSELF
+#
+#   (a) ADDING A LISTENER FILTER TO ANY LISTENER DISARMS `l_raw`.
+#       `tls_inspector` stamps "raw_buffer" on a plaintext preamble from
+#       envoy-go's OWN pipeline, so with one present BOTH sides answer INDEXED
+#       on `l_raw` EVEN AT THE UN-FIXED TIP. The fixture then runs GREEN over a
+#       LIVE DIVERGENCE IN THE EXACT DIMENSION IT CLAIMS TO COVER. The absence
+#       of `listener_filters` is a load-bearing experimental control, not an
+#       omission — do not add one "for realism".
+#
+#   (b) `l_bogus` ALONE IS A FALSE-AGREEMENT ARM, AND THE `l_raw` / `l_tls`
+#       PAIR IS WEAKER THAN THIS FILE ORIGINALLY CLAIMED. A subject that
+#       parses the field and then IGNORES the dimension entirely answers
+#       DEFAULT on `l_bogus` too, for the wrong reason. The pair DOES exclude
+#       a subject stamping a constant "tls" (which fails `l_raw`) and one
+#       stamping nothing at all (which also fails `l_raw`).
+#
+#       🔴 CORRECTED IN PLACE AT THE PHASE-98 IMPL, TASK 19, AFTER THE FIXTURE
+#       WAS FINALLY SCORED. This block used to assert that 'one stamping a
+#       constant "raw_buffer" passes `l_raw` and fails `l_tls`'. THAT IS
+#       FALSE, and it overstated the pair against the very constant this row
+#       installs. `l_tls`'s INDEXED chain requires the string `tls`; a
+#       subject stamping a constant `raw_buffer` leaves that chain
+#       INELIGIBLE, the DEFAULT chain serves, and DEFAULT is exactly what the
+#       table above expects for `l_tls` — so such a subject PASSES `l_tls`,
+#       PASSES `l_raw`, and THIS FIXTURE IS BLIND TO IT. The only arm that
+#       excludes it is unit arm (s3),
+#       `TestServeConnection_TLSInspector_ClassifiedInputNotOverwritten` in
+#       `internal/listener/manager_test.go`, which NC roster row 5b reddened
+#       ALONE, and whose failure observable is a 5.00 s DIAL TIMEOUT rather
+#       than a response byte. Recorded at `DECISIONS.md` ADR-0320
+#       §Consequences (d).
+#
+#       Deleting either half of the pair still reduces the fixture to a shape
+#       that cannot tell "matched" from "unenforced" — the pair is NECESSARY,
+#       it is simply not SUFFICIENT.
+#
+#   A third, smaller one: the six `stat_prefix` values MUST stay distinct. Two
+#   HCMs sharing one prefix panic envoy-go at boot with
+#   `panic: stats: duplicate metric registration:
+#   "http.<prefix>.downstream_rq_total"`. This fixture instantiates SIX HCMs
+#   and therefore sits six identifiers away from that banked defect.
+#
+# ## The un-fixed-tip verdict — WHICH ARM IS RED
+#
+#   With the boot reject lifted by hand and NOTHING else changed, the un-fixed
+#   subject answers DEFAULT on ALL THREE listeners. Therefore:
+#
+#     l_raw    RED         — the only arm that fails at the un-fixed tip
+#     l_bogus  GREEN       — STRUCTURALLY green; it agrees for the wrong reason
+#     l_tls    GREEN       — STRUCTURALLY green; same
+#
+#   ⚠️ Neither structurally-green arm is evidence ON ITS OWN. `l_tls` earns its
+#   place only as `l_raw`'s matched negative; `l_bogus` earns its place only as
+#   the boot-reject probe. Reading either one's green as a pass for this row is
+#   the false-agreement error this fixture is shaped to prevent.
+#
+# ## Asserted (cross-side EXACT via the runner's CompareBytes)
+#
+#   The per-listener byte stream `driveAll` emits, three lines, roster order:
+#
+#     listener l_bogus status=200 body="bogus-default\n"
+#     listener l_raw status=200 body="raw-indexed\n"
+#     listener l_tls status=200 body="tls-default\n"
+#
+#   ⚠️ The SIDE LABEL is deliberately NOT in those bytes: both sides must emit
+#   IDENTICAL bytes when behaviour is equivalent.
+#
+# ## Admin probe
+#
+#   `ProbeAdmin` issues GET /ready against BOTH admin endpoints over
+#   HTTP-over-TCP, and the runner compares the two responses.
+#
+# ## Stats endpoint — the FLAT /stats, measured rather than inherited
+#
+#   `scrapeStats` reads `http://<admin>/stats`, the flat text form, and parses
+#   "name: value" into a map (split on the LAST ": "; a value that does not
+#   ParseUint — every histogram — is SKIPPED, not coerced). The map makes line
+#   ORDER unpinned, which matters: flat /stats is alphabetical.
+#
+#   ⚠️ THE "EVERY STATS-ASSERTING DRIVER SCRAPES /stats/prometheus" CLAIM IS
+#   FALSE, and was re-derived AT THIS COMMIT rather than cited. Of the 88
+#   non-test fixture drivers declaring `AssertStats`, with whole-line `//`
+#   comments stripped: 31 scrape /stats/prometheus, 47 scrape the flat
+#   "/stats", and 10 scrape NEITHER — the stats-SINK fixtures (0089-0094,
+#   0098, 0101, 0112, 0113), which assert against a receiver rather than an
+#   admin endpoint. ⚠️ A "31 / 57" split folds those 10 into the flat column
+#   and is wrong; the flat figure is 47. The shape precedent 0122 is one of
+#   the 47, and its ONLY /stats/prometheus occurrence is a COMMENT DENYING
+#   that it uses it — a name-presence grep cannot tell a use from a
+#   disclaimer, which is how the miscount arose. The flat form also
+#   sidesteps the prometheus spelling
+#   (`envoy_http_downstream_rq_total{envoy_http_conn_manager_prefix="<prefix>"}`)
+#   and its registration-order listing.
+#
+# ## UNasserted — a CLOSED enumeration
+#
+# Everything asserted is listed above. The following are the ONLY deliberate
+# exclusions; a name in NEITHER list reads as asserted.
+#
+#   1. `no_filter_chain_match`, on EITHER side. envoy-go has no production site
+#      for that string at all, so a `== 0` pin would read the zero value for a
+#      missing key and pass for the wrong reason forever. That divergence is
+#      NAME-level, not value-level, and no arm here may depend on it. It is
+#      also why EVERY listener carries a default chain.
+#   2. The `listener.<addr>.*` scope. The address token differs cross-side
+#      (`listener.0.0.0.0_15123.*` vs `listener.127_0_0_1_<port>.*` — different
+#      address AND different dot-mangling), so any assertion keyed on the full
+#      listener-scoped name is cross-side INFEASIBLE, not merely noisy.
+#   3. All `ssl.*` — no chain on any listener terminates TLS.
+#   4. All histograms (any admin line whose value does not ParseUint).
+#   5. All `tracing.*` — no tracing provider on either side.
+#   6. Every `http.<prefix>.*` name outside the six pinned `downstream_rq_total`
+#      ones (rq_2xx, cx_*, rq_active, no_route, ...). envoy-go emits only stats
+#      it increments, so a whole-map or per-name-set comparison is not
+#      meaningful here.
+#   7. Response header set equality, and connection-level framing.
+#   8. `cluster.c_unused.*` — no route dials it; it exists only to satisfy two
+#      boot/harness preconditions.
+#
+# ## Non-vacuous decode proof
+#
+#   `AssertStats` `log.Printf`s each arm's live status, body, both counter
+#   values AND both presence flags on both sides, pass or fail
+#   (`fixture.TB` has no `Logf`). A green run therefore still leaves the
+#   measurement in the transcript, so a future reader can tell a real pass from
+#   a pass over a counter that stopped being emitted.
+#
+# ## Why the QUIC arm does not ride here
+#
+#   SPEC §7.3: the differential harness cannot mix TCP and UDP listeners in one
+#   fixture, and one fixture directory dispatches to exactly ONE runner branch.
+#   The `transport_protocol: quic` arm lives in `internal/listener/quic_test.go`
+#   instead.
+#
+# Cross-refs: SPEC-98 §7 (fixture charter) + §7.3 (assertions) + PLAN-98 §0.6
+#             (the pre-traffic 168-line measurement) + ADR-0320 + ADR-0319 +
+#             reference_reference_stamps_raw_buffer_default +
+#             reference_matched_negative_per_dimension +
+#             reference_differential_backendcount_min_one +
+#             reference_differential_fixture_dispatch_constraint +
+#             reference_differential_asserter_dispatch +
+#             reference_http_expectations_tcp_only +
+#             reference_fixture_tb_has_no_logf +
+#             reference_fatalf_makes_assertions_unreachable +
+#             reference_stats_sink_emits_used_only +
+#             reference_listener_stat_scope_cross_side_divergence.

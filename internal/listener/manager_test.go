@@ -1685,10 +1685,13 @@ func TestParseChainSpecSilentlyIgnoresDirectSourcePrefixRanges(t *testing.T) {
 	}
 }
 
-// TestParseChainSpecRejectsUnknownTransportProtocol verifies the
-// transport_protocol enum domain is enforced at parse: only "tls",
-// "raw_buffer", "quic", or "" are accepted (phase 61.1 lifted "quic").
-func TestParseChainSpecRejectsUnknownTransportProtocol(t *testing.T) {
+// TestParseChainSpecAcceptsUnknownTransportProtocolAsNonMatchingValue verifies
+// the reference's transport_protocol semantics: an arbitrary string is ACCEPTED
+// at parse (there is no enum domain), is stored byte-exactly, and is simply a
+// value that no detected transport protocol equals -- so the chain is
+// ineligible for every realistic detected value, while the dimension is still
+// ENFORCED when the detected value does equal it.
+func TestParseChainSpecAcceptsUnknownTransportProtocolAsNonMatchingValue(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
 	l := &listenerv3.Listener{
@@ -1699,18 +1702,344 @@ func TestParseChainSpecRejectsUnknownTransportProtocol(t *testing.T) {
 				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
 			},
 		}},
-		FilterChains: []*listenerv3.FilterChain{{
-			FilterChainMatch: &listenerv3.FilterChainMatch{TransportProtocol: "sctp"},
-			Filters:          []*listenerv3.Filter{filter},
-		}},
+		FilterChains: []*listenerv3.FilterChain{
+			{
+				FilterChainMatch: &listenerv3.FilterChainMatch{TransportProtocol: "sctp"},
+				Filters:          []*listenerv3.Filter{filter},
+			},
+			{
+				// The sibling MUST match on source_type. A raw_buffer or
+				// empty-match sibling boot-rejects with "at most one
+				// filter_chain may omit filter_chain_match.server_names
+				// (catch-all); got 2", which would mask this arm.
+				FilterChainMatch: &listenerv3.FilterChainMatch{
+					SourceType: listenerv3.FilterChainMatch_SAME_IP_OR_LOOPBACK,
+				},
+				Filters: []*listenerv3.Filter{filter},
+			},
+		},
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
-	if err == nil {
-		t.Fatal("expected error for transport_protocol=sctp, got nil")
+	// (a) NewManager succeeds -- t.Fatalf, because nothing below is reachable
+	// without a manager.
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("(a) NewManager must ACCEPT transport_protocol %q, got error: %v", "sctp", err)
 	}
-	if !strings.Contains(err.Error(), `transport_protocol "sctp"`) {
-		t.Errorf("error %q does not name the bad value", err.Error())
+	if len(mgr.runtimes) == 0 {
+		t.Fatalf("(a) Manager has no runtimes after accepting transport_protocol %q", "sctp")
+	}
+	rt := mgr.runtimes[0]
+	if rt.name != "l_tp" {
+		t.Fatalf("(a) runtimes[0].name = %q, want %q -- this arm must not drift onto another listener", rt.name, "l_tp")
+	}
+	// (b) storage is byte-exact.
+	if got := rt.chainSpecs[0].TransportProtocol; got != "sctp" {
+		t.Errorf("(b) parsed TransportProtocol: got %q, want byte-exactly %q", got, "sctp")
+	}
+	// (c) three realistic detected values must NOT pick fc[0] and MUST pick fc[1].
+	for _, detected := range []string{"", "tls", "raw_buffer"} {
+		in := listenerfilter.ChainMatchInputs{SourceIP: net.ParseIP("127.0.0.1"), TransportProtocol: detected}
+		got, err := listenerfilter.SelectChain(in, rt.chainSpecs, rt.defaultSpec)
+		if err != nil {
+			t.Errorf("(c) detected=%q: SelectChain: %v", detected, err)
+			continue
+		}
+		if got.Name != "l_tp/filter_chains[1]" {
+			t.Errorf("(c) detected=%q: picked %q, want %q -- an unknown value must be INELIGIBLE, not a wildcard",
+				detected, got.Name, "l_tp/filter_chains[1]")
+		}
+	}
+	// (d) the dimension is ENFORCED, not ignored.
+	in := listenerfilter.ChainMatchInputs{SourceIP: net.ParseIP("127.0.0.1"), TransportProtocol: "sctp"}
+	got, err := listenerfilter.SelectChain(in, rt.chainSpecs, rt.defaultSpec)
+	if err != nil || got.Name != "l_tp/filter_chains[0]" {
+		t.Errorf("(d) detected=%q: picked %v (err %v), want %q -- the dimension must be ENFORCED, not ignored",
+			"sctp", got, err, "l_tp/filter_chains[0]")
+	}
+}
+
+// TestServeConnection_NoListenerFilter_RawBufferChainServes is phase 98 §5.2
+// arm (s1) — the divergence this row exists to repair, expressed as a unit
+// test. The reference stamps `raw_buffer` as the detected transport protocol
+// on a TCP connection that NO listener filter classified, so a
+// `filter_chain_match.transport_protocol: raw_buffer` chain is eligible and
+// serves it. At the un-fixed tip envoy-go LEFT `inputs.TransportProtocol`
+// empty, the `c.TransportProtocol != inputs.TransportProtocol` branch in
+// listenerfilter.matches rejected the chain, and the connection fell through
+// to `default_filter_chain`; ADR-0320's stamp is what turns this arm GREEN.
+//
+// The discriminator is one the test CONTROLS: startTaggedBackend writes a
+// distinct byte on accept — 'A' behind the raw_buffer chain, 'B' behind the
+// default slot — so the byte the client reads names WHICH chain served. "the
+// connection stayed open" is NOT a discriminator here, because the default
+// chain keeps it open too.
+//
+// ⚠️ HAZARD — DO NOT ADD A LISTENER FILTER TO THIS LISTENER. The absence of
+// `listener_filters` is load-bearing. `tls_inspector` stamps `raw_buffer` on a
+// plaintext connection all by itself, so with any such filter present this arm
+// reads 'A' and PASSES EVEN AT THE UN-FIXED TIP: a green arm sitting on top of
+// a live divergence in the exact dimension it claims to cover. Any
+// "simplification" that adds a listener filter here silently disarms the test
+// without reddening anything.
+func TestServeConnection_NoListenerFilter_RawBufferChainServes(t *testing.T) {
+	addrChain, cleanChain := startTaggedBackend(t, 'A')
+	defer cleanChain()
+	addrDefault, cleanDefault := startTaggedBackend(t, 'B')
+	defer cleanDefault()
+
+	cm := twoClusterMgr(t,
+		[]string{"c_tp", "c_default"},
+		[]string{"127.0.0.1", "127.0.0.1"},
+		[]uint32{uint32(addrChain.Port), uint32(addrDefault.Port)},
+	)
+
+	chainFilter := mkTcpProxyFilter(t, "c_tp")
+	defaultFilter := mkTcpProxyFilter(t, "c_default")
+	l := &listenerv3.Listener{
+		Name: "l_tp_nolf",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		// NO ListenerFilters — see the hazard note above.
+		FilterChains: []*listenerv3.FilterChain{{
+			FilterChainMatch: &listenerv3.FilterChainMatch{TransportProtocol: "raw_buffer"},
+			Filters:          []*listenerv3.Filter{chainFilter},
+		}},
+		DefaultFilterChain: &listenerv3.FilterChain{
+			Filters: []*listenerv3.Filter{defaultFilter},
+		},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer mgr.Stop()
+
+	infos := mgr.Listeners()
+	if len(infos) != 1 {
+		t.Fatalf("Listeners: want 1, got %d", len(infos))
+	}
+	conn, err := net.DialTimeout("tcp", infos[0].Addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	// startTaggedBackend is server-speaks-first: it writes its tag on accept,
+	// so the client reads without writing anything.
+	got := readByteWithTimeout(t, conn, 2*time.Second)
+	if got != 'A' {
+		t.Errorf("tag byte = %q, want 'A': a TCP connection no listener filter classified must be "+
+			"stamped transport_protocol=raw_buffer, which makes filter_chains[0] eligible. "+
+			"%q is default_filter_chain, meaning the detected transport protocol stayed empty",
+			got, got)
+	}
+}
+
+// TestServeConnection_NoListenerFilter_TLSChainDoesNotServe is phase 98 §5.2
+// arm (s2): the MATCHED NEGATIVE of (s1), one string apart from it
+// (`transport_protocol: "tls"` in place of `"raw_buffer"`). Without it, (s1)
+// alone cannot distinguish "the input was stamped raw_buffer and the chain
+// matched it" from "the transport_protocol dimension is not enforced at all" —
+// both stories predict 'A'. This arm is red for a stamp that writes any
+// constant a `tls` chain equals, and red for a selector that ignores the
+// dimension.
+//
+// ⚠️ ITS PRE-FIX GREEN IS STRUCTURAL, NOT EVIDENCE. At the un-fixed tip the
+// subject answers "default chain" here for EXACTLY the reason it answers it in
+// (s1): the detected transport protocol is "", so no indexed chain is
+// eligible. *default* merely happens to be the right answer for (s2). The
+// subject could not have answered anything else, so this green measures
+// nothing about the transport_protocol dimension until (s1) goes green
+// alongside it. Record it as structurally-green, never as a pass.
+//
+// ⚠️ The same HAZARD as (s1) applies: adding any listener filter to this
+// listener changes what is detected and disarms the pair.
+func TestServeConnection_NoListenerFilter_TLSChainDoesNotServe(t *testing.T) {
+	addrChain, cleanChain := startTaggedBackend(t, 'A')
+	defer cleanChain()
+	addrDefault, cleanDefault := startTaggedBackend(t, 'B')
+	defer cleanDefault()
+
+	cm := twoClusterMgr(t,
+		[]string{"c_tp", "c_default"},
+		[]string{"127.0.0.1", "127.0.0.1"},
+		[]uint32{uint32(addrChain.Port), uint32(addrDefault.Port)},
+	)
+
+	chainFilter := mkTcpProxyFilter(t, "c_tp")
+	defaultFilter := mkTcpProxyFilter(t, "c_default")
+	l := &listenerv3.Listener{
+		Name: "l_tp_nolf",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+			SocketAddress: &corev3.SocketAddress{
+				Address:       "127.0.0.1",
+				PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 0},
+			},
+		}},
+		// NO ListenerFilters — see the hazard note above.
+		FilterChains: []*listenerv3.FilterChain{{
+			FilterChainMatch: &listenerv3.FilterChainMatch{TransportProtocol: "tls"},
+			Filters:          []*listenerv3.Filter{chainFilter},
+		}},
+		DefaultFilterChain: &listenerv3.FilterChain{
+			Filters: []*listenerv3.Filter{defaultFilter},
+		},
+	}
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer mgr.Stop()
+
+	infos := mgr.Listeners()
+	if len(infos) != 1 {
+		t.Fatalf("Listeners: want 1, got %d", len(infos))
+	}
+	conn, err := net.DialTimeout("tcp", infos[0].Addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	// startTaggedBackend is server-speaks-first: it writes its tag on accept,
+	// so the client reads without writing anything.
+	got := readByteWithTimeout(t, conn, 2*time.Second)
+	if got != 'B' {
+		t.Errorf("tag byte = %q, want 'B': a plaintext TCP connection is never transport_protocol=tls, "+
+			"so filter_chains[0] must be INELIGIBLE and default_filter_chain must serve. "+
+			"%q means a tls chain matched a plaintext connection",
+			got, got)
+	}
+}
+
+// TestServeConnection_TLSInspector_ClassifiedInputNotOverwritten is phase 98
+// §5.2 arm (s3): the serveConnection transport-protocol stamp must DEFAULT an
+// unclassified input, never OVERWRITE one a listener filter already
+// classified. The listener carries `listener_filters: [tls_inspector]`;
+// tls_inspector writes inputs.TransportProtocol = "tls" on a ClientHello
+// (internal/listener/listenerfilter/tls_inspector/tls_inspector.go:86), so the
+// `== ""` guard in front of the stamp must not fire and filter_chains[0]
+// (`transport_protocol: "tls"`, terminating TLS with the inline alpha PEM
+// pair) must serve — tag 'A'. The default_filter_chain, tag 'B', is the
+// negative slot.
+//
+// ⚠️ A PLAINTEXT ARM CANNOT CARRY THIS PROOF, and the reason is mechanical:
+// tls_inspector stamps "raw_buffer" on a plaintext connection all by itself,
+// so an unconditional `raw_buffer` stamp would overwrite that input WITH THE
+// SAME VALUE and every plaintext arm would stay green. Only an input the
+// inspector classified as something OTHER than the default discriminates.
+// This was the error SPEC.md §0.10 caught in its own first draft — do not
+// "simplify" this arm into a plaintext one, and do not drop the real TLS
+// client: without an actual ClientHello on the wire the inspector classifies
+// "raw_buffer" and the arm silently stops testing anything.
+//
+// ⚠️ THIS ARM IS GREEN BOTH BEFORE AND AFTER THE PRODUCTION EDITS, because at
+// the un-fixed tip tls_inspector already writes "tls" here and nothing in this
+// path depends on the stamp. Its green is NOT evidence on its own. Its only
+// falsifiability is the NC roster: it must NOT redden under row 5 (stamp
+// unconditionally with "tls") and it is the ONLY arm that MUST redden under
+// row 5b (drop the `== ""` guard, stamping "raw_buffer" unconditionally).
+//
+// The discriminator is one the test CONTROLS: startTaggedBackend is
+// server-speaks-first, so the byte read AFTER the handshake names WHICH chain
+// served. "the handshake completed" is not the question — the question is
+// which chain served the connection.
+func TestServeConnection_TLSInspector_ClassifiedInputNotOverwritten(t *testing.T) {
+	addrChain, cleanChain := startTaggedBackend(t, 'A')
+	defer cleanChain()
+	addrDefault, cleanDefault := startTaggedBackend(t, 'B')
+	defer cleanDefault()
+
+	cm := twoClusterMgr(t,
+		[]string{"c_tp", "c_default"},
+		[]string{"127.0.0.1", "127.0.0.1"},
+		[]uint32{uint32(addrChain.Port), uint32(addrDefault.Port)},
+	)
+
+	chainFilter := mkTcpProxyFilter(t, "c_tp")
+	defaultFilter := mkTcpProxyFilter(t, "c_default")
+	l := mkTLSListener("l_tp_tlsinspect", "127.0.0.1", 0, []*listenerv3.FilterChain{{
+		FilterChainMatch: &listenerv3.FilterChainMatch{TransportProtocol: "tls"},
+		TransportSocket:  mkDownstreamTSInline(t, testAlphaCertPEM, testAlphaKeyPEM),
+		Filters:          []*listenerv3.Filter{chainFilter},
+	}})
+	l.DefaultFilterChain = &listenerv3.FilterChain{
+		Filters: []*listenerv3.Filter{defaultFilter},
+	}
+	// The tls_inspector listener filter is LOAD-BEARING here — it is what
+	// classifies the input as "tls" in the first place.
+	l.ListenerFilters = []*listenerv3.ListenerFilter{mkTLSInspectorFilter(t)}
+
+	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+	mgr, err := NewManagerWithBaseDirAndAllowH2C(boot, cm, "", false, stats.NewRegistry(), nil, testHTTPRegistry(), testLFRegistry(), nil, nil, testNetRegistryWithTerminals(t, cm), nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer mgr.Stop()
+
+	infos := mgr.Listeners()
+	if len(infos) != 1 {
+		t.Fatalf("Listeners: want 1, got %d", len(infos))
+	}
+
+	// A REAL TLS client over a real loopback TCP pair: the ClientHello must
+	// actually reach the wire, because it is the inspector's only input.
+	conn, err := stdtls.DialWithDialer(
+		&net.Dialer{Timeout: 5 * time.Second},
+		"tcp", infos[0].Addr,
+		&stdtls.Config{
+			ServerName: "alpha.envoy-go.test",
+			RootCAs:    testCAPool(t),
+			MinVersion: stdtls.VersionTLS12,
+		},
+	)
+	if err != nil {
+		t.Fatalf("TLS dial: %v — the tls chain did not terminate TLS. If the transport-protocol "+
+			"stamp OVERWROTE the input tls_inspector classified as \"tls\", filter_chains[0] became "+
+			"ineligible and the plaintext default_filter_chain served, which cannot complete a handshake", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Proof the handshake really happened, not merely that a byte arrived.
+	cs := conn.ConnectionState()
+	if !cs.HandshakeComplete {
+		t.Fatalf("HandshakeComplete = false after a successful Dial")
+	}
+	if len(cs.PeerCertificates) == 0 {
+		t.Fatalf("no peer certificates after handshake")
+	}
+	if cn := cs.PeerCertificates[0].Subject.CommonName; cn != "alpha.envoy-go.test" {
+		t.Errorf("peer cert CN = %q, want %q (the tls chain's inline alpha leaf)", cn, "alpha.envoy-go.test")
+	}
+
+	// AFTER the handshake: which chain actually served?
+	got := readByteWithTimeout(t, conn, 5*time.Second)
+	if got != 'A' {
+		t.Errorf("tag byte = %q, want 'A': tls_inspector classified this connection as "+
+			"transport_protocol=tls, so the serveConnection stamp must NOT overwrite it and "+
+			"filter_chains[0] must serve. %q is default_filter_chain, meaning the classified "+
+			"input was clobbered before chain-match",
+			got, got)
 	}
 }
 

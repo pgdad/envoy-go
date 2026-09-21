@@ -988,15 +988,7 @@ func parseChainSpec(name string, fm *listenerv3.FilterChainMatch) (*listenerfilt
 	if sn := fm.GetServerNames(); len(sn) > 0 {
 		spec.ServerNames = append([]string(nil), sn...)
 	}
-	// transport_protocol: validate against the v3 enum domain. "quic" is
-	// accepted for QUIC/H3 listeners (phase 61.1); the runtime chain-match
-	// semantics for a QUIC connection land at leg 61.2.
-	switch tp := fm.GetTransportProtocol(); tp {
-	case "", "tls", "raw_buffer", "quic":
-		spec.TransportProtocol = tp
-	default:
-		return nil, fmt.Errorf("transport_protocol %q must be \"tls\", \"raw_buffer\", \"quic\", or empty", tp)
-	}
+	spec.TransportProtocol = fm.GetTransportProtocol()
 	// application_protocols: copy slice.
 	if ap := fm.GetApplicationProtocols(); len(ap) > 0 {
 		spec.ApplicationProtocols = append([]string(nil), ap...)
@@ -1364,6 +1356,9 @@ func (rt *listenerRuntime) serveConnection(ctx context.Context, raw net.Conn) {
 		// continue_on_listener_filters_timeout=true: fall through with partial inputs.
 	}
 
+	if inputs.TransportProtocol == "" { // ADR-0320: a TCP connection no listener filter classified is raw_buffer on the reference.
+		inputs.TransportProtocol = "raw_buffer" // Stamped at the ENTRY of selection, so every path that reaches SelectChain is covered.
+	}
 	// (5) Run chain-match algorithm.
 	selectedSpec, err := listenerfilter.SelectChain(inputs, rt.chainSpecs, rt.defaultSpec)
 	if err != nil {

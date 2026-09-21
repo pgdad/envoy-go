@@ -210,3 +210,37 @@ func TestSelectChainSourcePorts(t *testing.T) {
 		t.Errorf("expected source_ports-specified chain; got %v", got)
 	}
 }
+
+// TestSelectChain_EmptyTransportProtocolDoesNotMatchRawBufferChain pins that
+// SelectChain does NOT default an empty detected transport protocol. The TCP
+// default lives in serveConnection (ADR-0320), deliberately, because
+// SelectChain is shared with the QUIC path (the listenerRuntime.selectQUICChain
+// call site), whose input is always "quic". This is the ONLY arm in the tree
+// that fires NC roster row 6.
+func TestSelectChain_EmptyTransportProtocolDoesNotMatchRawBufferChain(t *testing.T) {
+	chains := []*ChainSpec{{Name: "rb", TransportProtocol: "raw_buffer"}}
+	got, err := SelectChain(ChainMatchInputs{}, chains, nil)
+	if !errors.Is(err, ErrNoChainMatched) {
+		t.Errorf("SelectChain(empty TP, raw_buffer chain, no default) = (%v, %v); want (nil, ErrNoChainMatched) — SelectChain must NOT default the input", got, err)
+	}
+	if got != nil {
+		t.Errorf("SelectChain(empty TP, raw_buffer chain, no default) returned chain %v; want nil", got)
+	}
+}
+
+// TestSelectChain_ClassifiedTransportProtocolStillMatches is the MATCHED
+// NEGATIVE for the purity arm above: it proves that arm is not a blanket
+// "SelectChain never matches on transport_protocol" detector. A classified
+// input still selects its chain, so a mutation that moves the TCP stamp into
+// SelectChain (NC roster row 6) leaves THIS test green while reddening the
+// purity arm.
+func TestSelectChain_ClassifiedTransportProtocolStillMatches(t *testing.T) {
+	tlsChain := &ChainSpec{Name: "tls", TransportProtocol: "tls"}
+	got, err := SelectChain(ChainMatchInputs{TransportProtocol: "tls"}, []*ChainSpec{tlsChain}, nil)
+	if err != nil {
+		t.Fatalf("SelectChain(TP=%q, tls chain, no default) returned err %v; want nil", "tls", err)
+	}
+	if got != tlsChain {
+		t.Errorf("SelectChain(TP=%q, tls chain, no default) = %v; want the tls chain %v", "tls", got, tlsChain)
+	}
+}
