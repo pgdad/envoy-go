@@ -19360,7 +19360,7 @@ catch-all count check; and supersedes nothing. It quotes no absolute stat-surfac
 
 ## ADR-0321 — `server_names` ties are broken by the pattern that MATCHED, and the longest matching wildcard suffix wins (phase 99)
 
-> **STATUS: PROPOSED — §Context drafted at the phase-99 SPEC; §Decision + §Consequences are APPENDED IN PLACE at the phase-99 IMPL, after the RETAINED italic footer below, with no renumber and no `---` separator (the ADR-0294-0320 shared block form).** ⚠️ **THIS BLOCK RE-ARMS THE HOUSE `PROPOSED` GUARD, AND NO COUNT OF EITHER MATCHER IS WRITTEN ANYWHERE IN IT, DELIBERATELY** — this line is itself a hit of the strict form, so any figure it named would be falsified by its own landing. **Verify by LINE and by ADR** (backward `^## ADR-` heading search), **never by the count alone**, and never conflate the strict house form with the unrelated **ADR-0231 decoy** at `DECISIONS.md:14866`, which is **BYTE-UNTOUCHED** by this row. **ROW 99 STAYS `in-progress` THROUGH THIS SPEC**; `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` are byte-untouched at this stage, a scope MEASURED across three prior SPEC commits. This is a **Listener / chain-match MAINTENANCE row claiming NO family ordinal**. It **AMENDS** ADR-0081 clauses 4 and 5 and **NOTES** ADR-0078 clause 9; it **SUPERSEDES nothing**, and it does not disturb ADR-0320 (accurate for phase 98: it touched no SNI precedence) or ADR-0319 (whose clause (d) stays true, with a wider reach recorded below).
+> **STATUS: ACCEPTED — §Context drafted at the phase-99 SPEC; §Decision + §Consequences APPENDED IN PLACE at the phase-99 IMPL, after the RETAINED italic footer, with no renumber and no `---` separator (the ADR-0294-0320 shared block form).** ⚠️ **THE HOUSE `PROPOSED` GUARD WAS RE-ARMED BY THIS BLOCK AT THE SPEC AND IS DISARMED BY THIS FLIP — AND NO COUNT OF EITHER MATCHER IS WRITTEN ANYWHERE IN IT, DELIBERATELY**: while it read PROPOSED this line was itself a hit of the strict form, so any figure it named would have been falsified by its own landing. **Verify by LINE and by ADR** (backward `^## ADR-` heading search), **never by the count alone**, and never conflate the strict house form with the unrelated **ADR-0231 decoy** at `DECISIONS.md:14866`, which is **BYTE-UNTOUCHED** by this row. **ROW 99 STAYS `in-progress` THROUGH THIS SPEC**; `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` are byte-untouched at this stage, a scope MEASURED across three prior SPEC commits. This is a **Listener / chain-match MAINTENANCE row claiming NO family ordinal**. It **AMENDS** ADR-0081 clauses 4 and 5 and **NOTES** ADR-0078 clause 9; it **SUPERSEDES nothing**, and it does not disturb ADR-0320 (accurate for phase 98: it touched no SNI precedence) or ADR-0319 (whose clause (d) stays true, with a wider reach recorded in §Consequences (d)).
 
 ### Context (drafted at the phase-99 SPEC)
 
@@ -19370,12 +19370,118 @@ catch-all count check; and supersedes nothing. It quotes no absolute stat-surfac
 
 **§Context ¶3 — THE MECHANISM: RANK IS TAKEN OVER THE WHOLE SET, AND LENGTH IS NEVER TAKEN AT ALL.** `sniSpecificityRank` returns the best rank over **all** of a chain's patterns, not the one that matched, and slot 2 has no suffix-length comparison — while slots 1 and 6 compare CIDR prefixes by length. So the tip both **closes** equal-rank wildcard pairs and **mis-serves** a mixed exact+wildcard chain over a longer wildcard. The existing suite is blind to the slot in every direction: the tip, the repair and an inverted repair all read the same all-green result over the five listener-reverse-dependency selectors.
 
-**§Context ¶4 — THE FIX SHAPE WAS MEASURED BEFORE BEING CHOSEN, AND THE PREDECESSOR's PROTOTYPE WAS WRONG.** Two shapes were built and driven through the real binary. The phase-99 BRAINSTORM's prototype kept whole-set rank and added a matched-suffix length compare; it agrees with the reference everywhere **except** the mixed exact+wildcard arm, where it still serves the mixed chain. Ranking the **matched** pattern (exact, else longest matching `*.` suffix, else `*`) and then comparing suffix length agrees with the reference on every arm both sides ran, on TCP and QUIC; it is one production function in `internal/listener/listenerfilter/chainmatch.go`. Suffix LENGTH is compared, never raw strings, so a later case fold composes with it.
+**§Context ¶4 — THE FIX SHAPE WAS MEASURED BEFORE BEING CHOSEN, AND THE PREDECESSOR's PROTOTYPE WAS WRONG.** Two shapes were built and driven through the real binary. The phase-99 BRAINSTORM's prototype kept whole-set rank and added a matched-suffix length compare; it agrees with the reference everywhere **except** the mixed exact+wildcard arm, where it still serves the mixed chain. Ranking the **matched** pattern (exact, else longest matching `*.` suffix, else `*`) and then comparing suffix length agrees with the reference on every arm both sides ran, on TCP and QUIC; it is one production file: the rank helper and its `breakTie` slot-2 call site, both in `internal/listener/listenerfilter/chainmatch.go`. Suffix LENGTH is compared, never raw strings, so a later case fold composes with it.
 
 **§Context ¶5 — THE BUILD-TIME CLAIM IS FALSE IN TWO NORMATIVE PLACES AND MISLEADING IN A THIRD.** ADR-0081 clause 5 says ambiguity is surfaced *"at config-load time, NOT at per-connection dispatch time"*, and the `ErrAmbiguousChainMatch` doc comment says the manager pre-runs the selector on a sample input. Neither is true: only structurally **identical** specs are rejected at build, and every other tie is a per-connection outcome that closes the connection. `BEHAVIOR_CONTRACT.md`'s one-line build-time statement is true of identical specs and misleading by omission.
 
-**§Context ¶6 — THE BEHAVIOUR CHANGES THAT CAN MOVE LIVE TRAFFIC.** Equal-rank wildcard pairs go from **closed** to **served by the longest suffix**. A mixed exact+wildcard chain that matched only through its wildcard **loses** to a longer matching wildcard — a change on a config that served before. And two chains whose best matched patterns are the **same string** go from an arbitrary served winner to **closed**; the reference refuses that configuration class at validate (`multiple filter chains with overlapping matching rules are defined`), so neither side of that change is parity, and parity there is a boot reject this row does not make.
+**§Context ¶6 — THE BEHAVIOUR CHANGES THAT CAN MOVE LIVE TRAFFIC.** Equal-rank wildcard pairs go from **closed** to **served by the longest suffix**. A mixed exact+wildcard chain that matched only through its wildcard **loses** to a longer matching wildcard — a change on a config that served before. And two chains whose best matched patterns are the **same string** go from the whole-set-rank winner (where the two sets' whole-set ranks differed) to **closed**; the reference refuses that configuration class at validate (`multiple filter chains with overlapping matching rules are defined`), so neither side of that change is parity, and parity there is a boot reject this row does not make.
 
 **§Context ¶7 — WHAT THIS ADR DOES NOT DECIDE.** It does not make precedence a nested per-dimension descent, which the reference is and envoy-go is not. It does not fold SNI case. It does not add the reference's overlapping-matcher boot reject. It does not repair the order-dependent pairwise fold in `SelectChain`, where an early tie can mask a strictly more specific later chain. It adds no `no_filter_chain_match` counter and registers, renames or removes no stat name. It does not touch the universal `"*"` tier, partial-wildcard acceptance, or per-connection certificate identity on QUIC. It quotes no absolute stat-surface figure.
 
 *§Decision and §Consequences follow at the phase-99 IMPL.*
+
+### Decision (landed at the phase-99 IMPL)
+
+**`breakTie`'s `server_names` slot ranks the pattern that MATCHED the connection's SNI, not the chain's
+whole pattern set, and between two matching `*.` wildcards the LONGEST matching suffix wins.** This is the
+pinned reference's measured behaviour on TCP and on QUIC (§Context ¶2). The repair is one production
+file: the rank helper and its `breakTie` slot-2 call site — `sniSpecificityRank(patterns)` is replaced by
+`sniMatchedRank(patterns, sni) (rank, suffixLen)` in `internal/listener/listenerfilter/chainmatch.go`, and
+slot 2 calls it for both chains with `inputs.ServerName`. Because the selector is shared, the TCP path and
+the QUIC path change together, and `internal/listener/quic.go` changes only in comments.
+
+**1 — The rank is taken over the MATCHED pattern.** `sniMatchedRank` returns rank 0 for a pattern equal to
+the SNI, rank 1 for a `*.` suffix wildcard the SNI ends with, rank 2 for the universal `"*"`, and rank 3
+when nothing matched (unreachable, because `matches()` has already removed such a chain before `breakTie`
+runs). A non-matching pattern in the chain's list no longer lends the chain its rank. Its matching
+predicate is byte-identical to `sniMatchAny`'s (`HasPrefix(p, "*.") && HasSuffix(sni, p[1:])`), so rank
+and eligibility cannot disagree about what matched.
+
+**2 — Equal rank is then broken by suffix LENGTH.** The second result is the length of the longest
+matching suffix (the pattern's length minus the `*`). A longer suffix wins, as slots 1 and 6 already let a
+longer CIDR prefix win. Lengths are compared, never raw strings, so a later SNI case fold
+is expected to compose with this without touching it, provided the fold normalises SNI and patterns
+before selection.
+
+**3 — This AMENDS ADR-0081 clause 4's `server_names` bullet.** That bullet read the ADR-0033 clause 9
+sub-ordering as a property of the chain. It now reads: the rank of the pattern that matched
+(exact > `*.` suffix > `*`), then the longest matching suffix, independent of declaration order and of any
+non-matching pattern the chain lists.
+
+**4 — This AMENDS ADR-0081 clause 5.** Only chains whose specs are structurally IDENTICAL are rejected at
+`NewManager` build time. Every other tie is a per-connection outcome: `SelectChain` returns
+`ErrAmbiguousChainMatch` for that connection, and the TCP path logs and closes it while the QUIC path
+fails it. The clause's *"at config-load time, NOT at per-connection dispatch time"* was never true of
+non-identical ties, and the `ErrAmbiguousChainMatch` doc comment in `chainmatch.go` now says so.
+
+**5 — This NOTES ADR-0078 clause 9.** The clause said the old `chainSpecificityRank` logic was
+*"preserved verbatim as `sniSpecificityRank`"*. That was accurate for its phase. It is no longer: the
+function is replaced, not preserved. Clause 9's placement of the SNI sub-ordering inside the
+`server_names` slot stands.
+
+**6 — The three declared behaviour changes, stated here because they are the decision's effect:**
+(1) two or more wildcard chains matching one SNI, with no exact match among them, go from CLOSED to served
+by the longest suffix, on TCP and QUIC, with or without a default chain; (2) a mixed exact+wildcard chain
+that matched only through a wildcard loses to a longer matching wildcard; (3) two chains whose best
+MATCHED patterns are the same string go from the whole-set-rank winner (where the two sets' whole-set
+ranks differed) to CLOSED. After this row,
+slot 2 yields `ErrAmbiguousChainMatch` only for (3). The other runtime sources of that error are
+unchanged.
+
+This ADR supersedes nothing else.
+
+### Consequences (landed at the phase-99 IMPL)
+
+**(a) EQUAL-RANK WILDCARD PAIRS ARE SERVED, NOT CLOSED.** Two chains `*.b.foo.test` and `*.foo.test` with
+SNI `a.b.foo.test` used to close the connection in either declaration order, and still closed it with a
+`default_filter_chain` configured. After this row the `*.b.foo.test` chain serves, on TCP and on QUIC,
+with or without a default chain. This is the parity direction and the row's purpose. At the un-fixed tip,
+differential fixture `0124-listener-sni-longest-suffix` was red on exactly its four `a.b.foo.test` rows
+(three closed, one served by the wrong chain), with the reference green on every row. At the fixed tip it
+is green on every row, and every subject counter matches the reference.
+
+**(b) A CONFIG THAT SERVED BEFORE NOW SERVES A DIFFERENT CHAIN.** A chain `["x.test","*.foo.test"]` used
+to win `a.b.foo.test` over `["*.b.foo.test"]` because the exact `x.test` in its set gave it rank 0, even
+though `x.test` did not match. It now loses to the longer matching wildcard. This is the parity direction,
+but it **moves traffic on a config that served before this row**, and it is the change most likely to
+surprise an operator: the requests and the per-chain counters move from one chain to the other.
+
+**(c) A SHAPE THAT SERVED NOW CLOSES, AND NEITHER SIDE OF THAT CHANGE IS PARITY.** Two chains whose best
+matched patterns are the same string (for example `["*.foo.test","q.test"]` and `["*.foo.test"]`) used to
+serve the whole-set-rank winner (where the two sets' whole-set ranks differed). They now tie honestly and
+the connection closes. The reference refuses this class at `--mode validate` with
+`multiple filter chains with overlapping matching rules are defined`, so parity is a boot reject. That
+reject is the banked duplicate/overlap row and is not made here. The closed outcome is declared, not
+hidden.
+
+**(d) ADR-0319 (d)'s REACH WIDENS.** ADR-0319 (d) records that QUIC selection is per connection while the
+certificate is chosen once at Start. That stays true. Before this row, two wildcard chains matching one SNI
+closed on QUIC, so that shape never reached the certificate question. Now they select a chain, so a
+two-wildcard QUIC listener whose chains carry different leaves can serve the right filters under the other
+chain's certificate. The residual stays unmeasured and open, as ADR-0319 (d) states it.
+
+**(e) +0 STAT NAMES.** The repair registers, renames and retires nothing, and the close path increments no
+stat. The observable effect is a redistribution of traffic across existing per-chain counters.
+`BEHAVIOR_CONTRACT.md` carries a `+0, UNCHANGED` ledger entry for phase 99, and no absolute stat-surface
+figure is quoted. A `no_filter_chain_match` counter is again deliberately not added.
+
+**(f) WHAT THIS ROW DOES NOT BUY.** Each item below is out of scope and stays banked:
+- nested per-dimension descent, which the reference uses and envoy-go does not;
+- SNI case folding;
+- the reference's overlapping-matcher boot reject (see (c));
+- the order-dependent pairwise tie fold in `SelectChain`, where an early tie can mask a strictly more
+  specific later chain;
+- a `no_filter_chain_match` counter;
+- the universal `"*"` tier and partial-wildcard acceptance;
+- per-connection certificate identity on QUIC (see (d)).
+
+**(g) THE TOOLCHAIN FOLD-IN, AND WHY `go.mod` GAINS NO `toolchain` LINE.** Under the ambient go1.27.1,
+`golangci-lint` v1.64.8 cannot read the new export data, and
+`TestEncodeData_LevelMapping_DifferentGzippedSizes` failed because go1.27.1's `compress/flate` gives
+levels 1 and 9 the same output size on its input. The test was re-pointed, test-only, to
+`TestEncodeData_LevelMapping_LevelReachesEncoder`, which asserts the gzip header's XFL byte and sends two
+responses per config so the pooled `Reset` path is exercised. It is green on both toolchains and red under
+both plumbing mutations. The lint gate runs as `GOTOOLCHAIN=go1.26.2 golangci-lint run ./...`, and a
+planted control that compiles fired errcheck, revive and ineffassign before it was deleted. CI needs no
+change, because it pins Go 1.23. `go.mod` gains no `toolchain` line: that would change the build for every
+consumer and is its own decision. A move to linter v2 stays a separate re-baseline.

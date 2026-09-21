@@ -2109,63 +2109,67 @@ func TestEncodeData_AllowPath_GzipEncodes_OverwriteBodyCalled_CountersIncremente
 	}
 }
 
-func TestEncodeData_LevelMapping_DifferentGzippedSizes(t *testing.T) {
-	// Sanity check that f.config.gzip.level threads through to gzip.NewWriterLevel:
-	// BestSpeed (1) vs BestCompression (9) on a compressible body produce
-	// different compressed-byte sizes. Both round-trip correctly. Per
-	// ADR-0130 §Decision (iv): the compression_level enum maps to int that
-	// passes through to compress/gzip verbatim.
+func TestEncodeData_LevelMapping_LevelReachesEncoder(t *testing.T) {
+	// Asserts that f.config.gzip.level is PLUMBED to gzip.NewWriterLevel, not
+	// that the stdlib emits different sizes per level: compress/flate's output
+	// per level is a toolchain property (go1.27.1's rewritten fast encoders
+	// emit 2121 bytes at BOTH level 1 and level 9 on this input). The
+	// discriminator is the gzip header's XFL byte (RFC 1952 §2.3.1, offset 8),
+	// which compress/gzip derives from the level the Writer was built at:
+	// 4 at BestSpeed, 2 at BestCompression, 0 otherwise. A level dropped on
+	// the way to the encoder (e.g. forced to DefaultCompression) yields XFL 0.
+	// Per ADR-0130 §Decision (iv) the level passes to compress/gzip verbatim;
+	// the enum→int mapping itself is pinned by the Group 3 tests.
 	body := make([]byte, 4096)
 	for i := range body {
-		// Non-repetitive enough that level choice meaningfully affects output.
 		body[i] = byte((i * 17) ^ (i >> 3))
 	}
 
-	encodeWithLevel := func(level int) []byte {
-		t.Helper()
-		cc := defaultCompiledConfig()
-		cc.gzip = &compiledGzipConfig{level: level}
-		f, cb := freshEncodeDataFilter(t, cc)
-		f.willCompress = true
-		if status := f.EncodeData(body, true); status != envoyhttp.DataContinue {
-			t.Fatalf("status @ level=%d = %v; want DataContinue", level, status)
-		}
-		if cb.overwriteBodyCallCount != 1 {
-			t.Fatalf("OverwriteBody calls @ level=%d = %d; want 1", level, cb.overwriteBodyCallCount)
-		}
-		return cb.overwriteBodyCalls[0]
-	}
-
-	bestSpeed := encodeWithLevel(gzip.BestSpeed)
-	bestComp := encodeWithLevel(gzip.BestCompression)
-
-	// Different levels should produce different compressed sizes on this input.
-	if len(bestSpeed) == len(bestComp) {
-		t.Errorf("expected different compressed sizes for BestSpeed vs BestCompression on a non-repetitive input; both = %d", len(bestSpeed))
-	}
-
-	// Both must round-trip correctly.
 	for _, tc := range []struct {
-		name string
-		data []byte
+		name    string
+		level   int
+		wantXFL byte
 	}{
-		{"BestSpeed", bestSpeed},
-		{"BestCompression", bestComp},
+		{"BestSpeed", gzip.BestSpeed, 4},
+		{"BestCompression", gzip.BestCompression, 2},
 	} {
-		gr, err := gzip.NewReader(bytes.NewReader(tc.data))
-		if err != nil {
-			t.Errorf("gzip.NewReader @ %s: %v", tc.name, err)
-			continue
-		}
-		decompressed, err := io.ReadAll(gr)
-		if err != nil {
-			t.Errorf("io.ReadAll @ %s: %v", tc.name, err)
-			continue
-		}
-		_ = gr.Close()
-		if !bytes.Equal(decompressed, body) {
-			t.Errorf("round-trip mismatch @ %s", tc.name)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			cc := defaultCompiledConfig()
+			cc.gzip = &compiledGzipConfig{level: tc.level}
+			// Two responses through ONE compiledGzipConfig: the second
+			// acquires the pooled writer (Reset path), which must keep the
+			// configured level too.
+			for i := 0; i < 2; i++ {
+				f, cb := freshEncodeDataFilter(t, cc)
+				f.willCompress = true
+				if status := f.EncodeData(body, true); status != envoyhttp.DataContinue {
+					t.Fatalf("response %d: status = %v; want DataContinue", i, status)
+				}
+				if cb.overwriteBodyCallCount != 1 {
+					t.Fatalf("response %d: OverwriteBody calls = %d; want 1", i, cb.overwriteBodyCallCount)
+				}
+				got := cb.overwriteBodyCalls[0]
+				if len(got) < 10 {
+					t.Fatalf("response %d: output %d bytes; shorter than a gzip header", i, len(got))
+				}
+				if got[8] != tc.wantXFL {
+					t.Errorf("response %d: gzip XFL = %d; want %d (level %d did not reach the encoder)",
+						i, got[8], tc.wantXFL, tc.level)
+				}
+				gr, err := gzip.NewReader(bytes.NewReader(got))
+				if err != nil {
+					t.Fatalf("response %d: gzip.NewReader: %v", i, err)
+				}
+				decompressed, err := io.ReadAll(gr)
+				if err != nil {
+					t.Fatalf("response %d: io.ReadAll: %v", i, err)
+				}
+				_ = gr.Close()
+				if !bytes.Equal(decompressed, body) {
+					t.Errorf("response %d: round-trip mismatch", i)
+				}
+			}
+		})
 	}
 }
 

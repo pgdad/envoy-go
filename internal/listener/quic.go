@@ -179,10 +179,10 @@ func (rt *listenerRuntime) quicChainMatchInputs(conn *quic.Conn) listenerfilter.
 // spec -> info mapping through rt.chainByName. SelectChain returns a
 // *ChainSpec, never a *chainInfo, so the map lookup is mandatory.
 //
-// Returns nil when no chain is selectable (SelectChain's
-// (nil, ErrNoChainMatched) branch: no indexed chain eligible AND no default
-// slot). A nil return is what makes serveQUICConnection close the connection,
-// mirroring the reference's "no filter chain found".
+// Returns nil when no chain is selectable: SelectChain's ErrNoChainMatched (no
+// indexed chain eligible AND no default slot) or ErrAmbiguousChainMatch (tied
+// eligible chains breakTie cannot separate on this connection's inputs). A nil
+// return is what makes serveQUICConnection close the connection.
 func (rt *listenerRuntime) selectQUICChain(conn *quic.Conn) *chainInfo {
 	spec, err := listenerfilter.SelectChain(rt.quicChainMatchInputs(conn), rt.chainSpecs, rt.defaultSpec)
 	if err != nil {

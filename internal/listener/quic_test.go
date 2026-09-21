@@ -949,7 +949,7 @@ func quicChainSpecByName(t *testing.T, rt *listenerRuntime, name string) *listen
 // On TCP, ChainMatchInputs.ApplicationProtocols is populated by the
 // tls_inspector listener filter from the ClientHello's ALPN extension: it is
 // the client's full OFFER LIST, several entries wide, and `alpnMatchAny`
-// (chainmatch.go:293-302) is a genuine any-of intersection over it.
+// (chainmatch.go:299-308) is a genuine any-of intersection over it.
 // On QUIC there is no ClientHello inspection at all. The handshake is already
 // complete when quic-go's Accept returns, and the only ALPN fact available is
 // crypto/tls.ConnectionState.NegotiatedProtocol — a SCALAR, the single
@@ -1030,7 +1030,7 @@ func TestQUICChainSelection_ApplicationProtocolsH3Matches(t *testing.T) {
 // PROPERTY: (*listenerRuntime).quicChain() must select the
 // default_filter_chain. The listener's QUIC config offers exactly ["h3"], so
 // no connection on this listener can have negotiated "h2"; `alpnMatchAny`
-// finds no intersection (chainmatch.go:131, 293-302) and filter_chains[0] is
+// finds no intersection (chainmatch.go:131, 299-308) and filter_chains[0] is
 // INELIGIBLE, so SelectChain's empty-eligible branch hands back the default
 // slot.
 //
@@ -1737,5 +1737,115 @@ func TestQUICChainSelection_TLSConfigPrefersIndexedChainOverTLSDefaultSlot(t *te
 	// says WHICH slot supplied the config rather than only that it was wrong.
 	if got == dflt.tlsCfg {
 		t.Errorf("default slot pre-empted: quicTLSConfig() = %p = default_filter_chain.tlsCfg — the default slot was consulted BEFORE the Start-time chain selection, which is the pre-Task-11 resolution order this arm exists to exclude", got)
+	}
+}
+
+// TestQUICChainSelection_TwoWildcardsLongestMatchedSuffixWins is the phase-99
+// QUIC wiring arm (SPEC §5.3).
+//
+// SHAPE: one QUIC listener with two QUIC-TLS filter_chains and NO default slot:
+// LONG carries server_names ["*.b.foo.test"] (body "LONG\n", stat_prefix
+// quic_fc0) and SHORT carries ["*.foo.test"] (body "SHORT\n", quic_fc1). Both
+// share one bitmask (server_names only), so SNI a.b.foo.test makes BOTH
+// eligible and the pair reaches breakTie slot 2 on the PER-CONNECTION path
+// (selectQUICChain(conn), SNI taken from the real ClientHello).
+//
+// PROPERTY: the longest matching suffix wins, in EITHER declaration order —
+// a.b.foo.test is served by LONG. The matched negative x.foo.test matches only
+// SHORT and must be served by SHORT, proving SHORT is live and LONG is not a
+// constant answer.
+//
+// 🔴 EXPECTED RED AT THE UN-FIXED TIP: both chains rank 1 on the whole-set
+// scan, breakTie returns nil, SelectChain returns ErrAmbiguousChainMatch,
+// selectQUICChain returns nil and serveQUICConnection closes the connection,
+// so the a.b.foo.test request fails instead of returning a body. The matched
+// negatives are green at the tip by construction (one chain eligible).
+//
+// ⚠️ This cannot be a nil-conn arm: SNI exists only on a real ClientHello
+// (see arm (h) above), so the manager is Started and real H3 traffic driven.
+// The Start-time selection sees no SNI, so neither chain is eligible there and
+// quicTLSConfig falls back to the first TLS-bearing chain; both chains carry
+// the same certificate, so that fallback cannot change which chain SERVES.
+func TestQUICChainSelection_TwoWildcardsLongestMatchedSuffixWins(t *testing.T) {
+	const sniDeep, sniShallow = "a.b.foo.test", "x.foo.test"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// PRECONDITION: the client shape transmits the deep name.
+	assertH3ClientTransmitsSNI(t, ctx, sniDeep)
+
+	for _, order := range []struct {
+		name      string
+		longFirst bool
+	}{
+		{"LONG_declared_first", true},
+		{"SHORT_declared_first", false},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			long := &listenerv3.FilterChainMatch{ServerNames: []string{"*.b.foo.test"}}
+			l := mkQUICListenerChains(t, long, "LONG\n", false, false, "")
+			short := &listenerv3.FilterChain{
+				FilterChainMatch: &listenerv3.FilterChainMatch{ServerNames: []string{"*.foo.test"}},
+				TransportSocket:  mkQUICDownstreamTS(t, testAlphaCertPEM, testAlphaKeyPEM, []string{"h3"}),
+				Filters:          []*listenerv3.Filter{mkHCMFilterQUICChain(t, "quic_fc1", "SHORT\n")},
+			}
+			if order.longFirst {
+				l.FilterChains = append(l.FilterChains, short)
+			} else {
+				l.FilterChains = []*listenerv3.FilterChain{short, l.FilterChains[0]}
+			}
+
+			cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+			reg := stats.NewRegistry()
+			mgr, err := NewManager(mkBoot(0, []*listenerv3.Listener{l}, nil), cm, reg, testHTTPRegistry())
+			if err != nil {
+				t.Fatalf("precondition: NewManager(quic, LONG [*.b.foo.test] + SHORT [*.foo.test], %s): %v", order.name, err)
+			}
+			if err := mgr.Start(ctx); err != nil {
+				t.Fatalf("precondition: Start: %v", err)
+			}
+			defer mgr.Stop()
+			// BEFORE THE FIRST BYTE.
+			assertQUICAcceptCounterPointers(t, mgr.runtimes[0])
+			infos := mgr.Listeners()
+			if len(infos) != 1 {
+				t.Fatalf("precondition: Listeners() = %d, want 1", len(infos))
+			}
+			addr := infos[0].Addr
+
+			// get performs one H3 GET with the given SNI. Unlike h3GetChainBody a
+			// transport failure is NOT a precondition here: a closed connection is
+			// exactly the tip's defect, so it is returned and scored per property.
+			get := func(sni string) (string, error) {
+				rctx, rcancel := context.WithTimeout(ctx, 10*time.Second)
+				defer rcancel()
+				tr := &http3.Transport{TLSClientConfig: mkH3ClientTLS(sni), QUICConfig: &quic.Config{}}
+				defer func() { _ = tr.Close() }()
+				req, err := http.NewRequestWithContext(rctx, http.MethodGet, "https://"+addr+"/health", nil)
+				if err != nil {
+					return "", err
+				}
+				resp, err := (&http.Client{Transport: tr}).Do(req)
+				if err != nil {
+					return "", err
+				}
+				defer func() { _ = resp.Body.Close() }()
+				b, err := io.ReadAll(resp.Body)
+				return string(b), err
+			}
+
+			// PROPERTY 1 — precedence: both chains match a.b.foo.test; the
+			// longer matched suffix (*.b.foo.test) must serve.
+			if body, err := get(sniDeep); err != nil || body != "LONG\n" {
+				t.Errorf("%s: SNI %q matches both *.b.foo.test and *.foo.test: got body %q err %v, want %q — the longest matching suffix must win, not close the connection as ambiguous", order.name, sniDeep, body, err, "LONG\n")
+			}
+
+			// PROPERTY 2 — matched negative: only *.foo.test matches
+			// x.foo.test, so SHORT must serve (SHORT is live).
+			if body, err := get(sniShallow); err != nil || body != "SHORT\n" {
+				t.Errorf("%s: SNI %q matches only *.foo.test: got body %q err %v, want %q", order.name, sniShallow, body, err, "SHORT\n")
+			}
+		})
 	}
 }

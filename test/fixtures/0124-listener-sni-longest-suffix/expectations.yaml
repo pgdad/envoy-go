@@ -1,0 +1,46 @@
+# Phase 99 fixture 0124-listener-sni-longest-suffix expectations (ADR-0019 —
+# prose; no code path reads this file. The enforcers are driver/driver.go's
+# per-side AssertStats, the runner's cross-side CompareBytes and the admin
+# probe).
+#
+# ## Topology — FOUR TLS listeners, each `listener_filters: [tls_inspector]`
+#
+#   listener       ref port  chains (declared order)                     server_names
+#   l_long_first   15124     fc_lf_long, fc_lf_short                     [*.b.foo.test], [*.foo.test]
+#   l_short_first  15225     fc_sf_short, fc_sf_long                     [*.foo.test], [*.b.foo.test]
+#   l_mixed        15226     fc_mx_x, fc_mx_y                            [x.test, *.foo.test], [*.b.foo.test]
+#   l_default      15227     fc_df_long, fc_df_short + default fc_df_default
+#
+#   Subject ports: subjListenerPort + 0..3 (0123 derivation). One shared leaf
+#   (pki/), inline_string: on both sides. c_unused: never-dialed STATIC
+#   placeholder cluster (runner needs BackendCount >= 1; envoy-go boot-rejects
+#   an absent clusters key).
+#
+# ## Workload — ONE fresh TLS connection + GET / per row, explicit ServerName
+#
+# ## Asserted, BOTH sides, ABSOLUTELY (status 200 + body):
+#
+#   l_long_first   a.b.foo.test    -> "l_long_first/LONG\n"      RED at tip (subject CLOSES)
+#   l_long_first   x.foo.test      -> "l_long_first/SHORT\n"     single-candidate (green at tip)
+#   l_short_first  a.b.foo.test    -> "l_short_first/LONG\n"     RED at tip (subject CLOSES)
+#   l_short_first  x.foo.test      -> "l_short_first/SHORT\n"    single-candidate
+#   l_mixed        a.b.foo.test    -> "l_mixed/Y\n"              RED at tip AND under P1 (subject serves X)
+#   l_mixed        q.foo.test      -> "l_mixed/X\n"              single-candidate
+#   l_mixed        x.test          -> "l_mixed/X\n"              single-candidate
+#   l_default      a.b.foo.test    -> "l_default/LONG\n"         RED at tip (subject CLOSES)
+#   l_default      nomatch.example -> "l_default/DEFAULT\n"      default chain; NOT a no-match close
+#
+# ## Asserted counters (VALUE, presence-guarded), re-projected from
+# ## envoy_http_downstream_rq_total{envoy_http_conn_manager_prefix="<p>"}:
+#
+#   http.lf_long.downstream_rq_total    1    http.lf_short.downstream_rq_total   1
+#   http.sf_short.downstream_rq_total   1    http.sf_long.downstream_rq_total    1
+#   http.mx_x.downstream_rq_total       2    http.mx_y.downstream_rq_total       1
+#   http.df_long.downstream_rq_total    1    http.df_short.downstream_rq_total   0
+#   http.df_default.downstream_rq_total 1
+#
+# ## NOT asserted
+#
+#   no_filter_chain_match (envoy-go emits no such name), downstream_cx_total
+#   cross-side, which certificate was served, mixed-case SNI, QUIC (carried by
+#   the unit arm; the harness cannot mix TCP + UDP listeners).

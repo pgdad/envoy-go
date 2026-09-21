@@ -22,10 +22,10 @@ type ChainSpec struct {
 	// requires conn.LocalAddr().IP to fall in at least one CIDR.
 	PrefixRanges []*net.IPNet
 	// ServerNames: empty means unspecified; non-empty means SNI must match
-	// at least one entry per chainSpecificityRank semantics (exact > suffix
-	// > universal > catch-all). Re-uses the existing
-	// internal/listener/manager.go:chainSpecificityRank logic at the
-	// tie-breaker level.
+	// at least one entry (exact name, "*." suffix wildcard, or "*"). When
+	// chains tie, breakTie ranks the pattern that MATCHED the SNI, not the
+	// chain's whole set: an exact name beats any wildcard, then the longest
+	// matching suffix wins (sniMatchedRank; ADR-0321).
 	ServerNames []string
 	// TransportProtocol: "" means unspecified; any non-empty string requires
 	// the connection's detected transport protocol to equal it exactly, set by
@@ -51,11 +51,11 @@ type ChainSpec struct {
 // eligible AND defaultChain is nil.
 var ErrNoChainMatched = errors.New("no filter_chain matches connection")
 
-// ErrAmbiguousChainMatch is returned by SelectChain when two chains have
-// identical specificity vectors AND identical sub-ordering values for the
-// highest-priority specific dimension. The listener manager detects this at
-// NewManager-build time (it pre-runs SelectChain on a sample input or
-// duplicate-matches the chain specs structurally) and rejects the bootstrap.
+// ErrAmbiguousChainMatch is returned by SelectChain, per connection, when two
+// eligible chains have identical specificity vectors and breakTie cannot
+// separate them on that connection's inputs; the connection is then closed.
+// Only structurally identical chain specs are caught at NewManager build time
+// (findIdenticalChainSpecs), which rejects the bootstrap.
 var ErrAmbiguousChainMatch = errors.New("ambiguous filter_chain selection")
 
 // priorityOrder is the 8-dimension specificity priority vector per SPEC
@@ -184,8 +184,8 @@ func specificityScore(c *ChainSpec) uint8 {
 
 // breakTie compares a vs b on the per-dimension finer-grain criteria when
 // their specificity vectors are identical. Returns the winner; returns nil
-// if a and b are entirely indistinguishable (a NewManager-time config error
-// the listener manager surfaces as ErrAmbiguousChainMatch).
+// if a and b are indistinguishable on these inputs: a per-connection outcome
+// SelectChain surfaces as ErrAmbiguousChainMatch, not a build-time error.
 //
 // Cascade order follows SPEC §5.5 line 519 ("walk down the priority list
 // with finer-grain tie-breakers") and §7.3 line 524 ("more-specific value
@@ -194,10 +194,10 @@ func specificityScore(c *ChainSpec) uint8 {
 // each only if both chains specify it (otherwise the specificityScore would
 // already have decided the winner). Only dimensions with a meaningful
 // finer-grain sub-ordering are listed: PrefixRanges (slot 1, longest CIDR),
-// ServerNames (slot 2, SNI rank), SourcePrefixRanges (slot 6, longest CIDR).
-// Dimensions that are exact-value match (DestinationPort, TransportProtocol,
-// ApplicationProtocols, SourceType, SourcePorts) have no sub-ordering and
-// are skipped.
+// ServerNames (slot 2, rank of the MATCHED pattern, then longest matching
+// suffix), SourcePrefixRanges (slot 6, longest CIDR). Dimensions that are
+// exact-value match (DestinationPort, TransportProtocol, ApplicationProtocols,
+// SourceType, SourcePorts) have no sub-ordering and are skipped.
 func breakTie(a, b *ChainSpec, inputs *ChainMatchInputs) *ChainSpec {
 	// Slot 1 — PrefixRanges: longer prefix wins (smaller IPNet).
 	if len(a.PrefixRanges) > 0 && len(b.PrefixRanges) > 0 {
@@ -210,14 +210,20 @@ func breakTie(a, b *ChainSpec, inputs *ChainMatchInputs) *ChainSpec {
 			return b
 		}
 	}
-	// Slot 2 — ServerNames: SNI specificity (exact > suffix > universal > catch-all).
+	// Slot 2 — ServerNames: rank of the MATCHED pattern, then longest matching suffix.
 	if len(a.ServerNames) > 0 && len(b.ServerNames) > 0 {
-		ra := sniSpecificityRank(a.ServerNames)
-		rb := sniSpecificityRank(b.ServerNames)
+		ra, la := sniMatchedRank(a.ServerNames, inputs.ServerName)
+		rb, lb := sniMatchedRank(b.ServerNames, inputs.ServerName)
 		if ra < rb {
 			return a
 		} // lower rank = more specific
 		if rb < ra {
+			return b
+		}
+		if la > lb { // same rank: longer matched suffix wins
+			return a
+		}
+		if lb > la {
 			return b
 		}
 	}
@@ -301,34 +307,31 @@ func alpnMatchAny(want, offered []string) bool {
 	return false
 }
 
-// sniSpecificityRank mirrors internal/listener/manager.go:chainSpecificityRank
-// (preserved from phase 03 per ADR-0033 clause 9 → ADR-0078). Lower rank =
-// more specific. Used as the SNI sub-ordering tie-breaker WITHIN the
-// server_names priority slot per SPEC §5.5.
+// sniMatchedRank ranks the pattern of patterns that MATCHES sni (not the
+// chain's whole pattern set). Lower rank = more specific:
 //
-//	0: any non-wildcard pattern
-//	1: any suffix-wildcard ("*.foo.test")
-//	2: universal-wildcard ("*")
-//	3: catch-all (empty patterns slice — unused here since
-//	   matches() rejects this case before breakTie sees it)
-func sniSpecificityRank(patterns []string) int {
-	if len(patterns) == 0 {
-		return 3
-	}
-	rank := 4
+//	0: an exact pattern equal to sni (suffix length 0)
+//	1: a "*." suffix wildcard matching sni; the second result is the length
+//	   of the LONGEST matching suffix (len of pattern minus "*"), so a
+//	   longer suffix is more specific
+//	2: the universal wildcard "*"
+//	3: nothing matched (unreachable: matches() rejects it before breakTie)
+func sniMatchedRank(patterns []string, sni string) (int, int) {
+	rank, suffix := 3, 0
 	for _, p := range patterns {
 		switch {
+		case p == sni:
+			return 0, 0
 		case p == "*":
-			if 2 < rank {
+			if rank > 2 {
 				rank = 2
 			}
-		case strings.HasPrefix(p, "*."):
-			if 1 < rank {
-				rank = 1
+		case strings.HasPrefix(p, "*.") && strings.HasSuffix(sni, p[1:]):
+			rank = 1
+			if n := len(p) - 1; n > suffix {
+				suffix = n
 			}
-		default:
-			return 0
 		}
 	}
-	return rank
+	return rank, suffix
 }
