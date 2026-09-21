@@ -39,7 +39,7 @@ done
 ```
 If ANY check prints output, the sentinel does NOT fire: proceed with the stage below and do NOT create `stop`.
 
-⚠️⚠️ **CHECK (2)'s SIX IS THE ONLY STRUCTURAL BARRIER, AND RIGHT NOW IT IS THE ONLY NON-SILENT CHECK AT ALL** — with row 98 `done`, checks (1) and (3) are both SILENT, so **two of the three sentinel checks are currently indistinguishable from broken ones.** That is not a reason to relax: it is precisely why the NCs are mandatory. **RUN ALL FOUR NCs EVERY SESSION:**
+⚠️⚠️ **CHECK (2)'s SIX IS THE ONLY STRUCTURAL BARRIER.** At this tip check (1) reads ONE line (`NOT DONE: row 99`) and check (3) is SILENT; **after YOUR IMPL flips row 99, check (1) goes SILENT too, and two of the three sentinel checks become indistinguishable from broken ones.** That is not a reason to relax: it is precisely why the NCs are mandatory. **RUN ALL FOUR NCs EVERY SESSION:**
 ```sh
 # NC-A — doctor a row to `in-progress`. ⚠️ READS *TWO* LINES at this tip
 #        (`NOT DONE: row 62`, `NOT DONE: row 99`). MEASURED on BOTH sides of the
