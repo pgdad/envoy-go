@@ -51,6 +51,15 @@ These apply implicitly to every task.
   selector that matches nothing prints `[no tests to run]` and EXITS 0.
 - **Lint:** `GOTOOLCHAIN=go1.26.2 golangci-lint run ./...`. **misspell runs in US locale**, so no British
   spellings go into `.go` comments. Check `gofmt -l` by its OUTPUT; it never exits non-zero.
+- **The appendices live in THIS file as fenced blocks — EXTRACT them, never re-derive them.** The SPEC-era
+  scratch patches are gone; these are the artifacts that were built and run. Extract one by its heading:
+  ```bash
+  ext () { awk -v want="$1" '$0 ~ "^## Appendix " want " —" {f=1; next} f && /^```/ {c++; if (c==1) {o=1; next} if (c==2) exit} o' "$2"; }
+  ext A docs/envoy-go/phases/100-listener-filters-timeout-enforce/PLAN.md > $S/patch-PB1.diff
+  ```
+  **Verified at the PLAN close:** Appendix A applies to `master` with `git apply --check`, B applies on A,
+  and H.1 applies on A+B; C.1 extracts to 338 lines and F.1 to 727. **Always `git apply --check` first**, and
+  for a `.go` appendix compare `wc -l` against §1.2's figure before trusting the extraction.
 - **Cost figures come from `git diff --numstat`, never `--stat`.**
 - **Build with `-o <scratch>`.** A bare `go build ./cmd/envoy-go/` drops a binary in the worktree.
 - **Ports:** the ephemeral range is `32768-60999`. The harness reserves `20000..31007` and `11000..14999`.
@@ -665,8 +674,8 @@ current. If the session stops mid-spine, say which task it reached and leave row
   - an `Inc` on `errors.Is(err, context.DeadlineExceeded)` in `serveConnection` step (4);
   - `parseListenerFiltersTimeout`: nil → 15000, explicit zero → 0.
 
-- [ ] **Step 1: Apply Appendix A** (`git -C $W apply <scratch>/patch-PB1.diff`, or hand-edit at anchors
-  A1-A5). `git -C $W diff --numstat` ⇒ `15 0 pipeline.go`, `14 6 manager.go`.
+- [ ] **Step 1: Extract and apply Appendix A** (`ext A <this file> > $S/patch-PB1.diff`, then
+  `git -C $W apply --check` and `git -C $W apply`; or hand-edit at anchors A1-A5). `git -C $W diff --numstat` ⇒ `15 0 pipeline.go`, `14 6 manager.go`.
 - [ ] **Step 2: Run the layout gate** (§6, `layout-gate.sh $W master`). Expected: sub-gates **a, b, c, e PASS**.
   Sub-gate **d FAILS** here BY DESIGN, because `tls_inspector.go` is not edited until Task 11. Record that
   exact shape.
@@ -726,7 +735,8 @@ current. If the session stops mid-spine, say which task it reached and leave row
 - Modify: `internal/listener/manager.go` (Appendix B, `11 10`, five sites: field doc `:166-167`, metric-block
   doc `:179-184` and registration doc `:376` (§0.9), parse doc `:948-950`, step (4) doc `:1295-1297`)
 
-- [ ] **Step 1: Apply Appendix B** (`git -C $W apply <scratch>/patch-COMMENTS.diff`). The added-line counts
+- [ ] **Step 1: Extract and apply Appendix B** (`ext B <this file> > $S/patch-COMMENTS.diff`, then
+  `git -C $W apply --check` and `git -C $W apply`; it applies on top of Appendix A). The added-line counts
   in `git -C $W diff --numstat HEAD` must be `2 2`, `3 3` and `11 10`.
 - [ ] **Step 2: Gate the KIND.** Every changed line in the Task-11 diff must be a comment:
   `git -C $W diff -U0 HEAD | /usr/bin/grep -E '^[+-]' | /usr/bin/grep -vE '^(\+\+\+|---) ' | sed -E 's/^[+-][[:space:]]*//' | /usr/bin/grep -vc '^//'`
@@ -747,8 +757,8 @@ current. If the session stops mid-spine, say which task it reached and leave row
 - Modify: `PROGRESS.md` only. **Every mutant is applied in a THROWAWAY worktree and removed.**
 
 **Interfaces:**
-- Consumes: Appendix H's eight patches, each **relative to PB1** (they apply with an offset on the final
-  tree; `patch -p1` reports the offset).
+- Consumes: Appendix H's eight patches (`ext H.1` … `ext H.8`), each **relative to PB1** (they apply with an
+  offset on the final tree; `patch -p1` reports the offset). H.1 was verified to apply on A+B at the PLAN close.
 
 - [ ] **Step 1: Create a throwaway detached worktree** at the Task 11 commit. Copy in the Task 4 OLD-U2 file
   (`zz_u2old_test.go`).
