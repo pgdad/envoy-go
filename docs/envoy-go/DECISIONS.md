@@ -19488,7 +19488,7 @@ consumer and is its own decision. A move to linter v2 stays a separate re-baseli
 
 ## ADR-0322 — `listener_filters_timeout` is ENFORCED by one clock inside `Pipeline.Run`, an explicit `0s` DISABLES it, and every timeout books `downstream_pre_cx_timeout` (phase 100)
 
-> **STATUS: PROPOSED — §Context drafted at the phase-100 SPEC; §Decision + §Consequences are APPENDED IN PLACE at the phase-100 IMPL, after the RETAINED italic footer below, with no renumber and no `---` separator (the ADR-0294-0321 shared block form).** ⚠️ **THIS BLOCK RE-ARMS THE HOUSE `PROPOSED` GUARD, AND NO COUNT OF EITHER MATCHER IS WRITTEN ANYWHERE IN IT, DELIBERATELY** — this line is itself a hit of the strict form, so any figure it named would be falsified by its own landing. **Verify by LINE and by ADR** (backward `^## ADR-` heading search), **never by the count alone**, and never conflate the strict house form with the unrelated **ADR-0231 decoy** at `DECISIONS.md:14866`, which is **BYTE-UNTOUCHED** by this row. **ROW 100 STAYS `in-progress` THROUGH THIS SPEC**; `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` are byte-untouched at this stage, a scope MEASURED across two prior SPEC commits. This is a **Listener / listener-filter MAINTENANCE row claiming NO family ordinal**. It **SUPERSEDES** ADR-0082 §Decision ¶1's *"honored"* and *"(zero-valued duration)"* clauses, ¶2 as a statement of behaviour, ¶3's *"enforced"*, and §Consequences (b)'s restriction of `0` to test scaffolding; it **LEAVES** ADR-0082's `[1s, 60s]` envelope (¶1, §Consequences (a) and (c)) to the next row and **KEEPS** its per-pipeline shared budget; it **NOTES** ADR-0296, whose `pipeline.go:43` claim stays true, and ADR-0320, whose *"NOT ENFORCED"* record becomes history.
+> **STATUS: ACCEPTED — §Context drafted at the phase-100 SPEC; §Decision + §Consequences APPENDED IN PLACE at the phase-100 IMPL, after the RETAINED italic footer, with no renumber and no `---` separator (the ADR-0294-0321 shared block form).** ⚠️ **THE HOUSE `PROPOSED` GUARD WAS RE-ARMED BY THIS BLOCK AT THE SPEC AND IS DISARMED BY THIS FLIP — AND NO COUNT OF EITHER MATCHER IS WRITTEN ANYWHERE IN IT, DELIBERATELY**: while it read PROPOSED this line was itself a hit of the strict form, so any figure it named would have been falsified by its own landing. **Verify by LINE and by ADR** (backward `^## ADR-` heading search), **never by the count alone**, and never conflate the strict house form with the unrelated **ADR-0231 decoy** at `DECISIONS.md:14866`, which is **BYTE-UNTOUCHED** by this row. **ROW 100 STAYS `in-progress` THROUGH THIS SPEC**; `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` are byte-untouched at this stage, a scope MEASURED across two prior SPEC commits. This is a **Listener / listener-filter MAINTENANCE row claiming NO family ordinal**. It **SUPERSEDES** ADR-0082 §Decision ¶1's *"honored"* and *"(zero-valued duration)"* clauses, ¶2 as a statement of behaviour, ¶3's *"enforced"*, and §Consequences (b)'s restriction of `0` to test scaffolding; it **LEAVES** ADR-0082's `[1s, 60s]` envelope (¶1, §Consequences (a) and (c)) to the next row and **KEEPS** its per-pipeline shared budget; it **NOTES** ADR-0296, whose `pipeline.go:43` claim stays true, and ADR-0320, whose *"NOT ENFORCED"* record becomes history.
 
 ### Context (drafted at the phase-100 SPEC)
 
@@ -19507,3 +19507,138 @@ consumer and is its own decision. A move to linter v2 stays a separate re-baseli
 **§Context ¶7 — WHAT THIS ADR DOES NOT DECIDE.** It does not lift the `[1s, 60s]` envelope (the reference validates and enforces `0.5s`, `61s`, `120s`); that is the next row, and it must follow this one. It does not move `downstream_cx_total` post-filter. It does not close a silent connection under `true`. It does not pin or change the close kind, the partial-byte `400`, or add the reference's `downstream_listener_filter_remote_close` / `downstream_listener_filter_error` names. It does not decide whether `continue_on_listener_filters_timeout` should gate non-timeout errors: none is constructible from a filter today (`tls_inspector` never errors), and the one that becomes constructible — a shutdown cancel of the manager context during inspection, returning `context.Canceled` — books no timeout and is recorded, not decided. It touches no QUIC path. It adds exactly one stat name and quotes no absolute stat-surface figure.
 
 *§Decision and §Consequences follow at the phase-100 IMPL.*
+
+### Decision (landed at the phase-100 IMPL)
+
+**`listener_filters_timeout` is enforced by ONE clock, the pipeline's own context, inside
+`Pipeline.Run`; every timeout books `listener.<addr>.downstream_pre_cx_timeout`; and an explicit `0s`
+DISABLES the timeout while an absent field keeps the 15 s default.** This is the pinned reference's
+measured behaviour (§Context ¶2), built as the shape §Context ¶4 chose (PB1). The behaviour change lives in
+two production files, `internal/listener/listenerfilter/pipeline.go` and `internal/listener/manager.go`,
+plus the help-text pair in `internal/stats`. A third production file,
+`internal/listener/listenerfilter/tls_inspector/tls_inspector.go`, is edited COMMENT-ONLY (`3 / 3` by
+`git diff --numstat` against the pre-row tip, no non-comment line): its `Inspect` comment said the socket
+read has no deadline, which PB1 falsifies. It belongs to a comment-only reconciliation that also rewrites
+the comments PB1 falsified inside `pipeline.go` and `manager.go`. The IMPL's layout gate checks
+`tls_inspector.go` for kind (every changed line a comment) and shape (`3 3`), and keeps `pipeline.go`'s
+cited lines in place; `manager.go`'s comment edits carry no layout gate, because its line citations were
+already drifted before this row.
+
+**1 — PB1 as built.** Inside `Run`'s existing `if timeoutMs > 0 {` block, directly after `defer cancel()`,
+a peeker that can take a read deadline gets a `context.AfterFunc` on the pipeline's context. When the
+context is done (at the deadline, or on a parent cancel), the callback sets the socket read deadline into
+the past, so a blocked `Peek` returns and the existing post-`Inspect` `ctx.Err()` check fires. A socket
+read is interrupted only AFTER the context is done, so an interrupted peek is always reported as the
+context's error. A deferred function stops the callback, or waits for it to finish if it already started,
+and then clears the deadline before `Run` returns. No deadline reaches chain selection, the TLS handshake
+or the handed-off connection. A peeker without `SetReadDeadline` keeps its previous behaviour. Nothing is
+inserted above `defer cancel()`, so **`pipeline.go:43`, the one `context.WithTimeout` line, is UNMOVED**,
+and `:33-37` (the `OnDestroy` defer) is unmoved too. This was checked by the IMPL's layout gate.
+`serveConnection` adds no second clock and rebinds no `ctx`.
+
+**2 — The counter.** `listenerRuntime` gains `downstreamPreCxTimeout`, registered by
+`registerListenerMetrics` **unconditionally** for every listener, beside the two cx metrics, at Start and
+before Freeze. A listener with no listener filters therefore carries the name at value 0, as the
+reference's does. In `serveConnection` step (4), when `Pipeline.Run` returns an error that
+`errors.Is(err, context.DeadlineExceeded)`, the counter is `Inc`'d once, BEFORE the
+`continue_on_listener_filters_timeout` branch, so it books under **both** values. `false` then logs and
+closes, and `true` falls through to chain selection (stamped `raw_buffer` by the ADR-0320 entry stamp).
+Both happen AT the deadline. A `context.Canceled` (a manager shutdown during inspection) does not book.
+The help-text key `envoy_listener_downstream_pre_cx_timeout` and its roster entry land as one pair, because
+`TestHelpText_KeySetExact` and `TestHelpText_NoSelfEqualHelp` redden when either half is added alone.
+
+**3 — The `0s` split.** `parseListenerFiltersTimeout` now separates absent from zero. A nil duration
+returns the 15 s default, and an explicit zero (seconds 0, nanos 0) returns `0`, which `Run` treats as
+"no deadline". The envelope check below both returns is unchanged. Without this split, enforcement would
+drop a `0s` listener's silent client at 15 s and so create a divergence (§Context ¶5).
+
+**4 — SUPERSESSIONS of ADR-0082.** ADR-0082 is not edited. It is superseded in part, here:
+- §Decision ¶1's *"honored"* was never true of enforcement, and is replaced by this ADR. ¶1's
+  *"(zero-valued duration)"* is replaced too: only an ABSENT field means 15 s, and an explicit zero
+  disables the timeout.
+- §Decision ¶2, read as a statement of behaviour, is replaced. Both `continue…` branches now act at the
+  deadline, not at the client's next act.
+- §Decision ¶3's *"enforced"* is now true, and true for every `Pipeline.Run` caller, not only
+  `serveConnection`.
+- §Consequences (b), which limited `0` to test scaffolding, is replaced. `0` is now a production value,
+  reached from an explicit `0s`.
+
+ADR-0082 **KEEPS** the per-pipeline shared budget (¶3: one `context.WithTimeout` shared by all filters'
+`Inspect` calls). It also keeps the `[1s, 60s]` envelope (¶1, §Consequences (a) and (c)), which is
+envoy-go's OWN. The reference accepts `0.5s` and `61s`. Lifting the envelope is the next row.
+
+**5 — ADR-0296 and ADR-0320.** ADR-0296's citation of `pipeline.go:43` stays true, because the layout gate
+kept that line where it was. ADR-0320's *"NOT ENFORCED"* record is now history. It was accurate for its
+phase, and it is not edited.
+
+This ADR supersedes nothing else.
+
+### Consequences (landed at the phase-100 IMPL)
+
+**(a) THE DECLARED BEHAVIOUR CHANGES** (`SPEC.md` §4.3, with the shutdown row corrected by the PLAN's
+§0.8):
+- **Filters, `false`, a silent client (or one sending partial bytes)**: before, it was held until the
+  client acted. Now it is **closed at the deadline**, and `pre_cx` goes up by 1. This is parity.
+- **Filters, `true`, a client that is silent and then sends**: it now falls through AT the deadline and is
+  served when it sends, with `pre_cx` +1. This is parity.
+- **Filters, `true`, a client that stays silent**: it is still held, but it has fallen through at the
+  deadline. The reference also holds it (for 90 s or more).
+- **An explicit `0s`, with a client that sends at 16 s**: before, it read EOF (a lazy 15 s abort). Now it
+  is **served**. This changes closed to served on a config that validates and boots on both sides, and it
+  is the parity direction.
+- **An explicit `0s`, with a manager `ctx` cancelled during inspection (shutdown)**: PB1's
+  `context.AfterFunc` is armed only inside `if timeoutMs > 0`, so a `0s` listener never arms it. A shutdown
+  cancel of the manager context therefore does not interrupt the peek, and the `serveConnection` goroutine
+  is held until the silent client acts on its own or the process exits; `acceptLoop` does not track it.
+  This IS what "`0s` disables" means, and it matches the absent-timeout side only in the sense that nothing
+  times the peek out — no reference shutdown measurement was taken for this row. This line is derived from
+  the mechanism (§Context ¶3-4, Decision 1), not measured.
+- **An absent field, `false`, a silent client**: now closed at 15 s.
+- **A manager `ctx` cancelled during inspection**: this **ends at the cancel and books nothing**. Under
+  `continue…: true` a client measured at a 300 ms cancel read EOF at 300 ms and was never served (4/4). No
+  log line distinguishes a fall-through followed by an aborted chain dispatch from a plain close, so this
+  row does NOT claim a fall-through. Only the counter half is pinned (it does not move, U5), and the
+  `errors.Is`-widening mutant NC7 reddens that pin. This row is derived from the mechanism and was not
+  measured on the reference.
+- **No listener filters**: unchanged. `Run` returns at `len(filters) == 0`, and nothing is timed out.
+
+**(b) THE EVIDENCE.** At the un-fixed tip, six unit tests were RED and differential fixture
+`0125-listener-filters-timeout` was RED on F1, F2, S and CompareBytes, with the reference green. After PB1
+the listener and stats unit suites read 470 `=== RUN` and 0 FAIL, `-race` is clean over
+`./internal/listener/...`, and `0125` PASSED on each of three solo runs. The reference's 50 concurrent
+silent drops, observed through the harness's host `-p` path, closed at 1000-1004 ms in the PLAN's runs.
+One IMPL run reached 1030 ms, still well inside the fixture's `[700, 1800]` window. The close KIND is
+pinned nowhere.
+
+**(c) QUIC LISTENERS CARRY THE NAME, AND THE REFERENCE WAS NOT MEASURED THERE.** `quic.go` calls
+`registerListenerMetrics` too, so a QUIC listener registers `downstream_pre_cx_timeout` at value 0 forever.
+QUIC runs no listener-filter pipeline. Whether the reference registers the name on a QUIC listener was
+**NOT measured**. That gap is banked, not pinned. It must be measured before any pin in either direction.
+
+**(d) THE NEGATIVE-CONTROL ROSTER.** PB1's negative-control set is the PLAN's §7 roster (NC1-NC8). The
+per-mutant results are recorded in the phase's `PROGRESS.md`. Two rows are structural, not accidental.
+**NC5** skips the `<-fired` wait. It opens only a narrow race with no deterministic path to a failure, so
+it is **declared BLIND**: at the PLAN the full suite stayed green under it five times, with `-race` clean.
+**NC6** deletes the abort branch's `pkConn.Close()`. It shows why the OLD U2 was vacuous: that test
+stayed GREEN under NC6 because its read returned at 3.00 s on the client's own deadline. The NEW U2 is
+RED under NC6, which is why U2 was replaced.
+
+**(e) +1 STAT NAME.** `listener.<addr>.downstream_pre_cx_timeout` is the only name added. Nothing is
+renamed or retired. `BEHAVIOR_CONTRACT.md` carries a **delta-only** `+1` ledger entry for phase 100 and
+quotes no absolute stat-surface figure (`SPEC.md` §9).
+
+**(f) WHAT THIS ROW DOES NOT BUY.** Each item below is out of scope and stays banked (`SPEC.md` §1,
+§14.3):
+- the close KIND under `false`: the reference sends RST when a peeked byte is unread, and envoy-go sends
+  FIN, which the harness cannot see through docker-proxy;
+- the HTTP/1 codec's wait for a line terminator before rejecting an invalid method byte (an HCM row);
+- the reference's `downstream_listener_filter_remote_close` and `downstream_listener_filter_error` names;
+- `downstream_cx_total` moving to post-filter accounting;
+- closing a silent connection under `true` (the reference parks it);
+- any QUIC path (see (c));
+- whether `continue_on_listener_filters_timeout` should gate non-timeout errors. This is recorded, not
+  decided (`SPEC.md` §10). It waits for a second listener filter that can error on its own.
+
+**(g) THE ENVELOPE LIFT IS THE NEXT ROW, AND IT IS NOW UNBLOCKED.** The reference validates and enforces
+`0.5s`, `61s` and `120s`, and envoy-go still rejects them at parse time. Before this row, lifting the
+envelope would have widened a knob that was never enforced. With enforcement landed, the lift can follow.

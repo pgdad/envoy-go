@@ -183,7 +183,8 @@ fixtures first. Grouped by area; see git history of this file for details.
   large clusters; ring/maglev gauges lost when the LB is wrapped
   (locality/priority wraps).
 - **listener**: `listener_filters_timeout` never enforced (silent client
-  hangs a goroutine+fd forever); `continue_on_listener_filters_timeout`
+  hangs a goroutine+fd forever) [FIXED at phase 100, ADR-0322 — this
+  timeout clause only]; `continue_on_listener_filters_timeout`
   wrongly gates non-timeout errors; SNI chain match is case-sensitive
   (reference is case-insensitive).
 - **hcm/h2**: `closedStreams` map grows unboundedly on long-lived downstream

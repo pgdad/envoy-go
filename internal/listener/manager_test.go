@@ -4077,16 +4077,22 @@ func TestUnifiedDispatchListenerFilterTimeoutAbortsConnection(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 
 	// The listener should close the conn after the pipeline aborts (~1s).
-	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+	start := time.Now()
+	if err := conn.SetReadDeadline(start.Add(3 * time.Second)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}
 	buf := make([]byte, 1)
 	n, rerr := conn.Read(buf)
+	elapsed := time.Since(start)
 	if rerr == nil && n > 0 {
 		t.Errorf("expected conn closed by listener (timeout abort), got %d bytes %q", n, buf[:n])
 	}
-	// The exact error is platform-dependent (EOF, ECONNRESET, …); any non-nil
-	// err with n==0 is acceptable evidence the listener aborted.
+	// The SERVER must have closed (EOF or ECONNRESET, zero bytes) before 2s. A
+	// client-deadline expiry at 3s is NOT evidence of an abort: it is what a
+	// listener that never closes the connection looks like.
+	if n == 0 && !((errors.Is(rerr, io.EOF) || errors.Is(rerr, syscall.ECONNRESET)) && elapsed < 2*time.Second) {
+		t.Errorf("expected the SERVER to close the conn (EOF/ECONNRESET, 0 bytes) before 2s; got err=%v after %v", rerr, elapsed)
+	}
 }
 
 // TestUnifiedDispatchListenerFilterTimeoutContinue verifies that the Task-10

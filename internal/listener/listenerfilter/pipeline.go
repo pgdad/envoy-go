@@ -24,8 +24,8 @@ type Pipeline struct{}
 //   - On Continue: advances to the next filter (or finishes if last).
 //   - On StopIteration: halts the loop; remaining filters are skipped.
 //   - On non-nil error: aborts; the error is wrapped with the filter index.
-//   - On context-deadline-exceeded after a filter's Inspect returns: the
-//     pipeline returns a wrapped timeout error.
+//   - timeoutMs > 0, ctx done: a Peek blocked on a deadline-capable peeker is
+//     cut (the deadline is cleared before return); returns wrapped ctx.Err().
 //   - OnDestroy is called on every filter (in declaration order) after the
 //     loop ends, regardless of how the loop exited (Continue/StopIteration/
 //     error/timeout).
@@ -42,6 +42,21 @@ func (p *Pipeline) Run(ctx context.Context, filters []ListenerFilter, peeker Pee
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
 		defer cancel()
+		// ONE clock: the socket read is interrupted only AFTER ctx is done, so
+		// an interrupted Peek always observes ctx.Err() != nil below.
+		if ds, ok := peeker.(interface{ SetReadDeadline(time.Time) error }); ok {
+			fired := make(chan struct{})
+			stop := context.AfterFunc(ctx, func() {
+				_ = ds.SetReadDeadline(time.Unix(1, 0))
+				close(fired)
+			})
+			defer func() {
+				if !stop() {
+					<-fired
+				}
+				_ = ds.SetReadDeadline(time.Time{})
+			}()
+		}
 	}
 	for i, f := range filters {
 		status, err := f.Inspect(ctx, peeker, inputs)

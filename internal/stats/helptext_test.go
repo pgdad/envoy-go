@@ -40,6 +40,7 @@ type helpTextRosterEntry struct {
 //	sds.<secret>.*      internal/xds/stats.go RegisterSDSStats
 var helpTextRoster = []helpTextRosterEntry{
 	{internal: "listener.0_0_0_0_10000.downstream_cx_total"},
+	{internal: "listener.0_0_0_0_10000.downstream_pre_cx_timeout"},
 	{internal: "listener.0_0_0_0_10000.downstream_cx_active", gauge: true},
 	{internal: "listener.0_0_0_0_10000.ssl.connection_error"},
 	{internal: "listener.0_0_0_0_10000.ssl.handshake"},

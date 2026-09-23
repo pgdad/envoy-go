@@ -1,0 +1,30 @@
+# Phase 100 fixture 0125-listener-filters-timeout expectations (ADR-0019 —
+# prose; the enforcers are driver/driver.go's per-side AssertStats arms, the
+# runner's cross-side CompareBytes of the timing-free verdict stream, and the
+# runner's admin probe. Nothing reads this file.)
+#
+# Reference: envoyproxy/envoy by digest (docs/envoy-go/ENVOY_TARGET.md);
+# listeners 0.0.0.0:15125, :15228, :15229, :15230, :15231.
+# Subject: envoy-go, listeners 127.0.0.1:<subjListenerPort>+0..+4.
+
+window_ms: { lo: 700, hi: 1800 }   # from dial-return; measured 1000-1004 ref, 1000-1021 subj
+
+listeners:
+  l_false:    { timeout: 1s, continue: false, filters: [tls_inspector], fc_indexed: raw_buffer, pre_cx_timeout: 51 }
+  l_true:     { timeout: 1s, continue: true,  filters: [tls_inspector], fc_indexed: raw_buffer, pre_cx_timeout: 1 }
+  l_true_tls: { timeout: 1s, continue: true,  filters: [tls_inspector], fc_indexed: tls,        pre_cx_timeout: 1 }
+  l_zero:     { timeout: 0s, continue: false, filters: [tls_inspector], fc_indexed: raw_buffer, pre_cx_timeout: 0 }
+  l_nofilt:   { timeout: 1s, continue: false, filters: [],              fc_indexed: raw_buffer, pre_cx_timeout: 0 }
+
+arms:
+  F1: { listener: l_false,    client: silent hold 3s,               expect: closed in window, 0 bytes }
+  F2: { listener: l_false,    client: 50 concurrent silent hold 3s, expect: all 50 closed in window, 0 bytes }
+  F3: { listener: l_false,    client: GET at 300ms,                 expect: 200 "INDEXED l_false\n" }
+  T1: { listener: l_true,     client: GET at 0,                     expect: 200 "INDEXED l_true\n" }
+  T2: { listener: l_true,     client: silent 2500ms then GET,       expect: 200 "INDEXED l_true\n" }
+  T3: { listener: l_true_tls, client: silent 2500ms then GET,       expect: 200 "DEFAULT l_true_tls\n" }
+  Z1: { listener: l_zero,     client: silent,                       expect: open at 16.5s }
+  N1: { listener: l_nofilt,   client: silent,                       expect: open at 2.8s }
+  S:  { metric: envoy_listener_downstream_pre_cx_timeout, keyed_by: envoy_listener_address, missing: hard failure }
+
+not_pinned: [downstream_cx_total, close kind, partial-byte arm, half-close arm, exact ms, downstream_listener_filter_*]

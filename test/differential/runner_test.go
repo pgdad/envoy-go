@@ -149,6 +149,7 @@ import (
 	_ "github.com/pgdad/envoy-go/test/fixtures/0122-quic-chain-selection/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0123-listener-transport-protocol/driver"
 	_ "github.com/pgdad/envoy-go/test/fixtures/0124-listener-sni-longest-suffix/driver"
+	_ "github.com/pgdad/envoy-go/test/fixtures/0125-listener-filters-timeout/driver"
 	"github.com/pgdad/envoy-go/test/helpers"
 
 	// Blank-imported so the lua filter's init() boot-registration fires for

@@ -163,8 +163,8 @@ type listenerRuntime struct {
 	chainByName  map[string]*chainInfo
 	// 07.2 (Task 9, ADR-0079) listener-filter pipeline plumbing. Populated
 	// from listener_filters[] at build time; consumed by serveConnection's
-	// per-conn pipeline. lfTimeoutMs is in [1000, 60000] (ADR-0082); default
-	// 15000.
+	// per-conn pipeline. lfTimeoutMs is 0 (an explicit 0s: disabled, ADR-0322)
+	// or in [1000, 60000] (ADR-0082); default (nil) 15000.
 	listenerFilterFactories []listenerfilter.FilterInstanceFactory
 	lfTimeoutMs             uint32
 	continueOnLfTimeout     bool
@@ -177,16 +177,17 @@ type listenerRuntime struct {
 	// larger configured sizes silently ineffective).
 	lfPeekBufSize int
 	// 06.1 metric fields (per SPEC §6 — listener-scope only). Allocated by
-	// registerListenerMetrics at Start time (post-bind, pre-Freeze) and
-	// Inc/Dec'd from the accept-loop hot path. The two cx metrics are
-	// registered for EVERY listener; the five ssl.* counters are registered
-	// only when rt.tlsMode is set (phase 74 — TLS-chains-only, matching the
-	// reference), so on a plaintext listener all five pointers stay NIL.
-	downstreamCxTotal   *stats.Counter
-	downstreamCxActive  *stats.Gauge
-	sslHandshake        *stats.Counter // phase 74: successful downstream TLS handshakes
-	sslFailVerifyError  *stats.Counter // phase 74: client cert presented, CHAIN VERIFICATION failed
-	sslFailVerifyNoCert *stats.Counter // phase 74: no client cert where one was required
+	// registerListenerMetrics at Start time (post-bind, pre-Freeze). downstreamCxTotal and
+	// downstreamCxActive.Inc() run in acceptLoop; the Dec and downstreamPreCxTimeout.Inc()
+	// run in serveConnection. All three are registered for EVERY listener; the ssl.* ones
+	// only when rt.tlsMode is set (phase 74 — TLS-chains-only, matching the reference), so
+	// on a plaintext listener all five ssl.* pointers stay NIL.
+	downstreamCxTotal      *stats.Counter
+	downstreamPreCxTimeout *stats.Counter // phase 100: listener_filters_timeout fired (ADR-0322)
+	downstreamCxActive     *stats.Gauge
+	sslHandshake           *stats.Counter // phase 74: successful downstream TLS handshakes
+	sslFailVerifyError     *stats.Counter // phase 74: client cert presented, CHAIN VERIFICATION failed
+	sslFailVerifyNoCert    *stats.Counter // phase 74: no client cert where one was required
 	// sslNoCertificate is phase 75's SUCCESS-PATH annotation: a COMPLETED
 	// handshake that presented no client certificate. It is NOT a synonym for
 	// sslFailVerifyNoCert (a FAILED handshake) — the two are disjoint by
@@ -373,7 +374,7 @@ func normalizeAddr(addr string) string {
 // configured with port 0 don't collide on the same registered name pre-bind).
 // Pre-Freeze (Task 12 owns the Freeze call after the admin server is up).
 //
-// The two cx metrics are unconditional. The three phase-74 ssl.* counters plus
+// The two cx metrics and downstream_pre_cx_timeout are unconditional. The three phase-74 ssl.* counters plus
 // the one phase-75 ssl.* counter (ssl.no_certificate) plus the one phase-94
 // ssl.* counter (ssl.connection_error — five in total) are all
 // gated on rt.tlsMode, matching the reference, which registers listener.<addr>.ssl.*
@@ -416,6 +417,7 @@ func normalizeAddr(addr string) string {
 func registerListenerMetrics(r *stats.Registry, rt *listenerRuntime) {
 	prefix := "listener." + normalizeAddr(rt.addr) + "."
 	rt.downstreamCxTotal = r.NewCounter(prefix + "downstream_cx_total")
+	rt.downstreamPreCxTimeout = r.NewCounter(prefix + "downstream_pre_cx_timeout")
 	rt.downstreamCxActive = r.NewGauge(prefix + "downstream_cx_active")
 	if rt.tlsMode {
 		rt.sslHandshake = r.NewCounter(prefix + "ssl.handshake")
@@ -946,12 +948,15 @@ func buildNetworkChainFactory(prefix string, filters []*listenerv3.Filter, netRe
 }
 
 // parseListenerFiltersTimeout parses Listener.listener_filters_timeout per
-// ADR-0082: nil/zero defaults to 15000ms; values outside [1000, 60000]ms
-// error.
+// ADR-0082/ADR-0322: nil defaults to 15000ms; an explicit zero is 0 (disabled,
+// as on the reference); other values outside [1000, 60000]ms error.
 func parseListenerFiltersTimeout(name string, d *durationpb.Duration) (uint32, error) {
 	const defaultMs = 15000
-	if d == nil || (d.GetSeconds() == 0 && d.GetNanos() == 0) {
+	if d == nil {
 		return defaultMs, nil
+	}
+	if d.GetSeconds() == 0 && d.GetNanos() == 0 {
+		return 0, nil
 	}
 	total := d.AsDuration()
 	ms := total / time.Millisecond
@@ -1292,9 +1297,10 @@ func (rt *listenerRuntime) acceptLoop(ctx context.Context, ln net.Listener) {
 //     largest build-time InitialReadBufferSizer hint when filters exist).
 //  3. Construct per-connection ListenerFilter instances from the per-listener
 //     factory slice (one allocation per filter per connection).
-//  4. Run the listener-filter pipeline; on error, honor
-//     `continue_on_listener_filters_timeout` — false aborts the connection,
-//     true falls through with whatever inputs were populated so far.
+//  4. Run the listener-filter pipeline, which cuts a blocked peek at
+//     listener_filters_timeout; a timeout books downstream_pre_cx_timeout.
+//     On any error, honor `continue_on_listener_filters_timeout` — false
+//     aborts the connection, true falls through with the inputs populated.
 //  5. Run listenerfilter.SelectChain over chainSpecs / defaultSpec; abort on
 //     ErrNoChainMatched or ErrAmbiguousChainMatch.
 //  6. If the selected chain has TLS, hand the peekerConn to stdtls.Server with
@@ -1348,6 +1354,9 @@ func (rt *listenerRuntime) serveConnection(ctx context.Context, raw net.Conn) {
 	// (4) Run listener-filter pipeline.
 	var p listenerfilter.Pipeline
 	if err := p.Run(ctx, filters, peeker, &inputs, rt.lfTimeoutMs); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			rt.downstreamPreCxTimeout.Inc()
+		}
 		if !rt.continueOnLfTimeout {
 			log.Printf("listener %q: listener-filter pipeline aborted: %v", rt.name, err)
 			_ = pkConn.Close()

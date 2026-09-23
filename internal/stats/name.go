@@ -556,6 +556,8 @@ var helpText = map[string]string{
 	"envoy_server_live":                   "1 if the server is live, 0 otherwise.",
 	"envoy_server_accesslog_dropped":      "Total access-log records dropped due to backpressure (per-process aggregate across all sinks).",
 
+	"envoy_listener_downstream_pre_cx_timeout": "Total listener-filter inspections that exceeded listener_filters_timeout.",
+
 	"envoy_listener_ssl_connection_error":    "Downstream TLS handshakes failed with an SSL protocol error.",
 	"envoy_listener_ssl_handshake":           "Total successful downstream TLS handshakes on the listener.",
 	"envoy_listener_ssl_fail_verify_error":   "Downstream TLS handshakes failed because client certificate chain verification failed.",

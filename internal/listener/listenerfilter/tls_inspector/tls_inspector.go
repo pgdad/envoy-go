@@ -52,9 +52,9 @@ type filter struct {
 // listener-filter pipeline began running on real network connections.
 func (f *filter) Inspect(ctx context.Context, peeker listenerfilter.Peeker, inputs *listenerfilter.ChainMatchInputs) (listenerfilter.ListenerFilterStatus, error) {
 	// Step 1: peek the 5-byte TLS record header to learn the record length.
-	// Peek yields only net/io errors (io.EOF, net.ErrClosed,
-	// os.ErrDeadlineExceeded) — ctx is not plumbed into the socket read —
-	// so every zero-byte error is a non-TLS classification, not an abort.
+	// Peek yields only net/io errors (io.EOF, net.ErrClosed, or the read
+	// deadline Pipeline.Run sets once its ctx is done), so every zero-byte
+	// error classifies raw_buffer; the pipeline, not this filter, aborts.
 	hdr, err := peeker.Peek(5)
 	if err != nil && len(hdr) == 0 {
 		inputs.TransportProtocol = "raw_buffer"
