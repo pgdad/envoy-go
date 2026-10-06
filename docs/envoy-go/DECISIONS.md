@@ -19645,7 +19645,7 @@ envelope would have widened a knob that was never enforced. With enforcement lan
 
 ## ADR-0323 — `listener_filters_timeout` accepts every value the reference accepts, carried as a `uint64` of milliseconds; negatives and seconds above `9223372035` are rejected (phase 101)
 
-> **STATUS: PROPOSED — §Context drafted at the phase-101 SPEC; §Decision + §Consequences are APPENDED IN PLACE at the phase-101 IMPL, after the RETAINED italic footer below, with no renumber and no `---` separator (the ADR-0294-0322 shared block form).** ⚠️ **THIS BLOCK RE-ARMS THE HOUSE `PROPOSED` GUARD, AND NO COUNT OF EITHER MATCHER IS WRITTEN ANYWHERE IN IT, DELIBERATELY** — this line is itself a hit of the strict form. **Verify by LINE and by ADR** (backward `^## ADR-` heading search), **never by the count alone**, and never conflate it with the unrelated **ADR-0231 decoy**, which is **BYTE-UNTOUCHED** by this row. **ROW 101 STAYS `in-progress` THROUGH THIS SPEC**; `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` are byte-untouched at this stage. A **Listener / listener-filter MAINTENANCE row claiming NO family ordinal**. It **SUPERSEDES** ADR-0082's heading clause *"in [1s, 60s]"*, §Decision ¶1's envelope and its message, §Consequences (a)'s envelope message (the `listener: %q:` prefix convention SURVIVES), (b)'s `timeoutMs uint32` (the unit, milliseconds, and `0 = no-op` SURVIVE) and (c) in full; it **NOTES** ADR-0081 §Consequences (c), whose microsecond latency claim survives without its *"1s lower bound"* yardstick, and ADR-0078's historical `lfTimeoutMs uint32` field list; it **SUPERSEDES** ADR-0322 §Consequences (g)'s *"envoy-go still rejects them"*, and **KEEPS** ADR-0322's single clock, its `0s` = DISABLED and its absent = 15 s.
+> **STATUS: ACCEPTED — §Context drafted at the phase-101 SPEC; §Decision + §Consequences APPENDED IN PLACE at the phase-101 IMPL, after the RETAINED italic footer, with no renumber and no `---` separator (the ADR-0294-0322 shared block form).** ⚠️ **THE HOUSE `PROPOSED` GUARD WAS RE-ARMED BY THIS BLOCK AT THE SPEC AND IS DISARMED BY THIS FLIP — AND NO COUNT OF EITHER MATCHER IS WRITTEN ANYWHERE IN IT, DELIBERATELY**: while it read PROPOSED this line was itself a hit of the strict form, so any figure it named would have been falsified by its own landing. **Verify by LINE and by ADR** (backward `^## ADR-` heading search), **never by the count alone**, and never conflate the strict house form with the unrelated **ADR-0231 decoy** at `DECISIONS.md:14866`, which is **BYTE-UNTOUCHED** by this row. **ROW 101 STAYED `in-progress` THROUGH THE SPEC AND THE PLAN** and flips to `done` at this IMPL. A **Listener / listener-filter MAINTENANCE row claiming NO family ordinal**. It **SUPERSEDES** ADR-0082's heading clause *"in [1s, 60s]"*, §Decision ¶1's envelope and its message, §Consequences (a)'s envelope message (the `listener: %q:` prefix convention SURVIVES), (b)'s `timeoutMs uint32` (the unit, milliseconds, and `0 = no-op` SURVIVE) and (c) in full, and **KEEPS** ADR-0082's pipeline, its `continue…` semantics and its per-pipeline shared budget; it **NOTES** ADR-0081 §Consequences (c), whose microsecond latency claim survives without its *"1s lower bound"* yardstick, and ADR-0078's historical `lfTimeoutMs uint32` field list; it **SUPERSEDES** ADR-0322 §Consequences (g)'s *"envoy-go still rejects them"*, and **KEEPS** ADR-0322's single clock, its `0s` = DISABLED and its absent = 15 s.
 
 ### Context (drafted at the phase-101 SPEC)
 
@@ -19655,8 +19655,167 @@ envelope would have widened a knob that was never enforced. With enforcement lan
 
 **§Context ¶3 — THE OBVIOUS LIFT IS WRONG, BECAUSE THE ENVELOPE WAS HIDING A WIDTH.** envoy-go carries the value as a `uint32` of milliseconds in the parser's return type, the listener runtime field and `Pipeline.Run`'s parameter. Deleting the range check alone makes `4294968s` wrap to 704 ms, and the real binary then drops a silent client at 705 ms where the reference holds it open. The same change boots `-1s`, `-0.5s`, `9223372036s` and `315576000000s`, which the reference refuses; today's agreement on those four is an accident of the envelope. Go's `durationpb.AsDuration` saturates at the `time.Duration` maximum, so the value must be computed from the Duration's seconds and nanos fields. A negative half-second arrives as zero seconds and negative nanos, so both fields must be checked.
 
-**§Context ¶4 — THE WIDTH WAS CHOSEN BY MEASUREMENT AND MECHANISM, NOT BY SIZE.** Four lifts were built and run through one 15-arm unit table and the real binary. The naive lift failed seven arms. A `uint32` clamp at the maximum failed two value arms and could differ from the reference only past 49.7 days, which no gate can observe. A `time.Duration` end to end compiled, vetted and linted clean while silently turning every untyped `Run(…, 1000)` test caller into 1000 nanoseconds; two pipeline tests then failed 18 and 19 times out of 20, a flake rather than a clean failure. A `uint64` of milliseconds kept every caller's meaning and agreed with the reference on every driven arm. At the largest accepted value it is 9223372035999 ms, which times `time.Millisecond` stays inside `int64` nanoseconds, so the ceiling check also protects `Pipeline.Run` from overflowing to an immediate timeout. The existing listener suite fails the same two envelope tests under all four lifts and cannot tell them apart.
+**§Context ¶4 — THE WIDTH WAS CHOSEN BY MEASUREMENT AND MECHANISM, NOT BY SIZE.** Four lifts were built and run through one 15-arm unit table and the real binary. The naive lift failed seven arms. A `uint32` clamp at the maximum failed two value arms and could differ from the reference only past 49.7 days, which no gate can observe. A `time.Duration` end to end compiled, vetted and linted clean while silently turning every untyped `Run(…, 1000)` test caller into 1000 nanoseconds; two pipeline tests then failed 18 and 19 times out of 20, a flake rather than a clean failure. A `uint64` of milliseconds kept every caller's meaning and agreed with the reference on every driven arm. At the largest accepted value it is 9223372035999 ms, which times `time.Millisecond` stays inside `int64` nanoseconds, so the ceiling check also protects `Pipeline.Run` from overflowing to an immediate timeout. That guarantee needs BOTH halves of the check: it rejects seconds above `9223372035` OR nanos above `999999999` (the nanos half was added at the IMPL's final review, §Consequences (h)). The existing listener suite fails the same two envelope tests under all four lifts and cannot tell them apart.
 
 **§Context ¶5 — WHAT THIS ADR DOES NOT DECIDE.** It does not change reject-message parity. It does not pin the 1 ms immediate-request race (on the reference an immediate request is served 47 of 50 times at `0.001s`) or the subject's 35-60 ms lateness at 61 s. It adds no QUIC enforcement and no stat name: `downstream_pre_cx_timeout` exists since ADR-0322 and the reference registers it on QUIC listeners too. It does not touch `stats_flush_interval`, the close kind, post-filter `downstream_cx_total`, the `downstream_listener_filter_*` names or the `0s` shutdown hold.
 
 *§Decision and §Consequences follow at the phase-101 IMPL.*
+
+### Decision (landed at the phase-101 IMPL)
+
+**`listener_filters_timeout` is read from the Duration's `seconds` and `nanos` fields, never through
+`AsDuration`, and carried as a `uint64` of whole milliseconds from the parse, through
+`listenerRuntime.lfTimeoutMs`, to `Pipeline.Run`'s `timeoutMs`. envoy-go's own `[1s, 60s]` envelope is gone,
+on every listener.** This is shape A (`SPEC.md` §4). Against the pre-row tip, `git diff --numstat` reads
+`15 15` for `internal/listener/manager.go` (shape A's `8 9` plus a comment-only reconciliation of `7 6`, whose
+changed lines all start with `//`), `1 1` for `internal/listener/listenerfilter/pipeline.go` and `1 1` for
+`pipeline_deadline_test.go`. No other production file changes.
+
+**1 — The rule as built (`SPEC.md` §2, V1-V5), evaluated in this order inside `parseListenerFiltersTimeout`:**
+- **V1** — a nil Duration returns **15000**: an absent field keeps the 15 s default (ADR-0322, kept).
+- **V2** — `seconds < 0` **or** `nanos < 0` is rejected with `listener: %q: listener_filters_timeout: expected
+  a positive duration: %ds %dns`. Nanos is tested on its own because protojson renders `-0.5s` as seconds 0
+  and nanos -500000000, so a seconds-only test would accept it. envoy-go runs no PGV, so V2 also rejects a
+  Go-constructed mixed-sign Duration, which is not a valid protobuf Duration anyway.
+- **V3** — `seconds > 9223372035` **or** `nanos > 999999999` is rejected with `listener: %q:
+  listener_filters_timeout: duration out of range: %ds %dns`. The seconds bound is the reference's, found by
+  bisection; the nanos bound is a valid protobuf Duration's, and only a Duration built in Go can exceed it
+  (protojson and YAML cannot), so it was added at the final review ((h)). V3 is also **load-bearing for
+  `Pipeline.Run`**, and only because of BOTH halves: the largest accepted value is 9223372035999 ms, which
+  times `time.Millisecond` is 9.223372035999e18 ns, inside `int64`. Without the seconds half, `9223372036s`
+  would overflow to a negative duration and `context.WithTimeout` would fire at once; without the nanos half,
+  `{9223372035, 2147483647}` parses to 9223372037147 ms and does the same.
+- **V4** — otherwise `uint64(s)*1000 + uint64(n)/1e6`: TRUNCATED to whole milliseconds, as the reference does.
+- **V5** — a V4 result of 0 (`0s`, or any `0.000999999s` or less) DISABLES the timeout: `Run` arms nothing.
+  ADR-0322's explicit `0s` = disabled is the same rule's simplest case.
+
+The one call site sits inside `buildListenerRuntimeWithCtx`, which TCP and QUIC listeners share, so V2 and V3
+fire on every listener carrying the field, with or without listener filters. That matches the reference,
+whose two Duration errors fire on a QUIC listener too. Both phrases are the reference's prefixes in lowercase
+behind envoy-go's own `listener: %q:` prefix; the unit arms pin the PHRASE, and message bytes are not a
+parity surface (the reference's messages carry a run-varying suffix).
+
+**2 — The width: `uint64` end to end, and why.** The parse returns `uint64`, the runtime field is `uint64` and
+`Pipeline.Run` takes `timeoutMs uint64`. Milliseconds stay the unit, so the seven untyped-constant callers in
+`pipeline_test.go` (`Run(…, 1000)` and its siblings) keep their meaning without an edit: an untyped constant
+converts to `uint64` with its value unchanged. Two alternatives were rejected on MECHANISM, not on size:
+- **B, `time.Duration` end to end** (`SPEC.md` §0.1): it compiled, vetted and linted clean while silently
+  turning every untyped caller's `1000` into 1000 ns. `TestPipelineRunContinuePath` and
+  `…StopIterationPath` then failed 18 and 19 times out of 20, a flake and not a clean red. A width change
+  that the type system accepts with a new meaning for the old literals is a value reused under a changed
+  invariant.
+- **C, a `uint32` clamp at the maximum** (`SPEC.md` §0.6): every driven arm agrees, but its parse returns
+  4294967295 for `4294968s` and for the maximum, so the two value arms fail. It bakes into the type a parity
+  answer no behavioural gate can see.
+
+The naive lift (deleting the range check and keeping `uint32`) wraps `4294968s` to 704 ms; its real binary
+drops a silent client at 705 ms where the reference holds it open (§Context ¶3).
+
+**3 — The layout.** `pipeline.go:43`, the one `context.WithTimeout` line (cited, at the PLAN's literal census, from
+`manager.go`, `BEHAVIOR_CONTRACT.md` and this file), and `pipeline.go:33-37` (the `OnDestroy` defer) are
+UNMOVED. `pipeline.go:32`, the `Run` signature, is WIDENED ONLY: `timeoutMs uint32` became `timeoutMs uint64`
+and nothing else on the line changed. The IMPL's layout gate checked all three and read zero failed
+sub-gates after the production edit and again after the comment reconciliation. `manager.go:1356`,
+`p.Run(ctx, filters, peeker, &inputs, rt.lfTimeoutMs)`, is unmoved too.
+
+**4 — SUPERSESSIONS of ADR-0082.** ADR-0082 is not edited. It is superseded in part, here:
+- its heading clause *"in [1s, 60s]"*;
+- §Decision ¶1's envelope (*"clamped/validated to a `[1s, 60s]` envelope"*) and its message
+  (*"`… is outside the supported [1s, 60s] envelope`"*), replaced by V2 and V3 and their two messages;
+- §Consequences (a)'s envelope message. The `listener: %q:` prefix convention it states **SURVIVES**: both new
+  messages begin with it;
+- §Consequences (b)'s `timeoutMs uint32`, which is `uint64` now. Milliseconds as the unit and *"`0 = no-op`"*
+  **SURVIVE**; the clause *"clamped/validated at parse time per the envelope above"* is replaced by V1-V5;
+- §Consequences (c) in full. The *"future hardening phase"* that would revisit the envelope is this one, and
+  it removes the envelope rather than relaxing it.
+
+ADR-0082 **KEEPS** three clauses, which survive as written: `DECISIONS.md:3048` (the per-connection
+listener-filter pipeline it introduces), `:3054` (the `continue_on_listener_filters_timeout` semantics, as
+ADR-0322 made them act at the deadline) and `:3056` (the per-pipeline shared budget: one
+`context.WithTimeout` shared by every filter's `Inspect`).
+
+**5 — NOTES, and one SUPERSESSION of ADR-0322.**
+- **ADR-0081 §Consequences (c)** (`:3175`) is NOTED. Its microsecond dispatch-latency claim survives. Its
+  yardstick, *"the `listener_filters_timeout` envelope's 1s lower bound"*, no longer exists: an accepted
+  value may now be 1 ms, or 0 (disabled). It is not edited.
+- **ADR-0078 §Consequences (d)** (`:3221`) is NOTED. Its field list names `lfTimeoutMs uint32`, which was true
+  at its phase and is history now; the field is a `uint64`. It is not edited.
+- **ADR-0322 §Consequences (g)**'s *"envoy-go still rejects them"* is SUPERSEDED: envoy-go now accepts and
+  enforces `0.5s`, `61s` and `120s`. ADR-0322 is otherwise KEPT whole: the single clock, `0s` = DISABLED,
+  absent = 15 s, and the `downstream_pre_cx_timeout` counter.
+- ADR-0296's citation of `pipeline.go:43` stays true, because the layout gate kept that line in place.
+
+This ADR supersedes nothing else.
+
+### Consequences (landed at the phase-101 IMPL)
+
+**(a) THE DECLARED BEHAVIOUR CHANGES.**
+- **A TCP listener with a value inside `[1s, 60s]`**: unchanged.
+- **A TCP listener with a value the reference accepts outside `[1s, 60s]`** (`0.5s`, `61s`, `90s`, `120s`,
+  `4294968s`, `9223372035.999999999s`): before, boot-rejected; now it boots and enforces the truncated value.
+  In fixture `0126`, `0.5s` under `false` dropped a silent client at 500-501 ms on the subject and 501-502 ms
+  on the reference over three solo runs, inside the `[350, 900]` window; `4294968s` held a silent client open
+  at 1500 ms on both sides, where the narrowed width would have dropped it at 704 ms.
+- **A sub-millisecond value** (`0.0005s`): before, boot-rejected; now it truncates to 0 and DISABLES the
+  timeout. In `0126` it held a silent client open at 1500 ms on both sides.
+- **`true` at `0.5s`**: falls through at the deadline and serves the DEFAULT chain, on both sides, in every
+  run (`DEFAULT l_half_true`).
+- **A negative value, or seconds above `9223372035`** (or nanos above `999999999`, (h)): still rejected, now with the reference-shaped phrases.
+  Before this row the two sides agreed on these four inputs only by the accident of the envelope; now they
+  agree by rule.
+- **A QUIC listener**: **REJECTED becomes ACCEPTED-AND-IGNORED**, the reference's measured behaviour
+  (§Context ¶2). A QUIC listener with `0.5s` or `120s` now builds
+  (`TestQUICListenerFiltersTimeoutOutsideOldEnvelopeBuilds`), and envoy-go's QUIC path never reads the value. V2 and V3 still fire there, as on
+  the reference. There is no QUIC differential arm (`SPEC.md` §7.6).
+
+**(b) THE EVIDENCE.** At the un-fixed tip the listener unit suite read 292 `=== RUN` with 16 top-level FAILs:
+13 of the 15 new parse and pipeline-hold arms, the two re-pointed envelope pins (`…SubSecondAccepted`,
+`…AboveOldCapAccepted`) and the QUIC build arm, each failing on the envelope message. Fixture `0126` was RED
+at the subject's BOOT (`listener_filters_timeout 500ms is outside the supported [1s, 60s] envelope`, on all
+three start attempts), so its reference side was never driven at the tip. After the edit the suite read 292
+`=== RUN` and 0 FAIL (293 and 0 on the final tree, after the final-review fix (h)), `-race` was clean over `./internal/listener/...`, `0126` PASSED on each of three solo
+runs and `0125` still PASSED.
+
+**(c) TWO ARMS MOVED FROM THE SPEC's PREDICTION, BOTH BY EXECUTION.**
+- **13 RED, not 11** (PLAN §0.2). `…NegativeNanosRejected` and `…ProtoMaxRejected` were predicted green at
+  the tip because the SPEC's probe table asserted no message for them. The final arms assert the phrase, so
+  both were RED at the tip on the MESSAGE. Only `…ZeroParsesToZero` and `…NilParsesToDefault` stayed green,
+  as regression guards.
+- **NC4 also reddens `…MaxAccepted`** (PLAN §0.3). Rounding turns `9223372035.999999999s` into
+  9223372036000 ms, not 9223372035999. `…PipelineHoldsAtMax` stays green under NC4, because that value is
+  still inside `int64` nanoseconds.
+
+**(d) THE NEGATIVE-CONTROL ROSTER**, scored PER ARM in the phase's `PROGRESS.md`; every cell matched the
+PLAN's §7. NC1 (narrow through `uint32`) reddened the wrap, max and past-wrap arms and fixture W1 (subject
+FIN at 704 ms), and left `…PipelineHoldsAtMax` green. NC2 and NC3 each reddened exactly their two reject arms.
+NC4 (round) reddened the two truncation arms and `…MaxAccepted`, and fixture M1 (subject FIN at 1 ms). NC6
+(the old envelope re-inserted after V2 and V3) reddened every accept arm outside the old range, both pipeline
+holds, both re-pointed pins and the QUIC arm, and left the four reject arms green with the right phrase.
+**NC5** (compute through `AsDuration`) is **VACUOUS by construction, recorded and NOT run**: `AsDuration`
+saturates only above about 292 years, which V3 already rejects, so no accepted input can tell it from the fix.
+
+**(e) +0 STAT NAMES.** No name is added, renamed or retired. `BEHAVIOR_CONTRACT.md` carries a delta-only `+0`
+ledger entry for phase 101 and quotes no absolute stat-surface figure. ADR-0322 (c)'s open question is
+answered: the reference registers `downstream_pre_cx_timeout` on a QUIC listener at value 0, as envoy-go does.
+
+**(f) WHAT THIS ROW DOES NOT BUY** (`SPEC.md` §1):
+- reject-MESSAGE parity: both sides fail closed, and parity is measured in rc and in the set of values refused;
+- a 1 ms immediate-request arm (a race on both sides) or a 61 s timing arm;
+- QUIC enforcement, or any QUIC listener-filter category;
+- the close KIND, post-filter `downstream_cx_total`, the `downstream_listener_filter_{remote_close,error}`
+  names, the `0s` shutdown hold (ADR-0322 (a)) and the subject's 35-60 ms lateness at 61 s;
+- any stat name.
+
+**(g) THE NEXT CANDIDATE.** `stats_flush_interval` was banked by this row's SPEC and is left untouched. It is
+the next candidate.
+
+**(h) A FINAL-REVIEW FINDING, FIXED IN THIS ROW.** As first built, V3 tested seconds only, so a Duration built in
+Go with nanos above `999999999` was accepted: `{1, 1500000000}` parsed to 2500 ms, and
+`{9223372035, 2147483647}` parsed to 9223372037147 ms, which overflows `int64` nanoseconds in `Pipeline.Run`
+to a negative duration, so the pipeline timed out after about 12 µs. V3 now rejects nanos above `999999999`
+too. `TestParseListenerFiltersTimeoutNanosOutOfRangeRejected` was RED before the fix (both inputs accepted)
+and is GREEN after; a negative control neutralising only the nanos clause reddened that arm and nothing else
+in the 24-arm selector. Reference parity here comes from Envoy's Duration validation as read in its source,
+NOT from a measurement: YAML cannot express such a Duration, so no differential arm can drive it. One
+residual stays: the exported `Pipeline.Run` itself accepts any `uint64` and overflows above 9223372036854 ms;
+only the parser bounds it, and `Run`'s doc comment, which sits on layout-gated lines, does not say so.

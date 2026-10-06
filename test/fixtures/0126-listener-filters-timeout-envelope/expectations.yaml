@@ -1,0 +1,29 @@
+# Phase 101 fixture 0126-listener-filters-timeout-envelope expectations
+# (ADR-0019 — prose; the enforcers are driver/driver.go's per-side AssertStats
+# arms, the runner's cross-side CompareBytes of the timing-free verdict stream,
+# and the runner's admin probe. Nothing reads this file.)
+#
+# Reference: envoyproxy/envoy by digest (docs/envoy-go/ENVOY_TARGET.md);
+# listeners 0.0.0.0:15126, :15232, :15233, :15234, :15235, :15236.
+# Subject: envoy-go, listeners 127.0.0.1:<subjListenerPort>+0..+5.
+
+window_ms: { lo: 350, hi: 900 }   # H1, from dial-return; measured 500-508 ref, 500-501 subj
+
+listeners:
+  l_half:       { timeout: 0.5s,     continue: false, filters: [tls_inspector], fc_indexed: tls, pre_cx_timeout: 1 }
+  l_half_true:  { timeout: 0.5s,     continue: true,  filters: [tls_inspector], fc_indexed: tls, pre_cx_timeout: 1 }
+  l_one_true:   { timeout: 1s,       continue: true,  filters: [tls_inspector], fc_indexed: tls, pre_cx_timeout: 0 }
+  l_wrap:       { timeout: 4294968s, continue: false, filters: [tls_inspector], fc_indexed: tls, pre_cx_timeout: 0 }
+  l_subms:      { timeout: 0.0005s,  continue: false, filters: [tls_inspector], fc_indexed: tls, pre_cx_timeout: 0 }
+  l_nofilt_120: { timeout: 120s,     continue: false, filters: [],              fc_indexed: tls, pre_cx_timeout: 0 }
+
+arms:
+  H1: { listener: l_half,       client: silent hold 2000ms,    expect: closed in window, 0 bytes }
+  W1: { listener: l_wrap,       client: silent hold 1500ms,    expect: open at 1500ms }
+  M1: { listener: l_subms,      client: silent hold 1500ms,    expect: open at 1500ms }
+  T1: { listener: l_half_true,  client: silent 800ms then GET, expect: 200 "DEFAULT l_half_true\n" }
+  T2: { listener: l_one_true,   client: silent 800ms then GET, expect: 200 "DEFAULT l_one_true\n" }
+  N1: { listener: l_nofilt_120, client: GET at 0,              expect: 200 "DEFAULT l_nofilt_120\n" }
+  S:  { metric: envoy_listener_downstream_pre_cx_timeout, keyed_by: envoy_listener_address, missing: hard failure }
+
+not_pinned: [reject message, close kind, exact ms, downstream_cx_total, downstream_listener_filter_*, 1ms immediate-request outcome]

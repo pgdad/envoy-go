@@ -16,6 +16,7 @@ import (
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	quic "github.com/quic-go/quic-go"
 	http3 "github.com/quic-go/quic-go/http3"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/pgdad/envoy-go/internal/listener/listenerfilter"
@@ -1845,6 +1846,40 @@ func TestQUICChainSelection_TwoWildcardsLongestMatchedSuffixWins(t *testing.T) {
 			// x.foo.test, so SHORT must serve (SHORT is live).
 			if body, err := get(sniShallow); err != nil || body != "SHORT\n" {
 				t.Errorf("%s: SNI %q matches only *.foo.test: got body %q err %v, want %q", order.name, sniShallow, body, err, "SHORT\n")
+			}
+		})
+	}
+}
+
+// TestQUICListenerFiltersTimeoutOutsideOldEnvelopeBuilds: a QUIC listener
+// carrying listener_filters_timeout 0.5s or 120s (both outside envoy-go's old
+// [1s, 60s] envelope) builds without error, as the reference accepts both on a
+// QUIC listener (ADR-0323). The value is stored and never read: no QUIC path
+// runs a listener-filter pipeline.
+func TestQUICListenerFiltersTimeoutOutsideOldEnvelopeBuilds(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		d      time.Duration
+		wantMs uint64
+	}{
+		{"0.5s", 500 * time.Millisecond, 500},
+		{"120s", 120 * time.Second, 120000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
+			l := mkQUICListener(t, "c_echo", testAlphaCertPEM, testAlphaKeyPEM, []string{"h3"})
+			l.ListenerFiltersTimeout = durationpb.New(tc.d)
+			boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
+			mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+			if err != nil {
+				t.Fatalf("build: QUIC listener with listener_filters_timeout %s rejected: %v", tc.name, err)
+			}
+			rt := mgr.runtimes[0]
+			if rt.kind != kindQUIC {
+				t.Errorf("kind: runtime kind = %v, want kindQUIC", rt.kind)
+			}
+			if uint64(rt.lfTimeoutMs) != tc.wantMs {
+				t.Errorf("value: lfTimeoutMs = %d, want %d", rt.lfTimeoutMs, tc.wantMs)
 			}
 		})
 	}

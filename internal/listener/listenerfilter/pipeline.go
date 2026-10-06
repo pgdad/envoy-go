@@ -29,7 +29,7 @@ type Pipeline struct{}
 //   - OnDestroy is called on every filter (in declaration order) after the
 //     loop ends, regardless of how the loop exited (Continue/StopIteration/
 //     error/timeout).
-func (p *Pipeline) Run(ctx context.Context, filters []ListenerFilter, peeker Peeker, inputs *ChainMatchInputs, timeoutMs uint32) (retErr error) {
+func (p *Pipeline) Run(ctx context.Context, filters []ListenerFilter, peeker Peeker, inputs *ChainMatchInputs, timeoutMs uint64) (retErr error) {
 	defer func() {
 		for _, f := range filters {
 			f.OnDestroy()

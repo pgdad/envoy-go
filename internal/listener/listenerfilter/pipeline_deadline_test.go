@@ -56,7 +56,7 @@ type runResult struct {
 
 // runPeekPipeline starts Pipeline.Run over a real peekerConn wrapping server
 // with one peekOnlyFilter{5}; the result arrives on the returned channel.
-func runPeekPipeline(server net.Conn, timeoutMs uint32) (net.Conn, <-chan runResult) {
+func runPeekPipeline(server net.Conn, timeoutMs uint64) (net.Conn, <-chan runResult) {
 	pc := NewPeekerConn(server)
 	ch := make(chan runResult, 1)
 	go func() {

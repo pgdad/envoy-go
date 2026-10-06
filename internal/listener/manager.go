@@ -163,10 +163,10 @@ type listenerRuntime struct {
 	chainByName  map[string]*chainInfo
 	// 07.2 (Task 9, ADR-0079) listener-filter pipeline plumbing. Populated
 	// from listener_filters[] at build time; consumed by serveConnection's
-	// per-conn pipeline. lfTimeoutMs is 0 (an explicit 0s: disabled, ADR-0322)
-	// or in [1000, 60000] (ADR-0082); default (nil) 15000.
+	// per-conn pipeline. lfTimeoutMs is any whole-millisecond value (0 =
+	// disabled, ADR-0322); default (nil) 15000 (ADR-0323).
 	listenerFilterFactories []listenerfilter.FilterInstanceFactory
-	lfTimeoutMs             uint32
+	lfTimeoutMs             uint64
 	continueOnLfTimeout     bool
 	// lfPeekBufSize is the LARGEST listenerfilter.InitialReadBufferSizer hint
 	// across the listener's listener_filters[] (tls_inspector's parsed
@@ -828,8 +828,8 @@ func buildListenerRuntimeWithCtx(l *listenerv3.Listener, idx int, cm *cluster.Ma
 		sample.OnDestroy()
 	}
 
-	// ADR-0082: parse listener_filters_timeout (default 15000ms; envelope
-	// [1000, 60000]).
+	// ADR-0323: parse listener_filters_timeout (default 15000ms; any whole-ms
+	// value, rejecting only a negative or out-of-range Duration).
 	lfTimeoutMs, err := parseListenerFiltersTimeout(name, l.GetListenerFiltersTimeout())
 	if err != nil {
 		return nil, err
@@ -948,22 +948,22 @@ func buildNetworkChainFactory(prefix string, filters []*listenerv3.Filter, netRe
 }
 
 // parseListenerFiltersTimeout parses Listener.listener_filters_timeout per
-// ADR-0082/ADR-0322: nil defaults to 15000ms; an explicit zero is 0 (disabled,
-// as on the reference); other values outside [1000, 60000]ms error.
-func parseListenerFiltersTimeout(name string, d *durationpb.Duration) (uint32, error) {
+// ADR-0323 from the Duration's fields (never AsDuration, which saturates):
+// nil defaults to 15000ms; negative seconds or nanos error; seconds above
+// 9223372035 or nanos above 999999999 error; else whole ms, truncated (0 off).
+func parseListenerFiltersTimeout(name string, d *durationpb.Duration) (uint64, error) {
 	const defaultMs = 15000
 	if d == nil {
 		return defaultMs, nil
 	}
-	if d.GetSeconds() == 0 && d.GetNanos() == 0 {
-		return 0, nil
+	s, n := d.GetSeconds(), d.GetNanos()
+	if s < 0 || n < 0 {
+		return 0, fmt.Errorf("listener: %q: listener_filters_timeout: expected a positive duration: %ds %dns", name, s, n)
 	}
-	total := d.AsDuration()
-	ms := total / time.Millisecond
-	if ms < 1000 || ms > 60000 {
-		return 0, fmt.Errorf("listener: %q: listener_filters_timeout %s is outside the supported [1s, 60s] envelope", name, total)
+	if s > 9223372035 || n > 999999999 {
+		return 0, fmt.Errorf("listener: %q: listener_filters_timeout: duration out of range: %ds %dns", name, s, n)
 	}
-	return uint32(ms), nil
+	return uint64(s)*1000 + uint64(n)/1e6, nil
 }
 
 // parseChainSpec converts a listenerv3.FilterChainMatch into the listener-filter

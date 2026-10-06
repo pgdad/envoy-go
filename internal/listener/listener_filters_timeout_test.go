@@ -16,6 +16,7 @@ import (
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	"github.com/pgdad/envoy-go/internal/listener/listenerfilter"
 	"github.com/pgdad/envoy-go/internal/stats"
 )
 
@@ -335,4 +336,226 @@ func TestListenerFilterTimeoutPreCxTimeoutOnAbort(t *testing.T) {
 	if v, _ := preCx(); v != 1 {
 		t.Errorf("abort: %s = %d after one timed-out, closed inspection (continue=false), want 1", name, v)
 	}
+}
+
+// ---- phase 101 (ADR-0323): the validity rule, one arm per row ----
+//
+// parseListenerFiltersTimeout computes whole milliseconds from the Duration's
+// FIELDS: nil gives 15000; a negative seconds OR nanos field is rejected; seconds
+// above 9223372035 are rejected; anything else is seconds*1000 + nanos/1e6,
+// truncated, so 0s and every sub-millisecond value give 0 (disabled). Each arm
+// below is single-cause and names the property it fails on.
+
+// lftParse parses {s, n} through the production parser for listener "l_lft".
+// The uint64 conversion is a no-op on the uint64 parser; it keeps this file
+// compiling against a narrower carrier, so a width regression reads as a
+// per-arm value failure instead of a package build failure.
+func lftParse(s int64, n int32) (uint64, error) {
+	v, err := parseListenerFiltersTimeout("l_lft", &durationpb.Duration{Seconds: s, Nanos: n})
+	return uint64(v), err
+}
+
+// lftAccept requires {s, n} to parse without error to exactly wantMs.
+func lftAccept(t *testing.T, label string, s int64, n int32, wantMs uint64) {
+	t.Helper()
+	ms, err := lftParse(s, n)
+	if err != nil {
+		t.Errorf("%s: accept: got error %v, want accepted", label, err)
+		return
+	}
+	if ms != wantMs {
+		t.Errorf("%s: value: got %d ms, want %d ms", label, ms, wantMs)
+	}
+}
+
+// lftReject requires {s, n} to be rejected; a non-empty sub must appear in the
+// error (the phrase is pinned, never the whole string).
+func lftReject(t *testing.T, label string, s int64, n int32, sub string) {
+	t.Helper()
+	ms, err := lftParse(s, n)
+	if err == nil {
+		t.Errorf("%s: reject: accepted with %d ms, want an error", label, ms)
+		return
+	}
+	if sub != "" && !strings.Contains(err.Error(), sub) {
+		t.Errorf("%s: reject message: %q does not contain %q", label, err.Error(), sub)
+	}
+}
+
+// TestParseListenerFiltersTimeoutAboveUint32MsAccepted: 4294968s is 4294968000
+// ms, 704 ms past 2^32 ms; a uint32 carrier wraps it to 704.
+func TestParseListenerFiltersTimeoutAboveUint32MsAccepted(t *testing.T) {
+	lftAccept(t, "4294968s", 4294968, 0, 4294968000)
+}
+
+// TestParseListenerFiltersTimeoutNegativeSecondsRejected: -1s is rejected as
+// the reference rejects it (Expected positive duration).
+func TestParseListenerFiltersTimeoutNegativeSecondsRejected(t *testing.T) {
+	lftReject(t, "-1s", -1, 0, "expected a positive duration")
+}
+
+// TestParseListenerFiltersTimeoutNegativeNanosRejected: -0.5s arrives as
+// {0, -5e8}; a seconds-only sign check would accept it.
+func TestParseListenerFiltersTimeoutNegativeNanosRejected(t *testing.T) {
+	lftReject(t, "-0.5s", 0, -500000000, "expected a positive duration")
+}
+
+// TestParseListenerFiltersTimeoutAboveMaxSecondsRejected: 9223372036s is one
+// second past the reference's measured ceiling (Duration out-of-range).
+func TestParseListenerFiltersTimeoutAboveMaxSecondsRejected(t *testing.T) {
+	lftReject(t, "9223372036s", 9223372036, 0, "duration out of range")
+}
+
+// TestParseListenerFiltersTimeoutProtoMaxRejected: the protobuf Duration
+// maximum, 315576000000s, is past the ceiling too.
+func TestParseListenerFiltersTimeoutProtoMaxRejected(t *testing.T) {
+	lftReject(t, "315576000000s", 315576000000, 0, "duration out of range")
+}
+
+// TestParseListenerFiltersTimeoutNanosOutOfRangeRejected: nanos above
+// 999999999 reach the parser only from a Duration built in Go (YAML cannot
+// carry them); {9223372035, 2147483647} would overflow Run's int64 deadline.
+func TestParseListenerFiltersTimeoutNanosOutOfRangeRejected(t *testing.T) {
+	lftReject(t, "{0s, 1000000000ns}", 0, 1000000000, "duration out of range")
+	lftReject(t, "{9223372035s, 2147483647ns}", 9223372035, 2147483647, "duration out of range")
+}
+
+// TestParseListenerFiltersTimeoutMaxAccepted: the largest accepted input,
+// 9223372035.999999999s, is 9223372035999 ms.
+func TestParseListenerFiltersTimeoutMaxAccepted(t *testing.T) {
+	lftAccept(t, "9223372035.999999999s", 9223372035, 999999999, 9223372035999)
+}
+
+// TestParseListenerFiltersTimeoutSubMillisecondTruncatesToZero: 0.0005s
+// truncates to 0, which disables the timeout.
+func TestParseListenerFiltersTimeoutSubMillisecondTruncatesToZero(t *testing.T) {
+	lftAccept(t, "0.0005s", 0, 500000, 0)
+}
+
+// TestParseListenerFiltersTimeoutTruncatesNotRounds: 0.0019s is 1 ms, not 2.
+func TestParseListenerFiltersTimeoutTruncatesNotRounds(t *testing.T) {
+	lftAccept(t, "0.0019s", 0, 1900000, 1)
+}
+
+// TestParseListenerFiltersTimeoutHalfSecond: 0.5s, below the old 1s floor.
+func TestParseListenerFiltersTimeoutHalfSecond(t *testing.T) {
+	lftAccept(t, "0.5s", 0, 500000000, 500)
+}
+
+// TestParseListenerFiltersTimeoutNinetySeconds: 90s, above the old 60s cap.
+func TestParseListenerFiltersTimeoutNinetySeconds(t *testing.T) {
+	lftAccept(t, "90s", 90, 0, 90000)
+}
+
+// TestParseListenerFiltersTimeoutSixtyOneSeconds: 61s parses to 61000, not a
+// value clamped to 60000.
+func TestParseListenerFiltersTimeoutSixtyOneSeconds(t *testing.T) {
+	lftAccept(t, "61s", 61, 0, 61000)
+}
+
+// TestParseListenerFiltersTimeoutZeroParsesToZero: an explicit 0s is 0.
+func TestParseListenerFiltersTimeoutZeroParsesToZero(t *testing.T) {
+	lftAccept(t, "0s", 0, 0, 0)
+}
+
+// TestParseListenerFiltersTimeoutNilParsesToDefault: an absent field is 15000.
+func TestParseListenerFiltersTimeoutNilParsesToDefault(t *testing.T) {
+	ms, err := parseListenerFiltersTimeout("l_lft", nil)
+	if err != nil {
+		t.Errorf("nil: accept: got error %v, want accepted", err)
+		return
+	}
+	if ms != 15000 {
+		t.Errorf("nil: value: got %d ms, want 15000 ms", ms)
+	}
+}
+
+// lftPeekFilter blocks in a 5-byte Peek, then continues.
+type lftPeekFilter struct{}
+
+func (lftPeekFilter) Inspect(_ context.Context, p listenerfilter.Peeker, _ *listenerfilter.ChainMatchInputs) (listenerfilter.ListenerFilterStatus, error) {
+	_, _ = p.Peek(5)
+	return listenerfilter.Continue, nil
+}
+
+func (lftPeekFilter) OnDestroy() {}
+
+// lftLoopbackPair returns both ends of one real loopback TCP connection.
+func lftLoopbackPair(t *testing.T) (peer, server net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	type acc struct {
+		c   net.Conn
+		err error
+	}
+	ch := make(chan acc, 1)
+	go func() {
+		c, err := ln.Accept()
+		ch <- acc{c, err}
+	}()
+	peer, err = net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	a := <-ch
+	if a.err != nil {
+		_ = peer.Close()
+		t.Fatalf("accept: %v", a.err)
+	}
+	return peer, a.c
+}
+
+// lftPipeHold parses {s, n}, runs Pipeline.Run with the PARSED value against a
+// silent loopback peer, and requires Run to still be blocked after hold: the
+// parsed value must not collapse to a short or already-expired deadline.
+func lftPipeHold(t *testing.T, label string, s int64, n int32, hold time.Duration) {
+	t.Helper()
+	v, err := parseListenerFiltersTimeout("l_lft", &durationpb.Duration{Seconds: s, Nanos: n})
+	if err != nil {
+		t.Errorf("%s: pipeline: parse rejected: %v", label, err)
+		return
+	}
+	peer, server := lftLoopbackPair(t)
+	pc := listenerfilter.NewPeekerConn(server)
+	type res struct {
+		err error
+		el  time.Duration
+	}
+	ch := make(chan res, 1)
+	start := time.Now()
+	go func() {
+		var p listenerfilter.Pipeline
+		err := p.Run(context.Background(), []listenerfilter.ListenerFilter{lftPeekFilter{}}, listenerfilter.AsPeeker(pc), &listenerfilter.ChainMatchInputs{}, v)
+		ch <- res{err, time.Since(start)}
+	}()
+	returned := false
+	select {
+	case r := <-ch:
+		returned = true
+		t.Errorf("%s: pipeline hold: Run returned after %v (err %v), want still blocked at %v", label, r.el, r.err, hold)
+	case <-time.After(hold):
+	}
+	_ = peer.Close()
+	_ = pc.Close()
+	if !returned {
+		<-ch
+	}
+}
+
+// TestListenerFilterTimeoutPipelineHoldsAtMax drives Run with the parsed
+// maximum. A uint32 carrier wraps it to ~24 days, which still holds, so this
+// arm guards the overflow edge, not the width.
+func TestListenerFilterTimeoutPipelineHoldsAtMax(t *testing.T) {
+	lftPipeHold(t, "9223372035.999999999s", 9223372035, 999999999, 1000*time.Millisecond)
+}
+
+// TestListenerFilterTimeoutPipelineHoldsPastUint32Wrap drives Run with the
+// parsed 4294968s. A uint32 carrier wraps it to 704 ms, inside the hold: this
+// is the behavioral arm that discriminates the width.
+func TestListenerFilterTimeoutPipelineHoldsPastUint32Wrap(t *testing.T) {
+	lftPipeHold(t, "4294968s", 4294968, 0, 1000*time.Millisecond)
 }

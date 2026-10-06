@@ -3336,9 +3336,10 @@ func TestParseListenerFiltersTimeoutDefault(t *testing.T) {
 	}
 }
 
-// TestParseListenerFiltersTimeoutBelowFloorErrors verifies that a 500ms
-// listener_filters_timeout errors with the [1s, 60s] envelope message.
-func TestParseListenerFiltersTimeoutBelowFloorErrors(t *testing.T) {
+// TestParseListenerFiltersTimeoutSubSecondAccepted verifies that a 500ms
+// listener_filters_timeout, once refused by envoy-go's own 1s floor, builds
+// and parses to lfTimeoutMs=500 (ADR-0323).
+func TestParseListenerFiltersTimeoutSubSecondAccepted(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
 	l := &listenerv3.Listener{
@@ -3353,19 +3354,19 @@ func TestParseListenerFiltersTimeoutBelowFloorErrors(t *testing.T) {
 		ListenerFiltersTimeout: durationpb.New(500 * time.Millisecond),
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
-	if err == nil {
-		t.Fatal("expected error for listener_filters_timeout=500ms, got nil")
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager: listener_filters_timeout=500ms rejected: %v", err)
 	}
-	want := `listener: "name": listener_filters_timeout 500ms is outside the supported [1s, 60s] envelope`
-	if !strings.Contains(err.Error(), want) {
-		t.Errorf("error %q does not contain %q", err.Error(), want)
+	if got := mgr.runtimes[0].lfTimeoutMs; got != 500 {
+		t.Errorf("lfTimeoutMs = %d, want 500", got)
 	}
 }
 
-// TestParseListenerFiltersTimeoutAboveCapErrors verifies that a 90s
-// listener_filters_timeout errors with the same envelope-violation format.
-func TestParseListenerFiltersTimeoutAboveCapErrors(t *testing.T) {
+// TestParseListenerFiltersTimeoutAboveOldCapAccepted verifies that a 90s
+// listener_filters_timeout, once refused by envoy-go's own 60s cap, builds and
+// parses to lfTimeoutMs=90000 (ADR-0323).
+func TestParseListenerFiltersTimeoutAboveOldCapAccepted(t *testing.T) {
 	cm := mkClusterMgr(t, "c_echo", "127.0.0.1", 9999)
 	filter := mkTcpProxyFilter(t, "c_echo")
 	l := &listenerv3.Listener{
@@ -3380,13 +3381,12 @@ func TestParseListenerFiltersTimeoutAboveCapErrors(t *testing.T) {
 		ListenerFiltersTimeout: durationpb.New(90 * time.Second),
 	}
 	boot := mkBoot(0, []*listenerv3.Listener{l}, nil)
-	_, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
-	if err == nil {
-		t.Fatal("expected error for listener_filters_timeout=90s, got nil")
+	mgr, err := NewManager(boot, cm, stats.NewRegistry(), testHTTPRegistry())
+	if err != nil {
+		t.Fatalf("NewManager: listener_filters_timeout=90s rejected: %v", err)
 	}
-	want := `listener: "name": listener_filters_timeout 1m30s is outside the supported [1s, 60s] envelope`
-	if !strings.Contains(err.Error(), want) {
-		t.Errorf("error %q does not contain %q", err.Error(), want)
+	if got := mgr.runtimes[0].lfTimeoutMs; got != 90000 {
+		t.Errorf("lfTimeoutMs = %d, want 90000", got)
 	}
 }
 
@@ -4050,7 +4050,7 @@ func TestUnifiedDispatchListenerFilterTimeoutAbortsConnection(t *testing.T) {
 		FilterChains: []*listenerv3.FilterChain{
 			{Filters: []*listenerv3.Filter{filter}},
 		},
-		// 1s pipeline timeout (ADR-0082 floor); slowListenerFilter blocks 2s.
+		// 1s pipeline timeout; slowListenerFilter blocks 2s.
 		ListenerFiltersTimeout: durationpb.New(1 * time.Second),
 		// continue_on_listener_filters_timeout defaults to false (zero value).
 	}
