@@ -1,0 +1,17 @@
+{
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/esa/bin/claude-stop-hook.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
