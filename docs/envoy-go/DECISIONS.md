@@ -19822,7 +19822,7 @@ only the parser bounds it, and `Run`'s doc comment, which sits on layout-gated l
 
 ## ADR-0324 — `stats_flush_interval` accepts exactly `[1ms, 5m)`, read from the Duration's fields, and rejects every other present value at Load in the reference's three phrases, with or without a stats sink (phase 102)
 
-> **STATUS: PROPOSED — §Context drafted at the phase-102 SPEC; §Decision + §Consequences are APPENDED IN PLACE at the phase-102 IMPL, after the RETAINED italic footer below, with no renumber and no `---` separator (the ADR-0294-0323 shared block form).** ⚠️ **THIS BLOCK RE-ARMS THE HOUSE `PROPOSED` GUARD, AND NO COUNT OF EITHER MATCHER IS WRITTEN ANYWHERE IN IT, DELIBERATELY** — this line is itself a hit of the strict form. **Verify by LINE and by ADR** (backward `^## ADR-` heading search), **never by the count alone**, and never conflate it with the unrelated **ADR-0231 decoy**, which is **BYTE-UNTOUCHED** by this row. **ROW 102 STAYS `in-progress` THROUGH THIS SPEC**; `ROADMAP.md` and `BEHAVIOR_CONTRACT.md` are byte-untouched at this stage. An **Observability / bootstrap MAINTENANCE row claiming NO family ordinal**. It **AMENDS** ADR-0262's D-MS-FLUSH parse arm (*"`stats_flush_interval` defaults to 5s"* SURVIVES for an absent field; the bounds and the three rejects are new) and **NARROWS** D-MS-FLUSH-INERT to in-range values; it **NOTES** ADR-0323 §Consequences (g), which named this row next, and ADR-0323 V3, whose `9223372035` seconds ceiling is the same reference bound measured on a different field; it **SUPERSEDES** nothing.
+> **STATUS: ACCEPTED — §Context drafted at the phase-102 SPEC; §Decision + §Consequences APPENDED IN PLACE at the phase-102 IMPL, after the RETAINED italic footer, with no renumber and no `---` separator (the ADR-0294-0323 shared block form).** ⚠️ **THE HOUSE `PROPOSED` GUARD WAS RE-ARMED BY THIS BLOCK AT THE SPEC AND IS DISARMED BY THIS FLIP — AND NO COUNT OF EITHER MATCHER IS WRITTEN ANYWHERE IN IT, DELIBERATELY**: while it read PROPOSED this line was itself a hit of the strict form, so any figure it named would have been falsified by its own landing. **Verify by LINE and by ADR** (backward `^## ADR-` heading search), **never by the count alone**, and never conflate the strict house form with the unrelated **ADR-0231 decoy** at `DECISIONS.md:14866`, which is **BYTE-UNTOUCHED** by this row. **ROW 102 STAYED `in-progress` THROUGH THE SPEC AND THE PLAN** and flips to `done` at this IMPL. An **Observability / bootstrap MAINTENANCE row claiming NO family ordinal**. It **AMENDS** ADR-0262's D-MS-FLUSH parse arm (*"`stats_flush_interval` defaults to 5s"* SURVIVES for an absent field; the bounds and the three rejects are new) and **NARROWS** D-MS-FLUSH-INERT to in-range values; it **NOTES** ADR-0323 §Consequences (g), which named this row next, and ADR-0323 V3, whose `9223372035` seconds ceiling is the same reference bound measured on a different field; it **SUPERSEDES** nothing.
 
 ### Context (drafted at the phase-102 SPEC)
 
@@ -19837,3 +19837,100 @@ only the parser bounds it, and `Run`'s doc comment, which sits on layout-gated l
 **§Context ¶5 — WHAT THIS ADR DOES NOT DECIDE.** It does not change whole-message byte parity (envoy-go mirrors the phrase after a `bootstrap: stats_flush_interval: ` prefix, not the reference's token, dump or field echo). It does not measure or pin sub-millisecond cadence, which is unobservable on the reference in this setup. It does not touch `stats_flush_on_admin` (still strict-rejected), the exported `Pipeline.Run` residual (ADR-0323 (h)), or any listener-side candidate. It adds no stat name.
 
 *§Decision and §Consequences follow at the phase-102 IMPL.*
+
+### Decision (landed at the phase-102 IMPL)
+
+**`parseStatsSinks` reads a present `stats_flush_interval` from the Duration's `seconds` and `nanos` fields,
+never through `AsDuration`, and applies the reference's three checks in the reference's order, before any
+`stats_sinks[]` entry is looked at.** Against the pre-row tip, `git diff --numstat` reads `21 10` for
+`internal/bootstrap/bootstrap.go`: the `9 2` code change of the SPEC's P2 plus three comment sites, in five `@@` hunks (the code change
+is two of them). No other production file changes.
+
+- **F1.** Absent ⇒ `FlushInterval = 5s` (ADR-0262's default, unchanged).
+- **F2.** `seconds < 0` or `nanos < 0` ⇒ `bootstrap: stats_flush_interval: Invalid duration: Expected positive
+  duration`.
+- **F3.** `seconds > 9223372035` or `nanos > 999999999` ⇒ `bootstrap: stats_flush_interval: Invalid duration:
+  Duration out-of-range`.
+- **F4.** `seconds >= 300`, or `seconds == 0` and `nanos < 1000000` ⇒ `bootstrap: stats_flush_interval: value
+  must be inside range [1ms, 5m0s)`.
+- **F5.** Otherwise `FlushInterval = seconds·1s + nanos`, exactly; nothing truncates or rounds.
+
+Each message is the `bootstrap: stats_flush_interval: ` prefix followed by the reference's phrase byte for
+byte, so a boot-reject fixture can assert one substring on both sides. The reference's run-varying
+`goo.gle/debug…` token, its trailing spaces, its proto dump and its `seconds:` / `nanos:` echo are NOT
+mirrored. Every field the arithmetic reads is bounded by F2-F4, so F5 stays below 300 s and cannot overflow.
+F4 also rejects `{0, 0}`, so the flusher can never be built with a non-positive interval: the old `> 0` guard
+is subsumed, not lost. The check is unconditional on sinks.
+
+**Layout.** The two comment hunks above `parseStatsSinks` (the `statsFlushIntervalDefault` comment and the
+`FlushInterval` field comment) are line-count-neutral, and the third comment site, a doc comment at :789 (+4
+lines), sits below the last cited line (:756), so none of the `bootstrap.go:<line>` citations in
+`internal/`, `cmd/`, `test/`, `BEHAVIOR_CONTRACT.md` or this file moves. Every cited line sits above
+`parseStatsSinks`, and a cite gate that compares each cited line's bytes at the base and at the tip read 27
+checked, 0 moved. At the PLAN, under the SPEC's line-adding comment shape, the same gate read 22 moved (a
+PLAN measurement, not re-run at the IMPL).
+
+**Tests.** `internal/bootstrap/stats_flush_interval_test.go` (39 leaves: nine YAML reject values and five YAML
+accept values, each on a bootstrap without a sink and with one statsd sink, plus eleven Go-built Durations
+called through `parseStatsSinks`), and `cmd/envoy-go/stats_flush_interval_test.go` (`--mode validate` on the
+built binary: `0s` and `-1s` exit 1 naming their class, `0.001s` validates). Reject arms assert exactly one
+class phrase, the absence of the other two, and the full `bootstrap: stats_flush_interval: ` prefix (pinned by the final review; a prefix-drop mutant reddens 27 leaves). At the un-fixed tip 29 of the 42
+leaves were RED; the 13 accept leaves were GREEN by design.
+
+**Fixtures.** `0127-stats-flush-interval-range-boot-reject` (`0s`, needle `value must be inside range [1ms,
+5m0s)`) and `0128-stats-flush-interval-negative-boot-reject` (`-0.5s`, needle `Invalid duration: Expected
+positive duration`), both symmetric `BootRejectFixture`s without a stats sink, each with an inline
+`direct_response` body (envoy-go refuses a body-less `direct_response`, which would reject the subject for an
+unrelated reason). Both were RED at the un-fixed tip (`subject proxy started cleanly`) and are GREEN after.
+`-0.5s` rather than `-1s` is the negative arm because a negative-seconds value never reaches F4's lower bound:
+with `-1s`, `0128` passed under the reordering mutant.
+
+*Amends ADR-0262 (D-MS-FLUSH parse arm; D-MS-FLUSH-INERT narrowed to in-range values).*
+
+### Consequences (landed at the phase-102 IMPL)
+
+**(a) THE DECLARED BEHAVIOUR CHANGES.**
+- **Absent, or a present value inside `[1ms, 5m)`**: unchanged. An in-range value without a sink is still
+  parsed and inert (D-MS-FLUSH-INERT, narrowed).
+- **`0s` or any negative value**: before, folded silently to the 5 s default and booted; now refused at Load,
+  at `--mode validate` and at boot (rc 1), with or without a sink.
+- **A sub-millisecond value** (`0.0005s`, `0.000999999s`): before, accepted and flushed about every
+  millisecond; now refused with the range phrase.
+- **`300s` and above, up to `9223372035.999999999s`**: before, accepted (no flush in a 300 s window); now
+  refused with the range phrase.
+- **`9223372036s` up to the protobuf maximum**: before, saturated by `AsDuration` to the Go `time.Duration`
+  maximum and never flushed; now refused with the out-of-range phrase. `315576000001s` is still refused by
+  the protojson decoder first, on both sides.
+
+**(b) THE CLASS ORDER IS LOAD-BEARING.** The reference validates the Duration before PGV, so `-0.5s` (seconds 0)
+and `9223372036s` never read the range phrase. A subject that checked the range first, or that printed one
+message for every class, agrees with the reference on rc and disagrees on the phrase; the two fixtures and
+the unit arms are what pin the phrase.
+
+**(c) THE PANIC HAZARD THE LOWER BOUND REMOVES IS SINK-PATH ONLY.** With the lower bound deleted, `0s`
+validates OK; at a real boot it prints `envoy-go ready` and then panics `non-positive interval for NewTicker`
+when a sink is configured, and boots silently when none is. A negative value behaves the same way when the
+negative case is deleted (`-1s` with a statsd sink: `ready`, then the same panic, exit 2, in about 11 ms;
+without a sink it boots and serves). The differential harness kills the subject as soon as it prints `ready`,
+so it classes such a subject as booted, with no panic text in its output; that is why both fixtures carry no
+sink.
+
+**(d) THE NEGATIVE-CONTROL ROSTER.** Nine mutants of the shipped shape, each marked and asserted in place before
+it ran, each reddening exactly the predicted unit leaves: the lower bound (8), the nanos clause of F3 (2, Go-built
+arms only, because protojson normalises YAML), the negative case (7), the 300 s edge (3), the seconds ceiling
+(6), the class order (8), a sink-gated check (26 new leaves plus the existing `TestStatsSink_InertFlushInterval`),
+the 1 ms edge (4) and a single message for all classes (15). At the fixture level, the lower-bound mutant
+reddens `0127`; the negative-case, class-order and single-message mutants redden `0128`; the sink-gated mutant
+reddens both; the other four redden neither.
+
+**(e) WHAT THIS ROW DID NOT BUY.**
+- whole-message byte parity (token, trailing spaces, proto dump, field echo);
+- sub-millisecond cadence parity among accepted values, which is unobservable on the reference in this setup,
+  and any explanation of the pre-row `0.0005s` cadence (moot now that it is refused);
+- a reference arm for `nanos > 999999999`, which YAML and protojson cannot carry; that half of F3 is source-read
+  parity, as in ADR-0323 (h);
+- a third fixture for the out-of-range class: its mechanism is the one `0128` exercises, and its unit arms pin
+  the phrase;
+- any change to `stats_flush_on_admin` (still strict-rejected), to the exported `Pipeline.Run` residual
+  (ADR-0323 (h)), or to any listener-side candidate;
+- any stat name: the stat surface moves by `+0`.

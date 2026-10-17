@@ -223,8 +223,8 @@ const (
 	// as flush-every-entry and is NOT coerced to this default.
 	alsDefaultBufferSizeBytes uint32 = 16384
 
-	// statsFlushIntervalDefault is the stats_flush_interval default (5s) applied
-	// when the field is absent or non-positive (ADR-0262 / D-MS-FLUSH).
+	// statsFlushIntervalDefault is the stats_flush_interval applied when the field
+	// is absent (ADR-0262 / D-MS-FLUSH); a present value is bounded (ADR-0324).
 	statsFlushIntervalDefault = 5 * time.Second
 )
 
@@ -531,10 +531,10 @@ type Bootstrap struct {
 	// OTLPMetricsSink is built in cmd/envoy-go/main.go after Load returns (and
 	// ONLY when this slice is non-empty).
 	OTLPSinkConfigs []OTLPSinkConfig
-	// FlushInterval is the stats_flush_interval (default 5s when absent/non-positive
-	// — D-MS-FLUSH). Parsed-and-stored even when no stats_sinks[] entry exists
-	// (inert in that case — D-MS-FLUSH-INERT); the Flusher uses it only when
-	// StatsSinkConfigs is non-empty.
+	// FlushInterval is the stats_flush_interval (default 5s when absent — D-MS-FLUSH;
+	// a present value outside [1ms, 5m) is rejected at Load, ADR-0324). An in-range
+	// value is stored even with no stats_sinks[] entry (inert — D-MS-FLUSH-INERT);
+	// the Flusher uses it only when StatsSinkConfigs is non-empty.
 	FlushInterval time.Duration
 	// ConfigPath is the file path the bootstrap was loaded from. Set by the
 	// caller (cmd/envoy-go/main.go) post-Load via bs.ConfigPath = *cfgPath;
@@ -786,8 +786,12 @@ func checkStaticLayerValues(fields map[string]*structpb.Value) error {
 }
 
 // parseStatsSinks reads the top-level stats_flush_interval (default 5s) and the
-// stats_sinks[] entries (ADR-0262). stats_flush_interval is ALWAYS stored on
-// result.FlushInterval, even with no stats_sinks[] (inert — D-MS-FLUSH-INERT).
+// stats_sinks[] entries (ADR-0262). An in-range stats_flush_interval is ALWAYS
+// stored on result.FlushInterval, even with no stats_sinks[] (inert —
+// D-MS-FLUSH-INERT); any other present value is rejected, with or without a
+// sink, in the reference's three phrases and in its order: a negative field,
+// then seconds above 9223372035 or nanos above 999999999, then a total outside
+// [1ms, 5m) (ADR-0324).
 // stats_flush_on_admin is STRICT-REJECTED (ADR-0080; envoy-go ships only the
 // periodic stats_flush_interval loop). Each stats_sinks[] entry must carry one
 // of the five supported typed_config types (metrics_service, statsd,
@@ -797,9 +801,16 @@ func checkStaticLayerValues(fields map[string]*structpb.Value) error {
 func parseStatsSinks(bs *bootstrapv3.Bootstrap, result *Bootstrap) error {
 	result.FlushInterval = statsFlushIntervalDefault
 	if d := bs.GetStatsFlushInterval(); d != nil {
-		if v := d.AsDuration(); v > 0 {
-			result.FlushInterval = v
+		secs, nanos := d.GetSeconds(), d.GetNanos()
+		switch {
+		case secs < 0 || nanos < 0:
+			return fmt.Errorf("bootstrap: stats_flush_interval: Invalid duration: Expected positive duration")
+		case secs > 9223372035 || nanos > 999999999:
+			return fmt.Errorf("bootstrap: stats_flush_interval: Invalid duration: Duration out-of-range")
+		case secs >= 300 || (secs == 0 && nanos < 1000000):
+			return fmt.Errorf("bootstrap: stats_flush_interval: value must be inside range [1ms, 5m0s)")
 		}
+		result.FlushInterval = time.Duration(secs)*time.Second + time.Duration(nanos)
 	}
 	if bs.GetStatsFlushOnAdmin() {
 		return fmt.Errorf("bootstrap: stats_flush_on_admin is not supported (envoy-go ships only the periodic stats_flush_interval sink loop)")
